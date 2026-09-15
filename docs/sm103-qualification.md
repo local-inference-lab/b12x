@@ -3,9 +3,13 @@
 Status: **implemented prototype, unqualified on B300**. The normal b12x API
 selects native NVFP4 and uniform, projection-tiered, grouped atom or BTX paired Trellis MoE
 backends for SM103. Native V4.1 checkpoint serving passes the recorded SM121
-checks. GLM checkpoint correctness, V4.1 Trellis model accuracy, physical SM103
-execution and Station RDMA remain unqualified. No B300 performance
-numbers or measured B300 policy profile are included.
+checks. GLM component regressions pass on SM120, and earlier bounded SM121
+TP4 eager/graph checkpoint gates passed. DFlash and a subsequent target-only
+graph control failed their accuracy gates. GLM checkpoint accuracy, V4.1 Trellis
+model accuracy, physical SM103 execution and Station RDMA remain unqualified. No B300 performance
+numbers or measured B300 policy profile are included. The
+[readiness report](sm103-readiness-report.md) summarizes the implementation and
+remaining qualification work.
 
 ## Support and architecture boundaries
 
@@ -28,8 +32,8 @@ numbers or measured B300 policy profile are included.
 | V4.1 supporting operators | Existing CSA compression, HyperConnection and embedding APIs admit SM103; HyperConnection selects CuTe for every stage; SM120/SM121 correctness and memcheck pass; 72 callables cross-compiled; native V4.1 checkpoint serving passes bounded SM121 TP4 checks | Physical SM103 state, graph and numeric qualification; Trellis checkpoint accuracy |
 | MTP feedback | GLM ordinary RMS-concat, Qwen flattened Gemma multi-stream and DeepSeek per-stream FP8 contracts use existing planned APIs and CuTe projections; GLM and DeepSeek companion call-site, graph and Inductor checks pass on SM120; 51 SM103 callables compiled | Physical SM103 execution, actual sequence-parallel collectives, head collapse and full speculative model evaluation |
 | Checkpoint-loader integration | Companion scoped allocation/copy hooks, file-range descriptors, filtering and post-load completion are implemented; host tests and SM120 model/MoE regressions pass; 34 direct-loader tests pass on SM121 | Execute companion loader integration on SM121; qualify Grace placement on the Station |
-| DFlash2 | GLM dummy target/draft execution on SM120 matches all 48 target-only tokens, with 54 graph replays and frozen resolution; Qwen target/draft execution and accepted proposals are exercised | Qwen exact token equality remains unresolved; GLM checkpoint acceptance/accuracy and physical SM103 execution remain unqualified |
-| Full GLM/V4.1 | Companion model integrations are implemented; native V4.1 SM121 TP4 checkpoint checks pass; GLM SM121 TP4 loads and generates but fails the arithmetic gate | Resolve GLM checkpoint correctness; qualify V4.1 Trellis weights and both models on SM103 |
+| DFlash2 | GLM dummy target/draft execution matches all 48 target-only tokens on SM120; real SM121 GLM accepts draft proposals, matches 39 fixed-request tokens and replays graphs with frozen resolution | GLM and Qwen checkpoint accuracy/parity remain unresolved; physical SM103 execution is unqualified |
+| Full GLM/V4.1 | Native V4.1 has bounded SM121 TP4 checkpoint evidence. GLM eager/graphs score 29/32 and 30/32 in the selection-fix trial; DFlash scores 25/32 and the history-only graph control scores 27/32, failing the declared 29/32 floor | Resolve GLM accuracy variation, qualify V4.1 Trellis weights and execute both models on SM103 |
 | HBM GDR | Experimental Grace transport is implemented; direct HBM transport is unsupported | Implement and qualify direct HBM transport on capable hardware |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
@@ -61,6 +65,48 @@ platform-specific execution checks. CuTe/CUTLASS
 supplies matrix, layout, TMA and synchronization primitives; b12x owns routing,
 fusion, capacity, lifecycle and policy. Generic NVIDIA attention/linear backends
 remain appropriate integration fallbacks where b12x has no SM103 implementation.
+
+## GLM pooling and checkpoint evidence
+
+The companion GLM adapter preserves selected partial-pool tails through stable
+compaction. Pool writers retain three preceding rows plus the planned verifier
+length, indexing a fixed-capacity ring by absolute token position. The write
+mask uses the original slot validity before converting packed page coordinates;
+an unmapped `-1` slot cannot become a write to page zero. All scaled row/page
+offsets use Int64. Native sparse MLA resolves its split count during planning.
+
+The [GLM validation receipt](sm103-glm-sparse-validation.json) binds each result
+to its runtime source. The final pooling source passes 53 cases under Compute
+Sanitizer in complementary processes of eight and 45 cases, with zero errors.
+A combined process passes 50 cases and fails three allocations after retaining
+22.23 GiB; that attempt remains failed. Rejection, planned capacities 4/11/18,
+unmapped slots, high page IDs, input mutation, frozen compilation, stable
+addresses and allocation-free graph replay are covered.
+
+All 27 companion metadata variants compile for `sm_103a`, with 108 hashed
+PTX/cubin/SASS/resource artifacts and no stack or local-memory use. One packed
+decode variant increases from 48 to 56 registers after the slot guard; its
+1,024-byte shared-memory allocation is unchanged. Retain this flag for physical
+occupancy and latency measurements. The separate b12x corpus retains its own
+44 stack/local flags and eight packing register increases.
+
+The real 45-layer GLM checkpoint passes 11 fixed requests in eager, graph and
+DFlash modes in the selection-fix trial, producing the same 39 output tokens.
+Its five-shot GSM8K scores are 29/32, 30/32 and 25/32, respectively, with zero
+invalid answers. DFlash accepts real proposals but fails the declared 29/32
+accuracy floor. The history-only graph control subsequently scores 27/32 and
+fails that floor before DFlash starts. These observations do not establish a
+DFlash-specific cause or qualify checkpoint accuracy. Neither the small sample
+nor its timings is a model-quality or performance benchmark.
+
+A final-source diagnostic repeats two serial passes and one C4 pass per mode.
+Target-only graphs score 26/32, 28/32 and 27/32; DFlash scores 26/32, 28/32 and
+28/32. Exact generated text matches only four serial pairs for graphs and three
+for DFlash. Prefix caching stays enabled, so repeated execution also changes
+cache reuse. These results do not isolate a race, a DFlash-specific regression
+or a single arithmetic defect. They leave checkpoint accuracy unqualified and
+preserve the preceding failed gates. The full prompts, generated text and
+comparisons remain in the source-bound diagnostic artifacts.
 
 ## Bring-up and compilation
 
@@ -112,25 +158,29 @@ with gate-first weights and capacity 8193 with 65,544 routes. Neither build
 emits stack or local-memory traffic. All 21 deferred operator suites collect
 successfully; collection verifies imports and selectors without executing tests.
 
-The [consolidated compilation receipt](sm103-consolidated-validation.json)
-binds source revision `2e6c166e` to 1,225 callables and 1,235 CUDA entry points,
+The [sparse selection validation receipt](sm103-glm-sparse-validation.json)
+binds source revision `ebace59f` to 1,225 callables and 1,235 CUDA entry points,
 including clamped Trellis TP1/TP2, MLA compression, HyperConnection, embedding
 and Engram. All artifact hashes verify, and 27 physical-SM103 suites are
-prepared from the identical frozen source and collect successfully without
-executing them. Of 1,108
-existing callables, 1,086 retain identical PTX and 1,050 retain identical
-cubins; no callable is removed. Source and Torch/Triton versions differ between
-these corpora, so this comparison does not isolate compiler effects.
+prepared from that source without GPU execution. Collection selects 1,461 cases,
+including overlap between suites. Against the preceding
+1,225-callable corpus, 1,187 PTX artifacts and 1,145 cubins remain identical;
+no callable is added or removed.
 
-Seventeen existing callables have positive register-set deltas. Two MXFP4 K128
-activation packers add two allocated GPRs each; the other increases affect exact
-R, UR, P or UP sets. No existing callable changes stack, local memory, local
-load/store counts or static shared memory. All 44 stack/local flags are
-unchanged, and no added callable has a flag. All positive deltas remain recorded;
-occupancy and latency require physical SM103 qualification. The wheel built
-from the same revision contains all Python sources and three embedded profiles;
-all 476 packaged files match the checkout and 56 host checks pass against the
-extracted wheel.
+The serving environment uses Torch 2.13 and Triton 3.7.1; the comparison corpus
+uses Torch 2.14 and Triton 3.8. Eight activation packers add one or two allocated
+GPRs. Reassembly with common PTXAS 13.3 preserves differences of one to five
+GPRs, with at most 29 allocated GPRs. Quantizer source and compile options are
+identical, so these flags reflect the emitted PTX rather than the sparse MLA
+source fix. All 44 stack/local flags remain visible. The comparison establishes
+no performance result; occupancy and latency require physical SM103 profiling.
+`scripts/audit_sm103_packing_ptxas.py` preserves the common-assembler experiment.
+
+All 476 runtime wheel files match the checkout. The extracted wheel passes 88
+host checks and four SM120 attention regressions. Two generator checks also
+pass with the checkout's benchmark drivers available. Checkout and wheel retain
+distinct raw package fingerprints because four repository Markdown files are
+excluded from packaging.
 
 Binary dependency resolution succeeds for b12x with Python 3.12, ARM64,
 CUDA 13.0 and glibc 2.28. Resolving b12x together with the companion vLLM CUDA
@@ -809,8 +859,11 @@ NSA, indexer, KDA, dense linears or draft model.
 
 Physical SM103 serving qualification follows per-operation correctness tests.
 Use the existing LIL vLLM model interfaces and capability-driven companion
-adapters. Complete GLM checkpoint execution remains unqualified.
-The companion implementation at `5d58e328c1` uses the public CuTe KDA prefill
+adapters. The [GLM receipt](sm103-glm-sparse-validation.json) records passing
+fixed requests and the earlier bounded eager/graph gates alongside subsequent
+accuracy failures. GLM checkpoint accuracy and physical SM103 model execution
+remain unqualified.
+The earlier companion implementation at `5d58e328c1` uses the public CuTe KDA prefill
 plan for mixed batches, binds sparse MLA through the public API, and negotiates
 compatible pooled-cache pages. Its SM120 synthetic model produces the same
 48 tokens in eager and graph execution, with 21 graph replays and frozen
