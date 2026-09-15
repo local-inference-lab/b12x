@@ -1980,3 +1980,20 @@ CuTe and reference decode closely match the independent FP32 oracle on
 those same inputs. B12x prefill output/state relative RMS errors stay below
 0.007/0.004. These captures do not establish a decoder defect or resolve
 the model discrepancy. The original service is restored with HTTP 200.
+
+## ARM64 external native build
+
+Status: compilation and CPU loading qualified; GPU execution unqualified.
+
+The isolated ARM64 build now produces FlashMLA, its extension, FlashKDA,
+QuTLASS and DeepGEMM. All ten core and external libraries load together
+with CUDA hidden and uninitialized. The 376 checked source/build files and
+nine dependency revisions match the verified x86 build, and the original
+five core library hashes remain unchanged.
+
+The external artifacts contain 195 SM100-family CUDA entry records. Resource
+reports retain all 51 entries with positive stack usage; none reports local
+memory. Host compilation uses no native CPU architecture flags. Commands,
+binaries, resource reports and hashes are preserved outside the repository.
+These results do not qualify GPU execution, DeepGEMM runtime JIT,
+FlashAttention, the Rust parser or a complete companion native build.

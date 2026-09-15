@@ -947,5 +947,20 @@
     "artifact_root": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/native-externals",
     "gpu_execution": false,
     "performance_claim": false
+  },
+  "arm64_external_build": {
+    "status": "Five external libraries build and load on ARM64; ten core and external libraries load together with CUDA hidden and uninitialized.",
+    "receipt": "companion vLLM docs/design/b12x_native_external_validation.json",
+    "core_library_hashes_unchanged": true,
+    "cuda_entries": 195,
+    "architectures": [
+      "sm_100f"
+    ],
+    "artifact_manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/arm64-externals/artifact-manifest.json",
+      "sha256": "4a4705c3ca6b7269db14dcf415734d9efeef517f4044592f1f1f7f64804d4166"
+    },
+    "gpu_execution": false,
+    "performance_claim": false
   }
 }
