@@ -2,7 +2,7 @@
 
 Status: **implemented prototype; physical SM103 execution unqualified**.
 The SM103 branch uses the preparation API based on master revision
-`213fc1b204b306bdbaa7d40d2a27529658128bf7`. Plans declare typed geometry and
+`ff36d2d12c2e1b347216140b348e7e14d78aaab1`. Plans declare typed geometry and
 capacity; preparation compiles, materializes and primes execution before binding
 or capture. There is no measured B300 performance result or B300 tuning winner.
 
@@ -25,7 +25,7 @@ separate tests. BTX GPU preparation tests use SM103 admission metadata on SM120 
 
 Host checks report 877 passes, 53 skips and one baseline failure. The SM120
 batches report 1,093 passes, 110 skips and three baseline failures. A pristine
-checkout of the stated master revision reproduces the device-reclaim cache
+checkout of master revision `213fc1b2` reproduces the device-reclaim cache
 expectation, mHC program-sharing expectation and first-use warning-key failures.
 No failing or skipped case is counted as a pass. The preparation-specific architecture tests
 exercise all corpus declarations without initializing CUDA.
@@ -37,6 +37,16 @@ matched pre-port baseline and establishes no performance or regression result.
 
 The source-bound preparation validation record is
 [sm103-preparation-validation.json](sm103-preparation-validation.json).
+Its complete corpus and component results identify the frozen preparation port
+before upstream MXFP8 scale-bounds fix `ff36d2d1`. The branch includes that fix;
+[integration validation](sm103-master-integration-validation.json) identifies
+the resulting source and its focused checks. Reapplying the upstream patch to
+the validated source produces exactly the integrated package. The upstream
+regression tests use explicit preparation plans and separate uncached memory
+checks from graph replay with PyTorch's capture-aware allocator.
+The integrated source passes 377 focused checks and three uncached eager cases
+under Compute Sanitizer with zero reported errors. Its rebuilt wheel contains
+exactly the package's 519 Python and 12 native source files.
 Raw local logs, compile caches and native artifacts remain outside the repository.
 
 The [GLM receipt](sm103-glm-sparse-validation.json) and

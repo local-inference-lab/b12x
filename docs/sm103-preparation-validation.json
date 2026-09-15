@@ -1,6 +1,6 @@
 {
   "status": "implemented prototype; physical SM103 execution unqualified",
-  "scope": "b12x preparation API port; no performance or full-model qualification",
+  "scope": "Frozen b12x preparation API port before upstream ff36d2d1; no performance or full-model qualification. See integration_record for the integrated source.",
   "working_branch": "work/sm103-bringup",
   "rebased_base": "213fc1b204b306bdbaa7d40d2a27529658128bf7",
   "pre_rebase_branch": "3c0e55d2a0c5f67384d234fd31693d433f9b7b1a",
@@ -298,5 +298,7 @@
     "local-resource-runs": "Local memory pressure caused test/disassembler timeouts; interrupted or timed-out runs are excluded. Final audits run on ripper with an on-disk temporary directory.",
     "staging-inventory": "A staging-only policy reference module was removed before final compilation and GPU runs. The final source inventory matches the working branch."
   },
-  "raw_local_evidence": "/home/jasonc/b12x-sm103-rebase-20260915"
+  "raw_local_evidence": "/home/jasonc/b12x-sm103-rebase-20260915",
+  "validated_source_revision": "713ceaab79f7063ec7dccaf24761964fb1101975",
+  "integration_record": "sm103-master-integration-validation.json"
 }

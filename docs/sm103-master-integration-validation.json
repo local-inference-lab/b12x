@@ -1,0 +1,147 @@
+{
+  "status": "implemented prototype; physical SM103 execution unqualified",
+  "scope": "Preparation port integrated with master MXFP8 scale-bounds fix ff36d2d1",
+  "working_branch": "work/sm103-bringup",
+  "rebased_base": "ff36d2d12c2e1b347216140b348e7e14d78aaab1",
+  "package_source_sha256": "75082e53cb881f089fd7e7107271c2fc50751a237c33f5403836da946475ab6c",
+  "source_identity": "The enclosing commit contains the integrated package and test sources. Package hashes use scripts/_sm103_source.py.",
+  "broad_validation_record": "sm103-preparation-validation.json",
+  "broad_validation_package_source_sha256": "011e157502f09456e59ee18b902ca1bdd5f3af544fa451ed838c8f11c29416dd",
+  "integration_delta": {
+    "upstream_patch_sha256": "2b5592bb735e59173941df61cd660874c8cd41ed2e06cebe48899ca9c410dedb",
+    "production_files": [
+      "b12x/_lib/dense_gemm.py"
+    ],
+    "exact_upstream_package_delta": true,
+    "verification": "Apply the upstream patch to the validated port through an isolated Git index; its tree equals the rebased tree before the test-only preparation adaptation.",
+    "test_file": "tests/gemm/test_mxfp8_linear.py",
+    "test_sha256": "2dffb47e4dd578dd95d9c41648783a03d0ad1ef3d34eae6a76f56a20dfe04442",
+    "test_changes": [
+      "Prepare exact-M BK64 prefill and a separate capacity plan using the public preparation lifecycle.",
+      "Separate uncached eager memory checks from graph replay with the capture-aware allocator.",
+      "Drain prior graph owners before comparing allocated bytes; retain exact equality and stable-address assertions."
+    ]
+  },
+  "focused_validation": {
+    "command": [
+      "/home/jasonc/vllm-sm103-regression-20260913/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/gemm/test_mxfp8_linear.py",
+      "tests/gemm/test_dense_gemm_expected_m.py",
+      "tests/preparation/test_sm103_contracts.py",
+      "-q",
+      "--tb=short",
+      "--junitxml=/home/jasonc/b12x-sm103-master-verified-gpu0-20260915.xml"
+    ],
+    "worktree": "/home/jasonc/b12x-sm103-master-delta-20260915",
+    "source_sha256": "75082e53cb881f089fd7e7107271c2fc50751a237c33f5403836da946475ab6c",
+    "gpu_before": "name, uuid, driver_version, compute_mode, pstate, memory.total [MiB], memory.used [MiB]\nNVIDIA RTX PRO 4000 Blackwell, GPU-47363510-b87a-13a5-4824-2542e97df76c, 580.173.02, Default, P8, 24467 MiB, 2 MiB",
+    "architecture": "sm_120a",
+    "performance_claim": false,
+    "toolchain": {
+      "torch": "2.13.0+cu130",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "triton": "3.7.1"
+    },
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0",
+      "CUTLASS_DSL_ARCH": "sm_120a",
+      "CUDA_HOME": "/models/b12x-sm103-validation/cuda-13.0/nvidia/cu13",
+      "TORCH_EXTENSIONS_DIR": "/home/jasonc/b12x-sm103-torch-extensions-20260915",
+      "B12X_COMPILE_CACHE_DIR": "/home/jasonc/b12x-sm103-master-delta-cache-0-20260915"
+    },
+    "returncode": 0,
+    "seconds": 7.937158460030332,
+    "gpu_after": "name, uuid, driver_version, compute_mode, pstate, memory.total [MiB], memory.used [MiB]\nNVIDIA RTX PRO 4000 Blackwell, GPU-47363510-b87a-13a5-4824-2542e97df76c, 580.173.02, Default, P1, 24467 MiB, 2 MiB",
+    "source_unchanged": true,
+    "test_sha256": "2dffb47e4dd578dd95d9c41648783a03d0ad1ef3d34eae6a76f56a20dfe04442",
+    "log_sha256": "fc3942076c174d4eb5595c7d520a1a632515c67ace320ea7b1e591d2d91b5620",
+    "passed": 377,
+    "failed": 0,
+    "skipped": 0,
+    "junit_sha256": "233983d77e8ddccdaf003aabb7a2c0dba7a19928d3064eb3a4ca22f9b412c4ad"
+  },
+  "uncached_memory_validation": {
+    "command": [
+      "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/bin/compute-sanitizer",
+      "--tool",
+      "memcheck",
+      "--target-processes",
+      "all",
+      "--error-exitcode",
+      "99",
+      "--report-api-errors",
+      "explicit",
+      "--print-limit",
+      "0",
+      "--xml",
+      "--save",
+      "/home/jasonc/b12x-sm103-master-verified-sanitizer.xml",
+      "/home/jasonc/vllm-sm103-regression-20260913/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/gemm/test_mxfp8_linear.py::test_mm_prefill_swizzle_bounds_weight_scales",
+      "-q",
+      "--tb=short",
+      "--junitxml=/home/jasonc/b12x-sm103-master-verified-gpu1-20260915.xml",
+      "-k",
+      "eager"
+    ],
+    "worktree": "/home/jasonc/b12x-sm103-master-delta-20260915",
+    "source_sha256": "75082e53cb881f089fd7e7107271c2fc50751a237c33f5403836da946475ab6c",
+    "gpu_before": "name, uuid, driver_version, compute_mode, pstate, memory.total [MiB], memory.used [MiB]\nNVIDIA RTX PRO 4000 Blackwell, GPU-cc109c01-9756-d0db-21ea-f1825d3f963f, 580.173.02, Default, P8, 24467 MiB, 2 MiB",
+    "architecture": "sm_120a",
+    "performance_claim": false,
+    "toolchain": {
+      "torch": "2.13.0+cu130",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "triton": "3.7.1"
+    },
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "1",
+      "CUTLASS_DSL_ARCH": "sm_120a",
+      "CUDA_HOME": "/models/b12x-sm103-validation/cuda-13.0/nvidia/cu13",
+      "TORCH_EXTENSIONS_DIR": "/home/jasonc/b12x-sm103-torch-extensions-20260915",
+      "B12X_COMPILE_CACHE_DIR": "/home/jasonc/b12x-sm103-master-delta-cache-1-20260915",
+      "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"
+    },
+    "returncode": 0,
+    "seconds": 7.758604918024503,
+    "gpu_after": "name, uuid, driver_version, compute_mode, pstate, memory.total [MiB], memory.used [MiB]\nNVIDIA RTX PRO 4000 Blackwell, GPU-cc109c01-9756-d0db-21ea-f1825d3f963f, 580.173.02, Default, P1, 24467 MiB, 2 MiB",
+    "source_unchanged": true,
+    "test_sha256": "2dffb47e4dd578dd95d9c41648783a03d0ad1ef3d34eae6a76f56a20dfe04442",
+    "log_sha256": "6d831f0568cf1e0434d84286d4b0c468714a9058003ca870e1955cd06320c7a1",
+    "passed": 3,
+    "failed": 0,
+    "skipped": 0,
+    "junit_sha256": "30ef46b6d51a2f857b86eec8f9dd6f16c030234ba98e37d8bb1bd1daa43135a1",
+    "deselected_graph_cases": 3,
+    "sanitizer_errors": 0,
+    "sanitizer_xml_sha256": "1cc63114e302c67321404c46fba233cd1f7ba81038f329964b88452276125a56",
+    "api_error_reporting": "explicit; no suppressions"
+  },
+  "wheel": {
+    "path": "/home/jasonc/b12x-sm103-rebase-20260915/wheel-master-delta/b12x-1.3.0-py3-none-any.whl",
+    "sha256": "545626f186259e5ae28272936d2c1d9b7cfcf938b504df1f959a926c22a3040b",
+    "python_files": 519,
+    "native_source_files": 12,
+    "extra_missing_or_different": 0,
+    "old_policy_files": 0,
+    "outside_checkout_import": "passed"
+  },
+  "static_validation": "Undefined-name and unused-import checks pass for the adapted test; git diff --check passes.",
+  "limits": [
+    "Broad compiler/resource and component evidence remains bound to its recorded pre-integration source; the integrated source receives the focused validation above.",
+    "No physical SM103 execution, performance result or full-model accuracy qualification.",
+    "The three preparation baseline failures and companion vLLM API-port requirement remain documented in the broad validation record."
+  ],
+  "superseded_runs": {
+    "master-delta": "The upstream regression omitted the required prepared plan.",
+    "master-integrated": "Using expected_m for varying live counts violated the exact-M contract.",
+    "master-qualified": "Uncached graph capture failed; the test now separates eager memory checks and graph replay.",
+    "master-final-gpu0": "Allocated bytes fell by 8192 during replay measurement; prior graph owners are now collected and synchronized before taking the baseline. The exact equality assertion remains.",
+    "sanitizer_api_probes": "Earlier compilation runs reported cuGetProcAddress_v2 driver API errors. The recorded final run loads compiled programs, reports explicit API errors, uses no suppressions and reports zero errors."
+  },
+  "raw_local_evidence": "/home/jasonc/b12x-sm103-rebase-20260915"
+}
