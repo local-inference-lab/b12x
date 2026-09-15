@@ -568,8 +568,14 @@ def plan(caps: B12XCompressedSparseMLAScratchCaps, *, invocation=FrozenMapping()
         )
 
     def compile_jobs(config, device):
-        return (CompileJob.create(
+        selection_identity = (
+            TUNING.encode_query(query),
+            TUNING.encode_config(config),
+            device.ordinal,
+        )
+        return (CompileJob.create_for_selection(
             "b12x.attention.compressed_sparse_mla._preparation:compile_compressed_sparse_mla",
+            selection_identity,
             query.to_dict(), TUNING.encode_config(config), device.ordinal,
         ),)
 

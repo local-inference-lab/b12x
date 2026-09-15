@@ -781,3 +781,15 @@ def test_staged_source_selection_accepts_merged_block_ids(indexer_session):
         args["candidate_output"][0, : expected.numel()], expected, rtol=0, atol=0
     )
     assert bool((args["candidate_output"][0, expected.numel() :] == -1).all())
+
+    # A merged block ID may be supplied by another rank. Multiplication by the
+    # eight-token block width must not wrap before the visibility check.
+    block_indices.fill_(-1)
+    block_indices[0, 0] = 2**28
+    block_scores.fill_(-torch.inf)
+    block_scores[0, 0] = 1
+    args["candidate_visible_lengths"].fill_(2**31 - 1)
+    args["candidate_active_width"].fill_(2**31 - 1)
+    api.expand_candidate_blocks(binding)
+    assert args["candidate_output_lengths"].item() == 0
+    assert bool((args["candidate_output"] == -1).all())

@@ -84,7 +84,9 @@ def _validate_query(query: PcieQuery, device) -> None:
         if (call["ratio"] not in (1, 2) or call["page_size"] not in (128, 256)
                 or type(call["stripe"]) is not int or call["stripe"] <= 0
                 or call["page_size"] % call["stripe"]):
-            raise ValueError("unsupported DS4.1 replica compression/page/stripe geometry")
+            raise ValueError(
+                "unsupported DeepSeek V4.1 replica compression/page/stripe geometry"
+            )
         if not 0 < call["max_tokens"] <= query.setup["max_tokens"]:
             raise ValueError("replica declaration exceeds the channel's token capacity")
         cycles, tail = divmod(call["max_tokens"], call["stripe"] * query.world_size)

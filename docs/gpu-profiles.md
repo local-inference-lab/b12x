@@ -386,7 +386,8 @@ system-scope barrier and graph slots are retained, with L1-bypassing incoming
 loads. Serialized launch/replay remains required; this is not a qualified default.
 
 `B12X_PCIE_TP4_REMOTE_PUSH=1` also enables the experimental native plain BF16
-all-reduce for DS4.1 widths5120/1280 and1-8 rows within the declared eager slot
+all-reduce for DeepSeek V4.1 widths 5120/1280 and 1-8 rows within the declared
+eager slot
 capacity. Other plain shapes retain pull, and the default remains off. This
 reuses the already-declared four source shards, alternating graph slots and
 system barrier. Destinations are rank-staggered, incoming loads bypass L1, and

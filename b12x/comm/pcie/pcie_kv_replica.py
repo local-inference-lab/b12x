@@ -132,7 +132,7 @@ class PCIePagedKvReplica(_IPCChannel):
             or out.numel() != (self.max_requests * width + 1) * page * 288
         ):
             raise ValueError(
-                "replica cache/output must use exact DS4.1 indexed byte pages"
+                "replica cache/output must use exact DeepSeek V4.1 indexed byte pages"
             )
         if table.ndim != 2 or table.shape[0] < requests:
             raise ValueError("replica requires a request-major page table")

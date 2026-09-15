@@ -248,7 +248,7 @@ def _declare_glm_cache_writer(spec, pool):
 
 
 def _declare_compressed_mla(spec, pool):
-    """The DS4.1 dual-cache declaration with caller-owned pool geometry."""
+    """DeepSeek V4.1 dual-cache plans retain caller-owned pool geometry."""
     from b12x.attention import compressed_sparse_mla as mla
 
     return mla.plan(

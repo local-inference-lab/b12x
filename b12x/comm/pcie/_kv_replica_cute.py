@@ -1,4 +1,4 @@
-"""Byte-preserving replica of owner-striped, paged DS4.1 compressed KV."""
+"""Replicate owner-striped DeepSeek V4.1 compressed-KV pages byte for byte."""
 
 from __future__ import annotations
 

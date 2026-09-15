@@ -840,7 +840,7 @@ class _SortPositions:
             if cutlass.const_expr(not self.expand_blocks):
                 valid = valid and value > Float32(-float("inf"))
             if cutlass.const_expr(self.expand_blocks):
-                valid = valid and idx * Int32(8) < visible
+                valid = valid and Int64(idx) * Int64(8) < Int64(visible)
             else:
                 valid = valid and idx < visible
             if not valid:
