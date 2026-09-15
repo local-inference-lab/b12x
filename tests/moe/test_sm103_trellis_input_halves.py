@@ -15,7 +15,7 @@ from b12x.moe import fused_moe
 from b12x.moe._shared.kernels.sm103.launch import pointer
 from b12x.moe._shared.kernels.sm103.trellis_gemm import RoutedTrellisGemm
 from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
-from b12x.policy.generation.providers.trellis_reference import moe_reference
+from tests._reference.trellis_reference import moe_reference
 from tests.moe.test_sm103_trellis_moe import prepare_experts
 from tests.moe.test_sm103_trellis_mixed_moe import prepare_mixed
 

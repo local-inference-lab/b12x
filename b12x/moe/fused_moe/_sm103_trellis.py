@@ -13,7 +13,6 @@ import torch
 from b12x._lib.architecture import UnsupportedArchitectureError
 from b12x._lib.scratch import scratch_buffer_spec, scratch_tensor
 from b12x._lib.scratch_layout import align_up, materialize_scratch_view
-from b12x.policy import PolicyResolution
 from .._shared.execution import (
     GemmEngine,
     GraphPartition,
@@ -26,7 +25,7 @@ from .._shared.execution import (
     WorkScheduler,
     make_moe_spec,
 )
-from ._policy import MOE_DECODE_POLICY, MoeDecodeConfig, MoeDecodeQuery
+from ._tuning import MoeDecodeConfig, MoeDecodeQuery
 
 BACKEND = "tcgen05_trellis"
 
@@ -68,7 +67,7 @@ def projection_rates(weight_plan):
 def validate_policy(query, config):
     if (
         query.source_format not in {"btx", "b12x_trellis"}
-        or query.quant_mode != "w4a16"
+        or not (query.quant_mode == "w4a16" or query.quant_mode == "multi" and "w4a16" in query.quant_modes)
         or query.activation not in {"silu", "situ"}
     ):
         raise UnsupportedArchitectureError(
@@ -101,7 +100,7 @@ def validate_policy(query, config):
         raise UnsupportedArchitectureError(
             "SM103 Trellis route capacity exceeds the CUDA grid limit"
         )
-    if config != MoeDecodeConfig(BACKEND, "internal", None):
+    if config != MoeDecodeConfig(backend=BACKEND, route_planner="internal", max_active_clusters=None):
         raise UnsupportedArchitectureError(
             "SM103 Trellis requires the native materialized tcgen05 backend"
         )
@@ -148,8 +147,7 @@ def plan_execution(
     swiglu_alpha,
     swiglu_beta,
     apply_router_weight_on_input,
-    policy_context,
-    policy_resolution=None,
+    decode_config,
 ):
     from ._impl import TPMoEPlan
     from .._shared.kernels.activations import normalize_swiglu_limit_for_activation
@@ -166,30 +164,13 @@ def plan_execution(
         raise UnsupportedArchitectureError(
             "SM103 Trellis applies router weights after the standard expert transform"
         )
-    query = MoeDecodeQuery(
-        quant_mode,
-        weight_plan.source_format,
-        weight_plan.activation,
-        weight_plan.num_experts,
-        weight_plan.hidden_size,
-        weight_plan.intermediate_size,
-        num_topk,
-        num_tokens,
-        num_tokens * num_topk,
+    from ._sm103 import query_for_weight_plan
+    query = query_for_weight_plan(
+        weight_plan, quant_mode=quant_mode, num_tokens=num_tokens, num_topk=num_topk,
+        swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
-    if policy_resolution is None:
-        resolution = policy_context.resolve(MOE_DECODE_POLICY, query)
-    else:
-        if (
-            not isinstance(policy_resolution, PolicyResolution)
-            or policy_resolution.component_id != MOE_DECODE_POLICY.component_id
-            or policy_resolution.device != policy_context.device
-        ):
-            raise ValueError(
-                "Trellis policy resolution must match the component and device"
-            )
-        validate_policy(query, policy_resolution.config)
-        resolution = policy_resolution
+    validate_policy(query, decode_config)
     spec = make_moe_spec(
         quant_mode=quant_mode,
         source_format=weight_plan.source_format,
@@ -226,7 +207,7 @@ def plan_execution(
         dtype=getattr(torch, weight_plan.io_dtype),
         max_tokens_per_launch=num_tokens,
         swiglu_limit=swiglu_limit,
-        policy_resolution=resolution,
+        decode_config=decode_config,
     )
 
 
@@ -647,6 +628,15 @@ def _atom_contract(caps, prepared):
     return prepared.trellis
 
 
+def lookup_table_nbytes(codebook):
+    if codebook == "sqg_e4m3":
+        return 3 * (1 << 16)
+    if codebook == "sqg_fp16":
+        from b12x._lib.quant.sqg_fp16_d3l import SQG_FP16_D3L_DESCRIPTOR_BYTES
+        return SQG_FP16_D3L_DESCRIPTOR_BYTES
+    return 16
+
+
 @dataclass(frozen=True)
 class BackendPlan:
     buffers: tuple
@@ -1059,7 +1049,7 @@ class BackendPlan:
         )
 
 
-def plan_scratch(caps, *, prewarm_launches, policy_resolution=None):
+def plan_scratch(caps, *, prewarm_launches):
     from ._impl import TPMoEArenaLayout, TPMoEScratchPlan
 
     if caps.collect_activation_amax or caps.route_logits_dtype is not None:
@@ -1080,8 +1070,7 @@ def plan_scratch(caps, *, prewarm_launches, policy_resolution=None):
         swiglu_alpha=caps.swiglu_alpha,
         swiglu_beta=caps.swiglu_beta,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
-        policy_context=caps.policy_context,
-        policy_resolution=policy_resolution,
+        decode_config=caps.decode_config,
     )
     buffers, size = scratch_layout(caps)
     plan = TPMoEScratchPlan(

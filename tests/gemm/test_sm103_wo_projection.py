@@ -3,7 +3,8 @@
 import pytest
 import torch
 
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
+from b12x.preparation import FrozenMapping
 from b12x.gemm import wo_projection as wo
 from b12x.gemm._shared.wo_mxfp8 import (
     empty_dense_gemm_mnl_view, empty_mxfp8_rows_for_dense_gemm,
@@ -114,8 +115,7 @@ def test_quantization_bytes_padding_frozen_counts_and_graph(dtype, mode, positio
 
     launch(items[0])
     misses = quant._get_compiled_wo_quant.cache_info().misses
-    freeze_kernel_resolution("WO live counts reuse warmed quantization")
-    try:
+    with kernel_resolution_guard("WO live counts reuse warmed quantization"):
         for item in items:
             for tensor in (item[1].values, item[1].scale_rows, item[1].scale_mma):
                 tensor.view(torch.uint8).fill_(0xA5)
@@ -149,8 +149,6 @@ def test_quantization_bytes_padding_frozen_counts_and_graph(dtype, mode, positio
         for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
             assert before[key] == after[key]
         assert addresses == [t.data_ptr() for t in (item[0], item[1].values, item[1].scale_rows, item[1].scale_mma)]
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_inverse_rope_cosine_pool_offset_exceeds_int32():
@@ -204,8 +202,9 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
     wb = torch.randn(hidden, groups * rank, device="cuda", dtype=torch.bfloat16).mul_(.125)
     weights = quantize_wo_projection_weights_mxfp8_torch(wa, wb)
     plan = wo.plan(wo.Caps(device=source.device, max_tokens=capacity, groups=groups,
-                           group_width=width, rank=rank, hidden=hidden))
-    assert plan.backend == "mxfp8_tcgen05"
+                           group_width=width, rank=rank, hidden=hidden),
+                   invocation=FrozenMapping(dict(operation="inv_rope", heads_per_group=width // head,
+                       nope_dim=head - rope, rope_dim=rope) if inverse else {"operation": "plain"}))
     spec, = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     output = torch.empty(capacity, hidden, device="cuda", dtype=torch.bfloat16)
@@ -219,62 +218,57 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
             binding = wo.bind(plan, scratch=scratch, source_tgd=source[:m].reshape(m, groups, width), weights=weights, out=output[:m])
         bindings.append(binding)
     fn = wo.run_inv_rope if inverse else wo.run
-    if inverse:
-        wo.prewarm_inv_rope(plan, scratch=scratch, weights=weights, cos_sin_cache=cache,
-                           heads_per_group=width // head, nope_dim=head-rope, rope_dim=rope)
-    else:
-        fn(binding=bindings[0])
+    fn(binding=bindings[0])
     frozen_pointers = tuple(t.data_ptr() for t in (source, scratch, weights.wo_a.values, weights.wo_b.values))
-    freeze_kernel_resolution("native WO retains geometry and capacity across live rows")
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        def verify(binding):
-            m = binding.output.shape[0]
-            x = rotate(source[:m], positions[:m], cache, head - rope, rope) if inverse else source[:m]
-            assert_rows(binding.x_q, x.reshape(m, groups, width).permute(1, 0, 2))
-            tmp_ref = torch.bmm(decode(binding.x_q), decode(weights.wo_a).transpose(1, 2))
-            check(binding.tmp.permute(2, 0, 1), tmp_ref)
-            assert_rows(binding.tmp_q, binding.tmp.permute(0, 2, 1).reshape(1, m, groups * rank))
-            expected = decode(binding.tmp_q)[0] @ decode(weights.wo_b)[0].T
-            check(binding.output[:, :, 0], expected)
-        for binding in bindings:
-            scratch.fill_(0xFF)
-            output.fill_(float("nan"))
-            out = fn(binding=binding)
-            assert out.data_ptr() == output.data_ptr() and binding.expected_m == capacity
+    with kernel_resolution_guard("native WO retains geometry and capacity across live rows"):
+        try:
+            def verify(binding):
+                m = binding.output.shape[0]
+                x = rotate(source[:m], positions[:m], cache, head - rope, rope) if inverse else source[:m]
+                assert_rows(binding.x_q, x.reshape(m, groups, width).permute(1, 0, 2))
+                tmp_ref = torch.bmm(decode(binding.x_q), decode(weights.wo_a).transpose(1, 2))
+                check(binding.tmp.permute(2, 0, 1), tmp_ref)
+                assert_rows(binding.tmp_q, binding.tmp.permute(0, 2, 1).reshape(1, m, groups * rank))
+                expected = decode(binding.tmp_q)[0] @ decode(weights.wo_b)[0].T
+                check(binding.output[:, :, 0], expected)
+            for binding in bindings:
+                scratch.fill_(0xFF)
+                output.fill_(float("nan"))
+                out = fn(binding=binding)
+                assert out.data_ptr() == output.data_ptr()
+                verify(binding)
+            binding = bindings[-1]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fn(binding=binding)
+            for _ in range(2):
+                source.normal_().mul_(.25)
+                eager = fn(binding=binding).clone()
+                scratch.fill_(0xA5)
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(binding.output[:, :, 0], eager, atol=0, rtol=0)
+                verify(binding)
+            other = torch.cuda.Stream()
+            other.wait_stream(torch.cuda.current_stream())
+            fn(binding=binding, stream=other)
+            torch.cuda.current_stream().wait_stream(other)
             verify(binding)
-        binding = bindings[-1]
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            fn(binding=binding)
-        for _ in range(2):
-            source.normal_().mul_(.25)
-            eager = fn(binding=binding).clone()
-            scratch.fill_(0xA5)
-            output.fill_(float("nan"))
-            graph.replay()
-            torch.testing.assert_close(binding.output[:, :, 0], eager, atol=0, rtol=0)
-            verify(binding)
-        other = torch.cuda.Stream()
-        other.wait_stream(torch.cuda.current_stream())
-        fn(binding=binding, stream=other)
-        torch.cuda.current_stream().wait_stream(other)
-        verify(binding)
-        torch.cuda.synchronize()
-        before = torch.cuda.memory_stats()
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("native WO allocated"))
-            fn(binding=binding)
-            graph.replay()
             torch.cuda.synchronize()
-        after = torch.cuda.memory_stats()
-        for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
-            assert before[key] == after[key]
-        assert frozen_pointers == tuple(t.data_ptr() for t in (source, scratch, weights.wo_a.values, weights.wo_b.values))
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
-        unfreeze_kernel_resolution()
+            before = torch.cuda.memory_stats()
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("native WO allocated"))
+                fn(binding=binding)
+                graph.replay()
+                torch.cuda.synchronize()
+            after = torch.cuda.memory_stats()
+            for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                assert before[key] == after[key]
+            assert frozen_pointers == tuple(t.data_ptr() for t in (source, scratch, weights.wo_a.values, weights.wo_b.values))
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
 @pytest.mark.parametrize("position", [-1, 2, 2**31])

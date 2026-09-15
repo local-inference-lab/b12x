@@ -9,7 +9,7 @@ from benchmarks.benchmark_qsrt_checkpoint_profiles import (
     _COMPLETION_KIND,
     _H308,
     _K2,
-    _STORAGE_SCHEMA,
+    _STORAGE_SCHEMAS,
     _VERSION,
     _balanced_atom_partition,
     _paired_ratio_bootstrap,
@@ -65,7 +65,8 @@ def test_paired_ratio_bootstrap_closes_exact_scale() -> None:
     assert half["bootstrap_ci95_high"] == pytest.approx(0.5)
 
 
-def test_completion_selects_the_sealed_layer_file(tmp_path) -> None:
+@pytest.mark.parametrize("storage_schema", sorted(_STORAGE_SCHEMAS))
+def test_completion_selects_the_sealed_layer_file(tmp_path, storage_schema) -> None:
     layer = 24
     layer_name = f"qsrt-layer-{layer:05d}.safetensors"
     layer_path = tmp_path / layer_name
@@ -73,7 +74,7 @@ def test_completion_selects_the_sealed_layer_file(tmp_path) -> None:
     completion = {
         "kind": _COMPLETION_KIND,
         "schema_version": _VERSION,
-        "storage_schema": _STORAGE_SCHEMA,
+        "storage_schema": storage_schema,
         "profile": _K2.profile,
         "complete": True,
         "layer_count": 92,

@@ -98,8 +98,11 @@ def _validate_query(query: DsaIndexerQuery, _device: DeviceIdentity | None) -> N
 def _validate_config(query, config: DsaIndexerConfig, _device) -> None:
     if not isinstance(config, DsaIndexerConfig):
         raise TypeError("config must be DsaIndexerConfig")
-    if config.backend != _BACKEND:
+    if config.backend not in (_BACKEND, "warp"):
         raise ValueError(f"unsupported attention.dsa_indexer backend {config.backend!r}")
+    if _device is not None and _device.compute_capability == (10, 3):
+        if config.backend != "warp" or config.mxfp4_score_kind == "score_tensorcore":
+            raise ValueError("SM103 DSA requires portable warp scoring")
     if config.fused_merge not in FUSED_MERGE_CHOICES:
         raise ValueError(f"unsupported fused_merge {config.fused_merge!r}")
 
@@ -116,7 +119,10 @@ def _default(query, _device) -> DsaIndexerConfig:
     score_kind = None
     if query.cache_format == "mxfp4":
         score_kind = "score_tensorcore" if query.mode == "prefill" or query.num_q_heads == 32 else "score"
-    return DsaIndexerConfig(backend=_BACKEND, fused_merge=FUSED_MERGE_AUTO, mxfp4_score_kind=score_kind)
+    backend = "warp" if _device is not None and _device.compute_capability == (10, 3) else _BACKEND
+    if backend == "warp" and query.cache_format == "mxfp4":
+        score_kind = "score"
+    return DsaIndexerConfig(backend=backend, fused_merge=FUSED_MERGE_AUTO, mxfp4_score_kind=score_kind)
 
 
 def _tuning_ctas(query: DsaIndexerQuery, device: DeviceIdentity | None) -> int:
@@ -150,16 +156,18 @@ def _equivalence(query, device, config):
 
 
 def _parameters(query, _device):
+    sm103 = _device is not None and _device.compute_capability == (10, 3)
     tensorcore_prefill = (
+        not sm103 and
         query.cache_format == "mxfp4" and query.mode == "prefill"
         and query.num_q_heads == 32 and query.max_q_rows >= 64
     )
     return ParameterSpace.create(
         TUNING.knobs,
         values={
-            "backend": (_BACKEND,),
+            "backend": ("warp" if sm103 else _BACKEND,),
             "fused_merge": (FUSED_MERGE_AUTO,) if query.cache_format == "mxfp4" else FUSED_MERGE_CHOICES,
-            "mxfp4_score_kind": ("score", "score_tensorcore") if query.cache_format == "mxfp4" else (None,),
+            "mxfp4_score_kind": (("score",) if sm103 else ("score", "score_tensorcore")) if query.cache_format == "mxfp4" else (None,),
         },
         exhaustive=query.exhaustive,
         efficiency_predicates=(lambda p: not tensorcore_prefill or p["mxfp4_score_kind"] != "score",),
@@ -167,17 +175,17 @@ def _parameters(query, _device):
 
 
 TUNING = TuningContract(
-    component_id="attention.dsa_indexer", query_schema_version=3, config_schema_version=3,
+    component_id="attention.dsa_indexer", query_schema_version=3, config_schema_version=4,
     query_fields=frozenset(DsaIndexerQuery.__dataclass_fields__),
     config_fields=frozenset(DsaIndexerConfig.__dataclass_fields__),
     encode_query=_encode_query, encode_config=_encode_config, decode_config=DsaIndexerConfig.from_config,
     validate_query=_validate_query, validate_config=_validate_config, default_config=_default,
     knobs=(
-        Knob(name="backend", values=(_BACKEND,), binding=ParameterBinding.COMPILE),
+        Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="fused_merge", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="mxfp4_score_kind", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=4, equivalence_key=_equivalence, parameters=_parameters,
+    candidate_contract_version=5, equivalence_key=_equivalence, parameters=_parameters,
     materialize=lambda query, device, choice: DsaIndexerConfig.from_config(choice),
 )
 

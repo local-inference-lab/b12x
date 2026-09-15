@@ -37,8 +37,9 @@ from .planning import (
     plan_weights as _plan_weights,
     prepare_weights as _prepare_weights,
 )
-from .source import PackedSource, PackedSourceFormat, W13Layout, WeightSource
+from .source import BtxSource, PackedSource, PackedSourceFormat, W13Layout, WeightSource
 from .weights import (
+    BtxWeights,
     PackedWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -68,7 +69,7 @@ def plan_weights(
 
 
 def prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights
+    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | BtxWeights
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
     return _prepare_weights(plan=plan, weights=weights)
@@ -127,6 +128,7 @@ def run(*, binding: Binding):
 def _state_for(plan: Plan, hidden_states: torch.Tensor):
     root = require_prepared(plan, "moe.decode", hidden_states.device)
     if hasattr(root, "variants"):
+        from ._preparation import variant_for
         return variant_for(root.variants, hidden_states.shape[0])
     return root
 
@@ -184,12 +186,15 @@ def run_fc2(
 
 def is_supported(device=None) -> bool:
     """Return whether the active device satisfies the fused-MoE requirements."""
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = [
+    "BtxSource",
+    "BtxWeights",
     "ActivationMode",
     "ActivationSpec",
+    "ExecutionCapacity",
     "Binding",
     "RouteBinding",
     "RouteTopKInvocation",
@@ -217,6 +222,7 @@ __all__ = [
     "bind",
     "bind_route",
     "bind_sparse",
+    "clear_caches",
     "is_supported",
     "plan_execution",
     "plan_route_topk",
@@ -229,4 +235,3 @@ __all__ = [
     "run_sparse",
     "run",
 ]
-

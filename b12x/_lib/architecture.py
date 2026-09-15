@@ -87,6 +87,7 @@ def require_kernel_architecture(
         "b12x.attention._shared.mla.merge",
         "b12x.attention._shared.mla.kv_cache",
         "b12x.attention.sparse_mla._sm103",
+        "b12x.attention.compressed_sparse_mla._warp",
         "b12x.attention.dsa_indexer.kernel",
         "b12x.attention.dsa_indexer.fused_indexer",
         "b12x.attention.dsa_indexer.contiguous_kernel",
@@ -96,6 +97,7 @@ def require_kernel_architecture(
         "b12x.gemm.bf16_gemv._kernel",
         "b12x.gemm.bf16_gemv._prefill",
         "b12x.gemm.blockscaled._a16_cute",
+        "b12x.gemm.blockscaled._reduce",
         "b12x.gemm.blockscaled._fp8_cute",
         "b12x._lib.fp8_gemm",
         "b12x.gemm.blockscaled._sm103",
@@ -123,7 +125,7 @@ def require_component_architecture(
 ) -> None:
     """Reject registered plans on recognized targets without an implementation.
 
-    Synthetic unknown devices retain the policy system's heuristic contract.
+    Synthetic unknown devices retain the preparation default contract.
     Registered metadata is authoritative for architecture coverage.
     """
     architecture = architecture_for(capability)
@@ -134,11 +136,19 @@ def require_component_architecture(
     ):
         return
     from b12x import find_op
-    from b12x.policy.catalog import PLANNING_COMPONENTS
+    from b12x.preparation.catalog import list_tuning_components
 
-    registrations = [r for r in PLANNING_COMPONENTS if r.component_id == component_id]
+    registrations = [
+        r for r in list_tuning_components()
+        if r.load().component_id == component_id
+    ]
     for registration in registrations:
-        meta = find_op(registration.op_qualname)
+        qualname = {"gemm.mm": "gemm.blockscaled"}.get(
+            registration.op_qualname, registration.op_qualname
+        )
+        if qualname == "norm.vision":
+            raise UnsupportedArchitectureError("vision normalization has no admitted SM103 backend")
+        meta = find_op(qualname)
         if not supports_architecture(capability, meta.archs):
             raise UnsupportedArchitectureError(
                 f"b12x.{meta.qualname} has no {architecture.name} backend; "

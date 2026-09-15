@@ -155,6 +155,16 @@ def compile_decode(query_payload, config_payload, ordinal):
     caps = layout.caps
     kda = caps.key_heads == caps.value_heads
     with torch.cuda.device(ordinal):
+        if kda and config.backend == "cutedsl":
+            from ._cute_kda import compile_kernels
+            recurrent, norm = compile_kernels((
+                ordinal, query.max_tokens, query.max_seqs, query.max_state_slots,
+                query.state_index_columns, query.value_heads, config.recurrent_block_v,
+                query.qk_l2norm, query.null_state_index, False,
+                caps.state_dtype, b.state_indices.dtype, b.A_log.dtype,
+                b.dt_bias.dtype, b.norm_weight.dtype,
+            ))
+            return {"recurrent": recurrent, "norm": norm}
         if kda:
             n, columns = b.state_indices.shape
             recurrent = kernels._packed_sequential_kda_decode_kernel.warmup(
@@ -293,6 +303,15 @@ class _GdnState:
                      query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
                      output))
         q, layout = self.query, self.layout
+        if self._kda and layout.config.backend == "cutedsl":
+            from ._cute_kda import run_prepared
+            return run_prepared(
+                (self.recurrent, self.norm),
+                (mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
+                 query_start_loc, num_accepted_tokens, state_indices, num_seqs,
+                 num_tokens, output),
+                eps=eps, scale=scale, lower_bound=lower_bound,
+            )
         m = int(output.shape[0])
         n, columns = map(int, state_indices.shape)
         stride_r, stride_c = state_indices.stride()

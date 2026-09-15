@@ -12,7 +12,6 @@ import torch
 from b12x._lib.architecture import UnsupportedArchitectureError
 from b12x._lib.scratch import scratch_buffer_spec, scratch_tensor
 from b12x._lib.scratch_layout import align_up, materialize_scratch_view
-from b12x.policy import PolicyResolution
 from .._shared.execution import (
     MoEExecutionPlan,
     MoERegime,
@@ -25,7 +24,7 @@ from .._shared.execution import (
     OutputReduction,
     make_moe_spec,
 )
-from ._policy import MoeDecodeQuery, MoeDecodeConfig, MOE_DECODE_POLICY
+from ._tuning import MoeDecodeQuery, MoeDecodeConfig
 
 BACKEND = "tcgen05_nvfp4"
 
@@ -54,7 +53,7 @@ def heuristic(query):
     if query.source_format in {"b12x_trellis", "btx"}:
         from ._sm103_trellis import BACKEND as trellis_backend
 
-        config = MoeDecodeConfig(trellis_backend, "internal", None)
+        config = MoeDecodeConfig(backend=trellis_backend, route_planner="internal", max_active_clusters=None)
         validate_policy(query, config)
         return config
     config = MoeDecodeConfig(
@@ -77,13 +76,18 @@ def validate_policy(query, config):
 
         return validate_trellis(query, config)
     if (
-        query.quant_mode not in {"nvfp4", "nvfp4_auto"}
+        not (query.quant_mode in {"nvfp4", "nvfp4_auto"} or
+             query.quant_mode == "multi" and "nvfp4" in query.quant_modes)
         or query.source_format != "modelopt_nvfp4"
         or query.activation != "silu"
     ):
         raise UnsupportedArchitectureError(
             "SM103 MoE implements ModelOpt NVFP4 A4 SiLU only"
         )
+    if (query.io_dtype != "bfloat16" or query.apply_router_weight_on_input
+            or query.collect_activation_amax or query.route_logits_dtype is not None
+            or query.route_num_experts not in (None, 0, query.num_experts)):
+        raise UnsupportedArchitectureError("SM103 NVFP4 requires BF16 with preselected local routes")
     if query.hidden_size % 256 or query.intermediate_size % 256:
         raise UnsupportedArchitectureError(
             "SM103 NVFP4 projection requires K and N divisible by 256"
@@ -122,6 +126,30 @@ def validate_policy(query, config):
         )
 
 
+def query_for_weight_plan(weight_plan, *, quant_mode, num_tokens, num_topk,
+                          swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None,
+                          apply_router_weight_on_input=False):
+    """Describe the low-level launch with the same typed preparation contract."""
+    from b12x.preparation import FrozenMapping
+    return MoeDecodeQuery(
+        quant_mode=quant_mode, quant_modes=tuple(sorted(weight_plan.quant_modes)),
+        source_format=weight_plan.source_format, activation=weight_plan.activation,
+        io_dtype=weight_plan.io_dtype, num_experts=weight_plan.num_experts,
+        hidden_size=weight_plan.hidden_size, intermediate_size=weight_plan.intermediate_size,
+        top_k=num_topk, num_tokens=num_tokens, routed_rows=num_tokens * num_topk,
+        route_num_experts=None, route_logits_dtype=None,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        collect_activation_amax=False, deterministic_output=True,
+        swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta,
+        w13_layout=weight_plan.w13_layout,
+        weight_layouts=tuple(sorted(item.value for item in weight_plan.weight_layouts)),
+        w4a16_weight_layout=weight_plan.w4a16_weight_layout,
+        w4a16_scale_format=weight_plan.w4a16_scale_format,
+        w4a16_block_size_m=None, fast_math=True, numerical_recipe=None,
+        controls=FrozenMapping(),
+    )
+
+
 def plan_execution(
     *,
     num_tokens,
@@ -133,8 +161,7 @@ def plan_execution(
     swiglu_alpha,
     swiglu_beta,
     apply_router_weight_on_input,
-    policy_context,
-    policy_resolution=None,
+    decode_config,
 ):
     from ._impl import TPMoEPlan
 
@@ -151,8 +178,7 @@ def plan_execution(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            policy_context=policy_context,
-            policy_resolution=policy_resolution,
+            decode_config=decode_config,
         )
     if weight_plan.io_dtype != "bfloat16":
         raise UnsupportedArchitectureError("SM103 NVFP4 MoE requires BF16 I/O")
@@ -162,30 +188,13 @@ def plan_execution(
         )
     if swiglu_alpha not in (None, 1.0) or swiglu_beta not in (None, 0.0):
         raise UnsupportedArchitectureError("SM103 NVFP4 implements standard SiLU only")
-    query = MoeDecodeQuery(
-        quant_mode=quant_mode,
-        source_format=weight_plan.source_format,
-        activation=weight_plan.activation,
-        num_experts=weight_plan.num_experts,
-        hidden_size=weight_plan.hidden_size,
-        intermediate_size=weight_plan.intermediate_size,
-        top_k=num_topk,
-        num_tokens=num_tokens,
-        routed_rows=num_tokens * num_topk,
+    from ._sm103 import query_for_weight_plan
+    query = query_for_weight_plan(
+        weight_plan, quant_mode=quant_mode, num_tokens=num_tokens, num_topk=num_topk,
+        swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
-    if policy_resolution is None:
-        resolution = policy_context.resolve(MOE_DECODE_POLICY, query)
-    else:
-        if (
-            not isinstance(policy_resolution, PolicyResolution)
-            or policy_resolution.component_id != MOE_DECODE_POLICY.component_id
-            or policy_resolution.device != policy_context.device
-        ):
-            raise ValueError(
-                "MoE policy resolution must match the component and device"
-            )
-        validate_policy(query, policy_resolution.config)
-        resolution = policy_resolution
+    validate_policy(query, decode_config)
     spec = make_moe_spec(
         quant_mode="nvfp4",
         source_format=weight_plan.source_format,
@@ -222,7 +231,7 @@ def plan_execution(
         device=torch.device(device),
         dtype=torch.bfloat16,
         max_tokens_per_launch=num_tokens,
-        policy_resolution=resolution,
+        decode_config=decode_config,
     )
 
 
@@ -395,14 +404,14 @@ class BackendPlan:
         )
 
 
-def plan_scratch(caps, *, prewarm_launches, policy_resolution=None):
+def plan_scratch(caps, *, prewarm_launches):
     from ._impl import TPMoEArenaLayout, TPMoEScratchPlan
 
     if caps.weight_plan.source_format in {"b12x_trellis", "btx"}:
         from ._sm103_trellis import plan_scratch as plan_trellis
 
         return plan_trellis(
-            caps, prewarm_launches=prewarm_launches, policy_resolution=policy_resolution
+            caps, prewarm_launches=prewarm_launches
         )
     if caps.collect_activation_amax or caps.route_logits_dtype is not None:
         raise UnsupportedArchitectureError(
@@ -422,8 +431,7 @@ def plan_scratch(caps, *, prewarm_launches, policy_resolution=None):
         swiglu_alpha=caps.swiglu_alpha,
         swiglu_beta=caps.swiglu_beta,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
-        policy_context=caps.policy_context,
-        policy_resolution=policy_resolution,
+        decode_config=caps.decode_config,
     )
     buffers, nbytes = scratch_layout(caps.max_tokens, caps.num_topk, caps.k, caps.n)
     plan = TPMoEScratchPlan(

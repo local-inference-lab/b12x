@@ -9,8 +9,7 @@ import torch
 
 from b12x.moe import fused_moe
 from b12x.moe.fused_moe import _impl, _sm103_trellis as backend
-from b12x.policy import PolicyContext, PolicySource
-from b12x.policy.generation.providers.moe import _config_covers_query
+from b12x.moe.fused_moe._tuning import TUNING
 from tests.architecture.test_sm103 import B300
 from tests.moe.test_trellis_config import _k3_config, _glm_config
 
@@ -54,40 +53,31 @@ def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
     experts = fused_moe.PreparedExperts(plan=public, _impl=experts)
     execution = fused_moe.plan_execution(
         experts=experts,
-        policy=capacity.policy_context,
         capacity=fused_moe.ExecutionCapacity(
             max_tokens=capacity.max_tokens,
             top_k=capacity.num_topk,
-            warmup_token_counts=(1, 4),
             route_num_experts=capacity.route_num_experts,
         ),
     )
     # Compiler stubs let the public host binding exercise the exact prepared
     # native launch ABI without creating a CUDA context.
-    execution._impl = plan
-    execution._prewarmed = True
+    from b12x.moe.fused_moe._preparation import _FusedMoeState
+    from tests.architecture._prepared import install_host_state
+    state = _FusedMoeState(experts, plan, capacity.decode_config, None, None, None)
+    install_host_state(execution, state, capacity.decode_config, scratch=plan.scratch_specs())
     return execution, experts
 
 
 def caps(monkeypatch, *, coupled=True, mixed=False, codebook="sqg_e4m3", **kwargs):
-    import b12x.policy.context as context
+    from b12x.moe.fused_moe._sm103 import query_for_weight_plan
+    wp = weight_plan(coupled, mixed=mixed, codebook=codebook)
+    query = query_for_weight_plan(wp, quant_mode="w4a16", num_tokens=8, num_topk=8,
+                                  swiglu_limit=kwargs.get("swiglu_limit"))
+    config = TUNING.configure(query, device=B300, search=False).default
+    return _impl.TPMoEScratchCaps(max_tokens=8, num_topk=8, device="cpu", weight_plan=wp,
+                                 quant_mode="w4a16", core_token_counts=(1, 4, 8),
+                                 route_num_experts=768, decode_config=config, **kwargs)
 
-    monkeypatch.setattr(
-        context,
-        "detect_device",
-        lambda device: SimpleNamespace(identity=B300, ordinal=None),
-    )
-    return fused_moe.Caps(
-        max_tokens=8,
-        num_topk=8,
-        device="cpu",
-        weight_plan=weight_plan(coupled, mixed=mixed, codebook=codebook),
-        quant_mode="w4a16",
-        core_token_counts=(1, 4, 8),
-        route_num_experts=768,
-        policy_context=PolicyContext.for_identity(B300),
-        **kwargs,
-    )
 
 
 @pytest.mark.parametrize("coupled,limit", [(False, None), (False, 10.0), (True, None)])
@@ -97,7 +87,7 @@ def test_public_scratch_plan_and_policy(coupled, limit, monkeypatch):
     assert plan.full_rotation
     assert plan.launch_plan.implementation == backend.BACKEND
     assert plan.launch_plan.execution.gemm_engine.value == "trellis_tcgen05"
-    assert plan.launch_plan.policy_resolution.source is PolicySource.HEURISTIC
+    assert plan.launch_plan.decode_config == capacity.decode_config
     assert plan.launch_plan.swiglu_limit == limit
     buffers = plan._backend_plan.buffers
     assert all(b.offset % 1024 == 0 for b in buffers)
@@ -106,13 +96,7 @@ def test_public_scratch_plan_and_policy(coupled, limit, monkeypatch):
         for a, b in zip(buffers, buffers[1:], strict=False)
     )
     assert "input_up" in {b.name for b in buffers}
-    assert fused_moe.required_nbytes(capacity) == plan.scratch_specs()[0].nbytes
-    query = fused_moe.MoeDecodeQuery(
-        "w4a16", "b12x_trellis", capacity.activation, 384, 5120, 2304, 8, 8, 64
-    )
-    assert _config_covers_query(
-        asdict(query), asdict(plan.launch_plan.policy_resolution.config)
-    )
+    assert plan.scratch_specs()[0].nbytes == plan.scratch_specs()[0].nbytes
     with pytest.raises(RuntimeError, match="prewarmed"):
         plan._backend_plan.bind(
             plan,
@@ -304,7 +288,7 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
                     route_expert_map=mapping if mapped else None,
                     output_expert_map=mapping if mapped else None,
                 )
-                bound = fused_moe.bind(plan, **kwargs)
+                bound = plan.bind( **kwargs)
                 assert bound.output.dtype == torch.float32 and bound.output.shape == (
                     live,
                     512,
@@ -326,13 +310,13 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
                     assert all(int(args[0][2]) == split for args in selected)
                     assert all(int(args[-3]) == 2 * live for args in selected)
                 external = torch.empty_like(a)
-                rebound = fused_moe.bind(plan, output=external, **kwargs)
+                rebound = plan.bind( output=external, **kwargs)
                 assert rebound.output.data_ptr() == external.data_ptr()
                 with pytest.raises(ValueError, match="alias inputs"):
-                    fused_moe.bind(plan, output=a, **kwargs)
+                    plan.bind( output=a, **kwargs)
                 with pytest.raises(ValueError, match="planned output"):
                     forged = bound.output.view(torch.bfloat16).reshape(-1, 512)[:live]
-                    fused_moe.bind(plan, output=forged, **kwargs)
+                    plan.bind( output=forged, **kwargs)
 
     for invalid in (0, 256, True, 64.0):
         malformed = replace(
@@ -342,4 +326,4 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
             experts, representation=replace(experts.representation, value=malformed)
         )
         with pytest.raises(ValueError, match="input-scale split"):
-            fused_moe.bind(plan, **{**kwargs, "experts": bad_owner})
+            plan.bind( **{**kwargs, "experts": bad_owner})

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 from .config import TrellisConfig
+
+if TYPE_CHECKING:
+    from b12x.moe._shared.btx_schema import BtxManifest
 
 
 class PackedSourceFormat(str, Enum):
@@ -37,10 +40,24 @@ class PackedSource:
         object.__setattr__(self, "w13_layout", W13Layout(self.w13_layout))
 
 
-WeightSource: TypeAlias = PackedSource | TrellisConfig
+@dataclass(frozen=True, kw_only=True)
+class BtxSource:
+    """Validated BTX manifest describing native expert records and transforms."""
+
+    manifest: BtxManifest
+
+    def __post_init__(self) -> None:
+        from b12x.moe._shared.btx_schema import BtxManifest
+
+        if not isinstance(self.manifest, BtxManifest):
+            raise TypeError("BTX source requires a parsed BtxManifest")
+
+
+WeightSource: TypeAlias = PackedSource | TrellisConfig | BtxSource
 
 
 __all__ = [
+    "BtxSource",
     "PackedSource",
     "PackedSourceFormat",
     "W13Layout",

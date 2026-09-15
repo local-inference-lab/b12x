@@ -4,7 +4,7 @@ import cutlass
 import pytest
 
 from b12x._lib.architecture import UnsupportedArchitectureError, require_kernel_architecture
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm.blockscaled._fp8_cute import DenseFp8Launch, compile_kernel
 
 
@@ -25,12 +25,9 @@ def test_fp8_rejects_invalid_static_contract(n, k, groups, block):
 
 def test_fp8_compile_miss_fails_under_frozen_resolution():
     compile_kernel.cache_clear()
-    freeze_kernel_resolution("FP8 host cache miss")
-    try:
+    with kernel_resolution_guard("FP8 host cache miss"):
         with pytest.raises(RuntimeError, match="frozen"):
             compile_kernel(128, 128, 1, "bfloat16", False, True, 0, 148, "sm_103a")
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_fp8_capture_requires_prewarm(monkeypatch):

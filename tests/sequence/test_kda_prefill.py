@@ -1059,7 +1059,7 @@ def test_op_zero_tokens_copies_states_only() -> None:
 
 @pytest.mark.parametrize("decode_backend", ["auto", "cutedsl"])
 def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_backend):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.policy import GDN_ATTENTION, PolicyContext
     from b12x.sequence import gdn_decode as decode, kda_prefill as prefill
     from ..conftest import require_sm103_or_sm12x
@@ -1120,8 +1120,7 @@ def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_
 
     run()
     addresses = (pool.data_ptr(), prefix.output.data_ptr(), binding.output.data_ptr())
-    freeze_kernel_resolution("KDA prefill-to-decode continuity")
-    try:
+    with kernel_resolution_guard("KDA prefill-to-decode continuity"):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
@@ -1151,5 +1150,3 @@ def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_
                 assert_kda_close("continued state", final, pool[tail + live - 1].cpu(), ratio=5e-3)
                 assert torch.isnan(pool[0]).all()
                 assert addresses == (pool.data_ptr(), prefix.output.data_ptr(), binding.output.data_ptr())
-    finally:
-        unfreeze_kernel_resolution()

@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.quantization.mxfp6 import allocate_fp6_linear_workspace
 from b12x.quantization.mxfp6 import _rows
 
@@ -104,8 +104,7 @@ def test_quantization_oracle_counts_graph_and_allocations(fmt, packed, per_row, 
     weight_scale = torch.tensor([.75], device="cuda")
     workspace.quantize(source[:1], weight_scale)
     cache = (_rows.compile_scales.cache_info().misses, _rows.compile_quantizer.cache_info().misses)
-    freeze_kernel_resolution("FP6 rows share a capacity-independent callable")
-    try:
+    with kernel_resolution_guard("FP6 rows share a capacity-independent callable"):
         for m in (1, 3, 8, 17, 129):
             workspace.scale_storage.fill_(0xA5)
             workspace.quantize(source[:m], weight_scale)
@@ -133,8 +132,6 @@ def test_quantization_oracle_counts_graph_and_allocations(fmt, packed, per_row, 
         after = torch.cuda.memory_stats()
         assert before["allocation.all.allocated"] == after["allocation.all.allocated"]
         assert pointers == [t.data_ptr() for t in buffers]
-    finally:
-        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("fault", ["values", "scale_storage", "global_scales", "inverse_scales", "alpha", "overlap", "source_overlap", "capacity", "alignment"])
@@ -180,8 +177,7 @@ def test_public_linear_workspace_graph(fmt, monkeypatch):
     def run(m):
         return dense_fp6_linear(source[:m], weight, out=out[:m], workspace=workspace, expected_m=129)
     run(1)
-    freeze_kernel_resolution("FP6 public linear reuses planned workspace")
-    try:
+    with kernel_resolution_guard("FP6 public linear reuses planned workspace"):
         for m in (1, 3, 8, 17, 129):
             result = run(m)
             assert_quantized(workspace, source[:m], weight.global_scale)
@@ -197,8 +193,6 @@ def test_public_linear_workspace_graph(fmt, monkeypatch):
         check(out, reference(129))
         run(129)
         torch.testing.assert_close(out, captured, rtol=0, atol=0)
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_quantizer_offsets_past_int32_elements_and_bytes():

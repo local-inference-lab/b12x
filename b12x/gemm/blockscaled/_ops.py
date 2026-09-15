@@ -25,7 +25,7 @@ def _execute(source, values, scales, global_scale, activation_scale, workspace, 
 
 
 def _metadata(source, values):
-    return source.new_empty((*source.shape[:-1], values.shape[0]), dtype=torch.bfloat16)
+    return source.new_empty((*source.shape[:-1], values.shape[0]), dtype=source.dtype)
 
 
 @torch.library.custom_op("b12x::blockscaled_bf16", mutates_args=())

@@ -20,6 +20,7 @@ class MtpFeedbackQuery:
     max_tokens: int
     hidden_size: int
     streams: int
+    contract: str = "qwen_multistream"
     input_alignments: tuple[int, ...] = (16, 16, 16, 16)
 
     def __post_init__(self):
@@ -60,15 +61,23 @@ def _encode(query: MtpFeedbackQuery) -> dict[str, object]:
 
 def _default_config(query: MtpFeedbackQuery, _device: DeviceIdentity | None) -> MtpFeedbackConfig:
     norm_block_h = 1 << (query.hidden_size - 1).bit_length()
-    norm_block_s = 1 << (query.streams - 1).bit_length()
+    norm_block_s = 1 if query.contract != "qwen_multistream" else 1 << (query.streams - 1).bit_length()
     return MtpFeedbackConfig(backend="cutedsl", norm_block_h=norm_block_h, norm_block_s=norm_block_s, norm_num_warps=8 if norm_block_h >= 2048 else 4)
 
 
 def _validate_query(query: MtpFeedbackQuery, _device: DeviceIdentity | None) -> None:
     if not isinstance(query, MtpFeedbackQuery):
         raise TypeError("query must be MtpFeedbackQuery")
-    if query.dtype != "bfloat16" or query.hidden_size != QWEN_HIDDEN_SIZE or query.streams != QWEN_STREAMS:
-        raise ValueError("MTP feedback requires the existing Qwen BF16 geometry")
+    if query.contract not in {"qwen_multistream", "rms_concat", "rms_streams_fp8"}:
+        raise ValueError("unknown MTP feedback tensor contract")
+    if query.dtype != "bfloat16":
+        raise ValueError("MTP feedback requires BF16 activations")
+    if query.contract == "qwen_multistream" and (query.hidden_size != QWEN_HIDDEN_SIZE or query.streams != QWEN_STREAMS):
+        raise ValueError("Qwen feedback requires its multistream geometry")
+    if query.contract == "rms_concat" and (query.streams != 1 or query.hidden_size <= 0 or query.hidden_size % 64 or query.hidden_size > 16384):
+        raise ValueError("RMS-concat requires S=1 and H divisible by 64 through 16384")
+    if query.contract == "rms_streams_fp8" and (query.hidden_size <= 0 or query.hidden_size % 128 or query.hidden_size > 16384 or not 0 < query.streams <= 16):
+        raise ValueError("FP8 stream feedback requires H128 through 16384 and S<=16")
     if type(query.max_tokens) is not int or query.max_tokens <= 0:
         raise ValueError("MTP token capacity must be a positive integer")
     if len(query.input_alignments) != 4 or any(
@@ -82,7 +91,9 @@ def _validate_config(query: MtpFeedbackQuery, config: MtpFeedbackConfig, _device
         raise TypeError("config must be MtpFeedbackConfig")
     if config.backend != "cutedsl": raise ValueError(f"unsupported MTP feedback backend {config.backend!r}")
     if config.norm_block_h < query.hidden_size: raise ValueError("norm_block_h must cover hidden_size")
-    if config.norm_block_s < query.streams: raise ValueError("norm_block_s must cover streams")
+    if query.contract != "qwen_multistream" and config.norm_block_s != 1:
+        raise ValueError("ordinary MTP stream normalization requires norm_block_s=1")
+    if query.contract == "qwen_multistream" and config.norm_block_s < query.streams: raise ValueError("norm_block_s must cover streams")
     for name, value in (("norm_block_h", config.norm_block_h), ("norm_block_s", config.norm_block_s)):
         if value <= 0 or value & (value - 1): raise ValueError(f"{name} must be a positive power of two")
     if config.norm_num_warps not in (1, 2, 4, 8): raise ValueError("norm_num_warps must be one of 1, 2, 4, or 8")
@@ -92,11 +103,11 @@ def _tuning_parameters(query: MtpFeedbackQuery, device):
     del device
     h = 1 << (query.hidden_size - 1).bit_length()
     s = 1 << (query.streams - 1).bit_length()
-    return {"norm_block_h": (h, 2 * h), "norm_block_s": (s, 2 * s)}
+    return {"norm_block_h": (h, 2 * h), "norm_block_s": (s, 2 * s) if query.contract == "qwen_multistream" else (1,)}
 
 
 TUNING = TuningContract(
-    component_id="sequence.mtp_feedback", query_schema_version=2, config_schema_version=1,
+    component_id="sequence.mtp_feedback", query_schema_version=3, config_schema_version=2,
     query_fields=frozenset(MtpFeedbackQuery.__dataclass_fields__),
     config_fields=frozenset(MtpFeedbackConfig.__dataclass_fields__),
     encode_query=_encode, encode_config=MtpFeedbackConfig.to_dict,
@@ -108,7 +119,7 @@ TUNING = TuningContract(
         Knob(name="norm_block_s", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="norm_num_warps", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3, parameters=_tuning_parameters,
+    candidate_contract_version=5, parameters=_tuning_parameters,
 )
 
 __all__ = ["MtpFeedbackConfig", "MtpFeedbackQuery", "TUNING"]

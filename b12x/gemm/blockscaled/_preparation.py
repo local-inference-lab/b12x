@@ -30,7 +30,7 @@ def _dense_lowering(query, config, device):
     functional = functional_mxfp8_quantization(query, config)
     inner = DenseGemmQuery(
         recipe=query.recipe, entry_point="gemm.blockscaled.mm", weight_storage="native",
-        output_dtype="bfloat16", batch=1, max_rows=query.num_tokens,
+        output_dtype=query.input_dtype, batch=1, max_rows=query.num_tokens,
         in_features=query.padded_in_features, out_features=query.out_features,
         output_mode="functional" if functional else "provided",
         alpha_mode="unit" if functional else "tensor",
@@ -72,12 +72,12 @@ def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_cou
             subgroup = 8 if rows <= 8 else mxfp8_rows._WARP_SUBGROUP_WIDTH
             threads = 128 if rows <= 8 else mxfp8_rows._THREADS
             programs["quantize"] = mxfp8_rows._get_compiled_mxfp8_rows_quant(
-                query.padded_in_features, torch.bfloat16, subgroup, threads, "linear",
+                query.padded_in_features, getattr(torch, query.input_dtype), subgroup, threads, "linear",
                 device_ordinal=ordinal, sm_count=sm_count,
             )
         else:
             programs["quantize"] = _quantize._quantize.warmup(
-                torch.bfloat16, torch.uint8 if fp4 else torch.float8_e4m3fn, torch.uint8,
+                getattr(torch, query.input_dtype), torch.uint8 if fp4 else torch.float8_e4m3fn, torch.uint8,
                 torch.float32, torch.float32, torch.float32, query.num_tokens,
                 INPUT_K=query.in_features, K=query.padded_in_features, FP4=fp4,
                 RECIPROCAL=query.global_scale_kind == "reciprocal", GROUP=16 if fp4 else 32,
@@ -152,7 +152,7 @@ class _PackedExecutionState:
         from ._linear import _source_2d, _pad_k
         q, config = self.query, self.config
         fp4 = q.recipe == "nvfp4"
-        if source.device != self.device or source.dtype != torch.bfloat16:
+        if source.device != self.device or source.dtype != getattr(torch, q.input_dtype):
             raise ValueError("packed source differs from prepared dtype/device")
         if source.ndim < 2 or source.shape[-1] != q.in_features:
             raise ValueError("packed source logical K differs from preparation")
@@ -190,11 +190,13 @@ class _PackedExecutionState:
         elif global_scale is not None:
             raise ValueError("MXFP8 has no weight global scale")
         if m == 0:
-            return _validate_output(source, out, q.out_features)
+            return _validate_output(source, out, q.out_features, dtype=getattr(torch, q.input_dtype))
         with torch.cuda.device(self.device), _stream_context(stream, self.device):
+            if m == 0:
+                return _validate_output(source, out, q.out_features, dtype=getattr(torch, q.input_dtype))
             if functional_mxfp8_quantization(q, config):
                 contiguous = _pad_k(_source_2d(source), q.padded_in_features)
-                _check_tensor("quantizer source", contiguous, self.device, torch.bfloat16)
+                _check_tensor("quantizer source", contiguous, self.device, getattr(torch, q.input_dtype))
                 packed = self._mxfp8_rows(m)
                 self.programs["quantize"](contiguous, packed.values, packed.scale_rows, packed.scale_mma)
                 result = self.dense.run(
@@ -203,8 +205,8 @@ class _PackedExecutionState:
                     stream=stream,
                 )[:, :, 0]
                 return result.view(*source.shape[:-1], q.out_features)
-            _check_tensor("source", source, self.device, torch.bfloat16)
-            out = _validate_output(source, out, q.out_features)
+            _check_tensor("source", source, self.device, getattr(torch, q.input_dtype))
+            out = _validate_output(source, out, q.out_features, dtype=getattr(torch, q.input_dtype))
             reads = (source, values, scale_bytes) + ((global_scale,) if fp4 else ())
             if any(_overlap(out, tensor) for tensor in reads):
                 raise ValueError("output must not overlap packed inputs")
@@ -340,8 +342,8 @@ def _query_bf16_from_call(source, weight, *, activation_mode="auto", activation_
                     out=None, workspace=None, expected_m=None):
     from ._a16 import _weight_parts
     values, _, _, fp4 = _weight_parts(weight)
-    if source.ndim < 2 or source.dtype != torch.bfloat16:
-        raise ValueError("packed BF16 queries require a BF16 source with at least two dimensions")
+    if source.ndim < 2 or source.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("packed queries require BF16 or FP16 activations with at least two dimensions")
     if source.shape[-1] != weight.in_features or values.shape[0] != weight.out_features:
         raise ValueError("packed source/weight logical geometry disagrees")
     if source.device != values.device:
@@ -354,6 +356,7 @@ def _query_bf16_from_call(source, weight, *, activation_mode="auto", activation_
         recipe="nvfp4" if fp4 else "mxfp8", num_tokens=source.numel() // weight.in_features,
         in_features=weight.in_features, padded_in_features=weight.padded_in_features,
         out_features=weight.out_features, activation_mode=activation_mode,
+        input_dtype=str(source.dtype).removeprefix("torch."),
         activation_scale_available=activation_global_scale is not None,
         global_scale_kind=weight.global_scale_kind if fp4 else "none",
         source_contiguous=source.is_contiguous(), source_aligned=source.data_ptr() % 16 == 0,
@@ -372,7 +375,7 @@ def _fixed_lowering(query, device):
     recipe = query.recipe
     use_block = False
     if recipe == "tensor_fp8":
-        use_block = _use_block_fp8_recipe(
+        use_block = device.identity.compute_capability != (10, 3) and _use_block_fp8_recipe(
             live_m=query.max_rows, expected_m=query.expected_m,
             out_features=query.out_features, padded_in_features=query.padded_in_features,
             sm_count=device.identity.sm_count,
@@ -382,7 +385,8 @@ def _fixed_lowering(query, device):
         recipe=recipe, entry_point="gemm.blockscaled.mm", weight_storage="native",
         output_dtype=query.output_dtype, batch=1, max_rows=query.max_rows,
         in_features=query.padded_in_features, out_features=query.out_features,
-        output_mode="functional", alpha_mode=query.alpha_mode, expected_m=query.expected_m,
+        output_mode="provided" if query.fp8_workspace else "functional",
+        alpha_mode=query.alpha_mode, expected_m=query.expected_m,
     )
     return _default_lowering(inner, device.identity), use_block
 
@@ -412,6 +416,15 @@ class _FixedExecutionState:
     quantizer: object | None
     unit_scale: torch.Tensor | None
     use_block: bool
+
+    workspace: torch.Tensor | None = None
+
+    @property
+    def required_workspace(self):
+        if not self.query.fp8_workspace:
+            return 0
+        from ._fp8_workspace import prepared_layout
+        return prepared_layout(self.query, self.dense.lowering, self.use_block)[-1]
 
     def _check(self, source, weight, output_dtype, *, serialized=False):
         q = self.query
@@ -539,7 +552,16 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
             resident = table.get(key)
             needed = query.max_rows * (query.padded_in_features // 128) * 4 if use_block else ((query.max_rows + 127) // 128) * ((query.padded_in_features + 127) // 128) * 512
             entries.append(PersistentMemory(("tensor_fp8.unit_scale", use_block, *key), needed, 0 if resident is None else resident.numel() * resident.element_size()))
-        return MemoryRequirements(persistent=tuple(entries))
+        scratch = ()
+        if query.fp8_workspace:
+            from ._fp8_workspace import prepared_layout
+            needed = prepared_layout(query, p, use_block)[-1]
+            if query.workspace_form == "provided":
+                scratch = (scratch_buffer_spec("blockscaled.fp8.scratch", nbytes=needed,
+                           device=torch.device("cuda", device.ordinal)),)
+            else:
+                entries.append(PersistentMemory(("fixed.fp8.workspace", query), needed))
+        return MemoryRequirements(persistent=tuple(entries), scratch=scratch)
 
     def materialize(selection, device):
         from b12x._lib import dense_gemm as dense
@@ -552,7 +574,11 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
         if query.recipe == "tensor_fp8":
             factory = _linear._cached_unit_activation_block_scale if use_block else _linear._cached_unit_scale_mma
             scale = factory("cuda", device.ordinal, query.max_rows, query.padded_in_features)
-        return _FixedExecutionState(query, target, core, programs.get("quantize"), scale, use_block)
+        workspace = None
+        if query.fp8_workspace and query.workspace_form == "owned":
+            from ._fp8_workspace import prepared_layout
+            workspace = torch.empty(prepared_layout(query, p, use_block)[-1], device=target, dtype=torch.uint8)
+        return _FixedExecutionState(query, target, core, programs.get("quantize"), scale, use_block, workspace)
 
     return Plan(
         shared=True, contract=FIXED_TUNING, query=query, invocation=FrozenMapping(invocation), override=override,
@@ -652,9 +678,9 @@ def query_from_call(source, weight, *, activation_mode="auto", activation_global
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
     from ._tuning import FixedBlockscaledQuery
     if isinstance(weight, NVFP4LinearWeight) or (
-        isinstance(weight, MXFP8LinearWeight) and isinstance(source, torch.Tensor) and source.dtype == torch.bfloat16
+        isinstance(weight, MXFP8LinearWeight) and isinstance(source, torch.Tensor) and source.dtype in (torch.bfloat16, torch.float16)
     ):
-        if options or alpha is not None or out_dtype not in (None, torch.bfloat16):
+        if options or alpha is not None or out_dtype not in (None, source.dtype):
             raise ValueError("unsupported packed BF16 declaration options")
         return _query_bf16_from_call(source, weight, activation_mode=activation_mode,
                                      activation_global_scale=activation_global_scale, out=out,
@@ -667,8 +693,12 @@ def query_from_call(source, weight, *, activation_mode="auto", activation_global
         if workspace is not None:
             recipe["_split_k_workspace"] = workspace
         return dense_query(source, weight, out, entry_point="gemm.blockscaled.mm", options=recipe)
-    if out is not None or workspace is not None or activation_mode != "auto" or activation_global_scale is not None:
-        raise ValueError("fixed packed wrappers do not accept A16/output/workspace constraints")
+    fp8_workspace = bool(options.pop("fp8_workspace", False) or out is not None or workspace is not None)
+    if activation_mode != "auto" or activation_global_scale is not None:
+        raise ValueError("fixed packed wrappers do not accept A16 constraints")
+    ownership = dict(fp8_workspace=fp8_workspace,
+                     output_mode="provided" if out is not None else "functional",
+                     workspace_form="provided" if workspace is not None else "owned")
     if isinstance(weight, (MXFP8LinearWeight, TensorFP8LinearWeight)):
         if options or alpha is not None:
             raise ValueError("fixed packed weights do not accept raw GEMM options")
@@ -687,7 +717,7 @@ def query_from_call(source, weight, *, activation_mode="auto", activation_global
             padded_in_features=weight.padded_in_features, out_features=weight.out_features,
             input_dtype=str(values.dtype).removeprefix("torch."),
             output_dtype=str(out_dtype or dtype).removeprefix("torch."),
-            expected_m=m if expected_m is None else expected_m, source_scale_form=form,
+            expected_m=m if expected_m is None else expected_m, source_scale_form=form, **ownership,
         )
     if not isinstance(source, tuple) or not isinstance(weight, tuple):
         raise TypeError("fixed serialized declarations require operand pairs")
@@ -710,5 +740,5 @@ def query_from_call(source, weight, *, activation_mode="auto", activation_global
         padded_in_features=k, out_features=b.shape[0], input_dtype=str(a.dtype).removeprefix("torch."),
         output_dtype=options.get("c_dtype", str(out_dtype or torch.bfloat16).removeprefix("torch.")),
         expected_m=a.shape[0] if expected_m is None else expected_m,
-        alpha_mode="unit" if alpha is None else "tensor",
+        alpha_mode="unit" if alpha is None else "tensor", **ownership,
     )

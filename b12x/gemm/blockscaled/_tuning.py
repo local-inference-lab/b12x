@@ -16,6 +16,7 @@ class BlockscaledQuery:
     padded_in_features: int
     out_features: int
     activation_mode: str = "auto"
+    input_dtype: str = "bfloat16"
     activation_scale_available: bool = False
     global_scale_kind: str | None = None
     source_contiguous: bool = True
@@ -52,6 +53,8 @@ class BlockscaledConfig:
 def _validate_query(query, device):
     if not isinstance(query, BlockscaledQuery) or query.recipe not in ("nvfp4", "mxfp8"):
         raise ValueError("packed BF16 execution requires NVFP4 or MXFP8 weights")
+    if query.input_dtype not in ("bfloat16", "float16") or (query.input_dtype == "float16" and query.recipe != "mxfp8"):
+        raise ValueError("packed FP16 activations require quantized MXFP8 weights")
     if any(type(value) is not int or value <= 0 for value in (
         query.num_tokens, query.in_features, query.padded_in_features, query.out_features,
     )):
@@ -81,7 +84,7 @@ def _validate_query(query, device):
 
 def _automatic_a16(query, device):
     return (
-        device is not None and device.compute_capability in ((12, 0), (12, 1))
+        query.input_dtype == "bfloat16" and device is not None and device.compute_capability in ((10, 3), (12, 0), (12, 1))
         and query.in_features == query.padded_in_features
         and query.in_features % 32 == 0 and query.out_features % 8 == 0
         and query.source_contiguous and query.source_aligned and query.num_tokens <= 8
@@ -113,14 +116,16 @@ def _validate_config(query, config, device):
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
     if config.mode == "a16":
+        if query.input_dtype != "bfloat16":
+            raise ValueError("A16 requires BF16 activations")
         if (type(config.tile_n) is not int or config.tile_n not in (64, 128)
                 or type(config.tile_k) is not int or config.tile_k not in (64, 128)
                 or type(config.split_k) is not int or config.split_k not in (1, 2, 4, 8)):
             raise ValueError("invalid A16 launch geometry")
         if query.padded_in_features % 32 or query.out_features % 8:
             raise ValueError("A16 requires stored K32 and N8")
-        if device is None or device.compute_capability not in ((12, 0), (12, 1)):
-            raise ValueError("A16 requires SM120/SM121")
+        if device is None or device.compute_capability not in ((10, 3), (12, 0), (12, 1)):
+            raise ValueError("A16 requires SM103/SM120/SM121")
         if not query.source_contiguous or not query.source_aligned:
             raise ValueError("A16 requires contiguous 16-byte-aligned source storage")
         if query.workspace_nbytes is not None:
@@ -175,13 +180,13 @@ def _equivalence(query, device, config):
 
 
 TUNING = TuningContract(
-    component_id="gemm.blockscaled_precision", query_schema_version=4, config_schema_version=2,
+    component_id="gemm.blockscaled_precision", query_schema_version=5, config_schema_version=2,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
     encode_config=BlockscaledConfig.to_dict, decode_config=BlockscaledConfig.from_config,
     validate_query=_validate_query, validate_config=_validate_config, default_config=_default_config,
-    candidate_contract_version=5,
+    candidate_contract_version=6,
     knobs=(
         Knob(name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=(64, 128), when=FrozenMapping({"mode": "a16"})),
@@ -207,6 +212,9 @@ class FixedBlockscaledQuery:
     alpha_mode: str | None = None
     source_scale_form: str | None = None
     codegen: FrozenMapping | None = None
+    fp8_workspace: bool = False
+    output_mode: str = "functional"
+    workspace_form: str = "owned"
 
     def __post_init__(self):
         if self.alpha_mode is None:
@@ -224,6 +232,12 @@ def _validate_fixed_query(query, device):
         raise TypeError("query must be FixedBlockscaledQuery")
     if query.codegen != _codegen_snapshot():
         raise ValueError("fixed packed code-generation snapshot changed")
+    if query.output_mode not in {"functional", "provided"} or query.workspace_form not in {"owned", "provided"}:
+        raise ValueError("invalid fixed output or workspace ownership")
+    if query.fp8_workspace and query.recipe not in {"tensor_fp8", "block_fp8"}:
+        raise ValueError("bounded fixed workspace requires an FP8 recipe")
+    if not query.fp8_workspace and (query.output_mode != "functional" or query.workspace_form != "owned"):
+        raise ValueError("caller-owned fixed output/workspace requires the FP8 workspace route")
     if (min(query.max_rows, query.in_features, query.out_features, query.expected_m) <= 0
             or query.padded_in_features < query.in_features
             or query.output_dtype not in ("bfloat16", "float16")
@@ -263,5 +277,5 @@ def _validate_fixed_query(query, device):
 
 FIXED_TUNING = replace(
     make_fixed_contract(component_id="gemm.blockscaled.fixed", query_type=FixedBlockscaledQuery, backend="cutedsl"),
-    query_schema_version=2, validate_query=_validate_fixed_query,
+    query_schema_version=3, validate_query=_validate_fixed_query,
 )

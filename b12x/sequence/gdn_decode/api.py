@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..._lib.gating import has_cutlass_dsl, has_triton
+from ..._lib.gating import default_is_supported
 from b12x.preparation import Plan
 
 from . import reference

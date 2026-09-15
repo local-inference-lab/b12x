@@ -1,80 +1,56 @@
-# SM103 features and required fixes
+# SM103 features and preparation contracts
 
 Status: **implemented prototype; physical SM103 execution unqualified**.
-SM103/B300 support uses the existing b12x planning, binding and execution APIs.
-Core compute uses CuTe DSL. Supporting packing and metadata kernels may use
-Triton. The [readiness report](sm103-readiness-report.md) records qualification
-limits, and the [implementation log](sm103-implementation-log.md) preserves
-source-specific decisions and validation.
+SM103 support uses the declaration, preparation-session, binding and execution
+contracts described in [GPU preparation](gpu-profiles.md). Core compute uses
+CuTe DSL. Supporting packing and metadata kernels may use Triton.
 
-The b12x implementation checkpoint is `2958ad63`. Companion vLLM checkpoint
-`f6c6ac72c3` includes the integration and pooling fixes; its runtime source is
-`ac96719947`. Companion changes reside in that repository, with their evidence
-bound by the [GLM receipt](sm103-glm-sparse-validation.json).
+## Implemented features
 
-## Features added
-
-| Feature | Implementation entry points |
+| Feature | Implementation |
 | --- | --- |
-| SM103 identity, capabilities, architecture target and typed planning | [Architecture descriptor](../b12x/_lib/architecture.py), [policy contracts](../b12x/policy/) and component capability metadata. Unsupported selections fail closed. |
-| Native NVFP4 fused MoE | [SM103 MoE planning](../b12x/moe/fused_moe/_sm103.py) and [CuTe kernels](../b12x/moe/_shared/kernels/sm103/): routing, TMA/tcgen05/TMEM projections, activation quantization and weighted reduction. |
-| Trellis expert execution | [Trellis planner](../b12x/moe/fused_moe/_sm103_trellis.py) and [inline projections](../b12x/moe/_shared/kernels/sm103/trellis_gemm.py): uniform, mixed-rate, grouped atom and BTX paired weights, including coupled transforms and codebook formats. |
-| Quantized and unquantized projections | [Block-scaled GEMM](../b12x/gemm/blockscaled/), [SM103 projection engine](../b12x/gemm/_shared/sm103_blockscaled.py) and [DeepSeek WO](../b12x/gemm/wo_projection/): FP4/FP6/FP8, inline dequantization and caller-owned workspace. |
-| GLM sparse attention and DeepSeek attention/indexing | [GLM sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/), [dense MLA](../b12x/attention/dense_mla/) and [DSA indexer](../b12x/attention/dsa_indexer/). |
-| Recurrent and model-supporting operators | [KDA/GDN decode](../b12x/sequence/gdn_decode/), [shared recurrent prefill](../b12x/sequence/_shared/delta_prefill/), [MTP feedback](../b12x/sequence/mtp_feedback/) and [mHC](../b12x/norm/mhc/), plus V4.1 compression, HyperConnection and embedding support. |
-| Station memory and communication | [Engram storage](../b12x/sequence/engram/_storage.py) supports explicit placement, resident scales and bounded disk prefetch. [RoCE transport](../b12x/comm/roce/_transport.py) implements explicit experimental Grace TP2 selection and its graph lifecycle. |
-| Reproducible bring-up tooling | [Offline compiler](../scripts/compile_sm103.py), [qualification launcher](../scripts/qualify_sm103.py), [resource auditor](../scripts/audit_sm103_resources.py), [common-PTXAS diagnostic](../scripts/audit_sm103_packing_ptxas.py), tests and [Station runbook](sm103-qualification.md). |
+| Architecture admission and compilation | [Architecture descriptors](../b12x/_lib/architecture.py), component capability metadata and [compiler](../b12x/_lib/compiler.py) admit SM103 and retain architecture-specific artifact identity. |
+| Quantized projections | [SM103 dense lowering](../b12x/gemm/_sm103_preparation.py) supplies NVFP4, MXFP4, MXFP8, both MXFP6 formats, W6A8 and ordinary tensor/block FP8 programs to preparation. [Packed linear adapters](../b12x/gemm/blockscaled/) preserve inline weight dequantization and bounded workspace. |
+| Native MoE | [NVFP4](../b12x/moe/fused_moe/_sm103.py) and [Trellis](../b12x/moe/fused_moe/_sm103_trellis.py) retain CuTe routing, tcgen05/TMEM projections and weighted reduction. Canonical Trellis weights cover uniform, coupled, mixed-rate and grouped-atom representations. `BtxSource` and `BtxWeights` expose paired BTX records through the same public weight and execution plans. |
+| Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
+| Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
+| Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |
+| Reproducible validation | [Preparation compiler](../scripts/compile_sm103_prepared.py), [kernel corpus compiler](../scripts/compile_sm103.py), resource auditors and the [qualification launcher](../scripts/qualify_sm103.py) preserve source and artifact identity. |
 
-## Required b12x fixes
+## Fixes required by preparation and execution
 
-These changes address correctness, legal launches or serving invariants. Their
-commit references identify the implementation and associated regression tests.
-Paths in this table are relative to the `b12x/` package.
-
-| Problem | Fix and source |
+| Contract or failure | Correction |
 | --- | --- |
-| Warmup and binding could resolve different capacity or precision choices | Retain one plan-time policy resolution and capacity lowering through warmup, prewarm and binding in `moe/fused_moe/_sm103.py` (`652621da`). |
-| TMEM reads require explicit completion before consumers use the results | Add completion waits in `gemm/_shared/sm103_blockscaled.py` and `moe/_shared/kernels/sm103/trellis_gemm.py`; inspect generated artifacts for the waits (`7e743dc7`). |
-| Routed prefill exceeded the 65,535 limit of the CUDA Y grid dimension | Launch routed GEMM, quantization and reduction along the X axis in the SM103 MoE launch and pointwise kernels (`725afdae`). |
-| Cooperative MoE grids could exceed actual compiled residency | Bound launch grids using function occupancy and actual resources in `_lib/cooperative.py` and `moe/fused_moe/_impl.py`; verify cached resource metadata (`172438b8`). |
-| FP16 split outputs could use BF16 atomic accumulation | Restrict BF16 atomics to BF16 outputs and reduce FP16 partials with CuTe in `_lib/dense_gemm.py`; retain FP8 serving buffers in `gemm/blockscaled/_fp8_workspace.py` (`1b675b5c`). |
-| Long-K SM120 MXFP4 scale fragments did not match the mainloop's expected modes | Normalize trailing scale-fragment modes in `_lib/dense_gemm.py` while preserving their order and quantization math (`070681c5`). |
-| Weight preparation and tensor-parallel extents could disagree with Trellis execution | Preserve global draw coordinates and distinct input-scale halves; keep BTX records whole at rank boundaries; select compatible tiles for non-256-divisible extents (`3e1e77db`, `b7d2a04b`, `fdfe284e`, `2e6c166e`). |
-| Clamped Trellis execution could lose transform precision or resolve another callable during serving | Preserve FP16 transform boundaries and retain launches by immutable transform layout in the W4A16 kernels and fused MoE implementation (`32531ecd`). |
-| Native sparse MLA split selection depended on live row counts | Resolve and serialize splits during planning in `attention/sparse_mla/_policy.py`; config schema 3 applies to both backends. Native profile coverage remains empty until the fixed schedule is requalified (`ebace59f`). |
-| Caller-owned scratch and launch schedules were incomplete for some serving paths | Retain FP8, WO, compressed MLA and paged-indexer capacities and buffers before capture (`1b675b5c`, `381fe5e8`, `84ec51d2`, `534ba168`). |
+| Declaration construction must not allocate or compile | Typed queries/configs and metadata-only compile factories replace component-local policy and warmup registries. Materialization owns storage and retains the exact programs declared to preparation. |
+| Live requests must not create specializations | Capacity and immutable geometry determine programs; runtime counts drive grids, masks and views. Tests freeze kernel resolution while varying live counts, including zero. |
+| SM103 dense plans must retain their architecture lowering | Dense, block-FP8 and WO factories explicitly carry target metadata into offline extraction. FP8 workspace queries distinguish output ownership, workspace ownership and recipe. |
+| CUDA graph and full-graph tracing must preserve mutation | Sparse/compressed MLA, block-FP8 linear, workspace FP8 and concatenated/FP8 MTP execute through typed opaque boundaries. Mutable output/scratch are explicit; owned functional storage has a separate operator boundary. |
+| Explicit-stream execution must include surrounding work | Block-FP8 quantization, output allocation, projection and bias execute on the requested stream. |
+| Empty requests must not launch zero-sized CUDA grids | Compressed MLA and concatenated/FP8 MTP return their empty output views before launching. |
+| FP16 split reductions must preserve output type | BF16 atomics are restricted to BF16; FP16 uses typed CuTe reduction of FP32 partials. |
+| Attention sink must contribute to decode normalization | Sparse MLA merges the sink into both output normalization and returned LSE. |
+| DSA compilation must replace deferred discovery kernels | The MXFP4 compiler uses the preparation-aware program cache so in-process compilation evicts placeholders and emits every declared native artifact. |
+| DSA score-output presence is immutable | Execution validates the declared output contract; indices-only and score-producing plans retain their respective programs. |
+| Mixed-rate Trellis cache hits must retain declared programs | Both mixed launch constructors and copied cache carriers attach their compiled kernels and weighted-reduction programs. |
+| Packed FP16 inputs require a distinct precision contract | MXFP8 queries retain input dtype, select quantized execution and reject BF16-only A16. Output/workspace ownership remains explicit, including empty requests. |
+| Full-rotation Trellis launch records carry broadcast metadata | The runtime selector unpacks and matches the retained broadcast field before launching the weighted reduction. |
+| Large pools and vocabularies exceed 32-bit offsets | Scaled page, state and vocabulary-row addresses use Int64. GPU tests park live data beyond the signed 32-bit offset boundary. |
+| Artifact loading can modify an ELF | Verified temporary copies protect manifest-bound cached objects while preserving raw hashes and launch-resource checks. |
 
-## Required companion vLLM fixes
+The native kernels retain explicit TMEM completion waits, X-axis routing grids,
+compiled occupancy bounds, distinct Trellis input-scale halves and global
+transform coordinates. W4A16 remains BF16 activations with inline FP4 weight
+dequantization; it has no activation-scale multiplication.
 
-Paths below are relative to the companion vLLM repository. They are integration
-changes required by the real GLM serving tests, rather than b12x kernel files.
+## Integration compatibility
 
-| Problem | Fix and source |
-| --- | --- |
-| GLM partial-pool selections after interior padding were omitted from attention | Compact valid selections into a stable prefix in `vllm/v1/attention/backends/mla/sparse_utils.py` and enable it in `b12x_mla_sparse.py`. Preserve DCP ordering (`4e981f168d`, regression `fcd1b70d1a`). |
-| Rejected verifier tokens overwrote the preceding partial pool | Retain three preceding rows plus the planned verifier length, using absolute-position ring indexing in `vllm/models/glm5next/nvidia/pooled_indexer.py` and `ops/glm_kpool.py`. Ordinary and speculative capacities cover 4/11/18 rows (`e1587ea558`). |
-| Packed page conversion could turn an unmapped `-1` slot into a page-zero write | Test original slot validity before conversion in `vllm/models/glm5next/nvidia/ops/glm_kpool.py` (`413bc2c00c`, `ac96719947`). |
+Consumers declare component queries or Caps, submit real preparation callbacks
+to `PreparationSession`, then bind and execute with the same `Plan`. The removed
+`b12x.policy` API, component `prewarm` calls and executable fields on public plans
+are not compatibility interfaces. Materialized state belongs to preparation.
 
-Pool-scaled addressing uses Int64. The regressions include high physical page
-IDs, independent numerical oracles, frozen compilation, input mutation, stable
-addresses and graph replay without allocation.
-
-## Evidence and limits
-
-The recorded b12x corpus compiles 1,225 callables and 1,235 CUDA entries for
-SM103. The companion metadata corpus compiles 27 variants. All 27 deferred
-operator suites collect, selecting 1,461 cases including overlap. Resource
-increases and stack/local-memory flags remain recorded for physical profiling.
-
-The final GLM component source passes 53 cases under Compute Sanitizer in two
-complementary processes, with zero errors. A combined run has three allocation
-failures after 50 passes and remains failed evidence. Real SM121 graph and
-DFlash runs pass the fixed requests and serving checks, but checkpoint accuracy
-and repeated generated text remain unqualified. Native V4.1 results do not
-qualify converted Trellis checkpoint accuracy.
-
-Physical B300 correctness and performance, Grace/NIC ordering and Station TP2
-remain unqualified. Separate SM103 tiny-M and TMEM-pipelined MoE strategies, SM103 GDN
-chunk-parallel prefill, direct HBM RDMA and frozen QSRT coupled high-rate
-conversion remain unimplemented. No B300 performance claim or measured B300
-profile is included.
+The companion vLLM branch at `f6c6ac72c3` targets the preceding b12x API. Its GLM
+pooling and loader fixes remain recorded in
+[historical evidence](sm103-glm-sparse-validation.json); that receipt does not
+qualify this preparation port or establish companion API compatibility.
+The companion must adopt these preparation contracts before serving validation.

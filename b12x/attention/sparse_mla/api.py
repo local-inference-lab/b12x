@@ -109,16 +109,11 @@ def bind(
         nsa_cache_seqlens_int32=selected_lengths,
         kv_cache=kv_cache,
     )
-    execution = None
-    if plan.policy_resolution.config.backend == "warp":
-        from . import _sm103
-        execution = _sm103.bind(plan, runtime, attention_sink)
     return Binding(
         plan=plan,
         runtime=runtime,
         kv_cache=kv_cache,
         attention_sink=attention_sink,
-        execution=execution,
     )
 
 
@@ -128,6 +123,10 @@ def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if not isinstance(binding, Binding):
         raise TypeError("binding must be sparse_mla.Binding")
     state = _state(binding.plan, device=binding.kv_cache.device)
+    if state.config.backend == "warp":
+        from ._sm103 import run_opaque
+
+        return run_opaque(binding, return_lse=state.caps.return_lse)
     return state.run(
         binding.runtime,
         kv_cache=binding.kv_cache,

@@ -33,8 +33,10 @@ from .._shared.mla.prefill_mg import UnifiedPrefillMGKernel
 from .._shared.mla.smem import make_smem_layout
 from .._shared.mla.smem_mg import make_smem_layout_mg
 
+from b12x._lib.program_cache import register_program_cache
+
 _CACHE = {}
-_PLANS = {}
+register_program_cache(_CACHE)
 
 
 class SplitLse:
@@ -131,7 +133,6 @@ class Runtime:
     sink: torch.Tensor | None
     output: torch.Tensor
     lse: torch.Tensor
-    plan_key: str
     prepared: object | None = None
 
 
@@ -152,17 +153,15 @@ def bind(plan, binding, sink):
     _validate_tensor_storage_bounds(cache, name="sparse MLA KV cache")
     rows = binding.q.shape[0]
     scratch = binding.scratch
-    key = repr((plan.caps, plan.policy_resolution.config))
-    _PLANS.setdefault(key, plan)
     return Runtime(
-        plan, binding, sink, scratch.output_buffer[:rows], scratch.final_lse[:rows], key
+        plan, binding, sink, scratch.output_buffer.narrow(0, 0, rows), scratch.final_lse.narrow(0, 0, rows)
     )
 
 
 def launch_specs(runtime):
     """Build kernel objects and launch arguments without device allocations."""
     caps = runtime.plan.caps
-    config = runtime.plan.policy_resolution.config
+    config = runtime.plan.config
     bound = runtime.binding
     scratch = bound.scratch
     traits = caps.cache_traits
@@ -178,7 +177,7 @@ def launch_specs(runtime):
     # The kernel consumes a raw pool base and an Int64 physical page stride.
     # A one-byte pointer view avoids a 32-bit dynamic DLPack extent for pools
     # larger than 2 GiB; all selected-row addressing remains in the kernel.
-    kv_c = _to_cute(_cache_base_tensor(kv)[:1], cutlass.Uint8)
+    kv_c = _to_cute(_cache_base_tensor(kv).narrow(0, 0, 1), cutlass.Uint8)
     index_c = _to_cute(indices, cutlass.Int32, align=4, dynamic_layout=True)
     length_c = _to_cute(lengths, cutlass.Int32, align=4, dynamic_layout=True)
     output_c = _to_cute(runtime.output, cutlass.BFloat16, dynamic_layout=True)
@@ -262,13 +261,10 @@ def launch_specs(runtime):
             merge_args = (partial_c, partial_lse_c, control_c, sink_c, output_c)
         launches.append(("merge", merge, merge_args))
         if caps.return_lse:
-            launches.append(
-                (
-                    "lse",
-                    SplitLse(splits, caps.lse_scale == "natural"),
-                    (partial_lse_c, lse_c),
-                )
-            )
+            lse = SplitLse(splits, caps.lse_scale == "natural", runtime.sink is not None)
+            entry = lse if runtime.sink is None else lse.call_sink
+            args = (partial_lse_c, lse_c) if runtime.sink is None else (partial_lse_c, lse_c, sink_c)
+            launches.append(("lse", entry, args))
     else:
         for blocks, valid, offset in segments:
             kernel = UnifiedPrefillMGKernel(
@@ -309,7 +305,7 @@ def launch_specs(runtime):
 
 def prepare(runtime):
     caps = runtime.plan.caps
-    config = runtime.plan.policy_resolution.config
+    config = runtime.plan.config
     bound = runtime.binding
     key = (
         caps,
@@ -342,75 +338,68 @@ def prepare(runtime):
     )
 
 
-def _run_bound(runtime):
-    with torch.cuda.device(runtime.output.device):
-        if runtime.output.shape[0] == 0:
-            return (
-                (runtime.output, runtime.lse)
-                if runtime.plan.caps.return_lse
-                else runtime.output
-            )
-        if runtime.prepared is None:
-            prepare(runtime)
+def run_prepared(runtime, programs):
+    """Rebind runtime descriptors to the programs retained during preparation."""
+    from b12x._lib.compiler import run_compiled
+
+    if runtime.output.shape[0]:
         stream = current_cuda_stream()
-        for kernel, args in runtime.prepared:
-            kernel(*args, stream)
-    return (
-        (runtime.output, runtime.lse)
-        if runtime.plan.caps.return_lse
-        else runtime.output
-    )
-
-
-@torch.library.custom_op("b12x::sparse_mla_warp", mutates_args=("scratch",))
-def _run_op(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    selected: torch.Tensor,
-    lengths: torch.Tensor,
-    active: torch.Tensor,
-    scratch: torch.Tensor,
-    sink: torch.Tensor | None,
-    plan_key: str,
-) -> None:
-    # The registry contains static plans only. Reconstructing views consumes
-    # the already-resolved config and allocates no CUDA storage. The custom op
-    # keeps CuTe launch objects opaque to torch.compile's serving graph.
-    plan = _PLANS[plan_key]
-    binding = plan.bind(
-        scratch=scratch,
-        q=q,
-        kv_cache=kv,
-        selected_indices=selected,
-        cache_seqlens_int32=lengths,
-        nsa_cache_seqlens_int32=active,
-    )
-    _run_bound(bind(plan, binding, sink))
-
-
-@_run_op.register_fake
-def _run_op_fake(q, kv, selected, lengths, active, scratch, sink, plan_key):
-    return None
-
-
-def run(runtime):
-    bound = runtime.binding
-    _run_op(
-        bound.q,
-        bound.kv_cache,
-        bound.selected_indices,
-        bound.cache_seqlens_int32,
-        bound.nsa_cache_seqlens_int32,
-        bound.scratch.shared_scratch,
-        runtime.sink,
-        runtime.plan_key,
-    )
-    return (
-        (runtime.output, runtime.lse)
-        if runtime.plan.caps.return_lse
-        else runtime.output
-    )
+        specs = launch_specs(runtime)
+        for program, (_, _, args) in zip(programs, specs, strict=True):
+            run_compiled(program, (*args, stream))
+    return ((runtime.output, runtime.lse)
+            if runtime.plan.caps.return_lse else runtime.output)
 
 
 def clear_caches():
     _CACHE.clear()
+
+
+@torch.library.custom_op("b12x::sparse_mla_warp", mutates_args=("scratch",))
+def _run_op(
+    scratch: torch.Tensor,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected_indices: torch.Tensor,
+    cache_lengths: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    attention_sink: torch.Tensor | None,
+    plan_handle: int,
+) -> None:
+    from b12x.preparation import plan_from_handle, require_prepared
+
+    plan = plan_from_handle(plan_handle)
+    state = require_prepared(plan, "attention.sparse_mla", q.device)
+    binding = state.bind(
+        scratch=scratch, q=q, kv_cache=kv_cache,
+        selected_indices=selected_indices,
+        cache_seqlens_int32=cache_lengths,
+        nsa_cache_seqlens_int32=selected_lengths,
+    )
+    state.run(binding, kv_cache=kv_cache, attention_sink=attention_sink)
+
+
+@_run_op.register_fake
+def _run_fake(
+    scratch: torch.Tensor, q: torch.Tensor, kv_cache: torch.Tensor,
+    selected_indices: torch.Tensor, cache_lengths: torch.Tensor, selected_lengths: torch.Tensor,
+    attention_sink: torch.Tensor | None, plan_handle: int,
+) -> None:
+    return None
+
+
+def run_opaque(binding, *, return_lse):
+    """Keep storage validation and retained CuTe launches outside Dynamo tracing."""
+    runtime = binding.runtime
+    scratch = runtime.scratch
+    torch.ops.b12x.sparse_mla_warp(
+        scratch.shared_scratch, runtime.q, binding.kv_cache,
+        runtime.selected_indices, runtime.cache_seqlens_int32,
+        runtime.nsa_cache_seqlens_int32, binding.attention_sink,
+        binding.plan.handle,
+    )
+    rows = runtime.q.shape[0]
+    output = scratch.output_buffer.narrow(0, 0, rows)
+    if return_lse:
+        return output, scratch.final_lse.narrow(0, 0, rows)
+    return output

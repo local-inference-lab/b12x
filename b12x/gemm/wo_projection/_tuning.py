@@ -66,6 +66,14 @@ def _validate_query(query, device):
 
 
 def _validate(query, config, device):
+    if device is not None and device.compute_capability == (10, 3):
+        if config != WoProjectionConfig(backend="mxfp8_tcgen05"):
+            raise ValueError("SM103 WO requires its native tcgen05 config")
+        if query.max_tokens >= 2**31 or query.groups > 65535 or query.dtype != "bfloat16" or query.group_width % 128 or query.rank % 8 or (query.rank * query.groups) % 128 or query.hidden % 8:
+            raise ValueError("SM103 WO requires BF16 input, K128 projections, and N8 output")
+        if query.operation == "inv_rope" and query.cos_sin_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("SM103 inverse RoPE requires BF16 or FP32 cos/sin")
+        return
     if not isinstance(config, WoProjectionConfig) or config.backend != "mxfp8":
         raise ValueError("WO projection requires an MXFP8 configuration")
     if type(config.decode_tile_n) is not int or config.decode_tile_n not in (0, 64, 128):
@@ -78,6 +86,8 @@ def _validate(query, config, device):
 
 
 def _default(query, device):
+    if device is not None and device.compute_capability == (10, 3):
+        return WoProjectionConfig(backend="mxfp8_tcgen05")
     if not _decode_domain(query):
         return WoProjectionConfig()
     override = query.codegen.get("wo_b_fused_tile", "")
@@ -86,6 +96,10 @@ def _default(query, device):
 
 
 def _parameters(query, device):
+    if device is not None and device.compute_capability == (10, 3):
+        return ParameterSpace.create(TUNING.knobs, values={
+            "backend": ("mxfp8_tcgen05",), "decode_tile_n": (0,),
+        })
     override = query.codegen.get("wo_b_fused_tile", "")
     tiles = (int(override.split("x")[1]),) if override else (64, 128)
     return ParameterSpace.create(TUNING.knobs, values={
@@ -96,7 +110,7 @@ def _parameters(query, device):
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
     query_schema_version=4,
-    config_schema_version=2,
+    config_schema_version=3,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
@@ -109,7 +123,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=("mxfp8",), binding=ParameterBinding.COMPILE),
         Knob(name="decode_tile_n", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     parameters=_parameters,
     materialize=lambda query, device, choice: WoProjectionConfig(**dict(choice)),
 )

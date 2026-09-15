@@ -8,6 +8,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 
+from b12x._lib.compiler import run_compiled
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import (
@@ -358,7 +359,6 @@ def _get_compiled_mxfp8_rows_quant(
         value_order,
         min_amax,
         device_ordinal,
-        architecture,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -391,6 +391,13 @@ def _get_compiled_mxfp8_rows_quant(
     ) -> None:
         if source.device.type != "cuda" or source.device.index != device_ordinal:
             raise ValueError("MXFP8 quantizer callable must run on its compiled device")
+        if source.ndim != 2 or source.dtype != source_dtype or not source.is_contiguous():
+            raise ValueError("MXFP8 source differs from its compiled row contract")
+        if max(source.shape) >= 2**31 or not 0 < source.shape[1] <= k or source.shape[1] % 32:
+            raise ValueError("MXFP8 source exceeds its compiled geometry")
+        _validate_storage(source, values, scale_rows, scale_mma, k)
+        if source.shape[0] == 0:
+            return
         if subgroup_width:
             groups_per_warp = 32 // subgroup_width
             total_tasks = int(source.shape[0]) * (
@@ -402,7 +409,7 @@ def _get_compiled_mxfp8_rows_quant(
         else:
             total_blocks = int(source.shape[0]) * (k // 32)
             grid_x = max(1, (total_blocks + threads - 1) // threads)
-        raw(
+        run_compiled(raw, (
             make_ptr(
                 source_type,
                 source.data_ptr(),
@@ -431,7 +438,7 @@ def _get_compiled_mxfp8_rows_quant(
             int(source.shape[1]),
             grid_x,
             current_cuda_stream(),
-        )
+        ))
 
     return attach_programs(launch_tensors, raw)
 
@@ -452,8 +459,6 @@ def mxfp8_rows_quant_launch_options(
     return _WARP_SUBGROUP_WIDTH, _THREADS
 
 
-_get_compiled_mxfp8_rows_quant.cache_clear = _compile_mxfp8_rows_quant.cache_clear
-_get_compiled_mxfp8_rows_quant.cache_info = _compile_mxfp8_rows_quant.cache_info
 
 
 def quantize_mxfp8_rows_cute(
@@ -505,3 +510,34 @@ def quantize_mxfp8_rows_cute(
         scale_rows,
         scale_mma,
     )
+
+
+def _validate_storage(source, values, scale_rows, scale_mma, k):
+    """Validate live capacity and physical byte layouts before writing output."""
+    m = source.shape[0]
+    for tensor, dtypes, count in (
+        (values, (torch.float8_e4m3fn, torch.uint8), m * k),
+        (scale_rows, (torch.float8_e8m0fnu, torch.uint8), m * (k // 32)),
+        (scale_mma, (torch.float8_e8m0fnu, torch.uint8), ((m + 127) // 128) * ((k // 32 + 3) // 4) * 512),
+    ):
+        if tensor.device != source.device or tensor.dtype not in dtypes or tensor.numel() < count:
+            raise ValueError("MXFP8 output storage must match the device, byte dtype, and live capacity")
+        if tensor.numel() and tensor.data_ptr() % 16:
+            raise ValueError("MXFP8 input and output pointers must be 16-byte aligned")
+    if source.numel() and source.data_ptr() % 16:
+        raise ValueError("MXFP8 input and output pointers must be 16-byte aligned")
+    if not values.is_contiguous() or not scale_rows.is_contiguous():
+        raise ValueError("MXFP8 values and row scales must have contiguous physical storage")
+    if values.ndim < 1 or scale_rows.ndim < 1 or values.shape[-1] != k or scale_rows.shape[-1] != k // 32:
+        raise ValueError("MXFP8 values and row scales must match the physical K stride")
+    if scale_mma.ndim == 6:
+        if (scale_mma.shape[0:2] != (32, 4) or scale_mma.shape[3:] != (4, (k // 32 + 3) // 4, 1)
+                or not scale_mma.permute(5, 2, 4, 0, 1, 3).is_contiguous()):
+            raise ValueError("MXFP8 MMA scales must use the physical F8_128x4 layout")
+    elif not scale_mma.is_contiguous():
+        raise ValueError("MXFP8 MMA scales require contiguous physical byte storage")
+    spans = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
+             for t in (source, values, scale_rows, scale_mma)]
+    for i, (lo, hi) in enumerate(spans):
+        if any(lo < end and start < hi for start, end in spans[:i]):
+            raise ValueError("MXFP8 source and output buffers must not overlap")

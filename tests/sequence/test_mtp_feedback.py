@@ -130,8 +130,7 @@ def test_rms_streams_fp8_quantizer_rounding_boundaries_and_dynamic_rows():
         _fp8._pointer(output, c.Uint32),
         _fp8._pointer(scales, c.Float32),
     )
-    freeze_kernel_resolution("FP8 quantizer live rows use retained callable")
-    try:
+    with kernel_resolution_guard("FP8 quantizer live rows use retained callable"):
         for live in (1, 17, rows):
             run_compiled(quant, (*args, c.Int32(live), current_cuda_stream()))
             expected_scale = (
@@ -153,8 +152,6 @@ def test_rms_streams_fp8_quantizer_rounding_boundaries_and_dynamic_rows():
                 output[:live].view(torch.uint8), expected.view(torch.uint8)
             )
             assert output[0, 1].item() == 80
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_rms_streams_fp8_rejects_invalid_bindings_and_accepts_int32_positions():
@@ -208,7 +205,7 @@ def test_rms_streams_fp8_matches_optional_vllm_native_quantization():
             False,
         )
         for name, expected in ((f"{path}_quant", quant), (f"{path}_scale", scales)):
-            offset, shape, dtype = planned._backend_plan.layout[name]
+            offset, shape, dtype = require_prepared(planned, "sequence.mtp_feedback").layout._backend_plan.layout[name]
             actual = materialize_scratch_view(
                 binding.scratch,
                 offset_bytes=offset,
@@ -232,10 +229,7 @@ def test_rms_streams_fp8_projection_quantization_and_graph(hidden, streams):
     binding = mtp.bind(planned, **tensors, tokens=1)
     mtp.run(binding)
     cached = _fp8.compile_projection.cache_info()
-    freeze_kernel_resolution(
-        "FP8 feedback retains norm, quantization, projection and add kernels"
-    )
-    try:
+    with kernel_resolution_guard("FP8 feedback retains norm, quantization, projection and add kernels"):
         for live in (1, 4, 17, 0):
             tensors["output"].fill_(7)
             binding = mtp.bind(planned, **tensors, tokens=live)
@@ -271,7 +265,7 @@ def test_rms_streams_fp8_projection_quantization_and_graph(hidden, streams):
                     (f"{path}_quant", quant.reshape(-1, hidden)),
                     (f"{path}_scale", scale),
                 ):
-                    offset, shape, dtype = planned._backend_plan.layout[name]
+                    offset, shape, dtype = require_prepared(planned, "sequence.mtp_feedback").layout._backend_plan.layout[name]
                     actual = materialize_scratch_view(
                         binding.scratch, offset_bytes=offset, shape=shape, dtype=dtype
                     )[0][: reference.shape[0]]
@@ -298,8 +292,6 @@ def test_rms_streams_fp8_projection_quantization_and_graph(hidden, streams):
             assert torch.equal(
                 tensors["output"][live:], torch.full_like(tensors["output"][live:], 7)
             )
-    finally:
-        unfreeze_kernel_resolution()
     assert _fp8.compile_projection.cache_info() == cached
 
 
@@ -318,9 +310,8 @@ def test_rms_concat_graph_reuses_capacity_and_reads_mutated_inputs(
     from b12x.sequence.mtp_feedback import _concat
 
     cache_before = _concat.compile_norm.cache_info()
-    projection = planned._backend_plan.projection
-    freeze_kernel_resolution("RMS-concat live counts reuse planned callables")
-    try:
+    projection = require_prepared(planned, "sequence.mtp_feedback").layout._backend_plan.projection
+    with kernel_resolution_guard("RMS-concat live counts reuse planned callables"):
         for live in (1, 4, 17, 33, 0):
             tensors["output"].fill_(7)
             binding = mtp.bind(planned, **tensors, tokens=live)
@@ -362,10 +353,8 @@ def test_rms_concat_graph_reuses_capacity_and_reads_mutated_inputs(
                 # Learned weights are ordinary RMS weights, not Gemma (1+w).
                 assert binding.state_normalized.count_nonzero() > 0
             del graph
-    finally:
-        unfreeze_kernel_resolution()
     assert _concat.compile_norm.cache_info() == cache_before
-    assert planned._backend_plan.projection is projection
+    assert require_prepared(planned, "sequence.mtp_feedback").layout._backend_plan.projection is projection
 
 
 def test_rms_concat_rejects_aliases_missing_weights_and_capacity_overflow():
@@ -570,7 +559,7 @@ def test_state_norm_uses_one_flattened_stream_group() -> None:
 def test_bind_rejects_bad_shapes_dtypes_and_mutable_aliases() -> None:
     device = require_sm120()
     binding, tensors = _make_case(device=device, max_tokens=2)
-    planned = binding.execution
+    planned = binding.plan
     bad = dict(tensors)
     bad["token_norm_weight"] = torch.empty((2559,), dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError, match="token_norm_weight must have shape"):
@@ -623,7 +612,7 @@ def test_zero_tokens_is_a_noop_and_live_count_is_capacity_checked() -> None:
     torch.testing.assert_close(tensors["output"], output_before, rtol=0, atol=0)
     for tokens in (-1, 4):
         with pytest.raises(ValueError, match="tokens="):
-            mtp.bind(binding.execution, **tensors, tokens=tokens)
+            mtp.bind(binding.plan, **tensors, tokens=tokens)
 
 
 @pytest.mark.parametrize(("tokens", "max_tokens"), [(1, 1), (3, 3), (17, 17)])
@@ -639,7 +628,7 @@ def test_target_s4_h2560_geometry_matches_reference(
         hidden_size=2560,
     )
     _parameterize_weights(tensors)
-    binding = mtp.bind(binding.execution, **tensors, tokens=tokens)
+    binding = mtp.bind(binding.plan, **tensors, tokens=tokens)
     expected = _reference(binding)
     actual = mtp.run(binding)
     torch.cuda.synchronize(device)
@@ -706,7 +695,7 @@ def test_capacity_specialization_is_reused_for_distinct_live_counts_when_frozen(
     one_token, tensors = _make_case(device=device, max_tokens=17, tokens=1)
     with kernel_resolution_guard("MTP live rows reuse prepared capacity kernels"):
         for tokens in (1, 17, 0, 3):
-            binding = mtp.bind(one_token.execution, **tensors, tokens=tokens)
+            binding = mtp.bind(one_token.plan, **tensors, tokens=tokens)
             expected = _reference(binding)
             actual = mtp.run(binding)
             torch.cuda.synchronize(device)
@@ -723,7 +712,7 @@ def test_target_geometry_cuda_graph_replay_uses_bound_storage() -> None:
         hidden_size=2560,
     )
     _parameterize_weights(tensors)
-    binding = mtp.bind(binding.execution, **tensors, tokens=3)
+    binding = mtp.bind(binding.plan, **tensors, tokens=3)
     mtp.run(binding)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -965,7 +954,7 @@ def test_target_torch_compile_accepts_parameter_weights() -> None:
         hidden_size=2560,
     )
     _parameterize_weights(tensors)
-    binding = mtp.bind(binding.execution, **tensors, tokens=1)
+    binding = mtp.bind(binding.plan, **tensors, tokens=1)
 
     def launch() -> torch.Tensor:
         return mtp.run(binding)
@@ -994,3 +983,23 @@ def test_caps_and_run_validate_contract() -> None:
     for eps in (0.0, -1.0, math.inf, math.nan):
         with pytest.raises(ValueError, match="eps must be finite and positive"):
             mtp.run(binding, eps=eps)
+
+
+@pytest.mark.parametrize("contract", ["rms_concat", "rms_streams_fp8"])
+def test_prepared_concat_and_fp8_feedback_fullgraph(contract):
+    device = require_sm103_or_sm12x()
+    if contract == "rms_concat":
+        planned, tensors = _make_concat_case(device, 256)
+        reference = _concat_reference
+    else:
+        planned, tensors = _make_fp8_case(device, 256, 4)
+        reference = _fp8_reference
+    binding = mtp.bind(planned, **tensors, tokens=3)
+    mtp.run(binding)
+    with kernel_resolution_guard("prepared MTP fullgraph retains compiled programs"):
+        compiled = torch.compile(lambda: mtp.run(binding), fullgraph=True)
+        compiled()
+        tensors["multi_state"].mul_(0.75)
+        expected = reference(binding)
+        binding.output.fill_(float("nan"))
+        torch.testing.assert_close(compiled(), expected, rtol=0.02, atol=0.04)

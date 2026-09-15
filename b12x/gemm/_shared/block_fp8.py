@@ -153,7 +153,6 @@ class _BlockFP8LinearScratchPlan:
             output=output, workspace=workspace, bias=bias,
             expected_m=self.caps.max_tokens if expected_m is None else expected_m,
             mma_tiler_mn=self.mma_tiler_mn,
-            backend=self.backend,
         )
 
 
@@ -507,7 +506,8 @@ def block_fp8_linear_mxfp8(
             "block_fp8_linear_mxfp8 requires source, packed_weight, and a prepared plan"
         )
     state = require_prepared(plan, "gemm.block_fp8_linear", source.device)
-    return state.run(source, packed_weight, bias=bias, workspace=workspace, stream=stream)
+    from b12x.gemm.block_fp8_linear._ops import run_functional
+    return run_functional(source, packed_weight, plan=plan, bias=bias, workspace=workspace, stream=stream)
 
 
 __all__ = [

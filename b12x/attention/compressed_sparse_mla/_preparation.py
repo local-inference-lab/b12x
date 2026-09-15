@@ -269,6 +269,24 @@ def _lower_launch(
     sm_count: int | None = None,
 ):
     """Resolve and retain the exact native route selected by this declaration."""
+    if config.backend == "warp":
+        from . import _warp
+        with torch.cuda.device(ordinal), FakeTensorMode():
+            device, binding, swa, indexed = _fake_binding(query, config, ordinal)
+            scratch_plan = plan_compressed_sparse_mla_scratch(
+                _caps(query, config, ordinal), execution_config=config
+            )
+            sink = _fake((query.num_q_heads,), dtype=torch.float32, device=device) if query.attn_sink_present else None
+            out = binding.scratch.output_buffer.narrow(0, 0, query.query_rows)
+            # A mapper pointer is part of the capacity ABI even when the first
+            # representative call happens to use physical selections directly.
+            table = _fake((query.query_rows, query.max_page_table_width), dtype=torch.int32, device=device)
+            specs = _warp.launch_specs(
+                scratch_plan, binding.scratch, binding.q, swa, binding.swa_indices,
+                binding.swa_lengths, indexed, binding.indexed_indices,
+                binding.indexed_lengths, table, sink, out, 512**-0.5,
+            )
+            return _warp.compile_launches((query, config, ordinal), specs)
     if config.single_pass:
         return _lower_prefill_launch(query, config, ordinal)
 
@@ -461,8 +479,8 @@ class _CompressedSparseMlaPrograms:
 
     @property
     def __b12x_dependencies__(self):
-        if isinstance(self.launch, tuple):
-            return (*self.launch, self.mapper)
+        if isinstance(self.launch, (tuple, dict)):
+            return (self.launch, self.mapper)
         return (*self.launch.grid_programs, self.launch.merge_program,
                 self.launch.lse_program, self.mapper)
 
@@ -471,7 +489,7 @@ class _CompressedSparseMlaPrograms:
         launch = self.launch
         programs = (
             program_keys(launch)
-            if isinstance(launch, tuple)
+            if isinstance(launch, (tuple, dict))
             else program_keys(
                 (*launch.grid_programs, launch.merge_program, launch.lse_program)
             )
@@ -488,7 +506,7 @@ def compile_compressed_sparse_mla(query_payload, config_payload, ordinal):
     config = SparseMlaConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     launch = _lower_launch(query, config, ordinal)
-    mapper = _lower_indexed_mapper(query, config, ordinal)
+    mapper = None if config.backend == "warp" else _lower_indexed_mapper(query, config, ordinal)
     programs = _CompressedSparseMlaPrograms(launch, mapper)
     if not programs.__b12x_programs__:
         raise RuntimeError("compressed MLA preparation produced no native programs")
@@ -542,6 +560,19 @@ class _PreparedCompressedSparseMla:
             raise ValueError("compressed MLA SWA page size differs from the prepared plan")
         if indexed and int(kwargs.get("indexed_page_size", 0)) != self.query.indexed_page_size:
             raise ValueError("compressed MLA indexed page size differs from the prepared plan")
+        if self.config.backend == "warp":
+            from . import _warp
+            out = kwargs.get("out")
+            if out is None:
+                out = binding.scratch.output_buffer[:binding.q.shape[0]]
+            _warp.execute(
+                self.scratch_plan, binding.scratch, binding.q, kwargs["swa_k_cache"],
+                binding.swa_indices, binding.swa_lengths, kwargs.get("indexed_k_cache"),
+                binding.indexed_indices, binding.indexed_lengths, binding.indexed_page_table,
+                kwargs.get("attn_sink"), out, kwargs.get("sm_scale", 512**-0.5),
+                self.query.lse_scale == "natural", compiled=self.launch,
+            )
+            return (out, binding.scratch.final_lse[:binding.q.shape[0]]) if self.query.return_lse else out
         return compressed_sparse_mla_decode_forward(
             binding=binding,
             prepared=self.launch,
@@ -620,6 +651,10 @@ def run(
         "attention.compressed_sparse_mla",
         binding.q.device,
     )
+    if state.config.backend == "warp":
+        from ._warp import run_opaque
+
+        return run_opaque(binding, **kwargs)
     return state.run(binding, **kwargs)
 
 

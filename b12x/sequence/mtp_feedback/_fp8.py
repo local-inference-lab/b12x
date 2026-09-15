@@ -1,7 +1,6 @@
 """Per-stream ordinary RMS feedback with separate compact K128 FP8 projections."""
 
 from dataclasses import dataclass
-from functools import lru_cache
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -87,7 +86,10 @@ class AddEmbedding:
             )
 
 
-@lru_cache(maxsize=None)
+from b12x._lib.program_cache import program_cache
+
+
+@program_cache
 def compile_aux(hidden, streams, device_index, architecture):
     from b12x._lib.utils import make_ptr
 
@@ -159,7 +161,7 @@ class BackendPlan:
         hidden_fc_scale,
         positions,
         output,
-        tokens,
+        tokens=None,
     ):
         from ._impl import Binding, _overlaps, _require_tensor
 
@@ -315,7 +317,7 @@ class BackendPlan:
             (_pointer(views["embedding_projection"]), _pointer(output)),
         )
         return Binding(
-            plan=planned,
+            _state=planned,
             tokens=live,
             scratch=storage,
             token_normalized=views["embedding_norm"][:live],
@@ -336,10 +338,12 @@ class BackendPlan:
         )
 
     def run(self, binding, *, eps):
+        if binding.tokens == 0:
+            return binding.output
         if torch.cuda.is_current_stream_capturing() and not self.warmed:
             raise RuntimeError("FP8 MTP feedback must be warm-run before graph capture")
         bound = binding._backend_binding
-        caps = binding.plan.caps
+        caps = binding._state.caps
         stream = current_cuda_stream()
         run_compiled(
             bound.norm,
@@ -367,10 +371,9 @@ class BackendPlan:
         return binding.output
 
 
-def plan(caps, resolution):
-    from ._impl import Plan
+def plan(caps, config, identity, *, compile_launches=True):
+    from ._impl import _Layout
 
-    identity = resolution.device
     if identity is None or not supports_architecture(
         identity.compute_capability, ("sm103a", "sm120a", "sm121a")
     ):
@@ -380,35 +383,36 @@ def plan(caps, resolution):
     architecture = (
         f"sm_{identity.compute_capability[0]}{identity.compute_capability[1]}a"
     )
-    config = resolution.config
     norm_capacity = align_up(caps.max_tokens, 4)
-    norms = {
-        dtype: compile_norm(
-            caps.hidden_size,
-            config.norm_block_h,
-            config.norm_num_warps,
-            dtype,
-            caps.device.index,
-            identity.compute_capability,
-            caps.streams,
-            norm_capacity,
+    norms, quant, add, projection = {}, None, None, None
+    if compile_launches:
+        norms = {
+            dtype: compile_norm(
+                caps.hidden_size,
+                config.norm_block_h,
+                config.norm_num_warps,
+                dtype,
+                caps.device.index,
+                identity.compute_capability,
+                caps.streams,
+                norm_capacity,
+            )
+            for dtype in (torch.int32, torch.int64)
+        }
+        quant, add = compile_aux(
+            caps.hidden_size, caps.streams, caps.device.index, architecture
         )
-        for dtype in (torch.int32, torch.int64)
-    }
-    quant, add = compile_aux(
-        caps.hidden_size, caps.streams, caps.device.index, architecture
-    )
-    projection = compile_projection(
-        caps.hidden_size,
-        caps.hidden_size,
-        1,
-        "bfloat16",
-        True,
-        True,
-        caps.device.index,
-        identity.sm_count,
-        architecture,
-    )
+        projection = compile_projection(
+            caps.hidden_size,
+            caps.hidden_size,
+            1,
+            "bfloat16",
+            True,
+            True,
+            caps.device.index,
+            identity.sm_count,
+            architecture,
+        )
     layout = {}
     offset = 0
     for name, shape, dtype in (
@@ -441,7 +445,7 @@ def plan(caps, resolution):
             elements *= dimension
         offset += elements * dtype.itemsize
     spec = scratch_buffer_spec("mtp_feedback", nbytes=offset, device=caps.device)
-    return Plan(
+    return _Layout(
         caps=caps,
         token_normalized_offset_bytes=layout["embedding_norm"][0],
         state_partial_sums_offset_bytes=None,
@@ -453,6 +457,5 @@ def plan(caps, resolution):
         norm_block_h=config.norm_block_h,
         norm_block_s=config.norm_block_s,
         norm_num_warps=config.norm_num_warps,
-        policy_resolution=resolution,
         _backend_plan=BackendPlan(layout, norms, quant, projection, add),
     )

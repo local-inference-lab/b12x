@@ -1069,7 +1069,7 @@ def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 @pytest.mark.parametrize("recipe", ["deepseek_v4", "deepseek_v41"])
 def test_compressed_prewarm_reuses_declared_capacity_and_rejects_capture(monkeypatch, mode, recipe):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention.compressed_sparse_mla import api
 
     plan = api.plan(api.Caps(
@@ -1100,12 +1100,9 @@ def test_compressed_prewarm_reuses_declared_capacity_and_rejects_capture(monkeyp
         expected |= {(True, sink, True) for sink in (False, True)}
     expected = {(*case, scale) for case in expected for scale in ("natural", "base2")}
     assert set(calls) == expected
-    freeze_kernel_resolution("prewarm must precede serving")
-    try:
+    with kernel_resolution_guard("prewarm must precede serving"):
         with pytest.raises(RuntimeError, match="frozen"):
             api.prewarm(plan, scratch=scratch)
-    finally:
-        unfreeze_kernel_resolution()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="eager"):
@@ -1117,7 +1114,7 @@ def test_compressed_prewarm_reuses_declared_capacity_and_rejects_capture(monkeyp
 def test_dsa_fp8_prewarm_uses_capacity_plan_and_rejects_capture(
     monkeypatch, mode, page_stride
 ):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention.dsa_indexer import api
 
     plan = api.plan(
@@ -1162,12 +1159,9 @@ def test_dsa_fp8_prewarm_uses_capacity_plan_and_rejects_capture(
             api.prewarm_fp8(
                 plan, scratch=scratch, cache_page_stride_bytes=invalid_stride
             )
-    freeze_kernel_resolution("prewarm precedes frozen serving")
-    try:
+    with kernel_resolution_guard("prewarm precedes frozen serving"):
         with pytest.raises(RuntimeError, match="frozen"):
             api.prewarm_fp8(plan, scratch=scratch)
-    finally:
-        unfreeze_kernel_resolution()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="eager"):

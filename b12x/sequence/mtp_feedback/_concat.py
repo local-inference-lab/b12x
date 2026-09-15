@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -119,7 +118,10 @@ def _pointer(tensor, dtype=c.BFloat16):
     )
 
 
-@lru_cache(maxsize=None)
+from b12x._lib.program_cache import program_cache
+
+
+@program_cache
 def compile_norm(
     hidden,
     block_h,
@@ -190,7 +192,7 @@ class BackendPlan:
         combined_fc_weight,
         positions,
         output,
-        tokens,
+        tokens=None,
     ):
         from ._impl import Binding, _overlaps, _require_tensor
 
@@ -281,7 +283,7 @@ class BackendPlan:
             concatenated,
         )
         return Binding(
-            plan=planned,
+            _state=planned,
             tokens=live,
             scratch=storage,
             token_normalized=concatenated[:live, : caps.hidden_size],
@@ -301,6 +303,8 @@ class BackendPlan:
         )
 
     def run(self, binding, *, eps):
+        if binding.tokens == 0:
+            return binding.output
         if torch.cuda.is_current_stream_capturing() and not self.warmed:
             raise RuntimeError(
                 "RMS-concat feedback must be warm-run before graph capture"
@@ -325,10 +329,10 @@ class BackendPlan:
         return binding.output
 
 
-def plan(caps, resolution):
-    from ._impl import Plan
+def plan(caps, config, identity, *, compile_launches=True):
+    from ._impl import _Layout
 
-    device = resolution.device
+    device = identity
     if device is None or not supports_architecture(
         device.compute_capability, ("sm103a", "sm120a", "sm121a")
     ):
@@ -336,31 +340,32 @@ def plan(caps, resolution):
             "RMS-concat feedback requires an implemented Blackwell architecture"
         )
     rows = ((caps.max_tokens + 15) // 16) * 16
-    config = resolution.config
-    norms = {
-        dtype: compile_norm(
+    norms, projection = {}, None
+    if compile_launches:
+        norms = {
+            dtype: compile_norm(
+                caps.hidden_size,
+                config.norm_block_h,
+                config.norm_num_warps,
+                dtype,
+                caps.device.index,
+                device.compute_capability,
+            )
+            for dtype in (torch.int32, torch.int64)
+        }
+        projection = compile_mtp_prefill_bf16_gemm(
+            rows,
             caps.hidden_size,
-            config.norm_block_h,
-            config.norm_num_warps,
-            dtype,
-            caps.device.index,
-            device.compute_capability,
+            2 * caps.hidden_size,
+            device=caps.device,
+            streams=1,
+            add_token_path=False,
         )
-        for dtype in (torch.int32, torch.int64)
-    }
-    projection = compile_mtp_prefill_bf16_gemm(
-        rows,
-        caps.hidden_size,
-        2 * caps.hidden_size,
-        device=caps.device,
-        streams=1,
-        add_token_path=False,
-    )
     backend = BackendPlan(rows, norms, projection)
     spec = scratch_buffer_spec(
         "mtp_feedback", nbytes=rows * 2 * caps.hidden_size * 2, device=caps.device
     )
-    return Plan(
+    return _Layout(
         caps=caps,
         token_normalized_offset_bytes=None,
         state_partial_sums_offset_bytes=None,
@@ -372,6 +377,5 @@ def plan(caps, resolution):
         norm_block_h=config.norm_block_h,
         norm_block_s=config.norm_block_s,
         norm_num_warps=config.norm_num_warps,
-        policy_resolution=resolution,
         _backend_plan=backend,
     )

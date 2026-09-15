@@ -202,6 +202,14 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    from ._backends import architecture_backend
+
+    backend = architecture_backend(_device)
+    if backend is not None:
+        backend.validate_policy(query, config)
+        return
+    if config.backend.startswith("tcgen05_"):
+        raise ValueError("tcgen05 MoE requires an SM103 device")
     if query.quant_mode == "multi":
         if config.backend == "w4a16":
             if "w4a16" not in query.quant_modes:
@@ -285,6 +293,11 @@ def validate_moe_decode_config(
 
 
 def _default_config(query: MoeDecodeQuery, device: DeviceIdentity | None) -> MoeDecodeConfig:
+    from ._backends import architecture_backend
+
+    backend = architecture_backend(device)
+    if backend is not None:
+        return backend.heuristic(query)
     from ._impl import _heuristic_moe_decode_config
 
     if query.quant_mode == "multi":
@@ -313,6 +326,8 @@ def _materialize_tuning(query, device, choice):
 
     config = MoeDecodeConfig.from_config(choice)
     validate_moe_decode_config(query, config, device)
+    if config.backend.startswith("tcgen05_"):
+        return config
     if (
         min(query.num_experts, query.hidden_size, query.intermediate_size, query.top_k, query.num_tokens) <= 0
         or query.top_k > query.num_experts
@@ -357,6 +372,13 @@ def _materialize_tuning(query, device, choice):
 
 
 def _tuning_parameters(query, device):
+    from ._backends import architecture_backend
+
+    backend = architecture_backend(device)
+    if backend is not None:
+        config = backend.heuristic(query)
+        return {"backend": (config.backend,), "route_planner": ("internal",),
+                "max_active_clusters": (None,)}
     if device is None or device.sm_count <= 0:
         raise ValueError("MoE launch tuning requires the device SM count")
     from ._impl import (
@@ -448,7 +470,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=8,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -457,7 +479,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     knobs=(
         Knob(name="backend", values=("micro", "dynamic", "w4a16"), binding=ParameterBinding.COMPILE),
         Knob(name="route_planner", values=("internal", "triton"), binding=ParameterBinding.COMPILE),

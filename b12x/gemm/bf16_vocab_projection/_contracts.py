@@ -56,7 +56,7 @@ def plan(
     return make_plan(caps, invocation=invocation, override=override)
 
 
-def _bind(caps: Caps, *, plan: Plan, source: torch.Tensor, weight: torch.Tensor) -> Binding:
+def _bind(caps: Caps, *, plan: Plan, source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None) -> Binding:
     if source.ndim != 2 or not 0 < source.shape[0] <= caps.max_tokens:
         raise ValueError(f"source must have 1..{caps.max_tokens} rows, got {tuple(source.shape)}")
     if source.shape[1] != caps.in_features:
@@ -72,19 +72,31 @@ def _bind(caps: Caps, *, plan: Plan, source: torch.Tensor, weight: torch.Tensor)
             raise TypeError(f"{name} must have dtype {caps.dtype}, got {tensor.dtype}")
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    return Binding(plan=plan, source=source, weight=weight)
+    if out is not None:
+        if (out.shape != (source.shape[0], caps.out_features) or out.dtype != caps.dtype
+                or out.device != caps.device or not out.is_contiguous()):
+            raise ValueError("vocabulary output must match the contiguous BF16 projection")
+        from ._cute import validate_output
+        if not torch.compiler.is_compiling():
+            validate_output(source, weight, out)
+    return Binding(plan=plan, source=source, weight=weight, output=out)
 
 
-def bind(plan: Plan, *, source: torch.Tensor, weight: torch.Tensor) -> Binding:
+def bind(plan: Plan, *, source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None) -> Binding:
     """Bind live tensors to a fully prepared vocabulary projection."""
     state = require_prepared(plan, "gemm.bf16_vocab_projection", source.device)
-    return state.bind(plan=plan, source=source, weight=weight)
+    return state.bind(plan=plan, source=source, weight=weight, out=out)
 
 
 def run(binding: Binding) -> torch.Tensor:
     """Run only the backend selected during preparation."""
     if not isinstance(binding, Binding):
         raise TypeError("binding must be Binding")
+    if binding.output is not None:
+        torch.ops.b12x.bf16_vocab_projection_out(
+            binding.source, binding.weight, binding.output, binding.plan.handle,
+        )
+        return binding.output
     return torch.ops.b12x.bf16_vocab_projection(
         binding.source, binding.weight, binding.plan.handle,
     )

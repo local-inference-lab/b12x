@@ -1,6 +1,5 @@
 """Shared capacity-independent FP8 warp-MMA launch factory."""
 
-from functools import lru_cache
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -123,7 +122,10 @@ class DenseFp8Launch:
         )
 
 
-@lru_cache(maxsize=1024)
+from b12x._lib.program_cache import program_cache
+
+
+@program_cache
 def compile_kernel(
     n,
     k,

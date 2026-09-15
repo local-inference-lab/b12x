@@ -14,8 +14,9 @@ from ._impl import (
     prepare_b12x_trellis_v2_weights,
 )
 from .config import TrellisConfig
-from .source import PackedSource, WeightSource
+from .source import BtxSource, PackedSource, WeightSource
 from .weights import (
+    BtxWeights,
     PackedWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -154,7 +155,7 @@ def _prepared_format(
             f"required packing {packing.value!r} is not available; "
             f"planner produced {sorted(value.value for value in available)}"
         )
-    if isinstance(source, TrellisConfig):
+    if isinstance(source, (TrellisConfig, BtxSource)):
         weights = WeightEncoding.TRELLIS
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
@@ -196,12 +197,21 @@ def plan_weights(
             or activation.io_dtype is not torch.bfloat16
             or activation.nonlinearity != "silu"
         ):
-            raise ValueError("automatic MoE precision requires BF16 inputs, SiLU, and ModelOpt NVFP4 weights")
-        if automatic and constraints.required_packing not in {None, WeightPacking.SOURCE_NATIVE}:
-            raise ValueError("automatic MoE precision requires source-native weight storage")
+            raise ValueError(
+                "automatic MoE precision requires BF16 inputs, SiLU, and ModelOpt NVFP4 weights"
+            )
+        if automatic and constraints.required_packing not in {
+            None,
+            WeightPacking.SOURCE_NATIVE,
+        }:
+            raise ValueError(
+                "automatic MoE precision requires source-native weight storage"
+            )
         if automatic and source.w13_layout.value != "w13":
             raise ValueError("automatic MoE precision requires up/gate W13 row order")
-        recipe = _packed_recipe(source, ActivationMode.A4 if automatic else activation.mode)
+        recipe = _packed_recipe(
+            source, ActivationMode.A4 if automatic else activation.mode
+        )
         requested_layout = None
         if automatic:
             requested_layout = WeightPacking.SOURCE_NATIVE.value
@@ -224,6 +234,40 @@ def plan_weights(
             intermediate_size=geometry.intermediate_size,
             w13_layout=source.w13_layout.value,
             w4a16_layout=requested_layout,
+        )
+    elif isinstance(source, BtxSource):
+        if activation.mode is not ActivationMode.A16:
+            raise ValueError("BTX fused MoE requires A16 activations")
+        manifest = source.manifest
+        if (
+            manifest.geometry.num_experts != geometry.num_experts
+            or manifest.geometry.hidden_size != geometry.hidden_size
+        ):
+            raise ValueError("BTX manifest and expert geometry differ")
+        if geometry.intermediate_size > manifest.geometry.intermediate_size:
+            raise ValueError(
+                "BTX local intermediate size exceeds the checkpoint geometry"
+            )
+        recipe = "w4a16"
+        raw_plan = plan_b12x_fp4_moe_weights(
+            quant_modes=recipe,
+            source_format="btx",
+            activation=activation.nonlinearity,
+            params_dtype=activation.io_dtype,
+            num_experts=geometry.num_experts,
+            hidden_size=geometry.hidden_size,
+            intermediate_size=geometry.intermediate_size,
+            trellis_bits=manifest.rates.bits or 3,
+            trellis_codebook=manifest.codebook,
+            trellis_rate_granularity=manifest.rates.structure,
+            trellis_pair_kinds=manifest.rates.pair_kinds or None,
+            coupled_hadamard=manifest.hadamard.coupled,
+            coupled_hadamard_blocks=(
+                manifest.hadamard.pre_block,
+                manifest.hadamard.post_block,
+            )
+            if manifest.hadamard.coupled
+            else None,
         )
     elif isinstance(source, TrellisConfig):
         if activation.mode is not ActivationMode.A16:
@@ -263,7 +307,7 @@ def plan_weights(
             ),
         )
     else:
-        raise TypeError("source must be a PackedSource or TrellisConfig")
+        raise TypeError("source must be a PackedSource, TrellisConfig or BtxSource")
 
     return WeightPlan(
         source=source,
@@ -282,13 +326,24 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights,
+    weights: PackedWeights | TrellisWeights | BtxWeights,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if isinstance(plan.source, TrellisConfig):
+    if isinstance(plan.source, BtxSource):
+        if not isinstance(weights, BtxWeights):
+            raise TypeError("BTX preparation requires BtxWeights")
+        if weights.layer.manifest != plan.source.manifest:
+            raise ValueError("BTX layer manifest differs from the weight declaration")
+        prepared = prepare_b12x_fp4_moe_weights(
+            plan=plan._impl,
+            params_dtype=plan.activation.io_dtype,
+            btx_layer=weights.layer,
+            btx_device=weights.device,
+        )
+    elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")
         prepared = prepare_b12x_trellis_v2_weights(

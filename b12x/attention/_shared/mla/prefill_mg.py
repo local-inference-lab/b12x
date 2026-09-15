@@ -30,6 +30,7 @@ from b12x._lib.compiler import (
 from b12x._lib.compiler import launch as b12x_launch, run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
+    named_barrier_sync,
     atomic_max_shared_f32_offset,
     byte_perm,
     create_l2_evict_first_policy,

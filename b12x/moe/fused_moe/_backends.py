@@ -14,3 +14,12 @@ def architecture_backend(device_identity):
     from . import _sm103
 
     return _sm103
+
+
+def config_backend(config):
+    """Lower an already selected backend without querying the live device."""
+    if config.backend not in {"tcgen05_nvfp4", "tcgen05_trellis"}:
+        return None
+    from . import _sm103
+
+    return _sm103

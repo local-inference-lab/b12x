@@ -41,7 +41,7 @@ def run(
 
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0."""
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = [

@@ -128,6 +128,7 @@ class WOProjectionBinding:
     # Set only by the private prepared-state binder.  This remains untyped here
     # to keep this shared storage/packing module independent of preparation.
     plan: object | None = None
+    backend: str = "mxfp8"
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         from b12x.preparation.types import require_prepared
@@ -152,6 +153,7 @@ class WOProjectionInvRopeBinding:
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
     expected_m: int | None = None
     plan: object | None = None
+    backend: str = "mxfp8"
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         from b12x.preparation.types import require_prepared
@@ -194,6 +196,10 @@ class _WOProjectionState:
     layout: object
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     config: WoProjectionConfig
+
+    @property
+    def backend(self):
+        return self.config.backend
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -2525,7 +2531,7 @@ def _materialize_wo_projection_scratch(
 ) -> _WOProjectionState:
     if not isinstance(caps, WOProjectionScratchCaps):
         raise TypeError("caps must be WOProjectionScratchCaps")
-    if not isinstance(config, WoProjectionConfig) or config.backend != "mxfp8":
+    if not isinstance(config, WoProjectionConfig) or config.backend not in {"mxfp8", "mxfp8_tcgen05"}:
         raise ValueError("WO projection requires a validated MXFP8 configuration")
     layout = _layout_wo_projection(
         offset_bytes=0,

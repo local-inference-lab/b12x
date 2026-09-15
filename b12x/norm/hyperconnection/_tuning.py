@@ -78,7 +78,7 @@ def _default_config(
 ) -> HyperConnectionConfig:
     reduction_block_h = 1 << (query.hidden_size - 1).bit_length()
     return HyperConnectionConfig(
-        backend="cutedsl",
+        backend="cutedsl_full" if _device is not None and _device.compute_capability == (10, 3) else "cutedsl",
         reduction_block_h=reduction_block_h,
         pointwise_block=256,
         reduction_num_warps=8 if reduction_block_h >= 2048 else 4,
@@ -90,8 +90,10 @@ def _validate(
     config: HyperConnectionConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if config.backend != "cutedsl":
+    if config.backend not in ("cutedsl", "cutedsl_full"):
         raise ValueError(f"unsupported HyperConnection backend {config.backend!r}")
+    if _device is not None and _device.compute_capability == (10, 3) and config.backend != "cutedsl_full":
+        raise ValueError("SM103 HyperConnection requires the complete CuTe backend")
     if config.reduction_block_h < query.hidden_size:
         raise ValueError("reduction_block_h must cover hidden_size")
     for name, value in (
@@ -186,7 +188,7 @@ def _materialize_tuning(
     choice: FrozenMapping,
 ) -> HyperConnectionConfig:
     return HyperConnectionConfig(
-        backend="cutedsl",
+        backend="cutedsl_full" if device is not None and device.compute_capability == (10, 3) else "cutedsl",
         reduction_block_h=choice["reduction_block_h"],
         pointwise_block=choice["pointwise_block"],
         reduction_num_warps=choice["reduction_num_warps"],
@@ -196,7 +198,7 @@ def _materialize_tuning(
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
     query_schema_version=3,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -205,7 +207,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate,
     default_config=_default_config,
-    candidate_contract_version=6,
+    candidate_contract_version=7,
     knobs=(
         Knob(name="reduction_block_h", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="pointwise_block", values=None, binding=ParameterBinding.COMPILE),

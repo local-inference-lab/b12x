@@ -9,7 +9,7 @@ from types import MappingProxyType
 import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
-from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, _CompositePlan
+from b12x.preparation.types import FrozenMapping, MemoryRequirements, PersistentMemory, Plan, _CompositePlan, current_plan
 
 from ._impl import TPMoEScratchCaps, plan_b12x_fp4_moe_weights, plan_tp_moe_scratch
 from ._tuning import FC2_TUNING, ROUTE_TUNING, MoeDecodeConfig, MoeDecodeQuery, TUNING
@@ -78,7 +78,7 @@ def _quant_mode(experts: PreparedExperts, config: MoeDecodeConfig) -> str:
     # A canonical weight plan may intentionally retain more than one recipe.
     # The selected backend determines the A16 route; all other retained recipes
     # use their declared concrete mode rather than assuming an arbitrary set order.
-    if config.backend == "w4a16":
+    if config.backend in {"w4a16", "tcgen05_trellis"}:
         if "w4a16" not in modes:
             raise ValueError("selected W4A16 backend is absent from the weight plan")
         return "w4a16"
@@ -178,6 +178,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "w4a16_layout": (
             None if w4a16_layout is None else w4a16_layout.value
         ),
+        "trellis_group_size": plan.trellis_group_size,
         "trellis_bits": plan.trellis_bits,
         "trellis_tile_config": plan.trellis_tile_config,
         "coupled_hadamard": plan.coupled_hadamard,
@@ -221,9 +222,9 @@ def _lower_caps(
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
     mode = query.quant_mode
     if mode == "nvfp4_auto":
-        mode = "w4a16" if config.backend == "w4a16" else "nvfp4"
+        mode = "w4a16" if config.backend in {"w4a16", "tcgen05_trellis"} else "nvfp4"
     elif mode == "multi":
-        if config.backend == "w4a16":
+        if config.backend in {"w4a16", "tcgen05_trellis"}:
             mode = "w4a16"
         else:
             modes = tuple(item for item in weight_plan.quant_modes if item != "w4a16")
@@ -546,6 +547,8 @@ def _program_carriers(
     """Return every real launch carrier required by the selected native branch."""
     from . import _impl
 
+    if scratch._backend_plan is not None:
+        return (scratch._backend_plan.launches,)
     launches = [item[-1] for item in scratch._prewarmed_fused_launches]
     launches.extend(item[-1] for item in scratch._prewarmed_topk_sum_launches)
     launches.extend(item[-1] for item in scratch._mixed_trellis_launches)
@@ -640,7 +643,18 @@ def compile_fused_moe(
     weight_args["params_dtype"] = getattr(torch, str(weight_args["params_dtype"]).removeprefix("torch."))
     weight_plan = plan_b12x_fp4_moe_weights(**weight_args)
     caps = _lower_caps(query, config, weight_plan, torch.device("cuda", ordinal))
-    scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
+    if config.backend in {"tcgen05_nvfp4", "tcgen05_trellis"}:
+        # Compile factories describe executable objects without allocating a LUT.
+        if config.backend == "tcgen05_trellis":
+            from ._sm103_trellis import compile_launches
+        else:
+            from b12x.moe._shared.kernels.sm103.launch import compile_launches
+        scratch = plan_tp_moe_scratch(caps, prewarm_launches=False)
+        scratch = replace(scratch, _backend_plan=replace(
+            scratch._backend_plan, launches=compile_launches(caps),
+        ))
+    else:
+        scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
     return attach_programs(
         scratch,
         *_program_carriers(
@@ -800,9 +814,16 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             )
 
         def memory(config, device):
+            persistent = ()
+            if config.backend == "tcgen05_trellis":
+                from ._sm103_trellis import lookup_table_nbytes
+                persistent = (PersistentMemory(
+                    ("sm103.trellis.lut", current_plan()),
+                    lookup_table_nbytes(experts.plan._impl.trellis_codebook),
+                ),)
             return MemoryRequirements(scratch=plan_tp_moe_scratch(
                 caps_for(config, device), prewarm_launches=False
-            ).scratch_specs())
+            ).scratch_specs(), persistent=persistent)
         def materialize(selection, device):
             caps = caps_for(selection.config, device)
             scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)

@@ -79,7 +79,7 @@ def infer_mode(cu_seqlens_q):
 
 
 def is_supported(device=None) -> bool:
-    if not default_is_supported(device, requires=META.requires):
+    if not default_is_supported(device, requires=META.requires, archs=META.archs):
         return False
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())

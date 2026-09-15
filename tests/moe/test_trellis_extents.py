@@ -145,7 +145,7 @@ def test_canonical_coupled_extent_matches_btx(
         write_btx_checkpoint,
     )
     from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
-    from b12x.policy.generation.providers.trellis_reference import moe_reference
+    from tests._reference.trellis_reference import moe_reference
 
     experts, hidden = 8, 512
     config = BtxSynthConfig(

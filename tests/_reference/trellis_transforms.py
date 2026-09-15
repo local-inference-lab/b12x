@@ -1,6 +1,6 @@
 """Independent dense-matrix oracles shared with profile qualification."""
 
-from b12x.policy.generation.providers.trellis_reference import (
+from tests._reference.trellis_reference import (
     activation,
     had128,
     had512,

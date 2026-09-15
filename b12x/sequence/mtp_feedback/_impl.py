@@ -110,6 +110,7 @@ class _Layout:
     norm_block_h: int
     norm_block_s: int
     norm_num_warps: int
+    _backend_plan: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -160,6 +161,11 @@ class Binding:
     hidden_fc_weight: torch.Tensor | None
     output: torch.Tensor
     plan: Plan | None = None
+    combined_fc_weight: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
+    embedding_fc_scale: torch.Tensor | None = None
+    hidden_fc_scale: torch.Tensor | None = None
+    _backend_binding: object | None = None
 
 
 def _materialize_layout(caps: Caps, config: MtpFeedbackConfig) -> _Layout:
@@ -370,6 +376,9 @@ def run(binding: Binding, *, eps: float = 1e-6) -> torch.Tensor:
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
     if binding.plan is None:
         raise TypeError("MTP run requires a session-prepared binding")
+    if binding._state._backend_plan is not None:
+        from ._ops import run as run_prepared
+        return run_prepared(binding, eps=eps_value)
     from ._kernels import run_mtp_feedback
 
     run_mtp_feedback(
