@@ -165,6 +165,16 @@ class _StagingLayout:
     slab_bytes: int
 
 
+@dataclass(frozen=True)
+class _HeadGatherBinding:
+    """Validated posted-write tensors for one prepared gather plan."""
+
+    runtime: object
+    state: object
+    local_input: torch.Tensor
+    out: torch.Tensor
+
+
 def _staging_layout(
     *,
     signal_bytes: int,
@@ -895,7 +905,7 @@ class PCIeDCPA2A:
 
     def all_gather_heads(
         self,
-        local_input: torch.Tensor,
+        local_input: torch.Tensor | _HeadGatherBinding,
         out: Optional[torch.Tensor] = None,
         *,
         plan: Plan,
@@ -904,10 +914,45 @@ class PCIeDCPA2A:
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
         with _device_guard(self.device):
+            state = self._prepared_state(plan)
+            binding = (
+                local_input if isinstance(local_input, _HeadGatherBinding) else None
+            )
+            if binding is not None:
+                if binding.runtime is not self or binding.state is not state:
+                    raise ValueError(
+                        "head-gather binding belongs to a different prepared runtime"
+                    )
+                if out is not None:
+                    raise ValueError("a bound head gather owns its output tensor")
+                local_input, out = binding.local_input, binding.out
             return self._all_gather_heads_on_device(
-                local_input, out, state=self._prepared_state(plan),
+                local_input, out, state=state,
+                peer_write_bound=binding is not None,
                 threads=threads, block_limit=block_limit,
             )
+
+    def bind_all_gather_heads(self, local_input, out, *, plan):
+        """Validate and retain posted-write tensor addresses before serving."""
+        with _device_guard(self.device):
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError("DCP head-gather tensors must be bound before capture")
+            state = self._prepared_state(plan)
+            return self._bind_all_gather_heads(state, local_input, out)
+
+    def _bind_all_gather_heads(self, state, local_input, out):
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2A is closed")
+        if state.query.call.get("peer_write", False):
+            if out is None:
+                raise ValueError("posted-write DCP head gather requires a bound output")
+            if local_input.dtype is not torch.bfloat16 or out.dtype is not torch.bfloat16:
+                raise ValueError("posted-write DCP head gather requires BF16 tensors")
+            if local_input.data_ptr() % 16 or out.data_ptr() % 16:
+                raise ValueError(
+                    "posted-write DCP head gather requires 16-byte alignment"
+                )
+        return _HeadGatherBinding(self, state, local_input, out)
 
     def _all_gather_heads_on_device(
         self,
@@ -915,6 +960,7 @@ class PCIeDCPA2A:
         out: Optional[torch.Tensor],
         *,
         state,
+        peer_write_bound: bool = False,
         threads: int,
         block_limit: int,
     ) -> torch.Tensor:
@@ -954,11 +1000,8 @@ class PCIeDCPA2A:
             )
         if not out.is_contiguous():
             raise ValueError("output must be contiguous")
-        if state.query.call.get("peer_write", False):
-            if local_input.dtype is not torch.bfloat16:
-                raise ValueError("posted-write DCP head gather requires BF16 input")
-            if local_input.data_ptr() % 16 or out.data_ptr() % 16:
-                raise ValueError("posted-write DCP head gather requires 16-byte alignment")
+        if state.query.call.get("peer_write", False) and not peer_write_bound:
+            raise ValueError("posted-write DCP head gather requires a tensor binding")
         if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
             raise ValueError("PCIe DCP all-gather staging capacity exceeded")
         threads, block_limit = self._resolve_launch_config(

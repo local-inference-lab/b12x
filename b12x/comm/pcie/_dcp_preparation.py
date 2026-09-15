@@ -157,7 +157,12 @@ class _DcpExecutionState:
         if surface.endswith("lse_reduce_scatter"):
             return self.runtime._lse_reduce_scatter_on_device(call["partial_output"], call["partial_lse"], call.get("out"), state=self, is_lse_base_on_e=call.get("is_lse_base_on_e", True), threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
         if surface.endswith("all_gather_heads"):
-            return self.runtime._all_gather_heads_on_device(call["local_input"], call.get("out"), state=self, threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
+            binding = call.get("binding")
+            if binding is not None:
+                local_input, out = binding.local_input, binding.out
+            else:
+                local_input, out = call["local_input"], call.get("out")
+            return self.runtime._all_gather_heads_on_device(local_input, out, state=self, peer_write_bound=binding is not None, threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
         if surface.endswith("all_gather_pair_kimi_topk"):
             return self.runtime._all_gather_pair_kimi_topk_on_device(call["local_down"], call["local_router"], call["correction_bias"], call.get("out_down"), call.get("topk_weights"), call.get("topk_ids"), state=self)
         if surface == "kimi_topk16":
@@ -211,6 +216,13 @@ def prepare_call(state: _DcpExecutionState, **call):
     if not isinstance(state, _DcpExecutionState):
         raise TypeError("DCP callback requires its materialized state")
     surface = state.query.surface
+    if surface.endswith("all_gather_heads") and state.query.call.get(
+        "peer_write", False
+    ):
+        call = dict(call)
+        call["binding"] = state.runtime._bind_all_gather_heads(
+            state, call["local_input"], call["out"]
+        )
     if surface.endswith("all_gather_pair_kimi_topk"):
         output = (call.get("out_down"), call.get("topk_weights"), call.get("topk_ids"))
     elif surface.endswith("all_gather_pair"):

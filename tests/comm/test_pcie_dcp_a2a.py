@@ -47,6 +47,32 @@ def test_posted_write_head_gather_is_frozen_and_rejects_unqualified_geometry(mon
             TUNING.configure(bad, device=None)
 
 
+def test_posted_write_head_gather_binds_fixed_tensor_abi_once(monkeypatch):
+    runtime = _make_runtime()
+    state = SimpleNamespace(query=SimpleNamespace(call={"peer_write": True}))
+    local_input = torch.empty((1, 16, 64), dtype=torch.bfloat16)
+    out = torch.empty((1, 32, 64), dtype=torch.bfloat16)
+
+    binding = runtime._bind_all_gather_heads(state, local_input, out)
+
+    assert binding.runtime is runtime
+    assert binding.state is state
+    assert binding.local_input is local_input
+    assert binding.out is out
+    calls = []
+    monkeypatch.setattr(runtime, "_prepared_state", lambda plan: state)
+    monkeypatch.setattr(
+        runtime,
+        "_all_gather_heads_on_device",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or out,
+    )
+    assert runtime.all_gather_heads(binding, plan=object()) is out
+    assert calls[0][0] == (local_input, out)
+    assert calls[0][1]["peer_write_bound"] is True
+    with pytest.raises(ValueError, match="requires BF16 tensors"):
+        runtime._bind_all_gather_heads(state, local_input.float(), out)
+
+
 class _FakeExt:
     def __init__(self) -> None:
         self.disposed = []

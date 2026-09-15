@@ -382,8 +382,8 @@ decode-context-parallel head gather for four ranks, BF16, 64 global heads, and a
 `query_from_runtime(..., call={..., "peer_write": True})` can pin the posted-write
 transport explicitly. The control is captured in declaration metadata and the
 compiled launcher identity; changing it after preparation does not change binding
-or graph replay. Other push geometry fails closed. The transport uses the channel's
-IPC slab, system-scope barrier, graph slots, and L1-bypassing incoming loads.
+or graph replay. Other push geometry fails closed. The posted-write DCP channel
+uses its IPC slab, system-scope barrier, graph slots, and L1-bypassing incoming loads.
 Serialized launch and replay remain required; this transport is not a qualified
 default.
 
@@ -394,8 +394,9 @@ shapes use the pull transport, and the default remains off. The transport uses
 four source shards, alternating graph slots, and a system-scope barrier.
 Destinations are rank-staggered, incoming loads bypass L1, and accumulation uses
 rotating-rank FP32 addition followed by one BF16 rounding operation. The factory
-snapshots the flag and checks rank agreement before allocating IPC; binding and
-replay do not reread it. Fused four-rank tensor-parallel eligibility is unchanged.
+The four-rank tensor-parallel preparation path snapshots the flag and checks rank
+agreement before allocating IPC; binding and replay do not reread it. Fused
+four-rank tensor-parallel eligibility is unchanged.
 
 `benchmarks/benchmark_startup_autotuner.py` uses the same declarations and
 session with explicit retained benchmark calls. Its optional group subsets are
