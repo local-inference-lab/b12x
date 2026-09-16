@@ -45,6 +45,7 @@ META = OpMeta(
         "concat_and_cache_glm_next_mla_fp8",
         "concat_and_cache_glm_next_mla_nvfp4",
         "expand_pooled_topk_to_physical_slots",
+        "plan_pooled_selection",
         "is_supported",
         "clear_caches",
     ),
@@ -82,6 +83,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         is_supported,
         plan,
         plan_cache_writer,
+        plan_pooled_selection,
         run,
     )
 

@@ -162,4 +162,108 @@ def expand_pooled_topk_to_physical_slots(
         )
 
 
-__all__ = ["expand_pooled_topk_to_physical_slots"]
+def compile_pooled_selection(query, ordinal):
+    """Compile GLM C4 expansion from planned metadata, without cache contents."""
+    with torch.cuda.device(ordinal):
+        return _expand_pooled_topk_to_physical_slots_kernel.warmup(
+            torch.int32,
+            torch.int64,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            512,
+            query.max_page_table_width,
+            2051,
+            query.max_page_table_width,
+            query.num_cache_blocks,
+            HISTORY_TOKENS=2048,
+            OUTPUT_WIDTH=2051,
+            POOL_SIZE=4,
+            BLOCK_SIZE=query.page_size,
+            BLOCK_STRIDE_ROWS=query.page_size,
+            BLOCK_COLS=128,
+            num_warps=4,
+            grid=(query.max_q_rows, triton.cdiv(2051, 128)),
+        )
+
+
+def plan_pooled_selection(
+    *,
+    device,
+    max_rows: int,
+    page_size: int,
+    max_page_table_width: int,
+    num_cache_blocks: int,
+):
+    """Declare GLM C4-to-physical selection for one allocated cache geometry.
+
+    The plan has no scratch or cache ownership. Prepare its request before
+    calling ``expand_pooled_topk_to_physical_slots`` with 512 pool IDs per row,
+    pool size four, and physical block stride equal to ``page_size``. Live row
+    counts do not specialize the compiled program.
+    """
+    from b12x._lib.compile_pool import CompileJob
+    from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
+    from ._tuning import SparseMlaQuery, TUNING
+
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if any(
+        type(value) is not int or value <= 0
+        for value in (
+            max_rows,
+            page_size,
+            max_page_table_width,
+            num_cache_blocks,
+        )
+    ):
+        raise ValueError("pooled-selection capacities must be positive integers")
+    if num_cache_blocks * page_size - 1 > torch.iinfo(torch.int32).max:
+        raise ValueError("physical cache slots exceed the int32 index range")
+    query = SparseMlaQuery(
+        mode="selection",
+        dtype="int32",
+        kv_dtype="uint8",
+        num_q_heads=0,
+        qk_head_dim=0,
+        v_head_dim=0,
+        max_q_rows=max_rows,
+        max_width=2051,
+        page_size=page_size,
+        model_type=2,
+        head_major_output=False,
+        scale_format=0,
+        cache_record_bytes=0,
+        fp8_rope=False,
+        latent_scale_per_token=False,
+        has_attention_sink=False,
+        cache_layout="paged",
+        operation="pooled_selection",
+        slot_dtype="int32",
+        prefill_mg_enabled=False,
+        max_page_table_width=max_page_table_width,
+        physical_block_size=page_size,
+        num_cache_blocks=num_cache_blocks,
+    )
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=FrozenMapping(),
+        _compile_jobs=lambda config, detected: (
+            CompileJob.create(
+                "b12x.attention.sparse_mla.pooled_selection:compile_pooled_selection",
+                query,
+                detected.ordinal,
+            ),
+        ),
+        _memory_requirements=lambda config, detected: MemoryRequirements(),
+        _materialize=lambda selection, detected: compile_pooled_selection(
+            query, detected.ordinal
+        ),
+        _device=device,
+    )
+
+
+__all__ = ["expand_pooled_topk_to_physical_slots", "plan_pooled_selection"]
