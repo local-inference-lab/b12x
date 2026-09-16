@@ -54,22 +54,25 @@ def test_collective_barrier_dispatch_contract(tmp_path):
     assert calls == [("comm.roce:7", (0, 1))]
     assert job._blocked is None
 
+    def barrier_job():
+        job = PreparationJob.__new__(PreparationJob)
+        job.session = barrier_session
+        return job
+
     def refusing(key, ranks):
         raise CollectiveBarrierTimeout(key, ranks, ())
 
     barrier_session.collective_barrier = refusing
-    job._blocked = requirement
     with pytest.raises(CollectiveBarrierTimeout) as info:
-        job._advance(collective_key="comm.roce:7")
+        barrier_job()._collective_barrier(requirement)
     assert info.value.key == "comm.roce:7"
 
     def broken(key, ranks):
         raise OSError("store down")
 
     barrier_session.collective_barrier = broken
-    job._blocked = requirement
     with pytest.raises(RuntimeError, match="collective barrier.*store down"):
-        job._advance(collective_key="comm.roce:7")
+        barrier_job()._collective_barrier(requirement)
 
 
 def session(tmp_path, **kwargs):
