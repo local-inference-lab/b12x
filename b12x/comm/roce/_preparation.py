@@ -22,6 +22,7 @@ def compile_roce(payload, ordinal: int):
     """Resolve exactly the all-reduce/all-gather launchers in a declaration."""
     from . import _allgather_cute
     from ._oneshot_cute import get_launcher
+    from .roce_oneshot import _DTYPE_NAMES
 
     query = RoceQuery(**dict(payload))
     setup = query.setup
@@ -35,7 +36,10 @@ def compile_roce(payload, ordinal: int):
         ordinal,
     )
     with torch.cuda.device(ordinal):
-        programs = {dtype: get_launcher(dtype, *common) for dtype in _dtypes(query)}
+        programs = {
+            dtype: get_launcher(_DTYPE_NAMES[dtype], *common)
+            for dtype in _dtypes(query)
+        }
         programs["gather"] = _allgather_cute.get_launcher(*common)
         return programs
 
