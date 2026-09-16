@@ -47,6 +47,7 @@ class _PreparedRuntime:
 def runtime():
     """Module-scoped RoCEnante runtime over the torchrun world; skips without RDMA support."""
     from b12x.comm import roce
+    from b12x.comm.roce import _preparation
 
     if not roce.is_supported():
         pytest.skip(
@@ -72,10 +73,17 @@ def runtime():
         peer_hosts=tuple(f"rank-{rank}" for rank in range(rt.world_size)),
     )
     declaration = roce.plan(query, runtime=rt)
-    seed = torch.zeros(4, dtype=torch.bfloat16, device=device)
+    seeds = [torch.zeros(16 // dtype.itemsize, dtype=dtype, device=device)
+             for dtype in (torch.float16, torch.bfloat16, torch.float32)]
+
+    def prepare(state):
+        calls = [_preparation.prepared_call(state, inp=seed) for seed in seeds]
+        calls.append(_preparation.prepared_gather_call(state, inp=seeds[1]))
+        return PreparedCall(run=lambda: [call.run() for call in calls])
+
     request = declaration.request(
         name="roce",
-        prepare_call=lambda state: PreparedCall(run=lambda: rt.prepare((seed.dtype,))),
+        prepare_call=prepare,
     )
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         session.prepare((request,))
