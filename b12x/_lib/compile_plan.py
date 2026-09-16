@@ -204,10 +204,12 @@ def launch_triton(kernel, grid, *args, **kwargs):
 
 
 def planning() -> bool:
+    """Report whether the caller is collecting compiler program identities."""
     return _PLANNING.get() is not None
 
 
 def record_program(program: ProgramKey, owner: Any = None) -> None:
+    """Record a compiled program identity for active planning observers."""
     captured = _PLANNING.get()
     if captured is not None:
         captured.add(program)

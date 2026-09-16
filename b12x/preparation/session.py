@@ -8,6 +8,7 @@ later batch so each candidate is compared head to head with it.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -114,26 +115,39 @@ _ADVANCE_SECONDS = 0.1
 # (autotune rounds) is unbounded, so the barrier converts the shared
 # authorization into a launch lockstep. Generous by default: it only ever waits
 # during preparation, and must cover the slowest rank's pre-launch round.
-_BARRIER_TIMEOUT_SECONDS = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+def _barrier_timeout_seconds():
+    """Return the finite positive collective-barrier deadline from the environment."""
+    timeout = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds")
+    return timeout
+
+
+_BARRIER_TIMEOUT_SECONDS = _barrier_timeout_seconds()
 
 
 class CollectiveBarrierTimeout(RuntimeError):
-    """A rank timed out waiting for peers to enter a collective it was authorized for."""
+    """A collective barrier callback exceeded its deadline."""
 
-    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...]):
-        """Record the authorized collective and ranks absent at timeout."""
-        waiting = tuple(sorted(set(ranks) - set(arrived)))
-        super().__init__(
-            f"collective barrier timed out for {key!r} after "
-            f"{_BARRIER_TIMEOUT_SECONDS:g}s: ranks {waiting} never entered "
-            f"(arrived: {tuple(sorted(arrived))})"
-        )
+    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...] | None = None):
+        """Record verified arrivals when the barrier backend supplies them."""
+        if arrived is None:
+            message = f"collective barrier callback timed out for {key!r} after {_BARRIER_TIMEOUT_SECONDS:g}s"
+        else:
+            waiting = tuple(sorted(set(ranks) - set(arrived)))
+            message = (
+                f"collective barrier timed out for {key!r} after "
+                f"{_BARRIER_TIMEOUT_SECONDS:g}s: ranks {waiting} never entered "
+                f"(arrived: {tuple(sorted(arrived))})"
+            )
+        super().__init__(message)
         self.key = key
         self.ranks = ranks
-        self.arrived = tuple(sorted(arrived))
+        self.arrived = None if arrived is None else tuple(sorted(arrived))
 
 
 def _declaration_key(plan):
+    """Return the immutable declaration identity used to coalesce requests."""
     if isinstance(plan, _CompositePlan):
         return (
             plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
@@ -235,6 +249,7 @@ def _coalesce_requests(requests):
 
 
 def _plans_of(request):
+    """Return a request plan and every child plan of a composite request."""
     plan = request.plan
     if isinstance(plan, _CompositePlan):
         return (plan, *plan.variants.values())
@@ -317,12 +332,14 @@ class PreparationSession:
         self._tuning_ranks = ranks
 
     def _check_thread(self):
+        """Reject use from another thread or after the session closes."""
         if threading.get_ident() != self._thread:
             raise RuntimeError("only cancel_tuning may run on another thread")
         if self.state == "CLOSED":
             raise RuntimeError("preparation session is closed")
 
     def _selection_cache(self):
+        """Return the session selection cache, creating it for CUDA devices."""
         if self._cache is None:
             if self.device.ordinal is None:
                 raise RuntimeError("selection caching requires a CUDA device")
@@ -334,23 +351,27 @@ class PreparationSession:
         return self._cache
 
     def _gpu_scope(self):
+        """Return the CUDA device context for preparation operations."""
         if self.device.ordinal is None:
             return nullcontext()
         import torch
         return torch.cuda.device(self.device.ordinal)
 
     def _synchronize(self):
+        """Synchronize the preparation device when it is CUDA-backed."""
         if self.device.ordinal is not None:
             import torch
             torch.cuda.synchronize(self.device.ordinal)
 
     def _allocated(self):
+        """Return bytes currently allocated on the preparation device."""
         if self.device.ordinal is None:
             return 0
         from ._memory import allocated_bytes
         return allocated_bytes(self.device.ordinal)
 
     def _race_budget(self):
+        """Return the configured or device-derived autotuning memory budget."""
         if self.race_budget is not None:
             return self.race_budget
         if self.device.ordinal is None:
@@ -536,6 +557,7 @@ class PreparationSession:
             yield
 
     def freeze(self):
+        """Forbid later kernel resolution after all preparation work drains."""
         self._check_thread()
         if self._job is not None or self._pool is not None:
             raise RuntimeError("freeze requires drained preparation")
@@ -545,6 +567,7 @@ class PreparationSession:
         self.state = "FROZEN"
 
     def close(self):
+        """Release preparation resources and mark the session closed."""
         if self.state == "CLOSED":
             return
         self._check_thread()
@@ -568,10 +591,12 @@ class PreparationSession:
         self._shared.clear()
 
     def __enter__(self):
+        """Enter the session after validating the owning thread."""
         self._check_thread()
         return self
 
     def __exit__(self, kind, value, traceback):
+        """Close session resources and preserve a body exception if cleanup fails."""
         try:
             self.close()
         except BaseException as error:
@@ -632,6 +657,7 @@ class PreparationJob:
         done,
         ready_tuning=(),
     ):
+        """Build a preparation progress snapshot from the live job state."""
         active_compilations = 0
         if self.session._pool is not None:
             summary = self.session._pool.summary()
@@ -694,7 +720,7 @@ class PreparationJob:
                 self.session._pending_collective_barrier = None
                 raise
             if not completed.wait(_BARRIER_TIMEOUT_SECONDS):
-                raise CollectiveBarrierTimeout(requirement.key, requirement.ranks, ())
+                raise CollectiveBarrierTimeout(requirement.key, requirement.ranks)
             if errors:
                 raise errors[0]
         except CollectiveBarrierTimeout:
@@ -705,6 +731,7 @@ class PreparationJob:
             ) from error
 
     def advance(self, *, collective_key=None, tuning=None):
+        """Advance preparation until work completes or reaches a readiness boundary."""
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)

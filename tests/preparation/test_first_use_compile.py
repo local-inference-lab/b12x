@@ -6,6 +6,7 @@ from b12x._lib.compile_plan import DeferredCuTeKernel, DeferredTritonKernel, Pro
 
 
 def test_evict_planning_artifacts_drops_unresolved_deferred_programs_only(monkeypatch):
+    """Planning eviction drops only unresolved deferred compiler artifacts."""
     planned = DeferredCuTeKernel(ProgramKey("cute", "a" * 64, "k"), memory_key=("m",))
     resolved = DeferredCuTeKernel(ProgramKey("cute", "b" * 64, "k"), memory_key=("n",))
     resolved._resolved = object()
@@ -35,6 +36,7 @@ def test_evict_planning_artifacts_drops_unresolved_deferred_programs_only(monkey
 
 
 def test_program_keys_skip_torch_scalars_inside_launch_records():
+    """Program discovery ignores Torch metadata alongside compiled kernels."""
     import torch
     from typing import NamedTuple
 
@@ -64,6 +66,7 @@ def test_program_keys_accept_plain_functions_without_triton(monkeypatch):
 
 
 def test_first_use_evicts_deferred_launchers_from_decorated_kernel_memos(monkeypatch):
+    """Deferred launchers are evicted while resolved launcher memo entries remain."""
     planned = DeferredCuTeKernel(ProgramKey("cute", "f" * 64, "planned"), memory_key=("p",))
     resolved = DeferredCuTeKernel(ProgramKey("cute", "1" * 64, "resolved"), memory_key=("r",))
     resolved._resolved = object()
@@ -88,6 +91,7 @@ def test_first_use_evicts_deferred_launchers_from_decorated_kernel_memos(monkeyp
 
 
 def test_mhc_program_bundle_reuse_obeys_deferred_and_resident_reclamation(monkeypatch):
+    """MHC program bundles preserve resolved entries across planning eviction."""
     from b12x.norm.mhc import _preparation as mhc
     from b12x.preparation import FrozenMapping
 
