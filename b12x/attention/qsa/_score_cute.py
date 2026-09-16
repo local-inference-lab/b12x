@@ -337,7 +337,12 @@ def compile_score_representatives(
         key = (device_index, geometry, tuple(t.dtype for t in tensors))
         raw = _CACHE.get(key)
         if raw is None:
-            kernel = _RepresentativeScoreKernel(*geometry)
+            if geometry[0] == 4 and geometry[1] % 16 == 0:
+                from ._score_pair_cute import PairedRepresentativeScoreKernel
+
+                kernel = PairedRepresentativeScoreKernel(*geometry)
+            else:
+                kernel = _RepresentativeScoreKernel(*geometry)
             raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
             fake = tuple(
                 make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
@@ -347,7 +352,7 @@ def compile_score_representatives(
                 kernel, fake, (Int64(1),) * 4, Int32(1), Int32(0),
                 Int32(1), current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "attention.qsa.representative_score", 1, key
+                    "attention.qsa.representative_score", 2, key
                 ),
             )
             _CACHE[key] = raw

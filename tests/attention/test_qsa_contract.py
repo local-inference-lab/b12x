@@ -1870,6 +1870,83 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
                 assert torch.equal(getattr(binding, name), value)
 
 
+@pytest.mark.parametrize("high_page", [False, True])
+@pytest.mark.parametrize("odd_alignment", [False, True])
+def test_qsa_paired_scores_preserve_request_boundaries_and_graph_replay(
+    high_page: bool, odd_alignment: bool,
+) -> None:
+    """Paired rows retain masks, page ownership, carry offsets and live extents."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.attention.qsa._score_cute import (
+        launch_score_representatives as launch_cute,
+    )
+
+    device = require_sm120()
+    page, dim, groups, rows = 188, 128, 1536, 129
+    stride = dim + int(odd_alignment)
+    first = 2**31 // (page * stride) + 1 if high_page else 3
+    pages = first + (groups + page - 1) // page
+    if high_page:
+        _require_free_cuda_bytes(device, pages * page * stride * 2 + 2**28)
+    storage = torch.empty(pages * page * stride + 1, device=device, dtype=torch.bfloat16)
+    cache = storage[int(odd_alignment):].as_strided(
+        (pages, page, dim), (page * stride, stride, 1),
+    )
+    cache[first:].normal_()
+    table = torch.arange(first, pages, device=device, dtype=torch.int32)
+    table = table.flip(0).expand(2, -1).contiguous()
+    table[1, 1] = -1
+    query = torch.randn((rows, 4, dim), device=device, dtype=torch.bfloat16)
+    positions = torch.arange(rows, device=device, dtype=torch.int64) + 4000
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    requests[65:] = 1
+    requests[63] = -1
+    lengths = torch.tensor([4096, 6144], device=device, dtype=torch.int32)
+    scores = torch.empty((rows, groups + 512), device=device)
+    counts = torch.empty(rows, device=device, dtype=torch.int32)
+    merges = torch.empty_like(counts)
+    caps = qsa.Caps(
+        device=device, max_batch=2, max_raw_state_slots=2, max_q_rows=rows,
+        max_seq_len=groups * 4, num_main_cache_pages=pages,
+        num_compressed_cache_pages=pages, main_page_size=page * 4,
+        compressed_page_size=page,
+    )
+
+    def invoke(launch, live, offset, count):
+        launch(
+            prepared_query=query[:live], query_positions=positions[:live],
+            request_ids=requests[:live], sequence_lengths=lengths,
+            compressed_cache=cache, compressed_block_table=table,
+            scores=scores[:live], eligible_counts=counts[:live],
+            merge_lengths=merges[:live], group_offset=offset,
+            group_count=count, caps=caps,
+        )
+
+    invoke(launch_cute, rows, 0, groups)
+    with kernel_resolution_guard('Paired score live rows and chunks reuse the prepared executable'):
+        for live, offset, count in ((32, 0, 65), (128, 0, groups), (129, 512, 1024)):
+            graph = _cuda_graph()
+            with torch.cuda.graph(graph):
+                invoke(launch_cute, live, offset, count)
+            for shift in (0, 4):
+                positions.add_(shift)
+                scores.fill_(123)
+                invoke(launch_score_representatives, live, offset, count)
+                expected = scores.clone()
+                expected_counts, expected_merges = counts[:live].clone(), merges[:live].clone()
+                scores.fill_(123)
+                allocation = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocation
+                torch.testing.assert_close(scores, expected, rtol=1e-5, atol=1e-5)
+                assert torch.equal(counts[:live], expected_counts)
+                assert torch.equal(merges[:live], expected_merges)
+                positions.sub_(shift)
+    if high_page:
+        assert first * cache.stride(0) > 2**31
+
+
 def test_qsa_paged_representative_scores_match_fp32_reference() -> None:
     device = require_sm120()
     caps = _caps(device)
