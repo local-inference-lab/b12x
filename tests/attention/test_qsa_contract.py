@@ -1923,8 +1923,11 @@ def test_qsa_paired_scores_preserve_request_boundaries_and_graph_replay(
         )
 
     invoke(launch_cute, rows, 0, groups)
+    cases = ((32, 0, 65), (128, 0, groups), (129, 512, 1024))
+    for live, offset, count in cases:
+        invoke(launch_score_representatives, live, offset, count)
     with kernel_resolution_guard('Paired score live rows and chunks reuse the prepared executable'):
-        for live, offset, count in ((32, 0, 65), (128, 0, groups), (129, 512, 1024)):
+        for live, offset, count in cases:
             graph = _cuda_graph()
             with torch.cuda.graph(graph):
                 invoke(launch_cute, live, offset, count)
