@@ -230,14 +230,14 @@ def program_keys(value: Any) -> tuple[ProgramKey, ...]:
     keys = getattr(value, "__b12x_programs__", None)
     if keys is not None:
         return tuple(keys)
-    from triton.compiler.compiler import CompiledKernel
-    if isinstance(value, CompiledKernel):
-        return (ProgramKey("triton", value.hash, value.name),)
     if isinstance(value, FunctionType):
         # A launch closure produced outside a compile factory carries no
         # program identity of its own; retain it rather than failing an
         # unrelated sweep.
         return ()
+    from triton.compiler.compiler import CompiledKernel
+    if isinstance(value, CompiledKernel):
+        return (ProgramKey("triton", value.hash, value.name),)
     raise TypeError(f"compile factory returned an unannotated {type(value).__name__}")
 
 
