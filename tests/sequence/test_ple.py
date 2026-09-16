@@ -1832,3 +1832,63 @@ def test_ple_state_slot_past_int32_element_offset_matches_oracle() -> None:
         del binding
         del conv_state
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("high_slot", [False, True])
+@torch.inference_mode()
+def test_ple_internal_checkpoint_replays_offsets_and_preserves_other_slots(high_slot):
+    device = require_b12x()
+    tokens, streams, hidden = 17, 4, 2560
+    length, speculative, kernel_size, dilation = 9, 3, 4, 3
+    channels = streams * hidden
+    stride = channels * (length + speculative)
+    destination = (2**31 // stride + 2) if high_slot else 4
+    pool = torch.empty(destination + 3, channels, length + speculative,
+                       dtype=torch.bfloat16, device=device)
+    pool[:3].normal_()
+    pool[destination:].fill_(91)
+    untouched = pool[0].clone()
+    prior = pool[1].clone()
+    residual, key, value, weights, generator = _cuda_projected_inputs(
+        tokens, streams, hidden, device=device, seed=1626,
+    )
+    conv_weight = torch.randn(channels, kernel_size, dtype=torch.bfloat16,
+                             device=device, generator=generator)
+    _, binding = _bind_cuda_layer(
+        mode="mixed", residual=residual, key=key, value=value, weights=weights,
+        conv_weight=conv_weight,
+        query_start_loc=torch.tensor([0, 16, 17, 17], dtype=torch.int32, device=device),
+        state_slot_ids=torch.tensor([1, 2, -1], dtype=torch.int64, device=device),
+        state_is_fresh=torch.tensor([False, False, True], device=device),
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32, device=device),
+        num_seqs=3, num_tokens=tokens, conv_state=pool,
+        max_speculative_tokens=speculative, dilation=dilation,
+        request_is_prefill=torch.tensor([True, False, True], device=device),
+    )
+    ple.run_mixed(binding, eps=1e-6)
+    _, normalized = ple_projected_u_reference(
+        residual, key, value, k_norm_weight=weights[0], q_norm_weight=weights[1],
+        u_norm_weight=weights[2], eps=1e-6,
+    )
+    history = torch.cat((prior[:, :length], normalized[:16].reshape(16, channels).T), dim=1)
+    offsets = torch.tensor([2, 1, 1], dtype=torch.int32, device=device)
+    slots = torch.tensor([destination, destination + 1, destination + 2], dtype=torch.int64, device=device)
+    ple.export_checkpoint(binding, offsets=offsets, slots=slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ple.export_checkpoint(binding, offsets=offsets, slots=slots)
+    for offset in (2, 12, 0, 16):
+        offsets[0] = offset
+        pool[destination:].fill_(91)
+        before = torch.cuda.memory_allocated(device)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated(device) == before
+        if 0 < offset < 16:
+            torch.testing.assert_close(pool[destination, :, :length],
+                                       history[:, offset:offset + length], rtol=0, atol=0)
+            assert bool((pool[destination, :, length:] == 0).all())
+        else:
+            assert bool((pool[destination] == 91).all())
+        assert bool((pool[destination + 1:] == 91).all())
+        torch.testing.assert_close(pool[0], untouched, rtol=0, atol=0)

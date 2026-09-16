@@ -410,6 +410,47 @@ def _update_state_kernel(
 
 
 
+@triton.jit
+def _export_checkpoint_kernel(
+    normalized_u_ptr, gathered_state_ptr, query_start_loc_ptr,
+    checkpoint_offsets_ptr, checkpoint_slots_ptr, request_is_prefill_ptr,
+    num_seqs_ptr, conv_state_ptr,
+    CHANNELS: tl.constexpr, STATE_LENGTH: tl.constexpr,
+    STATE_CAPACITY: tl.constexpr, STATE_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Copy an internal prefill window into an independent state slot."""
+    request = tl.program_id(0)
+    element = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = request < tl.load(num_seqs_ptr)
+    offset = tl.load(checkpoint_offsets_ptr + request, live, other=0)
+    slot = tl.load(checkpoint_slots_ptr + request, live, other=-1).to(tl.int64)
+    prefill = tl.load(request_is_prefill_ptr + request, live, other=False)
+    start = tl.load(query_start_loc_ptr + request, live, other=0)
+    end = tl.load(query_start_loc_ptr + request + 1, live, other=0)
+    valid = live & prefill & (slot >= 0) & (offset > 0) & (offset < end - start)
+    channel = element // STATE_CAPACITY
+    position = element % STATE_CAPACITY
+    relative = offset - STATE_LENGTH + position
+    payload = (channel < CHANNELS) & (position < STATE_LENGTH)
+    token = start.to(tl.int64) + relative.to(tl.int64)
+    query = tl.load(
+        normalized_u_ptr + token * CHANNELS + channel.to(tl.int64),
+        valid & payload & (relative >= 0), other=0,
+    )
+    history = tl.load(
+        gathered_state_ptr
+        + (request.to(tl.int64) * CHANNELS + channel.to(tl.int64)) * STATE_LENGTH
+        + (offset + position).to(tl.int64),
+        valid & payload & (relative < 0), other=0,
+    )
+    value = tl.where(relative >= 0, query, history)
+    tl.store(
+        conv_state_ptr + slot * STATE_STRIDE + element.to(tl.int64),
+        value, valid & (element < CHANNELS * STATE_CAPACITY),
+    )
+
+
 @torch.library.custom_op(
     "b12x::ple_layer_pipeline",
     mutates_args=(
