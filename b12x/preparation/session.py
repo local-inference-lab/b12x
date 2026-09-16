@@ -121,6 +121,7 @@ class CollectiveBarrierTimeout(RuntimeError):
     """A rank timed out waiting for peers to enter a collective it was authorized for."""
 
     def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...]):
+        """Record the authorized collective and ranks absent at timeout."""
         waiting = tuple(sorted(set(ranks) - set(arrived)))
         super().__init__(
             f"collective barrier timed out for {key!r} after "
@@ -246,6 +247,7 @@ class PreparationSession:
         compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
         race_batch=32, race_budget=None, collective_barrier=None,
     ):
+        """Initialize planning resources and an optional collective entry barrier."""
         if compile_workers is None:
             compile_workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
         for name, value in (
@@ -581,6 +583,7 @@ class PreparationSession:
 
 class PreparationJob:
     def __init__(self, session, requests, *, autotune):
+        """Initialize state for one bounded sequence of preparation requests."""
         self.session, self.requests = session, requests
         self.autotune = autotune
         self._steps = self._run()
@@ -700,6 +703,7 @@ class PreparationJob:
             self._last_advance_end = time.perf_counter()
 
     def _advance(self, *, collective_key=None, tuning=None, cache=None):
+        """Run work until it reaches a readiness boundary or time slice."""
         self.session._check_thread()
         if self._error is not None:
             raise self._error

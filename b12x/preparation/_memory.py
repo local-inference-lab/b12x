@@ -8,6 +8,7 @@ from pathlib import Path
 
 @lru_cache(maxsize=1)
 def _counter():
+    """Load the CUDA allocation counter under a source-derived extension name."""
     from torch.utils.cpp_extension import CUDA_HOME, load
 
     if CUDA_HOME is None:

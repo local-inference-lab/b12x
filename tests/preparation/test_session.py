@@ -24,6 +24,7 @@ def test_collective_barrier_dispatch_contract(tmp_path):
     calls = []
 
     def barrier(key, ranks):
+        """Record each collective barrier invocation."""
         calls.append((key, ranks))
 
     barrier_session = session(tmp_path, collective_barrier=barrier)
@@ -39,6 +40,7 @@ def test_collective_barrier_dispatch_contract(tmp_path):
     job._completed_requests = 0
 
     def _gen():
+        """Provide an exhausted synthetic job iterator."""
         return
         yield
 
@@ -55,11 +57,13 @@ def test_collective_barrier_dispatch_contract(tmp_path):
     assert job._blocked is None
 
     def barrier_job():
+        """Create a job shell for direct barrier callback checks."""
         job = PreparationJob.__new__(PreparationJob)
         job.session = barrier_session
         return job
 
     def refusing(key, ranks):
+        """Report a barrier timeout for the authorized collective."""
         raise CollectiveBarrierTimeout(key, ranks, ())
 
     barrier_session.collective_barrier = refusing
@@ -68,6 +72,7 @@ def test_collective_barrier_dispatch_contract(tmp_path):
     assert info.value.key == "comm.roce:7"
 
     def broken(key, ranks):
+        """Simulate a barrier backend store failure."""
         raise OSError("store down")
 
     barrier_session.collective_barrier = broken

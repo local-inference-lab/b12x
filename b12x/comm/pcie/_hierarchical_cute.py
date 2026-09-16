@@ -875,6 +875,7 @@ def get_hierarchical_launcher(
         elements: int,
         blocks: int,
     ) -> None:
+        """Launch the compiled hierarchical collective with runtime arguments."""
         if len(slab_addresses) != world_size:
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
