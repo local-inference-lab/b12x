@@ -253,6 +253,9 @@ def test_pooled_topk_expands_to_physical_slots(rows: int) -> None:
 
 @torch.inference_mode()
 def test_pooled_topk_physical_expansion_replays_live_inputs() -> None:
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import PreparedCall, PreparationSession
+
     device = require_sm120()
     rows, requests = 7, 4
     pool_indices = torch.arange(512, dtype=torch.int32, device=device).repeat(rows, 1)
@@ -278,9 +281,31 @@ def test_pooled_topk_physical_expansion_replays_live_inputs() -> None:
             num_cache_blocks=8_000_000,
         )
 
-    expand()
+    plan = sparse_mla.plan_pooled_selection(
+        device=device,
+        max_rows=rows,
+        page_size=256,
+        max_page_table_width=16,
+        num_cache_blocks=8_000_000,
+    )
+    request = plan.request(
+        name="glm-c4-selection",
+        prepare_call=lambda state: PreparedCall(
+            run=expand,
+            owners=(
+                pool_indices,
+                positions,
+                request_ids,
+                block_table,
+                output,
+                active_counts,
+            ),
+        ),
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=0)
+    session.prepare((request,))
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with kernel_resolution_guard("prepared C4 selection"), torch.cuda.graph(graph):
         expand()
 
     pool_indices.copy_(pool_indices.flip(dims=(1,)))
