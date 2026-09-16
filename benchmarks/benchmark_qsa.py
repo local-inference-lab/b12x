@@ -857,7 +857,6 @@ def _prepare_case(
 ) -> PreparedCase:
     kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
     caps = _make_caps(case, device, kv_dtype=kv_dtype)
-    declaration = qsa.plan(caps)
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
@@ -1124,12 +1123,23 @@ def _prepare_case(
                 value.copy_(original)
 
         return PreparedCall(
-            run=lambda: qsa.run(binding, **dynamic),
+            run=lambda: state.run_for_preparation(binding, **dynamic),
             reset=restore,
             restore=restore,
             owners=(binding,),
         )
 
+    native_operands = {
+        name: tensor for name, tensor in binding_args.items()
+        if name not in {"k_descale", "v_descale", "output", "selected_positions"}
+    }
+    native_operands.update({
+        name: dynamic[name]
+        for name in ("request_ids", "rope_positions", "index_query", "raw_index_key")
+    })
+    declaration = qsa.plan(
+        caps, invocation=qsa.invocation_from_tensors(caps, **native_operands),
+    )
     session = PreparationSession(device=device)
     request = declaration.request(
         name=case.name,
@@ -1340,7 +1350,7 @@ def _validate_correctness(
             is_prefilling=bool(prepared.dynamic["is_prefilling"][request]),
             compress_ratio=COMPRESS_RATIO,
             key_norm_weight=binding.index_k_norm_weight,
-            eps=binding.plan.caps.rms_norm_eps,
+            eps=binding.state.caps.rms_norm_eps,
             rope=_identity_rope,
         )
         paged_store_compressed_reference(
@@ -1367,7 +1377,7 @@ def _validate_correctness(
 
     actual = prepared.run().clone()
     selected = binding.selected_positions[: case.rows].clone()
-    torch.cuda.synchronize(binding.plan.caps.device)
+    torch.cuda.synchronize(binding.state.caps.device)
 
     if not bool(torch.all(torch.isfinite(actual))):
         raise BenchmarkFailure(f"{case.name}: eager output is non-finite")
@@ -1396,11 +1406,11 @@ def _validate_correctness(
     prepared_query = gemma_rmsnorm_reference(
         prepared.dynamic["index_query"],
         binding.index_q_norm_weight,
-        binding.plan.caps.rms_norm_eps,
+        binding.state.caps.rms_norm_eps,
     )
-    final_workspace_rows = case.rows % binding.plan.workspace_q_rows
+    final_workspace_rows = case.rows % binding.state.workspace_q_rows
     if final_workspace_rows == 0:
-        final_workspace_rows = min(case.rows, binding.plan.workspace_q_rows)
+        final_workspace_rows = min(case.rows, binding.state.workspace_q_rows)
     torch.testing.assert_close(
         binding.prepared_index_query[:final_workspace_rows],
         prepared_query[-final_workspace_rows:],
@@ -1488,7 +1498,7 @@ def _validate_correctness(
             sequence_length // COMPRESS_RATIO,
             case.groups,
         )
-        expanded_count = min(eligible, binding.plan.caps.group_budget) * COMPRESS_RATIO
+        expanded_count = min(eligible, binding.state.caps.group_budget) * COMPRESS_RATIO
         tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
         expected_tail = torch.arange(
             tail_start,
@@ -1514,7 +1524,7 @@ def _validate_correctness(
         main_v_cache=main_v_before,
     )
     prepared.state_restore.restore()
-    torch.cuda.synchronize(binding.plan.caps.device)
+    torch.cuda.synchronize(binding.state.caps.device)
     prepared.state_restore.assert_restored()
     return (
         actual,
