@@ -273,6 +273,7 @@ def _get_compiled_topk_stage(
     topk: int,
     threads: int,
 ) -> Callable:
+    """Compile and retain one owner top-k staging launcher specialization."""
     launch = _TopKOwnerStageLaunch(world_size, rank, topk, threads)
     key = (int(world_size), int(rank), int(topk), int(threads))
     raise_if_kernel_resolution_frozen(
@@ -314,6 +315,7 @@ def _get_compiled_topk_stage(
         blocks: int,
         wait_for_prior_consumer: bool,
     ) -> None:
+        """Launch the compiled owner top-k staging kernel with runtime arguments."""
         candidates = _pad_ptrs(candidate_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
         raw(

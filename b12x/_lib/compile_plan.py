@@ -220,6 +220,7 @@ def record_program(program: ProgramKey, owner: Any = None) -> None:
 
 
 def program_keys(value: Any) -> tuple[ProgramKey, ...]:
+    """Return compiler program identities retained by ``value``."""
     if value is None or isinstance(value, (str, int, float, bool)) or type(value).__module__ == "torch":
         return ()
     if isinstance(value, Mapping):

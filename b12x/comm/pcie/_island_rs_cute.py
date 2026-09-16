@@ -641,6 +641,7 @@ def get_island_rs_launcher(
         blocks: int,
         stream: object = None,
     ) -> None:
+        """Launch the compiled island reduce-scatter with runtime arguments."""
         if len(slab_addresses) != world_size:
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
