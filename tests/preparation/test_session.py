@@ -82,6 +82,7 @@ def test_collective_barrier_dispatch_contract(tmp_path):
 
 
 def session(tmp_path, **kwargs):
+    """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
     value._cache = SelectionCache(tmp_path, {"schema_version": 5, "tuning_cache_version": 1})
     return value
@@ -100,6 +101,7 @@ def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
 
 
 def declaration(*, tuning=None, pin=None, shared=False):
+    """Build a minimal arithmetic plan for preparation state-machine tests."""
     tuning = contract(values=(2,)) if tuning is None else tuning
     return Plan(
         contract=tuning, query=Query(3), override=pin, shared=shared,
@@ -158,6 +160,7 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
 
 
 def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
+    """Persistent allocations remain separate when their owner includes the plan."""
     buffers = {}
 
     def memory(config, device):
@@ -199,7 +202,9 @@ def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
 
 
 def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path):
+    """Stopped tuning installs defaults without enumerating optional candidates."""
     def no_optional(query, device, assignment):
+        """Reject materialization if stopped tuning enumerates an optional choice."""
         raise AssertionError("stopped session enumerated an optional candidate")
 
     tuning = replace(contract(), materialize=no_optional)
@@ -215,6 +220,7 @@ def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path
 
 
 def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_record(tmp_path):
+    """Cache-only mode permits fixed and explicit selections without cache records."""
     tuning = replace(contract(), equivalence_key=lambda query, device, config: {"same": True})
     calls = []
     with session(tmp_path, cache_only=True) as engine:
@@ -228,6 +234,7 @@ def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_recor
 
 
 def test_collective_requires_explicit_matching_authorization(tmp_path):
+    """Collective preparation resumes only after its exact key is authorized."""
     calls = []
     requirement = CollectiveRequirement("group/prime", (0, 1))
     req = request(name="collective", calls=calls, collective=requirement)
@@ -284,8 +291,11 @@ def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
     with session(tmp_path, collective_barrier=stalled) as engine:
         job = engine.begin((request(name="collective", collective=requirement),))
         assert job.advance().ready_collectives == (requirement,)
-        with pytest.raises(CollectiveBarrierTimeout):
+        with pytest.raises(CollectiveBarrierTimeout) as error:
             job.advance(collective_key=requirement.key)
+        assert "callback timed out" in str(error.value)
+        assert "never entered" not in str(error.value)
+        assert error.value.arrived is None
         assert started.is_set() and job._closed and engine._job is None
         pending = engine._pending_collective_barrier
         with pytest.raises(RuntimeError, match="previous collective barrier"):
@@ -316,7 +326,20 @@ def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkey
         engine.begin(())
 
 
+@pytest.mark.parametrize("value", ("0", "-1", "inf", "nan"))
+def test_collective_barrier_timeout_rejects_nonpositive_or_nonfinite_values(
+    monkeypatch, value,
+):
+    """The collective wait deadline rejects values that Event.wait cannot honor."""
+    from b12x.preparation import session as session_module
+
+    monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", value)
+    with pytest.raises(ValueError, match="finite positive"):
+        session_module._barrier_timeout_seconds()
+
+
 def test_new_obligation_fails_after_freeze(tmp_path):
+    """Frozen sessions reject declarations that were not prepared beforehand."""
     with session(tmp_path) as engine:
         engine.prepare((request(name="ready"),))
         engine.freeze()

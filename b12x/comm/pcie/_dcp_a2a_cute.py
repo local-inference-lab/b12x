@@ -1968,6 +1968,7 @@ def _gather_launcher_key(
     threads: int,
     device_slot_selection: bool,
 ) -> tuple[object, ...]:
+    """Return the cache key for an all-gather-heads launcher."""
     return (
         int(world_size),
         int(rank),
@@ -2081,6 +2082,7 @@ def _pair_launcher_key(
     device_slot_selection: bool,
     kimi_topk: bool,
 ) -> tuple[object, ...]:
+    """Return the cache key for a paired all-gather launcher."""
     return (
         int(world_size),
         int(rank),
@@ -2209,6 +2211,7 @@ def _get_compiled_all_gather_pair(
 
 
 def is_kimi_topk16_prepared(threads: int = 256) -> bool:
+    """Report whether the Kimi top-16 launcher is prepared for ``threads``."""
     return int(threads) in _PREPARED_KIMI_TOPK_LAUNCHERS
 
 
@@ -2288,6 +2291,7 @@ def lse_reduce_scatter(
     blocks: int,
     launcher: Callable | None = None,
 ) -> None:
+    """Reduce attention LSE values across PCIe ranks using a prepared launcher."""
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
         launcher = _get_compiled_lse_reduce_scatter(
