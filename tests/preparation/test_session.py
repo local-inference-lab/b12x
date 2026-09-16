@@ -1,6 +1,7 @@
 """Host state-machine boundaries, without substituting a serving kernel."""
 import gc
 from dataclasses import replace
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -245,6 +246,74 @@ def test_collective_requires_explicit_matching_authorization(tmp_path):
             progress = job.advance()
         assert calls == [6]
         job.result()
+
+
+def test_collective_barrier_failure_closes_active_job(tmp_path):
+    """Barrier callback failure clears the active job before propagation."""
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def broken(key, ranks):
+        """Simulate a collective backend failure after authorization."""
+        raise OSError("store down")
+
+    with session(tmp_path, collective_barrier=broken) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(RuntimeError, match="collective barrier.*store down"):
+            job.advance(collective_key=requirement.key)
+        assert job._closed
+        assert engine._job is None
+        engine.begin(())
+
+
+def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
+    tmp_path, monkeypatch,
+):
+    """A timed-out callback holds the collective gate until it returns."""
+    from b12x.preparation import session as session_module
+
+    started, release = threading.Event(), threading.Event()
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def stalled(key, ranks):
+        """Block the embedder barrier until the test permits completion."""
+        started.set()
+        release.wait()
+
+    monkeypatch.setattr(session_module, "_BARRIER_TIMEOUT_SECONDS", 0.01)
+    with session(tmp_path, collective_barrier=stalled) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(CollectiveBarrierTimeout):
+            job.advance(collective_key=requirement.key)
+        assert started.is_set() and job._closed and engine._job is None
+        pending = engine._pending_collective_barrier
+        with pytest.raises(RuntimeError, match="previous collective barrier"):
+            engine.begin(())
+        release.set()
+        assert pending.wait(1)
+        engine.begin(()).close()
+
+
+def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkeypatch):
+    """Thread-start failure does not leave the session's collective gate set."""
+    from b12x.preparation import session as session_module
+
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def broken_start(self):
+        """Fail the barrier thread before it can run its cleanup."""
+        raise OSError("thread start failed")
+
+    monkeypatch.setattr(session_module.threading.Thread, "start", broken_start)
+    with session(tmp_path, collective_barrier=lambda key, ranks: None) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(RuntimeError, match="collective barrier.*thread start failed"):
+            job.advance(collective_key=requirement.key)
+        assert job._closed and engine._job is None
+        assert engine._pending_collective_barrier is None
+        engine.begin(())
 
 
 def test_new_obligation_fails_after_freeze(tmp_path):

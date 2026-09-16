@@ -277,6 +277,7 @@ class PreparationSession:
         self._thread = threading.get_ident()
         self._pool = None
         self._job = None
+        self._pending_collective_barrier = None
         self._plans = []
         self._shared = {}
         self._guard = None
@@ -359,9 +360,15 @@ class PreparationSession:
         return max(int(free) // 2, 1)
 
     def begin(self, requests, *, autotune=None):
+        """Start one preparation job after the prior collective barrier drains."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("one preparation job may be active")
+        pending = self._pending_collective_barrier
+        if pending is not None:
+            if not pending.is_set():
+                raise RuntimeError("previous collective barrier is still running")
+            self._pending_collective_barrier = None
         if autotune is not None and type(autotune) is not bool:
             raise TypeError("job autotune override must be boolean or None")
         requests = tuple(requests)
@@ -659,15 +666,37 @@ class PreparationJob:
     def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
         """Convert a shared collective authorization into a launch lockstep.
 
-        Both ranks were authorized for the same requirement in the same
-        exchange round, but the local work before either rank launches is
+        All participant ranks were authorized for the same requirement in the
+        same exchange round, but the local work before any rank launches is
         unbounded (autotune races). The embedder-supplied barrier waits for
         every participant rank to enter before this rank proceeds to the
         launch, so the kernel-side spin window only covers launch jitter.
         """
         barrier = self.session.collective_barrier
+        completed = threading.Event()
+        errors = []
+
+        def wait_for_peers():
+            """Run the embedder barrier and publish its terminal state."""
+            try:
+                barrier(requirement.key, requirement.ranks)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
         try:
-            barrier(requirement.key, requirement.ranks)
+            thread = threading.Thread(target=wait_for_peers, daemon=True)
+            self.session._pending_collective_barrier = completed
+            try:
+                thread.start()
+            except BaseException:
+                self.session._pending_collective_barrier = None
+                raise
+            if not completed.wait(_BARRIER_TIMEOUT_SECONDS):
+                raise CollectiveBarrierTimeout(requirement.key, requirement.ranks, ())
+            if errors:
+                raise errors[0]
         except CollectiveBarrierTimeout:
             raise
         except Exception as error:
@@ -710,7 +739,15 @@ class PreparationJob:
             if collective_key != self._blocked.key:
                 return self._progress(False, False, (self._blocked,), False)
             if self.session.collective_barrier is not None:
-                self._collective_barrier(self._blocked)
+                try:
+                    self._collective_barrier(self._blocked)
+                except BaseException as error:
+                    self._error = error
+                    try:
+                        self.close()
+                    except BaseException as cleanup:
+                        error.add_note(f"job cleanup failed: {cleanup!r}")
+                    raise
             self._blocked = None
         elif isinstance(self._blocked, _TuningBatch):
             required = self._blocked.contributions

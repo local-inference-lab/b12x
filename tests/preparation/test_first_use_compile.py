@@ -47,6 +47,22 @@ def test_program_keys_skip_torch_scalars_inside_launch_records():
     assert compile_plan.program_keys(Launch(kernel, torch.int32, torch.zeros(1))) == kernel.__b12x_programs__
 
 
+def test_program_keys_accept_plain_functions_without_triton(monkeypatch):
+    """Host closures without retained programs do not import optional Triton."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_triton(name, *args, **kwargs):
+        """Fail if program-key discovery imports the optional Triton package."""
+        if name == "triton.compiler.compiler":
+            raise AssertionError("program_keys imported Triton for a plain function")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_triton)
+    assert compile_plan.program_keys(lambda: None) == ()
+
+
 def test_first_use_evicts_deferred_launchers_from_decorated_kernel_memos(monkeypatch):
     planned = DeferredCuTeKernel(ProgramKey("cute", "f" * 64, "planned"), memory_key=("p",))
     resolved = DeferredCuTeKernel(ProgramKey("cute", "1" * 64, "resolved"), memory_key=("r",))
