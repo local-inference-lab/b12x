@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +33,46 @@ from b12x.comm.pcie.pcie_twoshot_bf16 import _make_layout
 ROW_ELEMS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_ROW_ELEMS", "4096"))
 MAX_ROWS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_MAX_ROWS", "512"))
 ROWS = (8, 16, 32, 64, 96, 128, 192, 256)
+
+
+@pytest.mark.parametrize("shape", ((128, 1024), (32, 4096), (16, 8192), (131072,)))
+def test_prepared_all_reduce_counts_native_rows(monkeypatch, shape) -> None:
+    """Prepared all-reduce accepts the same contiguous layouts as the public API."""
+    import b12x.comm.pcie.pcie_twoshot_bf16 as twoshot_bf16
+
+    payload = torch.empty(shape, dtype=torch.bfloat16)
+    out = torch.empty_like(payload)
+    launches = []
+    layout = _make_layout(32, 4096, 4)
+    runtime = SimpleNamespace(
+        world_size=4,
+        rank=0,
+        row_elems=4096,
+        device=torch.device("cpu"),
+        _pack_stride=layout.pack_stride,
+        _reduced_offset=layout.reduced_offset,
+        _slot_bytes=layout.slot_bytes,
+        _capture_context_depth=0,
+        _device_slot_selection=False,
+        _device_slot_bias=0,
+        _slot=0,
+        _staging_ptrs=((1, 2, 3, 4), (5, 6, 7, 8)),
+        _signal_ptrs=(9, 10, 11, 12),
+    )
+    state = SimpleNamespace(
+        query=SimpleNamespace(
+            call={"operation": "all_reduce", "threads": 512, "block_limit": 64}
+        ),
+        launcher=lambda *_: lambda *args: launches.append(args),
+    )
+    monkeypatch.setattr(twoshot_bf16, "_is_current_stream_capturing", lambda _: False)
+    PCIeTwoShotBF16._launch_prepared(
+        runtime, payload, None, out, state=state, threads=512, block_limit=64
+    )
+    assert len(launches) == 1
+    assert launches[0][0] == payload.data_ptr()
+    assert launches[0][3] == out.data_ptr()
+    assert launches[0][-2] == 8  # 32 native rows split across four ranks.
 
 
 def test_layout_is_tp4_only_and_scales_with_capacity() -> None:
@@ -282,7 +323,9 @@ def _check_live_rows_reuse_prepared_launchers(
     torch.cuda.synchronize()
     dist.barrier()
 
-    with kernel_resolution_guard('PCIeTwoShotBF16 live rows must reuse warmed launcher geometry'):
+    with kernel_resolution_guard(
+        "PCIeTwoShotBF16 live rows must reuse warmed launcher geometry"
+    ):
         for payload, exact, all_reduce_out, shard, gathered in cases:
             local_rows = payload.shape[0] // world
             pool.all_reduce(payload, out=all_reduce_out)

@@ -349,9 +349,12 @@ class PCIeTwoShotBF16:
     def _launch_prepared(self, payload, scale, out, *, state, threads, block_limit):
         del scale
         operation = state.query.call["operation"]
+        # All-reduce accepts any contiguous shape; transport rows have the
+        # fixed runtime width, independently of the producer's tensor shape.
+        rows = payload.numel() // self.row_elems
         rows_per_rank = (
-            payload.shape[0] // self.world_size
-            if operation in ("reduce_scatter", "all_reduce") else payload.shape[0]
+            rows // self.world_size
+            if operation in ("reduce_scatter", "all_reduce") else rows
         )
         if int(threads) != state.query.call["threads"] or int(block_limit) != state.query.call["block_limit"]:
             raise ValueError("two-shot launch controls differ from the prepared plan")
