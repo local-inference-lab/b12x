@@ -13,6 +13,9 @@ from .test_iq2_xs import blocks
 
 
 @pytest.mark.parametrize(
+    "hidden_size,intermediate_size", [(256, 256), (2048, 512)]
+)
+@pytest.mark.parametrize(
     "activation,mapped,route,capacity,counts",
     [
         ("silu", False, "packed", 16, (1, 3, 8, 16)),
@@ -22,13 +25,19 @@ from .test_iq2_xs import blocks
         ("relu2", True, "packed", 16, (1, 3, 8, 16)),
     ],
 )
-def test_prepared_execution(activation, mapped, route, capacity, counts):
+def test_prepared_execution(
+    activation, mapped, route, capacity, counts, hidden_size, intermediate_size
+):
     device = require_b12x()
     ids = (7, 0, 5) if mapped else tuple(range(8))
-    w13 = blocks(e=len(ids), n=512 if activation == "silu" else 256, k=256)
-    w2 = blocks(e=len(ids), n=256, k=256)
+    w13 = blocks(
+        e=len(ids), n=intermediate_size * (2 if activation == "silu" else 1),
+        k=hidden_size,
+    )
+    w2 = blocks(e=len(ids), n=hidden_size, k=intermediate_size)
     layer = IQ2XSLayer(
-        IQ2XSWeights(w13, w2), 256, 256, 8, 2, ids, Path("synthetic-iq2-xs"), 0, 1, 0
+        IQ2XSWeights(w13, w2), hidden_size, intermediate_size, 8, 2, ids,
+        Path("synthetic-iq2-xs"), 0, 1, 0
     )
     experts, _ = prepare_experts(layer, device, activation=activation)
     with pytest.raises(NotImplementedError, match="standalone IQ2_XS FC2"):

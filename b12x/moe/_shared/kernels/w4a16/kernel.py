@@ -4877,6 +4877,9 @@ class W4A16GemmKernel:
                         get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
                     )
         cute.arch.cp_async_commit_group()
+        if cutlass.const_expr(self.weight_layout_iq2_xs):
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
 
     @cute.jit
     def _prefetch_pipeline_step(
