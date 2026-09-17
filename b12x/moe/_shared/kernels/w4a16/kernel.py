@@ -2725,7 +2725,9 @@ class W4A16GemmKernel:
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
-            for pipe in cutlass.range_constexpr(_STAGES):
+            for pipe in cutlass.range(
+                _STAGES, unroll_full=not self.weight_layout_iq2_xs
+            ):
                 if tile_idx < k_tiles:
                     for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
                         self._load_next_fragment_bundle(
@@ -3673,7 +3675,7 @@ class W4A16GemmKernel:
         b_sh_rd: Int32,
         s_sh_rd: Int32,
         a_sh_rd: Int32,
-        pipe: cutlass.Constexpr[int],
+        pipe: Int32,
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
@@ -4909,7 +4911,7 @@ class W4A16GemmKernel:
         scales_i32_flat: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
-        pipe: cutlass.Constexpr[int],
+        pipe: Int32,
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
@@ -5019,7 +5021,7 @@ class W4A16GemmKernel:
         scales_i32_flat: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
-        pipe: cutlass.Constexpr[int],
+        pipe: Int32,
         tile_idx: Int32,
         k_tiles: Int32,
         reduce_k_tile: Int32,
