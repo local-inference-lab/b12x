@@ -7663,6 +7663,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
     execution_lut_addr,
     pair_byte_offset,
     *,
+    shared_lut=False,
     loc=None,
     ip=None,
 ):
@@ -7677,6 +7678,20 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
     rows = (0, 0, 1, 1)
     decode = []
     for index, (extract, row) in enumerate(zip(extracts, rows, strict=True)):
+        load = (
+            f"""
+            cvt.u32.u64 sa{index}, $8;
+            mad.lo.u32 sa{index}, d{index}, 8, sa{index};
+            add.u32 sa{index}, sa{index}, $9;
+            ld.shared.u16 p{index}, [sa{index}];
+            """
+            if shared_lut
+            else f"""
+            mad.wide.u32 a{index}, d{index}, 8, $8;
+            add.u64 a{index}, a{index}, po;
+            ld.global.nc.u16 p{index}, [a{index}];
+            """
+        )
         decode.append(
             f"""
             {extract}
@@ -7687,9 +7702,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             or.b32 signs{index}, signs{index}, parity{index};
             shr.u32 signs{index}, signs{index}, $9;
             and.b32 d{index}, d{index}, 0x1ff;
-            mad.wide.u32 a{index}, d{index}, 8, $8;
-            add.u64 a{index}, a{index}, po;
-            ld.global.nc.u16 p{index}, [a{index}];
+            {load}
             cvt.u32.u16 u{index}, p{index};
             and.b32 xl{index}, u{index}, 0xff;
             shr.u32 xh{index}, u{index}, 8;
@@ -7717,6 +7730,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
                       sign_lo0, sign_lo1, sign_lo2, sign_lo3,
                       sign_hi0, sign_hi1, sign_hi2, sign_hi3;
             .reg .u64 po, a0, a1, a2, a3;
+            .reg .u32 sa0, sa1, sa2, sa3;
             .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
                       fh0, fh1, fh2, fh3;
             mov.b32 {dh0, unused0}, $6;
@@ -7750,7 +7764,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
         ],
         asm,
         "=r,=r,=r,=r,r,r,r,r,l,r",
-        has_side_effects=False,
+        has_side_effects=bool(shared_lut),
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -7771,6 +7785,7 @@ def packed_decode_iq2_xs_to_bfloat2x4(
     execution_lut_addr,
     pair_byte_offset,
     *,
+    shared_lut=False,
     loc=None,
     ip=None,
 ):
@@ -7781,6 +7796,7 @@ def packed_decode_iq2_xs_to_bfloat2x4(
         metadata_row1,
         execution_lut_addr,
         pair_byte_offset,
+        shared_lut=shared_lut,
         loc=loc,
         ip=ip,
     )

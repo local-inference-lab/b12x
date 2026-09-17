@@ -1131,6 +1131,7 @@ class W4A16GemmKernel:
         self.small_m_splitk = _w4a16_small_m_splitk_enabled()
         self.weight_layout_trellis256 = weight_layout == "trellis_t256"
         self.weight_layout_iq2_xs = weight_layout == "iq2_xs"
+        self.iq2_xs_smem_lut = False
         self.weight_layout_trellis256_proj = (
             self.weight_layout_trellis256 and w13_layout == "trellis_t256_proj"
         )
@@ -3748,6 +3749,7 @@ class W4A16GemmKernel:
             metadata_row1,
             execution_lut_addr,
             pair_byte_offset,
+            shared_lut=self.iq2_xs_smem_lut,
         )
         frag[0, 0] = b0_0
         frag[0, 1] = b0_1
@@ -6226,6 +6228,11 @@ class W4A16FusedMoeKernel:
         self.sms = self.fc1.sms
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
+        self.iq2_xs_lut_off = self.shared_words * 4
+        if self.weight_layout == "iq2_xs":
+            self.shared_words += 1024
+            self.fc1.iq2_xs_smem_lut = True
+            self.fc2.iq2_xs_smem_lut = True
         self.sqg_xor_cheb_t12_smem = (
             self.weight_layout == "trellis_t256"
             and self.trellis_codebook == SQG_E4M3
@@ -6667,6 +6674,20 @@ class W4A16FusedMoeKernel:
         # through the LUT ABI slot.
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
+        if cutlass.const_expr(self.weight_layout == "iq2_xs"):
+            for i in cutlass.range_constexpr(_covering_count(256, self.cta_threads)):
+                chunk = Int32(i * self.cta_threads) + tid
+                if chunk < Int32(256):
+                    cp_async4_shared_global(
+                        smem_base + Int32(self.iq2_xs_lut_off) + chunk * Int32(16),
+                        fc1_trellis_lut_addr + Int64(chunk) * Int64(16),
+                    )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+            table_addr = Int64(smem_base + Int32(self.iq2_xs_lut_off))
+            fc1_phase_lut_addr = table_addr
+            fc2_phase_lut_addr = table_addr
         if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
             self._sqg_smem_copy(
                 fc1_trellis_lut_addr,
@@ -6814,6 +6835,10 @@ class W4A16FusedMoeKernel:
         # single-tier entry staged the T12 staircase in shared memory.
         fc1_phase_lut = fc1_trellis_lut_addr
         fc2_phase_lut = fc2_trellis_lut_addr
+        if cutlass.const_expr(self.weight_layout == "iq2_xs"):
+            table_addr = Int64(smem_base + Int32(self.iq2_xs_lut_off))
+            fc1_phase_lut = table_addr
+            fc2_phase_lut = table_addr
         if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
             table_addr = Int64(
                 smem_base + Int32(self.sqg_xor_cheb_t12_smem_off)

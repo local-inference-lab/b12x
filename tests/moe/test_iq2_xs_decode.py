@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import packed_decode_iq2_xs_to_bfloat2x4
+from b12x._lib.intrinsics import (
+    cp_async4_shared_global,
+    packed_decode_iq2_xs_to_bfloat2x4,
+    shared_ptr_to_u32,
+)
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
 from b12x._lib.utils import current_cuda_stream
 from b12x.testing.iq2_xs_reference import descriptor_vectors
@@ -16,6 +20,13 @@ from tests._reference.helpers import require_b12x
 
 
 class _DecodeProbe:
+    def __init__(self, shared_lut=False):
+        self.shared_lut = shared_lut
+
+    @property
+    def __cache_key__(self):
+        return (self.shared_lut,)
+
     @cute.jit
     def __call__(
         self,
@@ -32,6 +43,19 @@ class _DecodeProbe:
     def kernel(self, base: cutlass.Int32, lut: cute.Tensor, out: cute.Tensor):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
+        table_addr = lut.iterator.toint()
+        if cutlass.const_expr(self.shared_lut):
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate_array(cutlass.Uint32, 1024, byte_alignment=16)
+            table_shared = shared_ptr_to_u32(storage)
+            cp_async4_shared_global(
+                table_shared + tid * 16,
+                table_addr + cutlass.Int64(tid) * 16,
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+            table_addr = cutlass.Int64(table_shared)
         row = block * 256 + tid
         descriptor = cutlass.Uint32(row // 64)
         pair = (row % 4) * 2
@@ -44,7 +68,7 @@ class _DecodeProbe:
             (15 - nibble) << 16
         )
         a, b, c, d = packed_decode_iq2_xs_to_bfloat2x4(
-            q0, q1, metadata, metadata1, lut.iterator.toint(), pair
+            q0, q1, metadata, metadata1, table_addr, pair, shared_lut=self.shared_lut
         )
         out[row, 0], out[row, 1] = cutlass.Int32(a), cutlass.Int32(b)
         out[row, 2], out[row, 3] = cutlass.Int32(c), cutlass.Int32(d)
@@ -53,7 +77,8 @@ class _DecodeProbe:
 @pytest.mark.parametrize(
     "base_bits", [0, 0x8000, 1, 0x8001, 0x3FF, 0x400, 0x3C01, 0x7BFF, 0xFBFF]
 )
-def test_all_descriptors_subscales_and_rounding(base_bits):
+@pytest.mark.parametrize("shared_lut", [False, True])
+def test_all_descriptors_subscales_and_rounding(base_bits, shared_lut):
     device = require_b12x()
     table = iq2_xs_execution_lut(device, prepare=True)
     output = torch.empty((65536 * 64, 4), dtype=torch.int32, device=device)
@@ -62,7 +87,7 @@ def test_all_descriptors_subscales_and_rounding(base_bits):
         from_dlpack(output, assumed_align=16),
     )
     compiled = b12x_compile(
-        _DecodeProbe(),
+        _DecodeProbe(shared_lut),
         cutlass.Int32(base_bits),
         lut_arg,
         out_arg,
