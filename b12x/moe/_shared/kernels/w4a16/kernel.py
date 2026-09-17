@@ -3140,16 +3140,23 @@ class W4A16GemmKernel:
         if reduce_slice_idx != reduce_slice_count - Int32(1):
             if tid < active_threads:
                 for jj in cutlass.range_constexpr(4):
-                    offset = (
-                        Int64(cta) * tile_elements
-                        + (Int64(active_threads) * Int64(jj) + Int64(tid)) * Int64(4)
-                    )
+                    offset = Int64(cta) * tile_elements + (
+                        Int64(active_threads) * Int64(jj) + Int64(tid)
+                    ) * Int64(4)
                     st_global_v4_f32(
                         get_ptr_as_int64(c_tmp_f32_flat, offset),
-                        acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4) % _SCALAR_ACC_FRAGMENT_WIDTH],
-                        acc[(jj * 4 + 1) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 1) % _SCALAR_ACC_FRAGMENT_WIDTH],
-                        acc[(jj * 4 + 2) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 2) % _SCALAR_ACC_FRAGMENT_WIDTH],
-                        acc[(jj * 4 + 3) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH],
+                        acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                            (jj * 4) % _SCALAR_ACC_FRAGMENT_WIDTH
+                        ],
+                        acc[(jj * 4 + 1) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                            (jj * 4 + 1) % _SCALAR_ACC_FRAGMENT_WIDTH
+                        ],
+                        acc[(jj * 4 + 2) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                            (jj * 4 + 2) % _SCALAR_ACC_FRAGMENT_WIDTH
+                        ],
+                        acc[(jj * 4 + 3) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                            (jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
+                        ],
                     )
             cute.arch.sync_threads()
             if tid == Int32(0):
@@ -3167,11 +3174,12 @@ class W4A16GemmKernel:
                     s2 = cutlass.Float32(0.0)
                     s3 = cutlass.Float32(0.0)
                     for part in cutlass.range(reduce_slice_count - Int32(1), unroll=1):
-                        source_cta = Int64(cta) + Int64(reduce_slice_count - Int32(1) - part)
-                        offset = (
-                            source_cta * tile_elements
-                            + (Int64(active_threads) * Int64(jj) + Int64(tid)) * Int64(4)
+                        source_cta = Int64(cta) + Int64(
+                            reduce_slice_count - Int32(1) - part
                         )
+                        offset = source_cta * tile_elements + (
+                            Int64(active_threads) * Int64(jj) + Int64(tid)
+                        ) * Int64(4)
                         v0, v1, v2, v3 = ld_global_v4_f32(
                             get_ptr_as_int64(c_tmp_f32_flat, offset)
                         )
@@ -3179,10 +3187,18 @@ class W4A16GemmKernel:
                         s1 = v1 + s1
                         s2 = v2 + s2
                         s3 = v3 + s3
-                    acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4) % _SCALAR_ACC_FRAGMENT_WIDTH] += s0
-                    acc[(jj * 4 + 1) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 1) % _SCALAR_ACC_FRAGMENT_WIDTH] += s1
-                    acc[(jj * 4 + 2) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 2) % _SCALAR_ACC_FRAGMENT_WIDTH] += s2
-                    acc[(jj * 4 + 3) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH] += s3
+                    acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                        (jj * 4) % _SCALAR_ACC_FRAGMENT_WIDTH
+                    ] += s0
+                    acc[(jj * 4 + 1) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                        (jj * 4 + 1) % _SCALAR_ACC_FRAGMENT_WIDTH
+                    ] += s1
+                    acc[(jj * 4 + 2) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                        (jj * 4 + 2) % _SCALAR_ACC_FRAGMENT_WIDTH
+                    ] += s2
+                    acc[(jj * 4 + 3) // _SCALAR_ACC_FRAGMENT_WIDTH][
+                        (jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
+                    ] += s3
             cute.arch.sync_threads()
             if tid == Int32(0):
                 st_global_i32(lock_addr, Int32(0))
@@ -11636,6 +11652,7 @@ def _compile_w4a16_gemm_launch(
             route_slots=int(route_slots),
             moe_block_size=moe_block_size,
             sms=sms,
+            weight_layout=weight_layout,
         ),
         device=device,
         scratch=c_tmp,
