@@ -8,6 +8,15 @@ from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
 from .prepare import PreparedW4A16MoeWeights, _make_workspace
 
 
+IQ2_XS_BARRIER_GROUP_CTAS = 32
+IQ2_XS_BARRIER_COUNTER_STRIDE = 32
+
+
+def iq2_xs_workspace_elements(sms: int) -> int:
+    groups = (4 * sms + IQ2_XS_BARRIER_GROUP_CTAS - 1) // IQ2_XS_BARRIER_GROUP_CTAS
+    return 4 * sms + 2 + groups * IQ2_XS_BARRIER_COUNTER_STRIDE
+
+
 def pack_iq2_xs_matrix(
     blocks: torch.Tensor, *, swap_halves: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -109,7 +118,12 @@ def prepare_iq2_xs_moe_weights(
         w2=q2,
         w2_scale=s2,
         w2_global_scale=unit,
-        workspace=_make_workspace(w13.device),
+        workspace=_make_workspace(
+            w13.device,
+            min_elements=iq2_xs_workspace_elements(
+                torch.cuda.get_device_properties(w13.device).multi_processor_count
+            ),
+        ),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,

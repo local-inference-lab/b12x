@@ -89,6 +89,11 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import IQ2_XS_MAGNITUDE_LUT_BYTES, iq2_xs_execution_lut
+from b12x.moe._shared.kernels.w4a16.iq2_xs import (
+    IQ2_XS_BARRIER_COUNTER_STRIDE,
+    IQ2_XS_BARRIER_GROUP_CTAS,
+    iq2_xs_workspace_elements,
+)
 from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
@@ -200,6 +205,23 @@ _TC_DECODE_PACK_COLLIDING_PAIRS = 3
 _TC_DECODE_PACK_SM_COVERAGE_CAP = 64
 _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR = 7
 _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR = 8
+
+
+@dsl_user_op
+def _atomic_arrive_acq_rel(addr, *, loc=None, ip=None):
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.s32 $0, [$1], 1;",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -7088,8 +7110,29 @@ class W4A16FusedMoeKernel:
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
             old_sense = ld_global_acquire_i32(sense_addr)
-            old_count = atomic_add_global_i32(count_addr, Int32(1))
-            if old_count == grid_x - Int32(1):
+            arrival_count = grid_x
+            old_count = Int32(-1)
+            if cutlass.const_expr(self.weight_layout == "iq2_xs"):
+                cta, _, _ = cute.arch.block_idx()
+                group = Int32(cta) // Int32(IQ2_XS_BARRIER_GROUP_CTAS)
+                group_size = grid_x - group * Int32(IQ2_XS_BARRIER_GROUP_CTAS)
+                if group_size > Int32(IQ2_XS_BARRIER_GROUP_CTAS):
+                    group_size = Int32(IQ2_XS_BARRIER_GROUP_CTAS)
+                group_addr = get_ptr_as_int64(
+                    locks_i32_flat,
+                    Int64(self.barrier_sense_off + 1)
+                    + Int64(group) * Int64(IQ2_XS_BARRIER_COUNTER_STRIDE),
+                )
+                arrival_count = (
+                    grid_x + Int32(IQ2_XS_BARRIER_GROUP_CTAS - 1)
+                ) // Int32(IQ2_XS_BARRIER_GROUP_CTAS)
+                group_arrivals = _atomic_arrive_acq_rel(group_addr)
+                if group_arrivals == group_size - Int32(1):
+                    st_global_i32(group_addr, Int32(0))
+                    old_count = _atomic_arrive_acq_rel(count_addr)
+            else:
+                old_count = atomic_add_global_i32(count_addr, Int32(1))
+            if old_count == arrival_count - Int32(1):
                 st_global_i32(count_addr, Int32(0))
                 threadfence()
                 red_add_global_release_i32(sense_addr, Int32(1))
@@ -9893,7 +9936,11 @@ def compile_w4a16_fused_moe(
     )
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * 256 + 2,),
+        (
+            iq2_xs_workspace_elements(kernel.sms)
+            if weight_layout == "iq2_xs"
+            else 4 * 256 + 2,
+        ),
         assumed_align=16,
     )
     rot_scales_fake = make_ptr(
@@ -12640,7 +12687,12 @@ def run_w4a16_moe(
     intermediate_cache13_flat = intermediate_cache13.view(-1)
     intermediate_cache2_flat = intermediate_cache2.view(-1)
 
-    if int(prepared.workspace.numel()) < sms * 4 + 2:
+    workspace_elements = (
+        iq2_xs_workspace_elements(sms)
+        if prepared.weight_layout == "iq2_xs"
+        else sms * 4 + 2
+    )
+    if int(prepared.workspace.numel()) < workspace_elements:
         raise ValueError("prepared W4A16 workspace is too small for fused FC1+FC2")
     if fused_launch is None:
         fused = compile_w4a16_fused_moe(
