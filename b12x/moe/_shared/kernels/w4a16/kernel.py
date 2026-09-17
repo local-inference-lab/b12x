@@ -1149,7 +1149,7 @@ class W4A16GemmKernel:
         self.b_region_variable = (
             self.weight_layout_trellis256 or self.weight_layout_iq2_xs
         )
-        self.b_bundle_rows = 4 if self.weight_layout_iq2_xs else 2
+        self.b_bundle_rows = 2
         self.scale_format = scale_format
         self.native_nvfp4_scales = (
             weight_layout == "modelopt" and scale_format == "e4m3_k16"
@@ -2768,6 +2768,8 @@ class W4A16GemmKernel:
                                     b_scale_cur,
                                     a_regs_cur,
                                     tid,
+                                    smem_base,
+                                    Int32(pipe),
                                     reduce_k_tile + tile_idx,
                                     kk,
                                     trellis_lut_addr,
@@ -2784,6 +2786,8 @@ class W4A16GemmKernel:
                                     b_scale_cur,
                                     a_regs_cur,
                                     tid,
+                                    smem_base,
+                                    Int32(pipe),
                                     reduce_k_tile + tile_idx,
                                     kk,
                                     trellis_lut_addr,
@@ -2800,6 +2804,8 @@ class W4A16GemmKernel:
                                 b_scale_cur,
                                 a_regs_cur,
                                 tid,
+                                smem_base,
+                                Int32(pipe),
                                 reduce_k_tile + tile_idx,
                                 kk,
                                 trellis_lut_addr,
@@ -2859,6 +2865,8 @@ class W4A16GemmKernel:
         b_scale_cur: cute.Tensor,
         a_regs_cur: cute.Tensor,
         tid: Int32,
+        smem_base: Int32,
+        pipe: Int32,
         tile_idx: Int32,
         kk: cutlass.Constexpr[int],
         trellis_lut_addr: Int64,
@@ -2920,12 +2928,15 @@ class W4A16GemmKernel:
 
         for jj in cutlass.range_constexpr(4):
             if cutlass.const_expr(self.weight_layout_iq2_xs):
+                metadata0, metadata1 = self._load_iq2_xs_metadata(
+                    smem_base, tid, pipe, Int32(kk), jj
+                )
                 self._scaled_dequant_b_fragment_iq2_xs(
                     b_frag,
                     b_scale_cur[0, jj],
                     b_scale_cur[1, jj],
-                    b_scale_cur[2, jj],
-                    b_scale_cur[3, jj],
+                    metadata0,
+                    metadata1,
                     trellis_lut_addr,
                     tid,
                 )
@@ -3481,13 +3492,8 @@ class W4A16GemmKernel:
         kt_local = Int32(self.b_sh_wr_iters) * warp_row + kk
         tc_col = lane // Int32(4)
         b_region = (
-            smem_base
-            + Int32(self.sh_b_off * 16)
+            smem_base + Int32(self.sh_b_off * 16)
             + pipe * Int32(self.b_sh_stage_bytes)
-        )
-        base_region = b_region + Int32(self.cta_k_blocks * self.cta_n_blocks * 64)
-        scale_region = base_region + Int32(
-            _covering_count(self.cta_k_blocks, 16) * self.cta_n_blocks * 32
         )
         for jj in cutlass.range_constexpr(4):
             local_n16 = Int32(4) * warp_n + Int32(jj)
@@ -3500,26 +3506,46 @@ class W4A16GemmKernel:
             regs[1, jj] = ld_shared_u32(
                 b_region + (tile_base + tc_col + Int32(8)) * Int32(4)
             )
-            base_addr = base_region + (
-                (kt_local // Int32(16) * Int32(self.cta_n_blocks) + local_n16)
-                * Int32(16) + tc_col // Int32(2) * Int32(2)
-            ) * Int32(2)
-            scale_addr = scale_region + (
-                (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
-                * Int32(16) + tc_col // Int32(4) * Int32(4)
-            )
-            shift = (tc_col % Int32(4)) * Int32(8) + (kt_local % Int32(2)) * Int32(4)
-            nibble0 = (ld_shared_u32(scale_addr) >> shift) & Uint32(15)
-            nibble1 = (ld_shared_u32(scale_addr + Int32(8)) >> shift) & Uint32(15)
-            base_shift = (tc_col % Int32(2)) * Int32(16)
-            base0 = (ld_shared_u32(base_addr) >> base_shift) & Uint32(0xffff)
-            base1 = (ld_shared_u32(base_addr + Int32(16)) >> base_shift) & Uint32(0xffff)
-            regs[2, jj] = base0 | (
-                nibble0 << Uint32(16)
-            )
-            regs[3, jj] = base1 | (
-                nibble1 << Uint32(16)
-            )
+
+    @cute.jit
+    def _load_iq2_xs_metadata(
+        self,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: Int32,
+        kk: Int32,
+        jj: cutlass.Constexpr[int],
+    ):
+        lane = tid & Int32(31)
+        warp_id = tid >> Int32(5)
+        warp_row = warp_id // Int32(self.tb_n_warps)
+        warp_n = warp_id % Int32(self.tb_n_warps)
+        kt_local = Int32(self.b_sh_wr_iters) * warp_row + kk
+        tc_col = lane // Int32(4)
+        b_region = (
+            smem_base + Int32(self.sh_b_off * 16)
+            + pipe * Int32(self.b_sh_stage_bytes)
+        )
+        base_region = b_region + Int32(self.cta_k_blocks * self.cta_n_blocks * 64)
+        scale_region = base_region + Int32(
+            _covering_count(self.cta_k_blocks, 16) * self.cta_n_blocks * 32
+        )
+        local_n16 = Int32(4) * warp_n + Int32(jj)
+        base_addr = base_region + (
+            (kt_local // Int32(16) * Int32(self.cta_n_blocks) + local_n16)
+            * Int32(16) + tc_col // Int32(2) * Int32(2)
+        ) * Int32(2)
+        scale_addr = scale_region + (
+            (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
+            * Int32(16) + tc_col // Int32(4) * Int32(4)
+        )
+        shift = (tc_col % Int32(4)) * Int32(8) + (kt_local % Int32(2)) * Int32(4)
+        nibble0 = (ld_shared_u32(scale_addr) >> shift) & Uint32(15)
+        nibble1 = (ld_shared_u32(scale_addr + Int32(8)) >> shift) & Uint32(15)
+        base_shift = (tc_col % Int32(2)) * Int32(16)
+        base0 = (ld_shared_u32(base_addr) >> base_shift) & Uint32(0xffff)
+        base1 = (ld_shared_u32(base_addr + Int32(16)) >> base_shift) & Uint32(0xffff)
+        return base0 | (nibble0 << Uint32(16)), base1 | (nibble1 << Uint32(16))
 
     @cute.jit
     def _load_b_scale_registers(
