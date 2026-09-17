@@ -7655,6 +7655,124 @@ def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
     return Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip))
 
 
+def _packed_decode_iq2_xs_to_bfloat2x4(
+    q_row0,
+    q_row1,
+    metadata_row0,
+    metadata_row1,
+    execution_lut_addr,
+    pair_byte_offset,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode one IQ2_XS MMA RHS fragment with one-round BF16 conversion."""
+
+    extracts = (
+        "and.b32 d0, $4, 0xffff;",
+        "shr.u32 d1, $4, 16;",
+        "and.b32 d2, $5, 0xffff;",
+        "shr.u32 d3, $5, 16;",
+    )
+    rows = (0, 0, 1, 1)
+    decode = []
+    for index, (extract, row) in enumerate(zip(extracts, rows, strict=True)):
+        decode.append(
+            f"""
+            {extract}
+            mad.wide.u32 a{index}, d{index}, 8, $8;
+            add.u64 a{index}, a{index}, po;
+            ld.global.nc.u16 p{index}, [a{index}];
+            cvt.u32.u16 u{index}, p{index};
+            and.b32 xl{index}, u{index}, 0xff;
+            shr.u32 xh{index}, u{index}, 8;
+            cvt.s32.s8 il{index}, xl{index};
+            cvt.s32.s8 ih{index}, xh{index};
+            cvt.rn.f32.s32 fl{index}, il{index};
+            cvt.rn.f32.s32 fh{index}, ih{index};
+            mul.f32 fl{index}, fl{index}, s{row};
+            mul.f32 fh{index}, fh{index}, s{row};
+            cvt.rn.satfinite.bf16x2.f32 ${index}, fh{index}, fl{index};
+            """
+        )
+    asm = (
+        """
+        {
+            .reg .b16 dh0, dh1, unused0, unused1, p0, p1, p2, p3;
+            .reg .b32 d0, d1, d2, d3, n0, n1;
+            .reg .u32 u0, u1, u2, u3, xl0, xl1, xl2, xl3,
+                      xh0, xh1, xh2, xh3;
+            .reg .s32 il0, il1, il2, il3, ih0, ih1, ih2, ih3;
+            .reg .u64 po, a0, a1, a2, a3;
+            .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
+                      fh0, fh1, fh2, fh3;
+            mov.b32 {dh0, unused0}, $6;
+            mov.b32 {dh1, unused1}, $7;
+            cvt.f32.f16 s0, dh0;
+            cvt.f32.f16 s1, dh1;
+            bfe.u32 n0, $6, 16, 4;
+            bfe.u32 n1, $7, 16, 4;
+            cvt.rn.f32.u32 fl0, n0;
+            cvt.rn.f32.u32 fl1, n1;
+            add.f32 fl0, fl0, 0f3f000000;
+            add.f32 fl1, fl1, 0f3f000000;
+            mul.f32 s0, s0, fl0;
+            mul.f32 s1, s1, fl1;
+            mul.f32 s0, s0, 0f3e800000;
+            mul.f32 s1, s1, 0f3e800000;
+            cvt.u64.u32 po, $9;
+        """
+        + "".join(decode)
+        + "\n}"
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(q_row0).ir_value(loc=loc, ip=ip),
+            Uint32(q_row1).ir_value(loc=loc, ip=ip),
+            Uint32(metadata_row0).ir_value(loc=loc, ip=ip),
+            Uint32(metadata_row1).ir_value(loc=loc, ip=ip),
+            Int64(execution_lut_addr).ir_value(loc=loc, ip=ip),
+            Int32(pair_byte_offset).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,=r,=r,r,r,r,r,l,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [index], loc=loc, ip=ip))
+        for index in range(4)
+    )
+
+
+@dsl_user_op
+def packed_decode_iq2_xs_to_bfloat2x4(
+    q_row0,
+    q_row1,
+    metadata_row0,
+    metadata_row1,
+    execution_lut_addr,
+    pair_byte_offset,
+    *,
+    loc=None,
+    ip=None,
+):
+    return _packed_decode_iq2_xs_to_bfloat2x4(
+        q_row0,
+        q_row1,
+        metadata_row0,
+        metadata_row1,
+        execution_lut_addr,
+        pair_byte_offset,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
 def packed_decode_sqg_fp16_d3l_to_bfloat2x4(
     win_a, win_b, descriptor_addr, bits: int, *, loc=None, ip=None

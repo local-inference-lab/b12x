@@ -145,6 +145,7 @@ _FP4_SOURCE_FORMATS = {name: name for name in _EXECUTION_SOURCE_FORMATS}
 _TRELLIS_SOURCE_FORMATS = frozenset(_EXECUTION_TRELLIS_SOURCE_FORMATS)
 _PROJECTION_MIXED_TRELLIS_MAX_ROUTE_BLOCK_SIZE = 48
 _W4A16_SCALE_FORMATS = {
+    "iq2_xs": "iq2_xs",
     "e4m3_k16": "e4m3_k16",
     "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
@@ -1527,6 +1528,8 @@ def _normalize_w4a16_scale_format(scale_format: str) -> str:
 
 def _w4a16_scale_format_for_source(source_format: str) -> str:
     source_format = _normalize_fp4_source_format(source_format)
+    if source_format == "iq2_xs":
+        return "iq2_xs"
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "e4m3_k32"
     return "e8m0_k32" if source_format == "fp4_e8m0_k32" else "e4m3_k16"
@@ -1539,6 +1542,8 @@ def _w4a16_weight_layout_for_source(
 ) -> str:
     """Return the default W4A16 layout selected by weight preparation."""
     source_format = _normalize_fp4_source_format(source_format)
+    if source_format == "iq2_xs":
+        return "iq2_xs"
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
     if (
@@ -1550,7 +1555,7 @@ def _w4a16_weight_layout_for_source(
     return "packed"
 
 
-_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256"}
+_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256", "iq2_xs"}
 
 
 def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
@@ -2582,6 +2587,12 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
             intermediate_size=query.intermediate_size,
         )
     )
+    if weight_layout == "iq2_xs":
+        return bool(
+            query.num_tokens <= 8 and query.io_dtype == "bfloat16"
+            and query.activation == "silu" and not query.deterministic_output
+            and not query.collect_activation_amax and not query.apply_router_weight_on_input
+        )
     if weight_layout == "trellis_t256":
         return False
     from b12x.moe._shared.kernels.w4a16.kernel import (
@@ -2607,6 +2618,8 @@ def _heuristic_w4a16_route_mode(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> str:
+    if query.source_format == "iq2_xs":
+        return "packed"
     if not _w4a16_direct_routing_supported(query):
         return "packed"
     if (
@@ -3402,7 +3415,7 @@ def _plan_core_workspace(
         topk = max(int(num_topk), 1)
         token_capacity = (routed_capacity + topk - 1) // topk
         direct_route_slots_by_block: dict[int, int] = {}
-        if weight_layout == "packed":
+        if weight_layout in {"packed", "iq2_xs"}:
             direct_m_cap = _MAX_DIRECT_TOPK_ROUTE_M
             if dtype == torch.bfloat16 and is_gated_moe_activation(activation):
                 direct_m_cap = _TC_DECODE_MAX_M
@@ -3466,7 +3479,7 @@ def _plan_core_workspace(
         # route geometry here as well.
         direct_decode_capacity = routed_capacity // max(int(num_topk), 1)
         if (
-            weight_layout == "packed"
+            weight_layout in {"packed", "iq2_xs"}
             and dtype == torch.bfloat16
             and is_gated_moe_activation(activation)
             and direct_decode_capacity >= 1
@@ -6671,6 +6684,27 @@ def prepare_b12x_fp4_moe_weights(
     )
 
 
+def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
+    """Own compact IQ2_XS planes through the canonical expert package."""
+    from b12x.moe._shared.kernels.w4a16.iq2_xs import prepare_iq2_xs_moe_weights
+
+    value = prepare_iq2_xs_moe_weights(
+        weights.w13, weights.w2, hidden_size=plan.hidden_size,
+        intermediate_size=plan.intermediate_size, num_experts=plan.num_experts,
+        activation=plan.activation, w13_layout=plan.w13_layout,
+    )
+    unit = torch.ones((), dtype=torch.float32, device=value.w13.device)
+    return B12XFP4ExpertWeights(
+        plan=plan, a1_gscale=unit, a2_gscale=unit,
+        w1_fp4=value.w13, w2_fp4=value.w2,
+        w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
+        w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
+        representation=_PreparedWeightRepresentation(
+            quant_mode="w4a16", layout=PreparedWeightLayout.IQ2_XS_COMPACT, value=value,
+        ),
+    )
+
+
 def prepare_b12x_trellis_v2_weights(
     *,
     plan: MoEWeightPreparationPlan,
@@ -7488,7 +7522,7 @@ def _w4a16_preplanned_launches(
     if (
         not collect_activation_amax
         and route_mode != "packed"
-        and weight_layout == "packed"
+        and weight_layout in {"packed", "iq2_xs"}
         and is_gated_moe_activation(workspace.activation)
         and token_count <= _TC_DECODE_MAX_M
         and prefer_tc_decode
@@ -7499,7 +7533,7 @@ def _w4a16_preplanned_launches(
     if (
         not collect_activation_amax
         and route_mode == "direct"
-        and weight_layout == "packed"
+        and weight_layout in {"packed", "iq2_xs"}
     ):
         direct = workspace.planned_direct_topk_launches.get(token_count)
         if direct is not None:
@@ -8702,7 +8736,7 @@ def _prewarm_w4a16_planned_launches(
         # can dispatch to it instead of the general fused launch.
         build_tc_decode = bool(
             not collect_activation_amax
-            and weight_layout == "packed"
+            and weight_layout in {"packed", "iq2_xs"}
             and element_dtype == "bf16"
             and is_gated_moe_activation(workspace.activation)
         )
@@ -8881,7 +8915,7 @@ def _prewarm_w4a16_planned_launches(
                     )
         mapped_tc_decode = bool(
             not full_rotation
-            and weight_layout == "packed"
+            and weight_layout in {"packed", "iq2_xs"}
             and element_dtype == "bf16"
             and is_gated_moe_activation(workspace.activation)
         )
@@ -8993,7 +9027,7 @@ def _prewarm_w4a16_planned_launches(
 
         build_direct_topk = bool(
             not collect_activation_amax
-            and weight_layout == "packed"
+            and weight_layout in {"packed", "iq2_xs"}
             and not is_gated_moe_activation(workspace.activation)
         )
         if build_direct_topk:
