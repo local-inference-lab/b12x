@@ -61,7 +61,6 @@ from b12x._lib.intrinsics import (
     packed_dequant_e8m0x4_to_bfloat2x2,
     packed_dequant_e8m0x4_to_half2x2,
     packed_decode_iq2_xs_to_bfloat2x4,
-    iq2_xs_scale_to_f32_bits,
     packed_dequant_trellis_to_bfloat2x4,
     packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_bfloat2x4,
@@ -4562,7 +4561,7 @@ class W4A16GemmKernel:
                     nibble = (packed_scales >> shift) & Uint32(15)
                     st_shared_u32(
                         b_region + local_tile * Int32(128) + Int32(64) + col * Int32(4),
-                        iq2_xs_scale_to_f32_bits(base_bits | (nibble << Int32(16))),
+                        base_bits | (nibble << Int32(16)),
                     )
 
         if cutlass.const_expr(self.weight_layout_trellis256):

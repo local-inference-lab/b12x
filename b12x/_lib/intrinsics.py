@@ -7655,37 +7655,11 @@ def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
     return Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip))
 
 
-@dsl_user_op
-def iq2_xs_scale_to_f32_bits(metadata, *, loc=None, ip=None):
-    """Reconstruct an IQ2_XS FP32 subscale before staging its shared word."""
-    result = llvm.inline_asm(
-        T.i32(),
-        [Uint32(metadata).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .b16 base, unused;
-            .reg .u32 nibble;
-            .reg .f32 scale, factor;
-            mov.b32 {base, unused}, $1;
-            cvt.f32.f16 scale, base;
-            bfe.u32 nibble, $1, 16, 4;
-            cvt.rn.f32.u32 factor, nibble;
-            add.f32 factor, factor, 0f3f000000;
-            mul.f32 scale, scale, factor;
-            mul.f32 $0, scale, 0f3e800000;
-        }
-        """,
-        "=r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-    )
-    return Uint32(result)
-
-
 def _packed_decode_iq2_xs_to_bfloat2x4(
     q_row0,
     q_row1,
-    scale_row0,
-    scale_row1,
+    metadata_row0,
+    metadata_row1,
     execution_lut_addr,
     pair_byte_offset,
     *,
@@ -7724,16 +7698,28 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
     asm = (
         """
         {
-            .reg .b16 p0, p1, p2, p3;
-            .reg .b32 d0, d1, d2, d3;
+            .reg .b16 dh0, dh1, unused0, unused1, p0, p1, p2, p3;
+            .reg .b32 d0, d1, d2, d3, n0, n1;
             .reg .u32 u0, u1, u2, u3, xl0, xl1, xl2, xl3,
                       xh0, xh1, xh2, xh3;
             .reg .s32 il0, il1, il2, il3, ih0, ih1, ih2, ih3;
             .reg .u64 po, a0, a1, a2, a3;
             .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
                       fh0, fh1, fh2, fh3;
-            mov.b32 s0, $6;
-            mov.b32 s1, $7;
+            mov.b32 {dh0, unused0}, $6;
+            mov.b32 {dh1, unused1}, $7;
+            cvt.f32.f16 s0, dh0;
+            cvt.f32.f16 s1, dh1;
+            bfe.u32 n0, $6, 16, 4;
+            bfe.u32 n1, $7, 16, 4;
+            cvt.rn.f32.u32 fl0, n0;
+            cvt.rn.f32.u32 fl1, n1;
+            add.f32 fl0, fl0, 0f3f000000;
+            add.f32 fl1, fl1, 0f3f000000;
+            mul.f32 s0, s0, fl0;
+            mul.f32 s1, s1, fl1;
+            mul.f32 s0, s0, 0f3e800000;
+            mul.f32 s1, s1, 0f3e800000;
             cvt.u64.u32 po, $9;
         """
         + "".join(decode)
@@ -7744,8 +7730,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
         [
             Uint32(q_row0).ir_value(loc=loc, ip=ip),
             Uint32(q_row1).ir_value(loc=loc, ip=ip),
-            Uint32(scale_row0).ir_value(loc=loc, ip=ip),
-            Uint32(scale_row1).ir_value(loc=loc, ip=ip),
+            Uint32(metadata_row0).ir_value(loc=loc, ip=ip),
+            Uint32(metadata_row1).ir_value(loc=loc, ip=ip),
             Int64(execution_lut_addr).ir_value(loc=loc, ip=ip),
             Int32(pair_byte_offset).ir_value(loc=loc, ip=ip),
         ],
@@ -7767,8 +7753,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
 def packed_decode_iq2_xs_to_bfloat2x4(
     q_row0,
     q_row1,
-    scale_row0,
-    scale_row1,
+    metadata_row0,
+    metadata_row1,
     execution_lut_addr,
     pair_byte_offset,
     *,
@@ -7778,8 +7764,8 @@ def packed_decode_iq2_xs_to_bfloat2x4(
     return _packed_decode_iq2_xs_to_bfloat2x4(
         q_row0,
         q_row1,
-        scale_row0,
-        scale_row1,
+        metadata_row0,
+        metadata_row1,
         execution_lut_addr,
         pair_byte_offset,
         loc=loc,
