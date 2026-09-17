@@ -130,6 +130,20 @@ increases from 222 to 384 MiB per TP1 layer, or from 8.671875 to 15 GiB across
 all 40 layers. The implemented default retains compact storage; expanded
 storage is not exposed as a supported public packing option.
 
+The matching `nvidia/Qwen3.6-35B-A3B-NVFP4` safetensors checkpoint at revision
+`491c2f1ea524c639598bf8fa787a93fed5a6fbce` measured 20.5/26.6/43.0/77.8 µs
+with the same W4A16 activation mode, geometry, microbatch matrix and timing
+settings at code revision `1e0dd36c`. Its 36.8 µs geometric mean makes compact
+IQ2_XS latency 2.41 times NVFP4 latency; expanded IQ2_XS latency is 1.96 times
+NVFP4 latency. All four NVFP4 W4A16 oracle checks passed, with minimum cosine
+0.999979. Automatic preparation selected direct routing for NVFP4 M=1/2/4
+and packed routing for M=8; IQ2_XS selected packed routing throughout.
+Use `--model-profile qwen36-35b-nvfp4 --quant-mode w4a16` to reproduce.
+
+The FP4-activation NVFP4 backend is unqualified for this checkpoint matrix:
+M=8 cosine was 0.999797 against its required 0.9999. Its observed 43.1 µs
+geometric mean is not a correctness-qualified performance comparison.
+
 The targeted CPU suite passed 206 tests. Its two execution-planner failures
 also fail on base revision `a83336581` because tests omit `decode_config`.
 The reference/sparse-routing/scratch guardrails have the same 44 failures on
