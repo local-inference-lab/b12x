@@ -2928,13 +2928,13 @@ class W4A16GemmKernel:
 
         for jj in cutlass.range_constexpr(4):
             if cutlass.const_expr(self.weight_layout_iq2_xs):
-                metadata0, metadata1 = self._load_iq2_xs_metadata(
+                q0, q1, metadata0, metadata1 = self._load_iq2_xs_fragment(
                     smem_base, tid, pipe, Int32(kk), jj
                 )
                 self._scaled_dequant_b_fragment_iq2_xs(
                     b_frag,
-                    b_scale_cur[0, jj],
-                    b_scale_cur[1, jj],
+                    q0,
+                    q1,
                     metadata0,
                     metadata1,
                     trellis_lut_addr,
@@ -3477,38 +3477,7 @@ class W4A16GemmKernel:
             self._copy_a_register_bundle_large_m(dst, src)
 
     @cute.jit
-    def _load_b_registers_iq2_xs(
-        self,
-        regs: cute.Tensor,
-        smem_base: Int32,
-        tid: Int32,
-        pipe: Int32,
-        kk: Int32,
-    ):
-        lane = tid & Int32(31)
-        warp_id = tid >> Int32(5)
-        warp_row = warp_id // Int32(self.tb_n_warps)
-        warp_n = warp_id % Int32(self.tb_n_warps)
-        kt_local = Int32(self.b_sh_wr_iters) * warp_row + kk
-        tc_col = lane // Int32(4)
-        b_region = (
-            smem_base + Int32(self.sh_b_off * 16)
-            + pipe * Int32(self.b_sh_stage_bytes)
-        )
-        for jj in cutlass.range_constexpr(4):
-            local_n16 = Int32(4) * warp_n + Int32(jj)
-            tile_base = (
-                kt_local * Int32(self.cta_n_blocks) + local_n16
-            ) * Int32(16)
-            regs[0, jj] = ld_shared_u32(
-                b_region + (tile_base + tc_col) * Int32(4)
-            )
-            regs[1, jj] = ld_shared_u32(
-                b_region + (tile_base + tc_col + Int32(8)) * Int32(4)
-            )
-
-    @cute.jit
-    def _load_iq2_xs_metadata(
+    def _load_iq2_xs_fragment(
         self,
         smem_base: Int32,
         tid: Int32,
@@ -3545,7 +3514,10 @@ class W4A16GemmKernel:
         base_shift = (tc_col % Int32(2)) * Int32(16)
         base0 = (ld_shared_u32(base_addr) >> base_shift) & Uint32(0xffff)
         base1 = (ld_shared_u32(base_addr + Int32(16)) >> base_shift) & Uint32(0xffff)
-        return base0 | (nibble0 << Uint32(16)), base1 | (nibble1 << Uint32(16))
+        tile_base = (kt_local * Int32(self.cta_n_blocks) + local_n16) * Int32(16)
+        q0 = ld_shared_u32(b_region + (tile_base + tc_col) * Int32(4))
+        q1 = ld_shared_u32(b_region + (tile_base + tc_col + Int32(8)) * Int32(4))
+        return q0, q1, base0 | (nibble0 << Uint32(16)), base1 | (nibble1 << Uint32(16))
 
     @cute.jit
     def _load_b_scale_registers(
@@ -3638,7 +3610,6 @@ class W4A16GemmKernel:
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
         if cutlass.const_expr(self.weight_layout_iq2_xs):
-            self._load_b_registers_iq2_xs(regs, smem_base, tid, pipe, kk)
             return
         q0, q1, q2, q3, s0, s1, s2, s3 = self._load_b_scale_registers(
             smem_base,
