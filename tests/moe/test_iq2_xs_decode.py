@@ -13,7 +13,7 @@ from b12x._lib.intrinsics import (
     packed_decode_iq2_xs_to_bfloat2x4,
     shared_ptr_to_u32,
 )
-from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
+from b12x._lib.quant.iq2_xs import IQ2_XS_MAGNITUDE_LUT_BYTES, iq2_xs_execution_lut
 from b12x._lib.utils import current_cuda_stream
 from b12x.testing.iq2_xs_reference import descriptor_vectors
 from tests._reference.helpers import require_b12x
@@ -46,12 +46,15 @@ class _DecodeProbe:
         table_addr = lut.iterator.toint()
         if cutlass.const_expr(self.shared_lut):
             smem = cutlass.utils.SmemAllocator()
-            storage = smem.allocate_array(cutlass.Uint32, 1024, byte_alignment=16)
-            table_shared = shared_ptr_to_u32(storage)
-            cp_async4_shared_global(
-                table_shared + tid * 16,
-                table_addr + cutlass.Int64(tid) * 16,
+            storage = smem.allocate_array(
+                cutlass.Uint32, IQ2_XS_MAGNITUDE_LUT_BYTES // 4, byte_alignment=16
             )
+            table_shared = shared_ptr_to_u32(storage)
+            for i in cutlass.range_constexpr(IQ2_XS_MAGNITUDE_LUT_BYTES // (256 * 16)):
+                cp_async4_shared_global(
+                    table_shared + (i * 256 + tid) * 16,
+                    table_addr + cutlass.Int64(i * 256 + tid) * 16,
+                )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()

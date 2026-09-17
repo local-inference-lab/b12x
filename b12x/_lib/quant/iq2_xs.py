@@ -18,6 +18,7 @@ IQ2_XS_BLOCK_SIZE = 256
 IQ2_XS_DESCRIPTOR_WEIGHTS = 8
 IQ2_XS_NATIVE_TILE = 16
 IQ2_XS_EXEC_LUT_ENTRIES = 1 << 16
+IQ2_XS_MAGNITUDE_LUT_BYTES = 512 * 8 * 2
 
 # Public llama.cpp iq2xs_grid, encoded at two bits per magnitude with
 # 0 -> 8, 1 -> 25, and 2 -> 43.
@@ -97,6 +98,7 @@ def _iq2_xs_execution_lut_device(
 ) -> torch.Tensor:
     return (
         iq2_xs_grid_cpu()
+        .to(dtype=torch.bfloat16)
         .to(device=torch.device(device_type, device_index))
         .contiguous()
     )
@@ -105,7 +107,7 @@ def _iq2_xs_execution_lut_device(
 def iq2_xs_execution_lut(
     device: torch.device | str, *, prepare: bool = False
 ) -> torch.Tensor:
-    """Return the process-lifetime 4 KiB magnitude table."""
+    """Return the process-lifetime 8 KiB BF16 magnitude table."""
 
     resolved = torch.device(device)
     index = resolved.index

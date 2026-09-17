@@ -7681,15 +7681,15 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
         load = (
             f"""
             cvt.u32.u64 sa{index}, $8;
-            mad.lo.u32 sa{index}, d{index}, 8, sa{index};
-            add.u32 sa{index}, sa{index}, $9;
-            ld.shared.u16 p{index}, [sa{index}];
+            mad.lo.u32 sa{index}, d{index}, 16, sa{index};
+            add.u32 sa{index}, sa{index}, so;
+            ld.shared.u32 u{index}, [sa{index}];
             """
             if shared_lut
             else f"""
-            mad.wide.u32 a{index}, d{index}, 8, $8;
+            mad.wide.u32 a{index}, d{index}, 16, $8;
             add.u64 a{index}, a{index}, po;
-            ld.global.nc.u16 p{index}, [a{index}];
+            ld.global.nc.u32 u{index}, [a{index}];
             """
         )
         decode.append(
@@ -7703,11 +7703,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             shr.u32 signs{index}, signs{index}, $9;
             and.b32 d{index}, d{index}, 0x1ff;
             {load}
-            cvt.u32.u16 u{index}, p{index};
-            and.b32 xl{index}, u{index}, 0xff;
-            shr.u32 xh{index}, u{index}, 8;
-            cvt.rn.f32.u32 fl{index}, xl{index};
-            cvt.rn.f32.u32 fh{index}, xh{index};
+            shl.b32 fl{index}, u{index}, 16;
+            and.b32 fh{index}, u{index}, 0xffff0000;
             shl.b32 sign_lo{index}, signs{index}, 31;
             shl.b32 sign_hi{index}, signs{index}, 30;
             and.b32 sign_hi{index}, sign_hi{index}, 0x80000000;
@@ -7730,7 +7727,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
                       sign_lo0, sign_lo1, sign_lo2, sign_lo3,
                       sign_hi0, sign_hi1, sign_hi2, sign_hi3;
             .reg .u64 po, a0, a1, a2, a3;
-            .reg .u32 sa0, sa1, sa2, sa3;
+            .reg .u32 sa0, sa1, sa2, sa3, so;
             .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
                       fh0, fh1, fh2, fh3;
             mov.b32 {dh0, unused0}, $6;
@@ -7747,7 +7744,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             mul.f32 s1, s1, fl1;
             mul.f32 s0, s0, 0f3e800000;
             mul.f32 s1, s1, 0f3e800000;
-            cvt.u64.u32 po, $9;
+            shl.b32 so, $9, 1;
+            cvt.u64.u32 po, so;
         """
         + "".join(decode)
         + "\n}"

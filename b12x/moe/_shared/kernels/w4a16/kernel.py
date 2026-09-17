@@ -88,7 +88,7 @@ from b12x._lib.intrinsics import (
     trellis_align_stream_u32x2,
     warp_reduce,
 )
-from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
+from b12x._lib.quant.iq2_xs import IQ2_XS_MAGNITUDE_LUT_BYTES, iq2_xs_execution_lut
 from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
@@ -6236,7 +6236,7 @@ class W4A16FusedMoeKernel:
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
         self.iq2_xs_lut_off = self.shared_words * 4
         if self.weight_layout == "iq2_xs":
-            self.shared_words += 1024
+            self.shared_words += IQ2_XS_MAGNITUDE_LUT_BYTES // 4
             self.fc1.iq2_xs_smem_lut = True
             self.fc2.iq2_xs_smem_lut = True
         self.sqg_xor_cheb_t12_smem = (
@@ -6681,9 +6681,9 @@ class W4A16FusedMoeKernel:
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
         if cutlass.const_expr(self.weight_layout == "iq2_xs"):
-            for i in cutlass.range_constexpr(_covering_count(256, self.cta_threads)):
+            for i in cutlass.range_constexpr(_covering_count(IQ2_XS_MAGNITUDE_LUT_BYTES // 16, self.cta_threads)):
                 chunk = Int32(i * self.cta_threads) + tid
-                if chunk < Int32(256):
+                if chunk < Int32(IQ2_XS_MAGNITUDE_LUT_BYTES // 16):
                     cp_async4_shared_global(
                         smem_base + Int32(self.iq2_xs_lut_off) + chunk * Int32(16),
                         fc1_trellis_lut_addr + Int64(chunk) * Int64(16),
