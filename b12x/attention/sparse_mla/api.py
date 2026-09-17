@@ -19,10 +19,7 @@ from .._shared.mla.api import (
 from .._shared.mla.api import (
     clear_mla_caches as clear_caches,
 )
-from .pooled_selection import (
-    expand_pooled_topk_to_physical_slots,
-    plan_pooled_selection,
-)
+from .pooled_selection import expand_pooled_topk_to_physical_slots, plan_pooled_selection
 from ._scratch import (
     B12XSparseMLABinding as _RuntimeBinding,
 )
@@ -58,6 +55,7 @@ def plan(
 ) -> Plan:
     """Declare a sparse-MLA route for PreparationSession."""
     return _plan(caps, invocation=invocation, override=override)
+
 
 
 def bind(
@@ -131,6 +129,7 @@ def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+
 def concat_and_cache_glm_next_mla(
     kv_c: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -161,7 +160,6 @@ def concat_and_cache_glm_next_mla_nvfp4(
 ) -> None:
     concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
 
-
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
     return default_is_supported(device, requires=META.requires)
@@ -180,11 +178,11 @@ __all__ = [
     "bind",
     "run",
     "plan_cache_writer",
+    "plan_pooled_selection",
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",
     "expand_pooled_topk_to_physical_slots",
-    "plan_pooled_selection",
     "is_supported",
     "clear_caches",
 ]

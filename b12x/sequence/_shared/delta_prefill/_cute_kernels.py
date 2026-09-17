@@ -481,8 +481,9 @@ class _PrologueKernel:
 
         # Per window: the band holding its first position and that position's
         # rank within the band.
-        if thread < Int32(self.max_windows):
-            window_begin = thread * Int32(self.window_tiles)
+        window = thread
+        while window < Int32(self.max_windows):
+            window_begin = window * Int32(self.window_tiles)
             low = Int32(0)
             high = Int32(self.tiles_capacity)
             while high - low > Int32(1):
@@ -491,8 +492,9 @@ class _PrologueKernel:
                     low = mid
                 else:
                     high = mid
-            window_table[thread * Int32(2)] = low
-            window_table[thread * Int32(2) + Int32(1)] = window_begin - bands[low]
+            window_table[window * Int32(2)] = low
+            window_table[window * Int32(2) + Int32(1)] = window_begin - bands[low]
+            window += Int32(_PROLOGUE_THREADS)
         # Position tables (binary search of the band) and the unused tail.
         bounded_tiles = cutlass.min(total_tiles, Int32(self.tiles_capacity))
         tile = thread
@@ -2038,7 +2040,7 @@ def _compile_prologue(binding: Binding) -> tuple[tuple[object, ...], Callable[..
         _fake_pointer(Int32),
         Int32(1),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.delta_prefill.prologue", 3, key),
+        compile_spec=KernelCompileSpec.from_key("sequence.delta_prefill.prologue", 4, key),
     )
 
     def launch(active: Binding) -> None:

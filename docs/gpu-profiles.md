@@ -80,6 +80,17 @@ pins, fixed choices and partial races are never saved as measured winners.
 Malformed matching cache data fails closed. Compiler artifact availability is
 checked independently of selection-cache presence.
 
+`B12X_COMPILE_WORKERS` limits compiler processes per preparation session
+(default: 8). An explicit `compile_workers` argument takes precedence. Lower
+this on unified-memory systems where compiler processes share RAM with model
+weights and KV caches. This changes compilation concurrency, not autotuning.
+`session.configure_compile_workers()` can change the budget between jobs
+without releasing prepared plans. vLLM's `B12X_WEIGHTS_COMPILE_WORKERS` and
+`B12X_STATE_COMPILE_WORKERS` override the common budget for their respective
+preparation stages. State tuning uses disposable pools with the final KV layout
+before allocating serving KV. `B12X_BIND_COMPILE_WORKERS` controls final binding
+and priming. The Spark TP2 launchers default to 16, 16, and 4 respectively.
+
 `autotune=False` uses a serial warmup through the same session's materialize,
 prime and resource-ownership hooks. It skips selection-cache lookup, candidate
 enumeration, compilation planning, compiler worker processes and measurement

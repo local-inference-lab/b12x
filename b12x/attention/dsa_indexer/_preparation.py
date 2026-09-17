@@ -72,6 +72,9 @@ def invocation_from_descriptors(caps, *, operands: Mapping[str, Mapping[str, obj
         required = {"shape", "strides", "dtype", "alignment"}
         if set(fields) != required:
             raise ValueError(f"DSA {name} ABI descriptor fields do not match schema")
+        if name == "index_k_cache":
+            # Physical pool size is a runtime bound, not a kernel specialization.
+            fields = FrozenMapping({**dict(fields), "shape": (1, *fields["shape"][1:])})
         normalized[name] = fields
     return FrozenMapping({
         "operands": FrozenMapping(normalized),

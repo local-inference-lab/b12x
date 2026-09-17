@@ -99,7 +99,7 @@ def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
 def test_loader_policy_keeps_hyperconnection_workspaces_out_of_shared_weights(tmp_path):
     """Constructor workspaces stay GPU-owned while weights receive direct reads."""
     from vllm.model_executor.weight_transfer import copy_weight, weight_transfer
-    from vllm.models.qwen3_8_flash_next.hyperconnection import (
+    from vllm.models.qwen4_exp.nvidia.hyperconnection import (
         GroupedGemmaRMSNorm,
         HyperConnectionConfig,
         HyperConnectionWorkspace,
@@ -116,7 +116,15 @@ def test_loader_policy_keeps_hyperconnection_workspaces_out_of_shared_weights(tm
     ):
         norm = GroupedGemmaRMSNorm(128, eps=1e-6, group_size=32, dtype=expected.dtype)
         workspace = HyperConnectionWorkspace(
-            HyperConnectionConfig(4, 32, expected.dtype, 16, 1e-6), 8
+            HyperConnectionConfig(
+                hc_count=4,
+                hidden_size=32,
+                params_dtype=expected.dtype,
+                hc_lowrank=16,
+                rms_norm_eps=1e-6,
+                hc_per_branch_norm=True,
+            ),
+            8,
         )
         source = dict(session.weights([path]))["weight"]
         copy_weight(norm.weight, source)

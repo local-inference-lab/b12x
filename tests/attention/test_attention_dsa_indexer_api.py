@@ -84,6 +84,24 @@ def test_public_plan_is_declarative_and_frozen_bind_rejects_it() -> None:
     assert "resolve_paged_prefill_k_rows" not in dsa_indexer.__all__
 
 
+def test_public_selection_metadata_ignores_pool_size_but_preserves_layout() -> None:
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4, topk=2
+    )
+    inputs = _public_dsa_inputs()
+    base = dsa_indexer.invocation_from_tensors(caps, **inputs)
+    width = inputs["index_k_cache"].shape[1]
+    inputs["index_k_cache"] = torch.empty((32, width), dtype=torch.uint8)
+    grown = dsa_indexer.invocation_from_tensors(caps, **inputs)
+    assert grown == base
+    inputs["index_k_cache"] = torch.empty_strided(
+        (32, width), (2 * width, 1), dtype=torch.uint8
+    )
+    interleaved = dsa_indexer.invocation_from_tensors(caps, **inputs)
+    assert interleaved != base
+    assert interleaved["operands"]["index_k_cache"]["strides"] == (2 * width, 1)
+
+
 @pytest.mark.parametrize(
     ("output_index_space", "output_physical_slots"),
     [("logical", False), ("physical", True)],

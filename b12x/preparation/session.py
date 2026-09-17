@@ -222,9 +222,11 @@ def _plans_of(request):
 class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
-        compile_workers=8, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
+        compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
         race_batch=32, race_budget=None,
     ):
+        if compile_workers is None:
+            compile_workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
         for name, value in (
             ("compile_workers", compile_workers), ("rounds", rounds), ("samples", samples),
             ("race_batch", race_batch),
@@ -255,6 +257,17 @@ class PreparationSession:
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
         self.state = "OPEN"
+
+    def configure_compile_workers(self, workers: int | None = None) -> None:
+        """Change compiler concurrency between preparation jobs."""
+        self._check_thread()
+        if self._job is not None or self._pool is not None:
+            raise RuntimeError("compiler concurrency can only change between jobs")
+        if workers is None:
+            workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
+        if type(workers) is not int or workers < 0:
+            raise ValueError("compile_workers must be an integer of at least 0")
+        self.compile_workers = workers
 
     def configure_tuning_shard(self, rank: int, ranks: tuple[int, ...]) -> None:
         """Assign this process a disjoint share of non-collective candidates."""
@@ -606,7 +619,7 @@ class PreparationJob:
             latest_round_us=self._latest_round_us, cache_hits=self._cache_hits,
             compilations=self._compilations, active_compilations=active_compilations,
             elapsed_seconds=time.monotonic() - self._started,
-            tuning_stopped=self._warmup_only,
+            tuning_stopped=self._warmup_only and self.session._stop.is_set(),
             ready_tuning=tuple(ready_tuning),
             candidate_sharded=self._candidate_sharded,
             batch_index=self._batch_index, batch_candidates=self._batch_candidates,

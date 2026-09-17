@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
 
+from b12x._lib.compile_pool import CompileJob
+from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
+from b12x.preparation.types import require_prepared
 
-@triton.jit
+from ._tuning import SparseMlaConfig, SparseMlaQuery, TUNING
+
+
+@triton.jit(do_not_specialize=(
+    "pool_stride", "block_table_stride", "output_stride",
+    "max_num_blocks", "num_cache_blocks",
+))
 def _expand_pooled_topk_to_physical_slots_kernel(
     pool_indices,
     last_token_positions,
@@ -88,6 +99,7 @@ def expand_pooled_topk_to_physical_slots(
     block_size: int,
     block_stride_rows: int,
     num_cache_blocks: int,
+    plan: Plan | None = None,
 ) -> None:
     """Expand selected pools and the live tail into physical cache slots.
 
@@ -136,7 +148,16 @@ def expand_pooled_topk_to_physical_slots(
     if not pool_indices.is_contiguous() or not output.is_contiguous():
         raise ValueError("pool_indices and output must be contiguous")
 
-    if rows:
+    if plan is not None:
+        state = require_prepared(plan, TUNING.component_id, pool_indices.device)
+        if not isinstance(state, _PooledSelectionState):
+            raise ValueError("pooled selection requires a pooled-selection plan")
+        state.run(
+            pool_indices, last_token_positions, request_ids, block_table,
+            output, active_counts, pool_size=pool_size, block_size=block_size,
+            block_stride_rows=block_stride_rows, num_cache_blocks=num_cache_blocks,
+        )
+    elif rows:
         block_cols = 128
         _expand_pooled_topk_to_physical_slots_kernel[
             (rows, triton.cdiv(output_width, block_cols))
@@ -162,105 +183,101 @@ def expand_pooled_topk_to_physical_slots(
         )
 
 
-def compile_pooled_selection(query, ordinal):
-    """Compile GLM C4 expansion from planned metadata, without cache contents."""
+@dataclass(frozen=True)
+class _CompilePointer:
+    dtype: torch.dtype
+
+    def data_ptr(self):
+        return 8 if self.dtype == torch.int64 else 4
+
+
+def compile_pooled_selection(query_payload, ordinal):
+    query = SparseMlaQuery(**dict(query_payload))
+    i32, i64 = _CompilePointer(torch.int32), _CompilePointer(torch.int64)
     with torch.cuda.device(ordinal):
         return _expand_pooled_topk_to_physical_slots_kernel.warmup(
-            torch.int32,
-            torch.int64,
-            torch.int32,
-            torch.int32,
-            torch.int32,
-            torch.int32,
-            512,
-            query.max_page_table_width,
-            2051,
-            query.max_page_table_width,
-            query.num_cache_blocks,
-            HISTORY_TOKENS=2048,
-            OUTPUT_WIDTH=2051,
-            POOL_SIZE=4,
+            i32, i64, i32, i32, i32, i32,
+            query.pool_topk, query.max_page_table_width, query.max_width,
+            query.max_page_table_width, query.num_cache_blocks,
+            HISTORY_TOKENS=query.pool_topk * query.pool_size,
+            OUTPUT_WIDTH=query.max_width, POOL_SIZE=query.pool_size,
             BLOCK_SIZE=query.page_size,
-            BLOCK_STRIDE_ROWS=query.page_size,
-            BLOCK_COLS=128,
-            num_warps=4,
-            grid=(query.max_q_rows, triton.cdiv(2051, 128)),
+            BLOCK_STRIDE_ROWS=query.physical_block_size,
+            BLOCK_COLS=128, num_warps=4, grid=(1, 1, 1),
         )
+
+
+@dataclass(frozen=True)
+class _PooledSelectionState:
+    query: SparseMlaQuery
+    program: object
+
+    def run(self, pool_indices, positions, request_ids, block_table, output,
+            active_counts, *, pool_size, block_size, block_stride_rows,
+            num_cache_blocks):
+        q = self.query
+        rows = int(pool_indices.shape[0])
+        if (pool_size, int(pool_indices.shape[1]), block_size, block_stride_rows) != (
+            q.pool_size, q.pool_topk, q.page_size, q.physical_block_size
+        ):
+            raise ValueError("pooled selection geometry differs from preparation")
+        if (rows > q.max_q_rows or block_table.shape[1] > q.max_page_table_width
+                or not 0 < num_cache_blocks <= q.num_cache_blocks):
+            raise ValueError("pooled selection exceeds prepared capacity")
+        if rows:
+            self.program[(rows, triton.cdiv(q.max_width, 128), 1)](
+                pool_indices, positions, request_ids, block_table, output,
+                active_counts, int(pool_indices.stride(0)),
+                int(block_table.stride(0)), int(output.stride(0)),
+                int(block_table.shape[1]), int(num_cache_blocks),
+                q.pool_topk * q.pool_size, q.max_width, q.pool_size,
+                q.page_size, q.physical_block_size, 128,
+            )
 
 
 def plan_pooled_selection(
-    *,
-    device,
-    max_rows: int,
-    page_size: int,
-    max_page_table_width: int,
-    num_cache_blocks: int,
-):
-    """Declare GLM C4-to-physical selection for one allocated cache geometry.
-
-    The plan has no scratch or cache ownership. Prepare its request before
-    calling ``expand_pooled_topk_to_physical_slots`` with 512 pool IDs per row,
-    pool size four, and physical block stride equal to ``page_size``. Live row
-    counts do not specialize the compiled program.
-    """
-    from b12x._lib.compile_pool import CompileJob
-    from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
-    from ._tuning import SparseMlaQuery, TUNING
-
+    *, device, max_rows: int, page_size: int, max_page_table_width: int,
+    num_cache_blocks: int, pool_size: int = 4, pool_topk: int = 512,
+    block_stride_rows: int | None = None,
+    override: SparseMlaConfig | None = None,
+) -> Plan:
+    """Declare the pool-to-physical-slot transform before graph capture."""
     device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
+    if device.type != "cuda":
+        raise ValueError("pooled selection requires a CUDA device")
+    if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    if any(
-        type(value) is not int or value <= 0
-        for value in (
-            max_rows,
-            page_size,
-            max_page_table_width,
-            num_cache_blocks,
-        )
-    ):
-        raise ValueError("pooled-selection capacities must be positive integers")
-    if num_cache_blocks * page_size - 1 > torch.iinfo(torch.int32).max:
+    if min(max_rows, page_size, max_page_table_width, num_cache_blocks,
+           pool_size, pool_topk) < 1:
+        raise ValueError("pooled selection capacities must be positive")
+    stride = page_size if block_stride_rows is None else block_stride_rows
+    if stride < page_size:
+        raise ValueError("physical cache block geometry is invalid")
+    max_slot = (num_cache_blocks - 1) * stride + page_size - 1
+    if max_slot > torch.iinfo(torch.int32).max:
         raise ValueError("physical cache slots exceed the int32 index range")
     query = SparseMlaQuery(
-        mode="selection",
-        dtype="int32",
-        kv_dtype="uint8",
-        num_q_heads=0,
-        qk_head_dim=0,
-        v_head_dim=0,
-        max_q_rows=max_rows,
-        max_width=2051,
-        page_size=page_size,
-        model_type=2,
-        head_major_output=False,
-        scale_format=0,
-        cache_record_bytes=0,
-        fp8_rope=False,
-        latent_scale_per_token=False,
-        has_attention_sink=False,
-        cache_layout="paged",
-        operation="pooled_selection",
-        slot_dtype="int32",
-        prefill_mg_enabled=False,
-        max_page_table_width=max_page_table_width,
-        physical_block_size=page_size,
-        num_cache_blocks=num_cache_blocks,
+        mode="selection", dtype="int32", kv_dtype="int32",
+        num_q_heads=0, qk_head_dim=0, v_head_dim=0,
+        max_q_rows=max_rows, max_width=pool_topk * pool_size + pool_size - 1,
+        page_size=page_size, model_type=2, head_major_output=False,
+        scale_format=0, cache_record_bytes=0, fp8_rope=False,
+        latent_scale_per_token=False, has_attention_sink=False,
+        cache_layout="paged", operation="pooled_selection", slot_dtype="int32",
+        prefill_mg_enabled=False, max_page_table_width=max_page_table_width,
+        physical_block_size=stride, num_cache_blocks=num_cache_blocks,
+        pool_size=pool_size, pool_topk=pool_topk,
     )
+    payload = TUNING.encode_query(query)
     return Plan(
-        contract=TUNING,
-        query=query,
-        invocation=FrozenMapping(),
-        _compile_jobs=lambda config, detected: (
-            CompileJob.create(
-                "b12x.attention.sparse_mla.pooled_selection:compile_pooled_selection",
-                query,
-                detected.ordinal,
-            ),
-        ),
+        contract=TUNING, query=query, invocation=FrozenMapping(), override=override,
+        _compile_jobs=lambda config, detected: (CompileJob.create(
+            "b12x.attention.sparse_mla.pooled_selection:compile_pooled_selection",
+            payload, detected.ordinal,
+        ),),
         _memory_requirements=lambda config, detected: MemoryRequirements(),
-        _materialize=lambda selection, detected: compile_pooled_selection(
-            query, detected.ordinal
+        _materialize=lambda selection, detected: _PooledSelectionState(
+            query, compile_pooled_selection(payload, detected.ordinal)
         ),
         _device=device,
     )

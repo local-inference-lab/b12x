@@ -24,6 +24,18 @@ def session(tmp_path, **kwargs):
     return value
 
 
+@pytest.mark.parametrize("workers", [0, 1, 4])
+def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
+    tmp_path, monkeypatch, workers
+):
+    monkeypatch.setenv("B12X_COMPILE_WORKERS", str(workers))
+    with session(tmp_path) as engine:
+        assert engine.compile_workers == workers
+        assert engine.autotune
+    with session(tmp_path, compile_workers=2) as engine:
+        assert engine.compile_workers == 2
+
+
 def declaration(*, tuning=None, pin=None, shared=False):
     tuning = contract(values=(2,)) if tuning is None else tuning
     return Plan(
@@ -32,6 +44,22 @@ def declaration(*, tuning=None, pin=None, shared=False):
         _memory_requirements=lambda config, device: MemoryRequirements(),
         _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
     )
+
+
+def test_compiler_budget_changes_between_jobs_preserve_prepared_plans(tmp_path):
+    with session(tmp_path) as engine:
+        first = request(name="weights")
+        engine.configure_compile_workers(16)
+        engine.prepare((first,))
+        prepared = first.plan.prepared
+        engine.configure_compile_workers(4)
+        job = engine.begin((request(name="state"),))
+        with pytest.raises(RuntimeError, match="between jobs"):
+            engine.configure_compile_workers(2)
+        job.close()
+        assert engine.compile_workers == 4
+        assert first.plan.prepared is prepared
+        assert require_prepared(first.plan, "test.arithmetic").value == 6
 
 
 def request(*, name, tuning=None, pin=None, calls=None, close=None, benchmark=None, dependencies=(), collective=None, shared=False):
