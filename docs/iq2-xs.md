@@ -98,3 +98,32 @@ descriptors, 16 subscale values and nine representative finite FP16 bases
 passed the production decoder with bit-exact BF16 results on the GPU.
 Separate prepared-plan tests cover SiLU/ReLU², reordered local experts,
 nonlocal routes and multiple live counts within one capacity.
+
+The canonical microbenchmark on physical GPU 11
+(`GPU-c7dc46e0-30bb-08e8-2ebb-f164ec57ce31`) used layer 0, TP1,
+warmup=10, iterations=20, repeats=5, CUDA graphs, a 256 MiB L2 flush and
+fast math. The 4 KiB magnitude table with register sign decoding was measured
+at revision `c890f628e`; revision `45d1188e2` supplies the signed 512 KiB
+table comparison with the same compact weights and benchmark settings.
+
+| Live tokens | Signed-table graph µs | Magnitude-table graph µs |
+| --- | ---: | ---: |
+| 1 | 67.0 | 63.5 |
+| 2 | 75.8 | 69.1 |
+| 4 | 112.6 | 96.3 |
+| 8 | 186.4 | 147.5 |
+| Geometric mean | 101.6 | 88.8 |
+
+Lower is better: the magnitude table reduced the geometric mean by 12.6%.
+Independent runs measured 101.2 and 88.7 µs respectively. Every timed batch
+passed the independent oracle. Active telemetry samples were P1 with no
+reported throttling and 15,865 MHz memory clocks; SM clocks were automatic.
+These measurements compare IQ2_XS decoder implementations, not NVFP4 model
+quality or whole-model serving throughput.
+
+The targeted CPU suite passed 206 tests. Its two execution-planner failures
+also fail on base revision `a83336581` because tests omit `decode_config`.
+The reference/sparse-routing/scratch guardrails have the same 44 failures on
+that base and the implementation: stale API calls and one FlashInfer backend
+without SM120 cubins. The exhaustive decoder and prepared IQ2_XS GPU tests
+pass, as do 22 additional FP4/E8M0/direct/mapped W4A16 regression tests.
