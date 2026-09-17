@@ -111,9 +111,10 @@ def compile_layer(query_payload, config_payload, ordinal):
             kernels._export_checkpoint_kernel.warmup(
                 p["normalized_u"], p["gathered_state"], p["query_start_loc"],
                 _CompilePointer(torch.int32, 4), _CompilePointer(torch.int64, 8),
-                p["request_is_prefill"], p["num_seqs"], p["conv_state"],
+                p["request_is_prefill"], p["num_seqs"], p["state_slot_ids"],
+                p["conv_state"], query.max_state_slots,
                 CHANNELS=channels, STATE_LENGTH=length, STATE_CAPACITY=capacity,
-                STATE_STRIDE=query.state_strides[0], BLOCK=256,
+                STATE_STRIDE=query.state_strides[0], MAX_SEQS=n, BLOCK=256,
                 num_warps=4, grid=(n, triton.cdiv(channels * capacity, 256)),
             ),
         )
@@ -194,12 +195,14 @@ class _PleState:
             if (tensor.shape != (self.query.max_seqs,) or tensor.dtype != dtype
                     or tensor.device != self.layout.caps.device or not tensor.is_contiguous()):
                 raise ValueError(f"PLE {name} must match the planned request capacity, dtype and device")
-        self.programs[5][(self.query.max_seqs, triton.cdiv(self.channels * self.state_capacity, 256), 1)](
-            binding.normalized_u, binding.gathered_state, binding.query_start_loc,
-            offsets, slots, binding.request_is_prefill, binding.num_seqs,
-            binding.conv_state, self.channels, self.state_length,
-            self.state_capacity, self.query.state_strides[0], 256,
-        )
+        with torch.cuda.device(self.layout.caps.device):
+            self.programs[5][(self.query.max_seqs, triton.cdiv(self.channels * self.state_capacity, 256), 1)](
+                binding.normalized_u, binding.gathered_state, binding.query_start_loc,
+                offsets, slots, binding.request_is_prefill, binding.num_seqs,
+                binding.state_slot_ids, binding.conv_state, self.query.max_state_slots,
+                self.channels, self.state_length, self.state_capacity,
+                self.query.state_strides[0], self.query.max_seqs, 256,
+            )
 
     def run_tensors(
         self, residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight,

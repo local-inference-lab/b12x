@@ -22,7 +22,9 @@ def export_checkpoint(binding: Binding, *, offsets, slots) -> None:
 
     Offsets are relative to each request's query start. Negative slots and
     zero offsets disable export. Call before reusing the binding's scratch.
-    Destination slots must be distinct from live input/output state slots.
+    Out-of-range destinations, destinations shared by enabled exports, and
+    destinations overlapping live input/output state slots are skipped on
+    the device, including during CUDA graph replay.
     """
     from b12x.preparation.types import require_prepared
 

@@ -1835,9 +1835,17 @@ def test_ple_state_slot_past_int32_element_offset_matches_oracle() -> None:
 
 
 @pytest.mark.parametrize("high_slot", [False, True])
+@pytest.mark.parametrize("other_device", [False, True])
 @torch.inference_mode()
-def test_ple_internal_checkpoint_replays_offsets_and_preserves_other_slots(high_slot):
+def test_ple_internal_checkpoint_replays_offsets_and_preserves_other_slots(high_slot, other_device):
     device = require_b12x()
+    original_device = torch.cuda.current_device()
+    if other_device:
+        if torch.cuda.device_count() < 2:
+            pytest.skip("Checkpoint export with another active device requires two CUDA GPUs")
+        device = torch.device("cuda", (original_device + 1) % torch.cuda.device_count())
+        with torch.cuda.device(device):
+            require_b12x()
     tokens, streams, hidden = 17, 4, 2560
     length, speculative, kernel_size, dilation = 9, 3, 4, 3
     channels = streams * hidden
@@ -1873,16 +1881,19 @@ def test_ple_internal_checkpoint_replays_offsets_and_preserves_other_slots(high_
     history = torch.cat((prior[:, :length], normalized[:16].reshape(16, channels).T), dim=1)
     offsets = torch.tensor([2, 1, 1], dtype=torch.int32, device=device)
     slots = torch.tensor([destination, destination + 1, destination + 2], dtype=torch.int64, device=device)
+    assert torch.cuda.current_device() == original_device
     ple.export_checkpoint(binding, offsets=offsets, slots=slots)
+    assert torch.cuda.current_device() == original_device
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    capture_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.device(device), torch.cuda.graph(graph, stream=capture_stream):
         ple.export_checkpoint(binding, offsets=offsets, slots=slots)
     for offset in (2, 12, 0, 16):
         offsets[0] = offset
         pool[destination:].fill_(91)
         before = torch.cuda.memory_allocated(device)
         graph.replay()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
         assert torch.cuda.memory_allocated(device) == before
         if 0 < offset < 16:
             torch.testing.assert_close(pool[destination, :, :length],
@@ -1892,3 +1903,108 @@ def test_ple_internal_checkpoint_replays_offsets_and_preserves_other_slots(high_
             assert bool((pool[destination] == 91).all())
         assert bool((pool[destination + 1:] == 91).all())
         torch.testing.assert_close(pool[0], untouched, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("slot_padding", [0, 11])
+@torch.inference_mode()
+def test_ple_internal_checkpoint_rejects_unsafe_slots_on_replay(slot_padding, monkeypatch):
+    from triton.runtime.jit import JITFunction
+    from b12x.sequence.ple import _kernels
+
+    device = require_b12x()
+    tokens, streams, hidden = 15, 2, 32
+    length, speculative, kernel_size, dilation = 9, 3, 4, 3
+    channels, capacity, pool_slots = streams * hidden, length + speculative, 10
+    stride = channels * capacity + slot_padding
+    storage = torch.randn(pool_slots * stride, dtype=torch.bfloat16, device=device)
+    pool = storage.as_strided((pool_slots, channels, capacity), (stride, capacity, 1))
+    initial_storage = storage.clone()
+    initial_pool = pool.clone()
+    residual, key, value, weights, generator = _cuda_projected_inputs(
+        tokens, streams, hidden, device=device, seed=1627,
+    )
+    conv_weight = torch.randn(channels, kernel_size, dtype=torch.bfloat16,
+                             device=device, generator=generator)
+    starts = [0, 4, 8, 11, 15, 15]
+    live_slots = [0, 1, 2, 3, 4]
+    _, binding = _bind_cuda_layer(
+        mode="mixed", residual=residual, key=key, value=value, weights=weights,
+        conv_weight=conv_weight,
+        query_start_loc=torch.tensor(starts, dtype=torch.int32, device=device),
+        state_slot_ids=torch.tensor(live_slots, dtype=torch.int64, device=device),
+        state_is_fresh=torch.zeros(5, dtype=torch.bool, device=device),
+        num_accepted_tokens=torch.ones(5, dtype=torch.int32, device=device),
+        num_seqs=4, num_tokens=tokens, conv_state=pool,
+        max_speculative_tokens=speculative, dilation=dilation,
+        request_is_prefill=torch.tensor([True, True, False, True, True], device=device),
+    )
+    _, normalized = ple_projected_u_reference(
+        residual, key, value, k_norm_weight=weights[0], q_norm_weight=weights[1],
+        u_norm_weight=weights[2], eps=1e-6,
+    )
+    offsets = torch.tensor([1, 2, 1, 1, 1], dtype=torch.int32, device=device)
+    slots = torch.tensor([5, 6, 5, -1, 5], dtype=torch.int64, device=device)
+    ple.run_mixed(binding, eps=1e-6)
+
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("Checkpoint export must reuse the prepared kernels")
+
+    for kernel in vars(_kernels).values():
+        if isinstance(kernel, JITFunction):
+            monkeypatch.setattr(kernel, "_do_compile", reject_resolution)
+
+    ple.export_checkpoint(binding, offsets=offsets, slots=slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ple.export_checkpoint(binding, offsets=offsets, slots=slots)
+
+    # Each row specifies destinations, offsets, live count, live state slots,
+    # and the request rows whose exports must succeed.
+    cases = [
+        ([5, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (0, 1)),
+        ([10, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (1,)),
+        ([2**40 + 5, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (1,)),
+        ([-1, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (1,)),
+        ([0, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (1,)),
+        ([2, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (1,)),
+        ([3, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (1,)),
+        ([5, 5, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, ()),
+        ([5, 5, 5, 5, 5], [1, 2, 1, 1, 1], 4, live_slots, ()),
+        ([5, 5, 5, -1, 5], [1, 0, 1, 1, 1], 4, live_slots, (0,)),
+        ([5, 5, 5, -1, 5], [1, -1, 1, 1, 1], 4, live_slots, (0,)),
+        ([5, 5, 5, -1, 5], [1, 4, 1, 1, 1], 4, live_slots, (0,)),
+        ([5, 5, 5, -1, 5], [1, 5, 1, 1, 1], 4, live_slots, (0,)),
+        ([5, 5, 5, -1, 5], [1, 2, 1, 1, 1], 1, live_slots, (0,)),
+        ([5, 6, 5, -1, 5], [1, 2, 1, 1, 1], 0, live_slots, ()),
+        ([4, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, live_slots, (0, 1)),
+        ([4, 6, 5, -1, 5], [1, 2, 1, 1, 1], 5, live_slots, (1,)),
+        ([5, 6, 5, -1, 5], [1, 2, 1, 1, 1], 4, [0, 1, 2, 5, 4], (1,)),
+        ([5, 6, 5, 9, 5], [1, 2, 1, 3, 1], 5, live_slots, (0, 1, 3)),
+    ]
+    for destinations, boundaries, num_seqs, state_slots, exported in cases:
+        slots.copy_(torch.tensor(destinations, dtype=slots.dtype, device=device))
+        offsets.copy_(torch.tensor(boundaries, dtype=offsets.dtype, device=device))
+        binding.state_slot_ids.copy_(torch.tensor(state_slots, dtype=torch.int64, device=device))
+        binding.num_seqs.fill_(num_seqs)
+        binding.num_tokens.fill_(starts[num_seqs])
+        storage.copy_(initial_storage)
+        ple.run_mixed(binding, eps=1e-6)
+        before_export = storage.clone()
+        expected_storage = storage.clone()
+        expected = expected_storage.as_strided(pool.shape, pool.stride())
+        for request in exported:
+            history = torch.cat((
+                initial_pool[state_slots[request], :, :length],
+                normalized[starts[request]:starts[request + 1]].reshape(-1, channels).T,
+            ), dim=1)
+            destination, offset = destinations[request], boundaries[request]
+            expected[destination, :, :length] = history[:, offset:offset + length]
+            expected[destination, :, length:] = 0
+        ple.export_checkpoint(binding, offsets=offsets, slots=slots)
+        torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
+        storage.copy_(before_export)
+        allocated = torch.cuda.memory_allocated(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_allocated(device) == allocated
+        torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)

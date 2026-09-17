@@ -41,6 +41,12 @@ have the plan's request capacity. An offset is relative to the request's query
 start and must lie strictly inside that query. Zero offsets, negative slots,
 decode rows and empty rows leave state unchanged. Each enabled destination must
 be a valid, distinct pool slot separate from every live input/output slot.
+The export kernel checks these destination constraints on the device before
+copying. An out-of-range destination or one matching any live state-slot ID
+is skipped. If enabled exports share a destination, all of those exports are
+skipped; independent valid exports still run. Disabled and inactive exports
+do not reserve destinations. These checks read runtime metadata on every
+CUDA graph replay and require no additional storage or host readback.
 Offsets shorter than the convolution window include the saved input history;
 the speculative tail is cleared. Export must finish before the mixed binding's
 scratch is reused. Kernel preparation includes the export path, and runtime
@@ -61,7 +67,7 @@ A `state_slot_ids[r]` value of `-1` is a dummy sink for CUDA-graph padding. Its
 tokens produce zero output and no state mutation. Other negative values and
 values at or above `max_state_slots` are invalid.
 
-The kernels read `num_seqs`, `num_tokens`, `query_start_loc`,
+The mixed, prefill and decode kernels read `num_seqs`, `num_tokens`, `query_start_loc`,
 `state_slot_ids`, and `num_accepted_tokens` from the device without checking
 them against the planned capacities or against each other; the only runtime
 masks are the live token count, the live request count, and the `-1` slot
