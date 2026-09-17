@@ -25,11 +25,19 @@ def blocks(e=2, n=544, k=768):
 def unpack_planes(words, metadata, shape):
     e, n, kb, _ = shape
     raw = torch.empty(shape, dtype=torch.uint8)
-    q = words.reshape(e, kb * 16, n, 1).view(torch.uint8)
+    q = (
+        words.reshape(e, kb * 16, n // 16, 8, 2)
+        .transpose(-2, -1).reshape(e, kb * 16, n, 1).view(torch.uint8)
+    )
     raw[..., 2:66] = q.permute(0, 2, 1, 3).reshape(e, n, kb, 64)
-    raw[..., :2] = metadata[: e * kb * n * 2].reshape(e, kb, n, 2).permute(0, 2, 1, 3)
+    raw[..., :2] = (
+        metadata[: e * kb * n * 2].view(torch.int16)
+        .reshape(e, kb, n // 16, 8, 2).transpose(-2, -1)
+        .reshape(e, kb, n, 1).view(torch.uint8).permute(0, 2, 1, 3)
+    )
     raw[..., 66:] = (
         metadata[e * kb * n * 2 :]
+        .reshape(e, kb, n // 16, 8, 8, 2).transpose(-2, -1)
         .reshape(e, kb, n // 16, 8, 16)
         .permute(0, 2, 4, 1, 3)
         .reshape(e, n, kb, 8)

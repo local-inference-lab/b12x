@@ -21,10 +21,11 @@ Preparation losslessly rearranges each matrix into:
 
 | Plane | Logical dtype and shape |
 | --- | --- |
-| Descriptors | uint16 `[E, K/16, N/16, 16, 2]` |
-| Bases | FP16 `[E, K/256, N/16, 16]` |
-| Paired subscales | uint8 `[E, K/256, N/16, 8, 16]` |
+| Descriptors | uint16 `[E, K/16, N/16, 8, 2, 2]` |
+| Bases | FP16 `[E, K/256, N/16, 8, 2]` |
+| Paired subscales | uint8 `[E, K/256, N/16, 8, 8, 2]` |
 
+The row-pair axes join output channels r and r+8 within each N16 tile.
 Descriptors are exposed as int32 words. The two metadata planes share one
 allocation. Their combined payload stays at 74 bytes per 256 weights
 (2.3125 bits per weight); there is no resident expanded weight or scale

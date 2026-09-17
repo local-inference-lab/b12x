@@ -13,9 +13,10 @@ def pack_iq2_xs_matrix(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack uint8[E,N,K/256,74] into descriptor and compact metadata planes.
 
-    Descriptors are uint16[E,K/16,N/16,16,2], exposed as int32 words.
-    Metadata holds contiguous FP16[E,K/256,N/16,16] bases followed by
-    uint8[E,K/256,N/16,8,16] scale pairs. The total is 74 bytes per 256
+    Descriptors are uint16[E,K/16,N/16,8,2,2], exposed as int32 words.
+    Each row pair joins output channels r and r+8 within an N16 tile.
+    Metadata holds contiguous FP16[E,K/256,N/16,8,2] bases followed by
+    uint8[E,K/256,N/16,8,8,2] scale pairs. The total is 74 bytes per 256
     weights. Temporary copies contain at most 256 output rows of one expert.
     """
     if blocks.dtype != torch.uint8:
@@ -28,12 +29,12 @@ def pack_iq2_xs_matrix(
     if swap_halves and n % 32:
         raise ValueError("IQ2_XS projection halves must be divisible by 16")
     words = torch.empty(
-        (e, kb * 16, n // 16, 16), dtype=torch.int32, device=blocks.device
+        (e, kb * 16, n // 16, 8, 2), dtype=torch.int32, device=blocks.device
     )
     metadata = torch.empty(e * kb * n * 10, dtype=torch.uint8, device=blocks.device)
     base_bytes = e * kb * n * 2
-    bases = metadata[:base_bytes].view(torch.float16).reshape(e, kb, n // 16, 16)
-    scales = metadata[base_bytes:].reshape(e, kb, n // 16, 8, 16)
+    bases = metadata[:base_bytes].view(torch.float16).reshape(e, kb, n // 16, 8, 2)
+    scales = metadata[base_bytes:].reshape(e, kb, n // 16, 8, 8, 2)
     for expert in range(e):
         boundaries = (0, n // 2, n) if swap_halves else (0, n)
         for begin, end in zip(boundaries[:-1], boundaries[1:], strict=True):
@@ -52,15 +53,17 @@ def pack_iq2_xs_matrix(
                 qs = chunk[..., 2:66].contiguous().view(torch.uint16)
                 q = qs.reshape(stop - row, kb * 16, 2).permute(1, 0, 2).contiguous()
                 words[expert, :, row // 16 : stop // 16].copy_(
-                    q.view(torch.int32).reshape(kb * 16, (stop - row) // 16, 16)
+                    q.view(torch.int32)
+                    .reshape(kb * 16, (stop - row) // 16, 2, 8)
+                    .transpose(-2, -1)
                 )
                 bases[expert, :, row // 16 : stop // 16].copy_(
-                    d.T.reshape(kb, (stop - row) // 16, 16)
+                    d.T.reshape(kb, (stop - row) // 16, 2, 8).transpose(-2, -1)
                 )
                 scales[expert, :, row // 16 : stop // 16].copy_(
                     chunk[..., 66:]
-                    .reshape((stop - row) // 16, 16, kb, 8)
-                    .permute(2, 0, 3, 1)
+                    .reshape((stop - row) // 16, 2, 8, kb, 8)
+                    .permute(3, 0, 4, 2, 1)
                 )
     return words.reshape(-1), metadata
 

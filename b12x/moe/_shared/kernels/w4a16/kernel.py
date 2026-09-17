@@ -3610,21 +3610,23 @@ class W4A16GemmKernel:
         local_n16 = Int32(4) * warp_n + Int32(jj)
         base_addr = base_region + (
             (kt_local // Int32(16) * Int32(self.cta_n_blocks) + local_n16)
-            * Int32(16) + tc_col // Int32(2) * Int32(2)
-        ) * Int32(2)
+            * Int32(8) + tc_col
+        ) * Int32(4)
         scale_addr = scale_region + (
             (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
-            * Int32(16) + tc_col // Int32(4) * Int32(4)
+            * Int32(16) + tc_col // Int32(2) * Int32(4)
         )
-        shift = (tc_col % Int32(4)) * Int32(8) + (kt_local % Int32(2)) * Int32(4)
-        nibble0 = (ld_shared_u32(scale_addr) >> shift) & Uint32(15)
-        nibble1 = (ld_shared_u32(scale_addr + Int32(8)) >> shift) & Uint32(15)
-        base_shift = (tc_col % Int32(2)) * Int32(16)
-        base0 = (ld_shared_u32(base_addr) >> base_shift) & Uint32(0xffff)
-        base1 = (ld_shared_u32(base_addr + Int32(16)) >> base_shift) & Uint32(0xffff)
+        shift = (tc_col % Int32(2)) * Int32(16) + (kt_local % Int32(2)) * Int32(4)
+        scale_pair = ld_shared_u32(scale_addr)
+        nibble0 = (scale_pair >> shift) & Uint32(15)
+        nibble1 = (scale_pair >> (shift + Int32(8))) & Uint32(15)
+        base_pair = ld_shared_u32(base_addr)
+        base0 = base_pair & Uint32(0xffff)
+        base1 = base_pair >> Uint32(16)
         tile_base = (kt_local * Int32(self.cta_n_blocks) + local_n16) * Int32(16)
-        q0 = ld_shared_u32(b_region + (tile_base + tc_col) * Int32(4))
-        q1 = ld_shared_u32(b_region + (tile_base + tc_col + Int32(8)) * Int32(4))
+        q0, q1 = ld_shared_v2_u32(
+            b_region + (tile_base + tc_col * Int32(2)) * Int32(4)
+        )
         return q0, q1, base0 | (nibble0 << Uint32(16)), base1 | (nibble1 << Uint32(16))
 
     @cute.jit
