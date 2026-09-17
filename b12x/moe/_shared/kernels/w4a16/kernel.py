@@ -2214,7 +2214,10 @@ class W4A16GemmKernel:
         output_n_tile: Int32,
         active_size_m: Int32,
     ):
-        global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
+        if cutlass.const_expr(self.weight_layout_iq2_xs):
+            global_scale_f32 = cutlass.Float32(1.0)
+        else:
+            global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
         if cutlass.const_expr(self.native_nvfp4_scales and not self.is_fp16):
             global_scale_f32 *= cutlass.Float32(128.0)
         if cutlass.const_expr(self.scale_format_e8m0_k32):
