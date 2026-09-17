@@ -121,6 +121,15 @@ reported throttling and 15,865 MHz memory clocks; SM clocks were automatic.
 These measurements compare IQ2_XS decoder implementations, not NVFP4 model
 quality or whole-model serving throughput.
 
+A research-only expanded-metadata control at revision `28c38516b` puts the
+FP16 base and subscale nibble beside each K16 descriptor tile. It uses the
+same 4 KiB magnitude decoder and preserves the exact quantization semantics.
+Two canonical benchmark runs measured 49.2/55.3/81.9/122.9 µs at M=1/2/4/8,
+with a 72.3 µs geometric mean and passing oracles. Resident weight payload
+increases from 222 to 384 MiB per TP1 layer, or from 8.671875 to 15 GiB across
+all 40 layers. The implemented default retains compact storage; expanded
+storage is not exposed as a supported public packing option.
+
 The targeted CPU suite passed 206 tests. Its two execution-planner failures
 also fail on base revision `a83336581` because tests omit `decode_config`.
 The reference/sparse-routing/scratch guardrails have the same 44 failures on
