@@ -48,7 +48,6 @@ from b12x._lib.intrinsics import (
     ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
-    ld_shared_u16_offset,
     ld_shared_v2_u32,
     ld_shared_v4_f32,
     ld_shared_v4_u32,
@@ -3498,7 +3497,7 @@ class W4A16GemmKernel:
             )
             base_addr = base_region + (
                 (kt_local // Int32(16) * Int32(self.cta_n_blocks) + local_n16)
-                * Int32(16) + tc_col
+                * Int32(16) + tc_col // Int32(2) * Int32(2)
             ) * Int32(2)
             scale_addr = scale_region + (
                 (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
@@ -3507,10 +3506,13 @@ class W4A16GemmKernel:
             shift = (tc_col % Int32(4)) * Int32(8) + (kt_local % Int32(2)) * Int32(4)
             nibble0 = (ld_shared_u32(scale_addr) >> shift) & Uint32(15)
             nibble1 = (ld_shared_u32(scale_addr + Int32(8)) >> shift) & Uint32(15)
-            regs[2, jj] = Uint32(ld_shared_u16_offset(base_addr, 0)) | (
+            base_shift = (tc_col % Int32(2)) * Int32(16)
+            base0 = (ld_shared_u32(base_addr) >> base_shift) & Uint32(0xffff)
+            base1 = (ld_shared_u32(base_addr + Int32(16)) >> base_shift) & Uint32(0xffff)
+            regs[2, jj] = base0 | (
                 nibble0 << Uint32(16)
             )
-            regs[3, jj] = Uint32(ld_shared_u16_offset(base_addr, 16)) | (
+            regs[3, jj] = base1 | (
                 nibble1 << Uint32(16)
             )
 
@@ -4877,9 +4879,6 @@ class W4A16GemmKernel:
                         get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
                     )
         cute.arch.cp_async_commit_group()
-        if cutlass.const_expr(self.weight_layout_iq2_xs):
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_threads()
 
     @cute.jit
     def _prefetch_pipeline_step(
