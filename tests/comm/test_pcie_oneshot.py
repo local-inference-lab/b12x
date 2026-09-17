@@ -325,7 +325,66 @@ def _make_cute_state(
         eager_buffer_bytes=eager_buffer_bytes if eager else None,
         transport_policy=transport_policy,
         sharded_eager_storage=sharded_eager_storage,
+        tp4_remote_push_capable=(
+            eager and world_size == 4 and transport_policy[3] and sharded_eager_storage
+        ),
         plain_remote_push_region_packs=plain_remote_push_region_packs,
+    )
+
+
+def test_plain_tp4_push_plan_rejects_unsharded_storage(monkeypatch):
+    from b12x.comm.pcie import _oneshot_preparation as preparation
+    from b12x.comm.pcie._tuning import PcieQuery
+    from b12x.preparation import FrozenMapping
+
+    query = PcieQuery(
+        surface="OneshotAllReduce.all_reduce",
+        world_size=4,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping({"transport": "tp4_remote_push"}),
+        setup=FrozenMapping(),
+    )
+    native = SimpleNamespace(
+        sharded_eager_storage=False,
+        eager_tables=(300, 400),
+        eager_buffer_bytes=84 * 1024,
+    )
+    monkeypatch.setattr(preparation, "_state", lambda runtime: native)
+    with pytest.raises(ValueError, match="four-shard IPC storage"):
+        preparation.plan(query, runtime=SimpleNamespace(world_size=4))
+
+
+def test_plain_tp4_push_uses_frozen_policy_for_supported_bf16_shapes(monkeypatch):
+    """Select TP4 remote push only for qualified BF16 shapes."""
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
+    state = _make_cute_state(4, eager_buffer_bytes=84 * 1024)
+    assert state.sharded_eager_storage
+    assert state.tp4_remote_push_capable
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
+    for rows, hidden in ((1, 5120), (6, 5120), (8, 1280)):
+        inp = torch.empty(rows, hidden, dtype=torch.bfloat16)
+        assert (
+            _CuTeOneshotBackend._plain_launch_config(state, inp)[0] == "tp4_remote_push"
+        )
+    for rows, hidden, dtype in (
+        (9, 5120, torch.bfloat16),
+        (6, 4096, torch.bfloat16),
+        (6, 5120, torch.float16),
+        (6, 5120, torch.float32),
+    ):
+        assert (
+            _CuTeOneshotBackend._plain_launch_config(
+                state, torch.empty(rows, hidden, dtype=dtype)
+            )[0]
+            == "pull"
+        )
+    disabled = _make_cute_state(4, eager_buffer_bytes=84 * 1024)
+    assert (
+        _CuTeOneshotBackend._plain_launch_config(
+            disabled, torch.empty(6, 5120, dtype=torch.bfloat16)
+        )[0]
+        == "pull"
     )
 
 

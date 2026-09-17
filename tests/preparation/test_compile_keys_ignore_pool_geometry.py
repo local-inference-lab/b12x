@@ -65,6 +65,12 @@ def _realigned(value: int) -> int:
 PERTURBATIONS = {"grown": _grown, "realigned": _realigned}
 
 
+def _perturb_pool_value(value, perturb):
+    if isinstance(value, tuple):
+        return (perturb(value[0]), *value[1:])
+    return perturb(value)
+
+
 def _thawed(value):
     if isinstance(value, dict):
         return {key: _thawed(item) for key, item in value.items()}
@@ -241,6 +247,24 @@ def _declare_glm_cache_writer(spec, pool):
         return m.plan_cache_writer(kv_c, kv_cache, slots)
 
 
+def _declare_compressed_mla(spec, pool):
+    """DeepSeek V4.1 dual-cache plans retain caller-owned pool geometry."""
+    from b12x.attention import compressed_sparse_mla as mla
+
+    return mla.plan(
+        mla.Caps(device=_cuda(), **spec["caps"]),
+        invocation=mla.invocation_from_descriptors(
+            q=FrozenMapping(spec["q"]),
+            swa_cache=FrozenMapping({
+                **spec["swa_cache"], "shape": pool["swa_cache_shape"],
+            }),
+            indexed_cache=FrozenMapping({
+                **spec["indexed_cache"], "shape": pool["indexed_cache_shape"],
+            }),
+        ),
+    )
+
+
 def _paged_geometry(plan):
     """Pool geometry of a paged declaration: the caps payload and the KV cache ABI."""
     return {
@@ -273,6 +297,12 @@ FAMILIES = {
     "attention.qsa": _Family(_declare_qsa, "b12x.attention.qsa._tuning", "QsaQuery", ("num_main_cache_pages", "num_compressed_cache_pages")),
     "attention.gqa": _Family(_declare_paged, "b12x.attention.paged._tuning", "GqaQuery", (), _paged_geometry),
     "attention.sparse_mla/cache_writer": _Family(_declare_glm_cache_writer, "b12x.attention.sparse_mla._tuning", "SparseMlaQuery", ("num_cache_blocks", "max_page_table_width", "max_physical_records")),
+    "attention.compressed_sparse_mla": _Family(
+        _declare_compressed_mla,
+        "b12x.attention.compressed_sparse_mla._tuning",
+        "SparseMlaQuery",
+        ("swa_cache_shape", "indexed_cache_shape"),
+    ),
 }
 
 # Families whose declared queries carry no pool geometry, with the reason.
@@ -291,11 +321,6 @@ POOL_FREE_FAMILIES = {
     "attention.mla_compress": (
         "max_states is declared from max_num_seqs (vllm/models/deepseek_v4_1/"
         "compressor.py), not from a pool; the compile key does include it"
-    ),
-    "attention.compressed_sparse_mla": (
-        "declared only by the DeepSeek v4.1 integration, outside the Qwen and GLM "
-        "scope; its swa/indexed cache shapes come from the pool tensors and are "
-        "not covered here"
     ),
     "attention.mla": (
         "no vLLM integration declares dense MLA; its query carries num_cache_pages, "
@@ -352,6 +377,46 @@ def _integration_cases():
             "spec": {"max_tokens": 64, "page_size": 64, "record_bytes": record_bytes},
             "pool": {"num_cache_blocks": 1000},
         }
+    yield {
+        "id": "attention.compressed_sparse_mla[ds41 decode dual-cache]",
+        "family": "attention.compressed_sparse_mla",
+        "spec": {
+            "caps": {
+                "num_q_heads": 16,
+                "max_q_rows": 1,
+                "max_width": 384,
+                "max_page_table_width": 4224,
+                "max_kv_rows": 540_672,
+                "swa_width": 256,
+                "indexed_width": 128,
+                "swa_page_size": 256,
+                "indexed_page_size": 128,
+                "cache_format": "deepseek_v41",
+                "mode": "decode",
+                "use_cuda_graph": True,
+            },
+            "q": {
+                "shape": (1, 16, 512),
+                "stride": (8192, 512, 1),
+                "alignment": 16,
+                "dtype": "bfloat16",
+            },
+            "swa_cache": {
+                "stride": (256 * 528, 1),
+                "alignment": 16,
+                "dtype": "uint8",
+            },
+            "indexed_cache": {
+                "stride": (128 * 288, 1),
+                "alignment": 16,
+                "dtype": "uint8",
+            },
+        },
+        "pool": {
+            "swa_cache_shape": (51_591, 256 * 528),
+            "indexed_cache_shape": (67_584, 128 * 288),
+        },
+    }
 
 
 CASES = [*_corpus_cases(), *_integration_cases()]
@@ -424,7 +489,10 @@ def _probe(case):
     _record_planned_facts()
     family = FAMILIES[case["family"]]
     pools = {"base": case["pool"], **{
-        label: {name: perturb(value) for name, value in case["pool"].items()}
+        label: {
+            name: _perturb_pool_value(value, perturb)
+            for name, value in case["pool"].items()
+        }
         for label, perturb in PERTURBATIONS.items()
     }}
     programs = {}
@@ -578,7 +646,10 @@ def _selection_key_parts(case):
     """The query and invocation as the selection cache keys them, per pool."""
     family = FAMILIES[case["family"]]
     pools = {"base": case["pool"], **{
-        label: {name: perturb(value) for name, value in case["pool"].items()}
+        label: {
+            name: _perturb_pool_value(value, perturb)
+            for name, value in case["pool"].items()
+        }
         for label, perturb in PERTURBATIONS.items()
     }}
     parts = {}
@@ -589,7 +660,7 @@ def _selection_key_parts(case):
         parts[label] = {
             "fixed": all(knob.values is not None and len(knob.values) == 1 for knob in contract.knobs),
             "query": encoded.to_dict(),
-            "invocation": plan.invocation.to_dict(),
+            "invocation": contract.invocation_payload(plan.invocation).to_dict(),
         }
     return parts
 

@@ -60,7 +60,75 @@ def test_qsa_key_ignores_the_cache_page_counts():
     assert not {"num_main_cache_pages", "num_compressed_cache_pages"} & set(_encoded(TUNING, query))
 
 
+def _compressed_mla_plan(*, swa_pages: int, indexed_pages: int):
+    from b12x.attention import compressed_sparse_mla as mla
+
+    def descriptor(shape, stride):
+        return {
+            "shape": shape,
+            "stride": stride,
+            "alignment": 16,
+            "dtype": "uint8",
+        }
+
+    swa_page_bytes = 256 * 528
+    indexed_page_bytes = 128 * 288
+    return mla.plan(
+        mla.Caps(
+            device="cpu",
+            num_q_heads=16,
+            max_q_rows=1,
+            max_width=384,
+            max_page_table_width=4224,
+            max_kv_rows=540_672,
+            swa_width=256,
+            indexed_width=128,
+            swa_page_size=256,
+            indexed_page_size=128,
+            cache_format="deepseek_v41",
+            mode="decode",
+            use_cuda_graph=True,
+        ),
+        invocation=mla.invocation_from_descriptors(
+            q={
+                "shape": (1, 16, 512),
+                "stride": (8192, 512, 1),
+                "alignment": 16,
+                "dtype": "bfloat16",
+            },
+            swa_cache=descriptor(
+                (swa_pages, swa_page_bytes), (swa_page_bytes, 1)
+            ),
+            indexed_cache=descriptor(
+                (indexed_pages, indexed_page_bytes), (indexed_page_bytes, 1)
+            ),
+        ),
+    )
+
+
+def test_compressed_mla_key_ignores_cache_page_counts_but_retains_full_abi():
+    from b12x.attention.compressed_sparse_mla._tuning import TUNING
+
+    base = _compressed_mla_plan(swa_pages=51_591, indexed_pages=67_584)
+    grown = _compressed_mla_plan(swa_pages=51_715, indexed_pages=67_708)
+
+    assert _encoded(TUNING, base.query) == _encoded(TUNING, grown.query)
+    assert TUNING.invocation_payload(base.invocation) == TUNING.invocation_payload(
+        grown.invocation
+    )
+    assert not {"swa_cache_shape", "indexed_cache_shape"} & set(
+        _encoded(TUNING, base.query)
+    )
+    assert base.query.swa_cache_shape == (51_591, 256 * 528)
+    assert grown.query.swa_cache_shape == (51_715, 256 * 528)
+    assert base.invocation != grown.invocation
+    encoded_swa = TUNING.invocation_payload(base.invocation)["swa_k_cache"]
+    assert encoded_swa["shape_tail"] == (256 * 528,)
+    assert "shape" not in encoded_swa
+
+
 def test_pool_dependent_contracts_exclude_pool_size_fields():
+    from b12x.attention.compressed_sparse_mla._tuning import TUNING as COMPRESSED_MLA
     from b12x.attention.qsa._tuning import TUNING as QSA
     from b12x.sequence.gdn_decode._tuning import TUNING as GDN_DECODE
     from b12x.sequence.gdn_prefill._tuning import TUNING as GDN_PREFILL
@@ -71,4 +139,5 @@ def test_pool_dependent_contracts_exclude_pool_size_fields():
     assert "max_state_slots" not in PLE.query_fields and PLE.query_schema_version == 4
     assert not {"num_main_cache_pages", "num_compressed_cache_pages"} & QSA.query_fields
     assert QSA.query_schema_version == 6
-
+    assert not {"swa_cache_shape", "indexed_cache_shape"} & COMPRESSED_MLA.query_fields
+    assert COMPRESSED_MLA.query_schema_version == 6

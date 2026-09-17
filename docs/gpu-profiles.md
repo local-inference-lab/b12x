@@ -63,6 +63,13 @@ count when present and otherwise uses the prefill capacity, passing live M
 to the native launch. A live count within capacity does not declare another
 plan. Kernels with a static-M ABI still require their exact specialization.
 
+WO projection defaults to exact-M preparation. Its optional invocation
+`dynamic_tokens=True` permits live rows within a prepared capacity.
+The ordinary native GEMMs and packing use the live count and group strides;
+small fused decode declarations remain exact. Preparing one large capacity
+therefore covers arbitrary prefix-replay suffixes without padding, changing
+precision, or declaring/JIT-compiling a serving-time plan.
+
 ## Selection and cache semantics
 
 With autotuning enabled, selection precedence is:
@@ -385,6 +392,28 @@ rank coordination, and its `between_advances` measures the external driver.
 These nested totals must not be added together.
 
 ## Native benchmark consumers
+
+`B12X_PCIE_DCP_HEAD_GATHER_PUSH=1` opts into the experimental native posted-write
+decode-context-parallel head gather for four ranks, BF16, 64 global heads, and a
+512-element head dimension. The default `0` selects the pull transport.
+`query_from_runtime(..., call={..., "peer_write": True})` can pin the posted-write
+transport explicitly. The control is captured in declaration metadata and the
+compiled launcher identity; changing it after preparation does not change binding
+or graph replay. Other push geometry fails closed. The posted-write DCP channel
+uses its IPC slab, system-scope barrier, graph slots, and L1-bypassing incoming loads.
+Serialized launch and replay remain required; this transport is not a qualified
+default.
+
+`B12X_PCIE_TP4_REMOTE_PUSH=1` enables the experimental native plain BF16
+all-reduce for four-rank tensor parallelism, DeepSeek V4.1 widths 5120 and 1280,
+and one through eight rows within the declared eager-slot capacity. Other plain
+shapes use the pull transport, and the default remains off. The transport uses
+four source shards, alternating graph slots, and a system-scope barrier.
+Destinations are rank-staggered, incoming loads bypass L1, and accumulation uses
+rotating-rank FP32 addition followed by one BF16 rounding operation. The
+four-rank tensor-parallel preparation path snapshots the flag and checks rank
+agreement before allocating IPC; binding and replay do not reread it. Fused
+four-rank tensor-parallel eligibility is unchanged.
 
 `benchmarks/benchmark_startup_autotuner.py` uses the same declarations and
 session with explicit retained benchmark calls. Its optional group subsets are

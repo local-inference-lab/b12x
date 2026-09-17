@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from b12x._lib.compile_plan import attach_programs, load_programs
+
 from b12x._lib.compile_pool import CompileJob
 from b12x.preparation import (
     CollectiveRequirement,
@@ -55,6 +57,7 @@ def _runtime_slab_bytes(runtime) -> int:
 def _surface_for_runtime(runtime) -> str:
     name = runtime.__class__.__name__
     return {
+        "PCIePagedKvReplica": "PagedKvReplica.replicate",
         "PCIeDCPTopKOwnerExchange": "DcpTopKOwnerExchange.stage_candidates",
         "PCIeVocabParallelArgmax": "VocabParallelArgmax.fused_add_argmax",
         "PCIeHierarchicalAllReduce": "PCIeHierarchicalAllReduce.all_reduce",
@@ -82,7 +85,11 @@ def query_from_runtime(runtime, *, surface: str | None = None, call=FrozenMappin
         raise TypeError("unsupported PCIe runtime owner")
     raw = dict(call)
     controls = {}
-    if surface == "DcpTopKOwnerExchange.stage_candidates":
+    if surface == "PagedKvReplica.replicate":
+        controls = {name: int(raw[name]) for name in ("page_size", "stripe", "ratio", "max_tokens")}
+        setup = {"max_requests": runtime.max_requests, "max_tokens": runtime.max_tokens,
+                 "local_capacity": runtime.local_capacity, "slab_bytes": runtime.slab_bytes}
+    elif surface == "DcpTopKOwnerExchange.stage_candidates":
         indices, scores = raw["local_indices"], raw["local_scores"]
         controls = {
             "topk": int(runtime.topk),
@@ -138,6 +145,10 @@ def compile_owner_surface(query_payload, ordinal):
     query = PcieQuery(**dict(query_payload))
     call = query.call
     with torch.cuda.device(ordinal):
+        if query.surface == "PagedKvReplica.replicate":
+            from ._kv_replica_cute import get_kv_replica_launchers
+            return get_kv_replica_launchers(query.world_size, query.rank, call["page_size"],
+                                           call["stripe"], call["ratio"])
         if query.surface == "DcpTopKOwnerExchange.stage_candidates":
             from ._dcp_topk_cute import _get_compiled_topk_stage
             return _get_compiled_topk_stage(query.world_size, query.rank, call["topk"], call["threads"])
@@ -201,6 +212,9 @@ def plan(query: PcieQuery, *, runtime, invocation=FrozenMapping(), override: Pci
         )
 
     def materialize(selection, device):
+        if query.surface == "PagedKvReplica.replicate":
+            launchers = load_programs(compile_owner_surface(TUNING.encode_query(query), device.ordinal))
+            return attach_programs(_OwnerState(query, runtime, launchers), launchers)
         return _OwnerState(query, runtime, compile_owner_surface(TUNING.encode_query(query), device.ordinal))
 
     return Plan(contract=TUNING, query=query, invocation=FrozenMapping(), override=override, _device=_runtime_device(runtime), _compile_jobs=lambda _config, device: (CompileJob.create("b12x.comm.pcie._owner_preparation:compile_owner_surface", TUNING.encode_query(query), device.ordinal),), _memory_requirements=memory, _materialize=materialize)
@@ -221,6 +235,24 @@ def collective(runtime, *, key: str) -> CollectiveRequirement:
 def prepared_call(state, **actual):
     """Build a priming call that invokes the materialized native owner state."""
     runtime, query = state.runtime, state.query
+    if query.surface == "PagedKvReplica.replicate":
+        binding = runtime._bind_prepared(
+            state,
+            actual["cache"],
+            actual["table"],
+            actual["positions"],
+            actual["starts"],
+            actual["out"],
+        )
+        return PreparedCall(
+            run=lambda: runtime._run_prepared(
+                state,
+                binding,
+                requests=actual["requests"],
+                max_tokens=actual["max_tokens"],
+            ),
+            output=actual["out"], capture_safe=True,
+        )
     if query.surface == "DcpTopKOwnerExchange.stage_candidates":
         def run():
             return runtime._stage_candidates_on_device(

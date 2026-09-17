@@ -13,8 +13,10 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
     fmax_f32,
+    ld_global_cg_v4_u32,
     ld_global_v4_u32,
     st_global_v4_u32,
     u32_as_f32,
@@ -805,6 +807,12 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
 
 
 class _AllGatherHeadsLaunch(_DCPA2ABase):
+    def __init__(
+        self, world_size, rank, threads, device_slot_selection, peer_write=False
+    ):
+        super().__init__(world_size, rank, threads, device_slot_selection)
+        self._peer_write = bool(peer_write)
+
     @cute.jit
     def __call__(
         self,
@@ -1027,10 +1035,25 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 )
                 pack = lane
                 while pack < packs_per_head:
-                    _copy_16b(
-                        local_input + base * Int64(4) + Int64(pack) * Int64(4),
-                        local_stage + base * Int64(4) + Int64(pack) * Int64(4),
+                    source = (
+                        local_input + base * Int64(4) + Int64(pack) * Int64(4)
                     )
+                    if cutlass.const_expr(self._peer_write):
+                        words = ld_global_v4_u32(source.toint())
+                        offset = (
+                            Int64(row) * Int64(packs_per_head) + Int64(pack)
+                        ) * Int64(4)
+                        for peer in cutlass.range_constexpr(self._world_size):
+                            if cutlass.const_expr(peer != self._rank):
+                                destination = (
+                                    self._staging_words(staging[peer]) + offset
+                                )
+                                st_global_v4_u32(destination.toint(), *words)
+                    else:
+                        _copy_16b(
+                            source,
+                            local_stage + base * Int64(4) + Int64(pack) * Int64(4),
+                        )
                     pack += Int32(32)
             row += warp_stride
 
@@ -1064,19 +1087,35 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                     if cutlass.const_expr(source == self._rank):
                         source_words = local_input
                     else:
-                        source_words = self._staging_words(staging[source])
+                        if cutlass.const_expr(self._peer_write):
+                            source_words = local_stage
+                        else:
+                            source_words = self._staging_words(staging[source])
+                    selected_base = source_base
+                    if cutlass.const_expr(self._peer_write and source != self._rank):
+                        selected_base = output_base
                     source_address = Int64(
-                        (source_words + source_base * Int64(4)).toint()
+                        (source_words + selected_base * Int64(4)).toint()
                     )
             output_address = Int64(
                 (output + output_base * Int64(4)).toint()
             )
             pack = lane
             while pack < packs_per_head:
-                _copy_16b_addr(
-                    source_address + Int64(pack) * Int64(16),
-                    output_address + Int64(pack) * Int64(16),
-                )
+                if cutlass.const_expr(self._peer_write):
+                    # Peer stores are ordered by the system barrier, but do not
+                    # invalidate this SM's L1 lines from an earlier replay.
+                    words = ld_global_cg_v4_u32(
+                        source_address + Int64(pack) * Int64(16)
+                    )
+                    st_global_v4_u32(
+                        output_address + Int64(pack) * Int64(16), *words
+                    )
+                else:
+                    _copy_16b_addr(
+                        source_address + Int64(pack) * Int64(16),
+                        output_address + Int64(pack) * Int64(16),
+                    )
                 pack += Int32(32)
             row += warp_stride
 
@@ -1956,7 +1995,7 @@ def _get_compiled_lse_reduce_scatter(
         )
 
     _PREPARED_LSE_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _gather_launcher_key(
@@ -1964,12 +2003,14 @@ def _gather_launcher_key(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    peer_write: bool = False,
 ) -> tuple[object, ...]:
     return (
         int(world_size),
         int(rank),
         int(threads),
         bool(device_slot_selection),
+        bool(peer_write),
     )
 
 
@@ -1978,12 +2019,14 @@ def is_all_gather_heads_prepared(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    peer_write: bool = False,
 ) -> bool:
     return _gather_launcher_key(
         world_size,
         rank,
         threads,
         device_slot_selection,
+        peer_write,
     ) in _PREPARED_GATHER_LAUNCHERS
 
 
@@ -1993,18 +2036,21 @@ def _get_compiled_all_gather_heads(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    peer_write: bool = False,
 ) -> Callable:
     launch = _AllGatherHeadsLaunch(
         world_size,
         rank,
         threads,
         device_slot_selection,
+        peer_write,
     )
     key = (
         int(world_size),
         int(rank),
         int(threads),
         bool(device_slot_selection),
+        bool(peer_write),
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2023,13 +2069,14 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
             key,
             labels=(
                 "world_size",
                 "rank",
                 "threads",
                 "device_slot_selection",
+                "peer_write",
             ),
         ),
     )
@@ -2066,7 +2113,7 @@ def _get_compiled_all_gather_heads(
         )
 
     _PREPARED_GATHER_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _pair_launcher_key(
@@ -2198,7 +2245,7 @@ def _get_compiled_all_gather_pair(
         )
 
     _PREPARED_PAIR_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def is_kimi_topk16_prepared(threads: int = 256) -> bool:
@@ -2251,7 +2298,7 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
         )
 
     _PREPARED_KIMI_TOPK_LAUNCHERS.add(normalized_threads)
-    return run
+    return attach_programs(run, raw)
 
 
 def lse_reduce_scatter(

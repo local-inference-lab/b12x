@@ -6,6 +6,7 @@ materialized state and no runtime path consults a compiler cache.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -13,6 +14,7 @@ from typing import Mapping
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.compile_plan import load_programs
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,
@@ -87,6 +89,15 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     elif surface.endswith("all_gather_heads"):
         value = _call_value(call, "local_input")
         metadata.update(dtype=str(value.dtype), shape=tuple(value.shape), stride=tuple(value.stride()))
+        push = call.get("peer_write")
+        if push is None:
+            raw = os.getenv("B12X_PCIE_DCP_HEAD_GATHER_PUSH", "0")
+            if raw not in ("0", "1"):
+                raise ValueError("B12X_PCIE_DCP_HEAD_GATHER_PUSH must be 0 or 1")
+            push = raw == "1"
+        if type(push) is not bool:
+            raise ValueError("DCP head gather peer_write must be a bool")
+        metadata["peer_write"] = push
     elif surface.endswith("all_gather_pair"):
         first, second = _call_value(call, "local_first"), _call_value(call, "local_second")
         metadata.update(first_dtype=str(first.dtype), second_dtype=str(second.dtype), first_shape=tuple(first.shape), second_shape=tuple(second.shape))
@@ -109,7 +120,12 @@ def compile_dcp_surface(query_payload, ordinal):
         if surface.endswith("lse_reduce_scatter"):
             return {slot: cute._get_compiled_lse_reduce_scatter(query.world_size, query.rank, call["dtype"], int(call["threads"]), slot) for slot in (False, True)}
         if surface.endswith("all_gather_heads"):
-            return {slot: cute._get_compiled_all_gather_heads(query.world_size, query.rank, int(call["threads"]), slot) for slot in (False, True)}
+            return {
+                slot: cute._get_compiled_all_gather_heads(
+                    query.world_size, query.rank, int(call["threads"]), slot,
+                    bool(call.get("peer_write", False)),
+                ) for slot in (False, True)
+            }
         if surface.endswith("all_gather_pair_kimi_topk"):
             return {slot: cute._get_compiled_all_gather_pair(query.world_size, query.rank, 512, slot, True) for slot in (False, True)}
         if surface.endswith("all_gather_pair"):
@@ -141,7 +157,12 @@ class _DcpExecutionState:
         if surface.endswith("lse_reduce_scatter"):
             return self.runtime._lse_reduce_scatter_on_device(call["partial_output"], call["partial_lse"], call.get("out"), state=self, is_lse_base_on_e=call.get("is_lse_base_on_e", True), threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
         if surface.endswith("all_gather_heads"):
-            return self.runtime._all_gather_heads_on_device(call["local_input"], call.get("out"), state=self, threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
+            binding = call.get("binding")
+            if binding is not None:
+                local_input, out = binding.local_input, binding.out
+            else:
+                local_input, out = call["local_input"], call.get("out")
+            return self.runtime._all_gather_heads_on_device(local_input, out, state=self, peer_write_bound=binding is not None, threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
         if surface.endswith("all_gather_pair_kimi_topk"):
             return self.runtime._all_gather_pair_kimi_topk_on_device(call["local_down"], call["local_router"], call["correction_bias"], call.get("out_down"), call.get("topk_weights"), call.get("topk_ids"), state=self)
         if surface == "kimi_topk16":
@@ -178,7 +199,7 @@ def plan(query: PcieQuery, *, runtime=None, invocation=FrozenMapping(), override
         raise ValueError("DCP invocation semantics belong in PcieQuery")
 
     def materialize(selection, device):
-        launchers = compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
+        launchers = load_programs(compile_dcp_surface(TUNING.encode_query(query), device.ordinal))
         return _DcpExecutionState(query, runtime, MappingProxyType(dict(launchers)))
 
     resident = int(getattr(runtime, "_slot_bytes", 0)) * 2
@@ -195,6 +216,13 @@ def prepare_call(state: _DcpExecutionState, **call):
     if not isinstance(state, _DcpExecutionState):
         raise TypeError("DCP callback requires its materialized state")
     surface = state.query.surface
+    if surface.endswith("all_gather_heads") and state.query.call.get(
+        "peer_write", False
+    ):
+        call = dict(call)
+        call["binding"] = state.runtime._bind_all_gather_heads(
+            state, call["local_input"], call["out"]
+        )
     if surface.endswith("all_gather_pair_kimi_topk"):
         output = (call.get("out_down"), call.get("topk_weights"), call.get("topk_ids"))
     elif surface.endswith("all_gather_pair"):

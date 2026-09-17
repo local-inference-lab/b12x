@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from b12x.preparation import (
-    CollectiveRequirement, DetectedDevice, MemoryRequirements,
+    CollectiveRequirement, DetectedDevice, FrozenMapping, MemoryRequirements,
     PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
     current_prepared_state, plan_from_handle, require_prepared,
 )
@@ -289,6 +289,52 @@ def test_complete_race_cached_restart_and_disabled_precedence(tmp_path, monkeypa
         result = engine.prepare((request(name="pin", tuning=contract(), pin=Config(9), calls=calls),))
         assert result.selections["pin"].source == "override"
     assert calls == [6, 6, 21, 27]
+
+
+def test_invocation_codec_coalesces_declarations_and_reuses_cached_selection(
+    tmp_path, monkeypatch
+):
+    from b12x.preparation.session import _declaration_key
+
+    _deterministic_timer(monkeypatch)
+    tuning = replace(
+        contract(),
+        encode_invocation=lambda invocation: {"layout": invocation["layout"]},
+    )
+
+    def make_plan(pages):
+        return Plan(
+            contract=tuning,
+            query=Query(3),
+            invocation=FrozenMapping({"layout": "paged", "live_pages": pages}),
+            _compile_jobs=lambda config, device: (),
+            _memory_requirements=lambda config, device: MemoryRequirements(),
+            _materialize=lambda selection, device: SimpleNamespace(
+                value=selection.config.width * 3
+            ),
+        )
+
+    first = make_plan(51_591)
+    restarted = make_plan(51_715)
+    assert first.invocation != restarted.invocation
+    assert _declaration_key(first) == _declaration_key(restarted)
+
+    def benchmark(state):
+        return PreparedCall(run=lambda: state.value, produce=lambda: None)
+
+    with session(tmp_path) as engine:
+        result = engine.prepare((first.request(
+            name="first",
+            prepare_call=lambda state: PreparedCall(run=lambda: state.value),
+            benchmark_call=benchmark,
+        ),))
+        assert result.selections["first"].source == "tuned"
+    with session(tmp_path) as engine:
+        result = engine.prepare((restarted.request(
+            name="restart",
+            prepare_call=lambda state: PreparedCall(run=lambda: state.value),
+        ),))
+        assert result.selections["restart"].source == "cached"
 
 
 def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypatch):

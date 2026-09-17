@@ -34,6 +34,7 @@ SURFACES = {
     "DcpAllToAllPool.all_gather_pair_kimi_topk": (2, 4, 8, 16),
     "DcpAllToAllPool.kimi_topk16": (2, 4, 8, 16),
     "DcpTopKOwnerExchange.stage_candidates": (2, 3, 4, 6, 8),
+    "PagedKvReplica.replicate": (4,),
     "VocabParallelArgmax.fused_add_argmax": (8, 12, 16),
     "PCIeHierarchicalAllReduce.all_reduce": (12, 16),
     "PCIeIslandRSAllReduce.all_reduce": (16,),
@@ -78,8 +79,35 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(
             "PCIe collectives require caller-established CUDA IPC topology"
         )
+    if query.surface == "PagedKvReplica.replicate":
+        call = query.call
+        if (call["ratio"] not in (1, 2) or call["page_size"] not in (128, 256)
+                or type(call["stripe"]) is not int or call["stripe"] <= 0
+                or call["page_size"] % call["stripe"]):
+            raise ValueError(
+                "unsupported DeepSeek V4.1 replica compression/page/stripe geometry"
+            )
+        if not 0 < call["max_tokens"] <= query.setup["max_tokens"]:
+            raise ValueError("replica declaration exceeds the channel's token capacity")
+        cycles, tail = divmod(call["max_tokens"], call["stripe"] * query.world_size)
+        max_owned = cycles * call["stripe"] + min(tail, call["stripe"])
+        if max_owned > query.setup["local_capacity"]:
+            raise ValueError(
+                "replica stripe geometry exceeds the channel's owner capacity"
+            )
+    if query.surface.endswith("all_gather_heads"):
+        push = query.call.get("peer_write", False)
+        if type(push) is not bool:
+            raise ValueError("DCP head gather peer_write must be a bool")
+        if push and (
+            query.world_size != 4
+            or query.call["dtype"] != "torch.bfloat16"
+            or query.setup["total_heads"] != 64
+            or query.setup["query_head_dim"] != 512
+        ):
+            raise ValueError("posted-write DCP head gather requires TP4 BF16 64x512 heads")
 
 
-TUNING = replace(TUNING, query_schema_version=4, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=6, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

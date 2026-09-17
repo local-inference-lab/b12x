@@ -87,6 +87,12 @@ def test_metadata_requires_explicit_nonfinite_codec():
     assert FrozenMapping({"limit": "+inf"}).to_dict() == {"limit": "+inf"}
 
 
+def test_invocation_codec_requires_a_mapping():
+    tuning = replace(contract(), encode_invocation=lambda invocation: None)
+    with pytest.raises(TypeError, match="invocation codec must return a mapping"):
+        tuning.invocation_payload({"live_pages": 1})
+
+
 def test_packed_forced_a16_fallback_and_quantized_pin_remain_distinct():
     from b12x.preparation import DeviceIdentity
     from b12x.gemm.blockscaled._tuning import BlockscaledQuery, BlockscaledConfig, TUNING

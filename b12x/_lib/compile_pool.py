@@ -52,6 +52,7 @@ class CompileJob:
     factory: str
     args: tuple[object, ...] = ()
     kwargs: tuple[tuple[str, object], ...] = ()
+    selection_identity: object | None = None
 
     def __post_init__(self):
         module, separator, name = self.factory.partition(":")
@@ -60,6 +61,7 @@ class CompileJob:
             raise ValueError("compile factories require an importable module:attribute")
         _validate_metadata(self.args)
         _validate_metadata(self.kwargs)
+        _validate_metadata(self.selection_identity)
         if any(not isinstance(key, str) for key, value in self.kwargs):
             raise TypeError("compile keyword names must be strings")
 
@@ -67,6 +69,22 @@ class CompileJob:
     def create(cls, factory: str, *args: object, **kwargs: object):
         # __post_init__ also validates direct construction and rejects tensors.
         return cls(factory=factory, args=tuple(args), kwargs=tuple(sorted(kwargs.items())))
+
+    @classmethod
+    def create_for_selection(
+        cls,
+        factory: str,
+        selection_identity: object,
+        *args: object,
+        **kwargs: object,
+    ) -> CompileJob:
+        """Retain full factory inputs while deduplicating one selection."""
+        return cls(
+            factory=factory,
+            args=tuple(args),
+            kwargs=tuple(sorted(kwargs.items())),
+            selection_identity=selection_identity,
+        )
 
 
 def _factory(reference):
@@ -463,7 +481,12 @@ class CompilePool:
     def plan(self, jobs: Iterable[CompileJob]) -> tuple[CompilationPlan, ...]:
         result = []
         for job in jobs:
-            payload = pickle.dumps(job, protocol=5)
+            identity = (
+                job
+                if job.selection_identity is None
+                else (job.factory, job.selection_identity)
+            )
+            payload = pickle.dumps(identity, protocol=5)
             if payload not in self._plans:
                 self._plans[payload] = describe_compilation(job)
             result.append(self._plans[payload])
