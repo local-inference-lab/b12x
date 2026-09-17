@@ -35,7 +35,9 @@ each device and is initialized before binding or replay.
 
 The W4A16 kernel asynchronously stages compact descriptors, FP16 bases and
 paired subscales in shared memory. It copies the magnitude table once per CTA
-and loads descriptors and metadata at fragment use. Shared word loads preserve
+and loads descriptors and metadata at fragment use. Descriptor sign bits are
+applied to packed BF16 pairs after rounding, preserving exact signed results.
+Shared word loads preserve
 pipeline ordering. IQ2_XS rolls the pipeline stage loop to bound decoder code
 size; microbatch execution uses split-K scheduling with up to two resident
 256-thread CTAs per SM. Microbatch CTAs publish split-K partials in parallel;
@@ -45,6 +47,8 @@ partial per possible resident CTA before binding or capture (at least
 Codec-specific packing, staging, and register decoding
 are separate from routing, BF16 MMA, activation, reduction and workspace planning.
 Additional IQ codecs require their own exact layout and decoding contracts.
+IQ2_XS uses `W4A16FusedMoeKernel`, including its M8 specialization. The separate
+`MoEMicroKernel` and FP8/FP4 activation paths do not support IQ2_XS.
 
 Packed routing supports planned capacities with runtime live token counts.
 Direct tensor-core routing with fused top-k accumulation is also available
@@ -89,15 +93,16 @@ Its single-sample qualification timings are not autobench evidence.
 ## Qualification evidence
 
 On an RTX PRO 6000 Blackwell Max-Q, CUDA 13.0 / Torch 2.12.0 and CUTLASS DSL
-4.6.2, code revision `75903e4a` and checkpoint revision `b5a12f1d999b5d8e1850ecd2f5f4c5b0ce2d16a2`
+4.6.2, code revision `e2b70867` and checkpoint revision `b5a12f1d999b5d8e1850ecd2f5f4c5b0ce2d16a2`
 passed 540 cases: layers 0/20/39, TP1 and both TP2 ranks, all 256 experts
 resident, top-k=8, live counts 1/2/4/8/16/32/128/512, and balanced, hot and
 imbalanced routes. Packed execution also covered deterministic output.
-Minimum cosine was 0.99998391 eagerly and 0.99998033 after changed-input
-replay; maximum relative L2 was 0.00572089 eagerly and 0.00629863 after replay. Every case passed zero-contribution,
+Minimum cosine was 0.99998379 eagerly and 0.99996758 after changed-input
+replay; maximum relative L2 was 0.00574489 eagerly and 0.00806719 after replay.
+Every case passed zero-contribution,
 poison, address-stability and replay-allocation checks.
 
-Code revision `75903e4a` also qualified 99 checkpoint cases using layer 0,
+Code revision `e2b70867` also qualified 99 checkpoint cases using layer 0,
 TP1 and both TP2 ranks, live counts
 1/3/8/16 and reordered local expert IDs
 `[255, 0, 17, 5, 127, 7, 253, 64, 128, 1]`. They passed the same checks,
@@ -113,7 +118,7 @@ multiple live counts within one capacity.
 The canonical microbenchmark on physical GPU 11
 (`GPU-c7dc46e0-30bb-08e8-2ebb-f164ec57ce31`) used layer 0, TP1,
 warmup=10, iterations=20, repeats=5, CUDA graphs, a 256 MiB L2 flush and
-fast math. Code revision `75903e4a` measured the IQ2_XS checkpoint. The comparison at
+fast math. Code revision `e2b70867` measured the IQ2_XS checkpoint. The comparison at
 code revision `aee141aa` measured `nvidia/Qwen3.6-35B-A3B-NVFP4` at snapshot
 `491c2f1ea524c639598bf8fa787a93fed5a6fbce`, using BF16 activations through
 W4A16 and identical geometry and benchmark settings.
@@ -121,12 +126,12 @@ W4A16 and identical geometry and benchmark settings.
 | Live tokens | IQ2_XS graph µs | NVFP4 W4A16 graph µs |
 | --- | ---: | ---: |
 | 1 | 32.8 | 20.5 |
-| 2 | 36.9 | 26.6 |
-| 4 | 57.7 | 43.0 |
-| 8 | 88.1 | 77.8 |
-| Geometric mean | 49.8 | 36.8 |
+| 2 | 34.8 | 26.6 |
+| 4 | 55.3 | 43.0 |
+| 8 | 84.0 | 77.8 |
+| Geometric mean | 48.0 | 36.8 |
 
-Lower is better: IQ2_XS latency is 1.35 times NVFP4 W4A16 latency. All four
+Lower is better: IQ2_XS latency is 1.30 times NVFP4 W4A16 latency. All four
 oracle checks passed for each checkpoint. Use
 `--model-profile qwen36-35b-nvfp4 --quant-mode w4a16` for the NVFP4 comparison.
 Resident IQ2_XS payload is 222 MiB per TP1 layer, or 8.671875 GiB across all
