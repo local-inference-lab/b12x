@@ -7697,9 +7697,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             {extract}
             shr.u32 signs{index}, d{index}, 9;
             popc.b32 parity{index}, signs{index};
-            and.b32 parity{index}, parity{index}, 1;
-            shl.b32 parity{index}, parity{index}, 7;
-            or.b32 signs{index}, signs{index}, parity{index};
+            mad.lo.u32 signs{index}, parity{index}, 128, signs{index};
             shr.u32 signs{index}, signs{index}, $9;
             and.b32 d{index}, d{index}, 0x1ff;
             {load}
