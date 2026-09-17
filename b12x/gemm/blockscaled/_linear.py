@@ -11,12 +11,8 @@ from typing import Any, TypeAlias
 import cutlass.cute as cute
 import torch
 
-from b12x._lib.dense_gemm import (
-    _dense_spark_policy_for_sm_count,
-    dense_gemm,
-)
-from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
-from b12x._lib.utils import cuda_stream_to_int, get_num_sm
+from b12x._lib.dense_gemm import _dense_spark_policy_for_sm_count
+from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,
@@ -434,6 +430,15 @@ def pack_weight(
     )
 
 
+def _fixed_state(plan_handle: int, source: torch.Tensor):
+    """Prepared fixed state for ``source``, resolving a declared regime by its rows."""
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source.device
+    )
+    resolve = getattr(state, "resolve", None)
+    return state if resolve is None else resolve(source)
+
+
 @torch.library.custom_op(
     "b12x::blockscaled_serialized",
     mutates_args=(),
@@ -453,9 +458,7 @@ def _blockscaled_serialized_op(
     plan_handle: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    state = require_prepared(
-        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", lhs_values.device
-    )
+    state = _fixed_state(plan_handle, lhs_values)
     return state.run_serialized(
         lhs_values,
         lhs_scale_storage,
@@ -506,9 +509,7 @@ def _packed_mxfp8_op(
     plan_handle: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    state = require_prepared(
-        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source_2d.device
-    )
+    state = _fixed_state(plan_handle, source_2d)
     return state.run_mxfp8(
         source_2d,
         weight_values,
@@ -548,9 +549,7 @@ def _packed_mxfp8_prequantized_op(
     out_dtype: torch.dtype,
     stream_int: int | None,
 ) -> torch.Tensor:
-    state = require_prepared(
-        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source_values.device
-    )
+    state = _fixed_state(plan_handle, source_values)
     return state.run_mxfp8(
         source_values,
         weight_values,
@@ -712,9 +711,7 @@ def _packed_tensor_fp8_op(
     out_dtype: torch.dtype,
     stream_int: int | None,
 ) -> torch.Tensor:
-    state = require_prepared(
-        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source_2d.device
-    )
+    state = _fixed_state(plan_handle, source_2d)
     return state.run_tensor_fp8(
         source_2d,
         weight_values,

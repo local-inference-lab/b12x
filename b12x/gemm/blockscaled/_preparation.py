@@ -13,8 +13,8 @@ from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from ._tuning import (
-    BlockscaledConfig, BlockscaledQuery, TUNING, effective_a16_config,
-    functional_mxfp8_quantization,
+    FIXED_TUNING, BlockscaledConfig, BlockscaledQuery, FixedBlockscaledQuery, TUNING,
+    effective_a16_config, functional_mxfp8_quantization,
 )
 
 
@@ -373,7 +373,8 @@ def _fixed_lowering(query, device):
     use_block = False
     if recipe == "tensor_fp8":
         use_block = _use_block_fp8_recipe(
-            live_m=query.max_rows, expected_m=query.expected_m,
+            live_m=query.max_rows,
+            expected_m=query.max_rows if query.expected_m is None else query.expected_m,
             out_features=query.out_features, padded_in_features=query.padded_in_features,
             sm_count=device.identity.sm_count,
         )
@@ -389,7 +390,6 @@ def _fixed_lowering(query, device):
 
 def compile_fixed(query_payload, lowering_payload, ordinal, sm_count):
     from b12x._lib import dense_gemm as dense
-    from ._tuning import FixedBlockscaledQuery
     query = FixedBlockscaledQuery(**dict(query_payload))
     with torch.cuda.device(ordinal):
         programs = dense._compile_dense_lowering(lowering_payload, ordinal)
@@ -418,8 +418,13 @@ class _FixedExecutionState:
         if source.ndim != 2 or source.device != self.device or source.dtype != getattr(torch, q.input_dtype):
             raise ValueError("fixed source layout/dtype/device differs from preparation")
         expected_k = q.in_features // 2 if serialized and q.recipe in ("nvfp4", "mxfp4") else q.in_features
-        if source.shape[1] != expected_k or source.shape[0] not in (0, q.max_rows):
-            raise ValueError("fixed execution requires its exact planned nonempty M and logical K")
+        if source.shape[1] != expected_k:
+            raise ValueError("fixed execution logical K differs from preparation")
+        rows = source.shape[0]
+        if rows > q.max_rows:
+            raise ValueError(f"fixed execution rows {rows} exceed capacity {q.max_rows}")
+        if q.expected_m is not None and rows not in (0, q.max_rows):
+            raise ValueError("fixed execution requires its exact planned nonempty M")
         weight_k = q.padded_in_features // 2 if serialized and q.recipe in ("nvfp4", "mxfp4") else q.padded_in_features
         if weight.device != self.device or weight.shape != (q.out_features, weight_k):
             raise ValueError("fixed weight geometry/device differs from preparation")
@@ -430,7 +435,6 @@ class _FixedExecutionState:
                        *, ab_dtype, sf_dtype, c_dtype, sf_vec_size, block_fp8, stream):
         from ._a16 import _stream_context, scale_storage
         from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
-        from b12x.gemm._tuning import DenseGemmQuery, operand_options
         q = self.query
         if q.call_kind != "serialized":
             raise ValueError("execution does not prepare serialized operands")
@@ -507,6 +511,9 @@ class _FixedExecutionState:
             return source_values.new_empty((0, q.out_features), dtype=out_dtype)
         with torch.cuda.device(self.device), _stream_context(stream, self.device):
             source = _pad_k(source_values, k)
+            # The unit scale is sized for max_rows. Its row blocks sit at
+            # offsets independent of the row count, and the kernel reads only
+            # the live rows, so a dynamic-row state passes the whole buffer.
             return self.dense.run(
                 (source.view(m, k, 1), self.unit_scale),
                 (weight_values.view(q.out_features, k, 1), weight_block_scale if self.use_block else weight_scale_mma),
@@ -515,7 +522,6 @@ class _FixedExecutionState:
 
 
 def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
-    from ._tuning import FIXED_TUNING
     if invocation:
         raise ValueError("fixed packed semantics belong in FixedBlockscaledQuery")
     cache = {}
@@ -565,7 +571,6 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
 
 
 def plan(query, *, invocation=FrozenMapping(), override=None):
-    from ._tuning import FixedBlockscaledQuery
     from b12x.gemm._tuning import DenseGemmQuery
     if isinstance(query, BlockscaledQuery):
         return _plan_bf16(query, invocation=invocation, override=override)
@@ -593,52 +598,75 @@ class _PackedRegimeState:
 
     def resolve(self, source: torch.Tensor) -> _PackedExecutionState:
         rows = source.numel() // self.capacity.query.in_features
-        if rows > self.capacity.query.num_tokens:
-            raise ValueError(
-                f"packed execution rows {rows} exceed capacity "
-                f"{self.capacity.query.num_tokens}"
-            )
-        return self.exact.get(rows, self.capacity)
+        return _resolve_regime(self, rows, self.capacity.query.num_tokens)
+
+
+@dataclass(frozen=True)
+class _FixedRegimeState:
+    """Exact static-shape fixed states plus one bounded dynamic-row state."""
+
+    capacity: _FixedExecutionState
+    exact: MappingProxyType
+
+    def resolve(self, source: torch.Tensor) -> _FixedExecutionState:
+        return _resolve_regime(self, source.shape[0], self.capacity.query.max_rows)
+
+
+def _resolve_regime(regimes, rows, capacity):
+    if rows > capacity:
+        raise ValueError(f"packed execution rows {rows} exceed capacity {capacity}")
+    return regimes.exact.get(rows, regimes.capacity)
 
 
 def plan_regimes(
-    query: BlockscaledQuery,
+    query: BlockscaledQuery | FixedBlockscaledQuery,
     *,
     exact_m: tuple[int, ...] = (),
     invocation=FrozenMapping(),
     override=None,
 ):
-    """Declare exact static shapes and a dynamic fallback through one execution."""
-    if not isinstance(query, BlockscaledQuery):
-        raise TypeError("packed regime planning requires BlockscaledQuery")
+    """Declare exact static shapes and a dynamic fallback through one execution.
+
+    ``query`` is the capacity declaration and must leave ``expected_m`` unset.
+    Each count in ``exact_m`` gets its own static-shape child; every other row
+    count up to the capacity runs the capacity child.
+    """
+    if isinstance(query, BlockscaledQuery):
+        capacity, rows_field, contract = query.num_tokens, "num_tokens", TUNING
+        child_plan, regime_state = _plan_bf16, _PackedRegimeState
+    elif isinstance(query, FixedBlockscaledQuery):
+        capacity, rows_field, contract = query.max_rows, "max_rows", FIXED_TUNING
+        child_plan, regime_state = _plan_fixed, _FixedRegimeState
+    else:
+        raise TypeError("packed regime planning requires BlockscaledQuery or FixedBlockscaledQuery")
     if query.expected_m is not None:
         raise ValueError("the packed capacity query must leave expected_m unset")
     counts = tuple(sorted({
         int(rows)
         for rows in exact_m
-        if 0 < int(rows) < query.num_tokens
+        if 0 < int(rows) < capacity
     }))
     if len(counts) != len(tuple(exact_m)):
         raise ValueError("exact M values must be unique and below capacity")
     child_queries = {
-        rows: replace(query, num_tokens=rows, expected_m=rows)
+        rows: replace(query, **{rows_field: rows}, expected_m=rows)
         for rows in counts
     }
-    child_queries[query.num_tokens] = query
+    child_queries[capacity] = query
     children = {
-        rows: _plan_bf16(child, invocation=invocation, override=override)
+        rows: child_plan(child, invocation=invocation, override=override)
         for rows, child in child_queries.items()
     }
+
     def assemble(states, device):
         del device
-        capacity = states[query.num_tokens]
         exact = MappingProxyType({rows: states[rows] for rows in counts})
-        return _PackedRegimeState(capacity, exact)
+        return regime_state(states[capacity], exact)
 
     return _CompositePlan(
-        component_id="gemm.blockscaled_precision",
+        component_id=contract.component_id,
         capacity_metadata=FrozenMapping({
-            "max_rows": query.num_tokens,
+            "max_rows": capacity,
             "exact_m": counts,
         }),
         variants=children,
@@ -650,7 +678,6 @@ def query_from_call(source, weight, *, activation_mode="auto", activation_global
                     out=None, workspace=None, expected_m=None, out_dtype=None, alpha=None, **options):
     from ._a16 import NVFP4LinearWeight
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
-    from ._tuning import FixedBlockscaledQuery
     if isinstance(weight, NVFP4LinearWeight) or (
         isinstance(weight, MXFP8LinearWeight) and isinstance(source, torch.Tensor) and source.dtype == torch.bfloat16
     ):

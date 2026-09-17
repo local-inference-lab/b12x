@@ -47,6 +47,134 @@ def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
     }
 
 
+def _fixed_capacity_query(recipe="block_fp8", **overrides):
+    serialized = recipe != "tensor_fp8"
+    k = 256
+    values = dict(
+        recipe=recipe, call_kind="serialized" if serialized else "packed",
+        max_rows=2048, in_features=k, padded_in_features=k, out_features=512,
+        input_dtype="uint8" if recipe in ("nvfp4", "mxfp4") else "float8_e4m3fn",
+        output_dtype="bfloat16", expected_m=None,
+    )
+    values.update(overrides)
+    return blockscaled.FixedBlockscaledQuery(**values)
+
+
+@pytest.mark.parametrize("recipe", ["block_fp8", "nvfp4", "mxfp4", "tensor_fp8"])
+def test_fixed_regime_plan_declares_one_capacity_and_exact_children(recipe) -> None:
+    from b12x.gemm.blockscaled._tuning import FIXED_TUNING
+
+    query = _fixed_capacity_query(recipe)
+    FIXED_TUNING.validate_query(query, None)
+
+    plan = blockscaled.plan_regimes(query, exact_m=(8, 1, 4))
+
+    assert plan.component_id == "gemm.blockscaled.fixed"
+    assert plan.token_counts == (1, 4, 8, 2048)
+    assert dict(plan.capacity_metadata) == {"max_rows": 2048, "exact_m": (1, 4, 8)}
+    assert plan.variants[2048].query is query
+    for rows in (1, 4, 8):
+        child = plan.variants[rows].query
+        assert (child.max_rows, child.expected_m) == (rows, rows)
+        assert child.recipe == recipe
+        FIXED_TUNING.validate_query(child, None)
+
+
+def test_fixed_regime_plan_rejects_invalid_capacity_declarations() -> None:
+    from b12x.gemm.blockscaled._tuning import FIXED_TUNING
+
+    with pytest.raises(ValueError, match="leave expected_m unset"):
+        blockscaled.plan_regimes(_fixed_capacity_query(expected_m=2048))
+    with pytest.raises(ValueError, match="unique and below capacity"):
+        blockscaled.plan_regimes(_fixed_capacity_query(), exact_m=(1, 2048))
+    with pytest.raises(ValueError, match="unique and below capacity"):
+        blockscaled.plan_regimes(_fixed_capacity_query(), exact_m=(4, 4))
+    with pytest.raises(TypeError, match="BlockscaledQuery or FixedBlockscaledQuery"):
+        blockscaled.plan_regimes(object())
+    packed_mxfp8 = _fixed_capacity_query(
+        "mxfp8", call_kind="packed", input_dtype="float16", output_dtype="float16",
+    )
+    with pytest.raises(ValueError, match="requires serialized operands or tensor-FP8"):
+        FIXED_TUNING.validate_query(packed_mxfp8, None)
+    with pytest.raises(ValueError, match="positive or None"):
+        FIXED_TUNING.validate_query(_fixed_capacity_query(expected_m=0), None)
+
+
+def test_fixed_regimes_resolve_exact_rows_then_capacity() -> None:
+    from types import MappingProxyType, SimpleNamespace
+
+    from b12x.gemm.blockscaled._preparation import _FixedRegimeState
+
+    capacity = SimpleNamespace(query=SimpleNamespace(max_rows=64))
+    exact = {rows: SimpleNamespace(query=SimpleNamespace(max_rows=rows)) for rows in (1, 8)}
+    regimes = _FixedRegimeState(capacity, MappingProxyType(exact))
+
+    def rows(m):
+        return torch.empty((m, 128), dtype=torch.float8_e4m3fn)
+
+    assert regimes.resolve(rows(1)) is exact[1]
+    assert regimes.resolve(rows(8)) is exact[8]
+    for m in (0, 2, 9, 63, 64):
+        assert regimes.resolve(rows(m)) is capacity
+    with pytest.raises(ValueError, match="rows 65 exceed capacity 64"):
+        regimes.resolve(rows(65))
+
+
+def test_fixed_capacity_state_accepts_dynamic_rows_and_exact_state_does_not() -> None:
+    from dataclasses import replace
+
+    from b12x.gemm.blockscaled._preparation import _FixedExecutionState
+
+    cpu = torch.device("cpu")
+    query = _fixed_capacity_query(max_rows=64)
+    weight = torch.empty((512, 256), dtype=torch.float8_e4m3fn)
+
+    def check(state, m):
+        state._check(
+            torch.empty((m, 256), dtype=torch.float8_e4m3fn), weight, torch.bfloat16,
+            serialized=True,
+        )
+
+    capacity = _FixedExecutionState(query, cpu, None, None, None, False)
+    for m in (0, 1, 17, 64):
+        check(capacity, m)
+    with pytest.raises(ValueError, match="rows 65 exceed capacity 64"):
+        check(capacity, 65)
+
+    exact = _FixedExecutionState(replace(query, expected_m=64), cpu, None, None, None, False)
+    check(exact, 0)
+    check(exact, 64)
+    with pytest.raises(ValueError, match="exact planned nonempty M"):
+        check(exact, 17)
+
+
+def test_fixed_op_bodies_resolve_the_live_regime(monkeypatch) -> None:
+    from types import MappingProxyType, SimpleNamespace
+
+    from b12x.gemm.blockscaled import _linear
+    from b12x.gemm.blockscaled._preparation import _FixedRegimeState
+
+    capacity = SimpleNamespace(query=SimpleNamespace(max_rows=64))
+    exact = SimpleNamespace(query=SimpleNamespace(max_rows=4))
+    prepared = {
+        "regimes": _FixedRegimeState(capacity, MappingProxyType({4: exact})),
+        "single": exact,
+    }
+    monkeypatch.setattr(_linear, "plan_from_handle", lambda handle: handle)
+    monkeypatch.setattr(
+        _linear, "require_prepared", lambda plan, component, device: prepared[plan],
+    )
+
+    def resolve(handle, m):
+        return _linear._fixed_state(handle, torch.empty((m, 256), dtype=torch.float8_e4m3fn))
+
+    assert resolve("regimes", 4) is exact
+    assert resolve("regimes", 5) is capacity
+    assert resolve("single", 4) is exact
+    with pytest.raises(ValueError, match="exceed capacity"):
+        resolve("regimes", 65)
+
+
 def _quantize_mxfp4_rows(
     source: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -408,6 +536,65 @@ def test_mm_serialized_nvfp4_and_block_fp8_match_native_views() -> None:
         )
         torch.testing.assert_close(serialized_block_fp8, native_block_fp8, rtol=0, atol=0)
         torch.testing.assert_close(wrapped_block_fp8, native_block_fp8, rtol=0, atol=0)
+
+
+def test_fixed_regimes_serve_dynamic_serialized_block_fp8_rows() -> None:
+    """One capacity child serves unplanned row counts with exact-M results."""
+
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    require_b12x()
+    torch.manual_seed(20260917)
+    capacity, n, k = 300, 256, 256
+    lhs = torch.randn((capacity + 1, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    rhs = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    lhs_scale = torch.rand((capacity + 1, k // 128), device="cuda", dtype=torch.float32) + 0.5
+    rhs_scale = torch.rand((n // 128, k // 128), device="cuda", dtype=torch.float32) + 0.5
+    options = dict(
+        ab_dtype="float8_e4m3fn", sf_dtype="float32", c_dtype="bfloat16",
+        sf_vec_size=128, block_fp8=True,
+    )
+    live_rows = (1, 3, 4, 17, 129, 257, capacity)
+    exact = {}
+    for rows in live_rows:
+        lhs_rows = (lhs[:rows].contiguous(), lhs_scale[:rows].contiguous())
+        with prepared(lhs_rows, (rhs, rhs_scale), expected_m=rows, **options) as plan:
+            exact[rows] = blockscaled.mm(lhs_rows, (rhs, rhs_scale), plan=plan, **options)
+
+    query = blockscaled.FixedBlockscaledQuery(
+        recipe="block_fp8", call_kind="serialized", max_rows=capacity, in_features=k,
+        padded_in_features=k, out_features=n, input_dtype="float8_e4m3fn",
+        output_dtype="bfloat16", expected_m=None,
+    )
+    plan = blockscaled.plan_regimes(query, exact_m=(1, 4))
+
+    def call(rows):
+        return lambda state: PreparedCall(run=lambda: state.run_serialized(
+            lhs[:rows], lhs_scale[:rows], rhs, rhs_scale, None,
+            ab_dtype="float8_e4m3fn", sf_dtype="float32", c_dtype="bfloat16",
+            sf_vec_size=128, block_fp8=True, stream=None,
+        ))
+
+    with PreparationSession(device=lhs.device, autotune=False, compile_workers=2) as session:
+        session.prepare((plan.request(
+            name="block_fp8_regimes",
+            prepare_calls={rows: call(rows) for rows in plan.token_counts},
+        ),))
+        session.freeze()
+        with kernel_resolution_guard("serialized block-FP8 capacity regime"):
+            for rows in live_rows:
+                actual = blockscaled.mm_block_fp8(
+                    lhs[:rows], lhs_scale[:rows], rhs, rhs_scale, plan=plan,
+                )
+                expected = (
+                    (lhs[:rows].float() * lhs_scale[:rows].repeat_interleave(128, dim=1))
+                    @ (rhs.float() * rhs_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)).T
+                ).to(torch.bfloat16)
+                assert actual.shape == (rows, n)
+                torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+                torch.testing.assert_close(actual, exact[rows], rtol=1e-3, atol=1e-3)
+            with pytest.raises(ValueError, match="exceed capacity"):
+                blockscaled.mm_block_fp8(lhs, lhs_scale, rhs, rhs_scale, plan=plan)
 
 
 def test_nvfp4_a16_preserves_logical_k_inside_padded_weight() -> None:
