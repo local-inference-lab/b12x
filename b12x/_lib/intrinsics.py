@@ -7705,14 +7705,11 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             {load}
             shl.b32 fl{index}, u{index}, 16;
             and.b32 fh{index}, u{index}, 0xffff0000;
-            shl.b32 sign_lo{index}, signs{index}, 31;
-            shl.b32 sign_hi{index}, signs{index}, 30;
-            and.b32 sign_hi{index}, sign_hi{index}, 0x80000000;
-            xor.b32 fl{index}, fl{index}, sign_lo{index};
-            xor.b32 fh{index}, fh{index}, sign_hi{index};
             mul.f32 fl{index}, fl{index}, s{row};
             mul.f32 fh{index}, fh{index}, s{row};
             cvt.rn.satfinite.bf16x2.f32 ${index}, fh{index}, fl{index};
+            mul.lo.u32 sign_pair{index}, signs{index}, 0x40008000;
+            lop3.b32 ${index}, ${index}, sign_pair{index}, 0x80008000, 0x78;
             """
         )
     asm = (
@@ -7724,8 +7721,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
                       xh0, xh1, xh2, xh3;
             .reg .u32 signs0, signs1, signs2, signs3,
                       parity0, parity1, parity2, parity3,
-                      sign_lo0, sign_lo1, sign_lo2, sign_lo3,
-                      sign_hi0, sign_hi1, sign_hi2, sign_hi3;
+                      sign_pair0, sign_pair1, sign_pair2, sign_pair3;
             .reg .u64 po, a0, a1, a2, a3;
             .reg .u32 sa0, sa1, sa2, sa3, so;
             .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
