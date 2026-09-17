@@ -1448,10 +1448,11 @@ class MoEDynamicKernelBackend:
             # The token N-role must be a multiple of the fixed sm120 N
             # permutation atom (8,2,2)=32; a smaller tile (tile_shape_mnk[0] is
             # 16 here) makes the MMA address phantom N-positions and scrambles
-            # tokens. Round the token tile up to a 64 multiple (>=64, dense's FP4
-            # swap_ab floor) and mask the padding with valid_rows. The 128-row
-            # activation atom supplies the extra token slots.
-            self._fc1_tok_tile = max(64, ((self.tile_shape_mnk[0] + 63) // 64) * 64)
+            # tokens. Round to the permutation atom's 32-column boundary and
+            # mask padding with valid_rows. The 128-row activation atom supplies
+            # the extra slots without retaining unused 64-column accumulators
+            # for M16 and M32 compute tiles.
+            self._fc1_tok_tile = max(32, ((self.tile_shape_mnk[0] + 31) // 32) * 32)
             self.fc1_tile_shape_mnk = (
                 self._fc1_int_tile,
                 self._fc1_tok_tile,
