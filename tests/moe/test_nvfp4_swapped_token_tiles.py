@@ -28,9 +28,15 @@ def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, fast_math
         intermediate_size=intermediate,
         logical_intermediate_size=160 if intermediate == 192 else None,
     )
+    # Use normal E4M3 activation scales to isolate tile layout from the
+    # independently tested subnormal-scale decoder contract. Keep the physical
+    # weights unchanged when varying each expert's activation quantization scale.
+    a1_scale = torch.linspace(32., 64., num_experts, device=device)
+    a2_scale = torch.linspace(256., 512., num_experts, device=device)
     weights = replace(weights,
-        a1_scale=torch.linspace(0.75, 1.25, num_experts, device=device),
-        a2_scale=torch.linspace(0.875, 1.375, num_experts, device=device))
+        a1_scale=a1_scale, a2_scale=a2_scale,
+        w1_alpha=weights.w1_alpha / a1_scale,
+        w2_alpha=weights.w2_alpha / a2_scale)
     inputs = _make_inputs(device, m=capacity, seed=820, route_shift=0,
                           num_experts=num_experts, hidden_size=hidden, topk=topk)
     weight_plan = fused_moe.plan_weights(
