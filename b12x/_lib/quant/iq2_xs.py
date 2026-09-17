@@ -96,7 +96,7 @@ def _iq2_xs_execution_lut_device(
     device_type: str, device_index: int | None
 ) -> torch.Tensor:
     return (
-        iq2_xs_execution_lut_cpu()
+        iq2_xs_grid_cpu()
         .to(device=torch.device(device_type, device_index))
         .contiguous()
     )
@@ -105,7 +105,7 @@ def _iq2_xs_execution_lut_device(
 def iq2_xs_execution_lut(
     device: torch.device | str, *, prepare: bool = False
 ) -> torch.Tensor:
-    """Return the process-lifetime 512 KiB signed descriptor table."""
+    """Return the process-lifetime 4 KiB magnitude table."""
 
     resolved = torch.device(device)
     index = resolved.index
