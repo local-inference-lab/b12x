@@ -548,7 +548,7 @@ def _determine_blocks_per_sm(
         _DEVICE_MAX_REG_BYTES // register_bytes,
         int(max_shared_mem) // (smem_bytes + 1536),
     )
-    if uses_m_block_8:
+    if uses_m_block_8 and weight_layout != "iq2_xs":
         # Small-M (moe_block_size==8) TC-decode is weight-bandwidth/overhead
         # bound, not parallelism bound (only m*top_k route-blocks of GEMM work).
         # The fused FC1->activation->FC2 path crosses several grid barriers whose
@@ -559,6 +559,8 @@ def _determine_blocks_per_sm(
         # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
         # is numerically identical.
         blocks_per_sm_limit = 1
+    elif uses_m_block_8:
+        blocks_per_sm_limit = max(min(blocks_per_sm_limit, 2), 1)
     elif cta_m_blocks == 1:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 4), 1)
     else:
