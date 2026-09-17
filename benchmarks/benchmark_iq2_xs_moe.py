@@ -7,9 +7,10 @@ retains checkpoint identity, source hashes, correctness and graph samples.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
+import gc
 import importlib.metadata
 import json
 from pathlib import Path
@@ -34,6 +35,19 @@ class Inputs:
     probabilities: torch.Tensor
     output: torch.Tensor
     expert_map: torch.Tensor | None
+
+
+@contextmanager
+def capture_lifetime():
+    """Keep deferred CUDA library destructors outside graph capture."""
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def make_inputs(layer: IQ2XSLayer, tokens: int, device, *, mapped: bool) -> Inputs:
@@ -140,6 +154,7 @@ def qualify_capacity(
 ):
     """Exercise several live counts with compilation and kernel resolution frozen."""
     from b12x._lib import compiler
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe._shared.kernels.w4a16 import kernel
     from b12x.moe.fused_moe import _preparation
 
@@ -199,6 +214,7 @@ def qualify_capacity(
 
     results = []
     with ExitStack() as frozen:
+        frozen.enter_context(kernel_resolution_guard("IQ2_XS capacity qualification"))
         frozen.enter_context(patch.object(compiler, "compile", forbidden))
         frozen.enter_context(patch.object(_preparation, "compile_fused_moe", forbidden))
         frozen.enter_context(patch.object(kernel, "compile_w4a16_fused_moe", forbidden))
@@ -222,7 +238,7 @@ def qualify_capacity(
                 metrics = check(inputs.output, expected)
                 graph = torch.cuda.CUDAGraph()
                 try:
-                    with session.capture(), torch.cuda.graph(graph):
+                    with capture_lifetime(), session.capture(), torch.cuda.graph(graph):
                         moe.run(binding=binding)
                     inputs.x.add_(0.03125)
                     set_routes(

@@ -2,8 +2,9 @@
 
 IQ2_XS encodes each group of eight weights as a 16-bit descriptor.  Bits
 0..8 select one of 512 magnitude vectors and bits 9..15 select one of 128
-permitted sign masks.  The process-local execution table expands those legal
-descriptors to signed int8 vectors; checkpoint weights remain descriptor-coded.
+permitted sign masks. The device execution table holds 512 magnitude vectors;
+the kernel derives the sign mask, including its parity bit, from the descriptor.
+Checkpoint weights remain descriptor-coded.
 """
 
 from __future__ import annotations

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -137,3 +138,36 @@ def test_invalid_payload_rejected(source):
         moe.IQ2XSWeights(source, source)
     with pytest.raises((TypeError, ValueError)):
         pack_iq2_xs_matrix(source)
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"num_tokens": 1}, True),
+        ({"num_tokens": 8}, True),
+        ({"num_tokens": 9}, False),
+        ({"activation": "relu2"}, False),
+        ({"deterministic_output": True}, False),
+        ({"collect_activation_amax": True}, False),
+        ({"apply_router_weight_on_input": True}, False),
+    ],
+)
+def test_direct_route_eligibility(overrides, expected):
+    from b12x.moe.fused_moe._impl import _w4a16_direct_routing_supported
+
+    query = SimpleNamespace(
+        **{
+            "source_format": "iq2_xs",
+            "quant_mode": "w4a16",
+            "hidden_size": 2048,
+            "intermediate_size": 512,
+            "num_tokens": 8,
+            "io_dtype": "bfloat16",
+            "activation": "silu",
+            "deterministic_output": False,
+            "collect_activation_amax": False,
+            "apply_router_weight_on_input": False,
+            **overrides,
+        }
+    )
+    assert _w4a16_direct_routing_supported(query) is expected

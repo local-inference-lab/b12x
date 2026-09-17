@@ -115,7 +115,7 @@ class TrellisWeights:
 
 @dataclass(frozen=True)
 class IQ2XSWeights:
-    """Safetensors IQ2_XS blocks, uint8[E,N,K/256,74], in source W13 order."""
+    """Safetensors uint8[E,N,K/256,74] blocks in PackedSource.w13_layout order."""
 
     w13: torch.Tensor
     w2: torch.Tensor

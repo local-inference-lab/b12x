@@ -2768,6 +2768,7 @@ def prepare_moe_execution(
     top_k: int,
     inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     outputs: dict[int, torch.Tensor],
+    route_mode: str = "auto",
 ) -> object:
     """Prepare each exact benchmark M before binding its real caller buffers."""
     capacity = fused_moe.ExecutionCapacity(
@@ -2775,7 +2776,17 @@ def prepare_moe_execution(
         top_k=top_k,
         warmup_token_counts=tuple(inputs),
     )
-    declaration = fused_moe.plan_execution(experts=experts, capacity=capacity)
+    override = None
+    if route_mode != "auto":
+        override = fused_moe.MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            w4a16_route_mode=route_mode,
+        )
+    declaration = fused_moe.plan_execution(
+        experts=experts, capacity=capacity, override=override
+    )
     calls = {
         m: prepared_call(
             output=outputs[m],
@@ -3666,6 +3677,7 @@ def bench_e2e() -> None:
         top_k=spec.top_k,
         inputs={1: (x_warm, topk_ids_w, topk_weights_w)},
         outputs={1: warmup_output},
+        route_mode=args.w4a16_route_policy,
     )
     warmup_binding = bind_prepared_moe(
         warmup_execution,
@@ -3775,6 +3787,7 @@ def bench_e2e() -> None:
             top_k=spec.top_k,
             inputs={batch_size: (x, topk_ids, topk_weights)},
             outputs={batch_size: backend_output},
+            route_mode=args.w4a16_route_policy,
         )
         backend_binding = bind_prepared_moe(
             backend_execution,

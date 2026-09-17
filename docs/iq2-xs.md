@@ -29,7 +29,7 @@ Descriptors are exposed as int32 words. The two metadata planes share one
 allocation. Their combined payload stays at 74 bytes per 256 weights
 (2.3125 bits per weight); there is no resident expanded weight or scale
 matrix. Preparation copies at most 256 output rows of one expert per chunk.
-A process-lifetime 512 KiB descriptor lookup table is shared on each device
+A process-lifetime 4 KiB magnitude lookup table is shared on each device
 and initialized before binding or replay.
 
 The W4A16 kernel stages compact descriptors and expands metadata only in
@@ -73,6 +73,8 @@ checkpoint qualification harness. It records source/weight hashes and raw
 graph samples, checks cosine >= 0.999 and relative L2 <= 0.01, mutates inputs
 and routes after capture, poisons scratch/output, checks fixed addresses and
 replay allocation counts, and freezes compilation and kernel resolution.
+The harness collects garbage before capture and defers collection until capture
+ends so deferred CUDA library destructors cannot invalidate the capture.
 Its single-sample qualification timings are not autobench evidence.
 
 ## Qualification evidence
@@ -82,9 +84,14 @@ On an RTX PRO 6000 Blackwell Max-Q, CUDA 13.0 / Torch 2.12.0 and CUTLASS DSL
 passed 540 cases: layers 0/20/39, TP1 and both TP2 ranks, all 256 experts
 resident, top-k=8, live counts 1/2/4/8/16/32/128/512, and balanced, hot and
 imbalanced routes. Packed execution also covered deterministic output.
-Minimum cosine was 0.9999838; maximum relative L2 was 0.005711 eagerly and
-0.006236 after changed-input replay. Every case passed zero-contribution,
+Minimum cosine was 0.9999840; maximum relative L2 was 0.005675 eagerly and
+0.006304 after changed-input replay. Every case passed zero-contribution,
 poison, address-stability and replay-allocation checks.
+
+Another 99 checkpoint cases used layer 0, TP1 and both TP2 ranks, live counts
+1/3/8/16 and reordered local expert IDs
+`[255, 0, 17, 5, 127, 7, 253, 64, 128, 1]`. They passed the same checks,
+including nonlocal routes and replay after the expert map became all nonlocal.
 
 The independent codebook fixture comes from llama.cpp `b2899`; all 65,536
 descriptors, 16 subscale values and nine representative finite FP16 bases
