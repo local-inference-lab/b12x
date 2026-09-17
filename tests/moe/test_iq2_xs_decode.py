@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import packed_decode_iq2_xs_to_bfloat2x4
+from b12x._lib.intrinsics import iq2_xs_scale_to_f32_bits, packed_decode_iq2_xs_to_bfloat2x4
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
 from b12x._lib.utils import current_cuda_stream
 from b12x.testing.iq2_xs_reference import descriptor_vectors
@@ -44,7 +44,8 @@ class _DecodeProbe:
             (15 - nibble) << 16
         )
         a, b, c, d = packed_decode_iq2_xs_to_bfloat2x4(
-            q0, q1, metadata, metadata1, lut.iterator.toint(), pair
+            q0, q1, iq2_xs_scale_to_f32_bits(metadata),
+            iq2_xs_scale_to_f32_bits(metadata1), lut.iterator.toint(), pair
         )
         out[row, 0], out[row, 1] = cutlass.Int32(a), cutlass.Int32(b)
         out[row, 2], out[row, 3] = cutlass.Int32(c), cutlass.Int32(d)
