@@ -4405,75 +4405,59 @@ def nvfp4_scale_from_amax(
 
 @dsl_user_op
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32."""
+    """Decode the low E4M3 byte, including subnormals and signed zero."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_neg;
-                .reg .u32 sign_u, exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
-
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 sign_u, $1, 0x80;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                neg.f32 fp8_neg, fp8_float;
-                setp.ne.u32 p_neg, sign_u, 0;
-                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
-                selp.f32 $0, 0f00000000, fp8_float, p_zero;
+                .reg .b16 source, low, high;
+                .reg .b32 pair;
+                cvt.u16.u32 source, $1;
+                cvt.rn.f16x2.e4m3x2 pair, source;
+                mov.b32 {low, high}, pair;
+                cvt.f32.f16 $0, low;
             }
             """,
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
 
 @dsl_user_op
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32 AND compute reciprocal."""
+    """Return the decoded E4M3 reciprocal, or zero for either signed zero."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, result;
-
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                rcp.approx.ftz.f32 result, fp8_float;
-                selp.f32 $0, 0f00000000, result, p_zero;
+                .reg .pred zero;
+                .reg .b16 source, low, high;
+                .reg .b32 pair;
+                .reg .f32 value, reciprocal;
+                cvt.u16.u32 source, $1;
+                cvt.rn.f16x2.e4m3x2 pair, source;
+                mov.b32 {low, high}, pair;
+                cvt.f32.f16 value, low;
+                setp.eq.f32 zero, value, 0f00000000;
+                rcp.approx.ftz.f32 reciprocal, value;
+                selp.f32 $0, 0f00000000, reciprocal, zero;
             }
             """,
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
