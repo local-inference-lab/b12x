@@ -43,7 +43,9 @@ def test_e4m3_decode_and_reciprocal_all_codes():
     torch.cuda.synchronize()
     reference = source.view(torch.float8_e4m3fn).float()
     torch.testing.assert_close(decoded, reference, rtol=0, atol=0, equal_nan=True)
-    assert torch.equal(torch.signbit(decoded), torch.signbit(reference))
+    # NaN conversion may canonicalize its sign; finite values retain it.
+    finite = reference.isfinite()
+    assert torch.equal(torch.signbit(decoded[finite]), torch.signbit(reference[finite]))
     expected_reciprocal = torch.where(reference == 0, 0., reference.reciprocal())
     torch.testing.assert_close(reciprocal, expected_reciprocal,
                                rtol=2e-7, atol=0, equal_nan=True)

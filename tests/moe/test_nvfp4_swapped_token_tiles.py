@@ -17,9 +17,10 @@ from .test_cute_migration_moe_standard_corpus import (
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize("intermediate", [160, 192, 320])
 @pytest.mark.parametrize("tile_m,planner", [(16, "internal"), (16, "triton"), (32, "internal")])
-def test_swapped_token_tile_live_replay(intermediate, tile_m, planner):
+def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, fast_math):
     device = require_b12x()
     capacity, hidden, num_experts, topk = 33, 512, 4, 2
     weights = _make_nvfp4_weights(
@@ -49,7 +50,7 @@ def test_swapped_token_tile_live_replay(intermediate, tile_m, planner):
         max_active_clusters=None, dynamic_tile_m=tile_m, dynamic_route_mode="grouped")
     plan = fused_moe.plan_execution(experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
-        invocation={"fast_math": False}, override=config)
+        invocation={"fast_math": fast_math}, override=config)
 
     def call(state):
         scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
@@ -83,7 +84,7 @@ def test_swapped_token_tile_live_replay(intermediate, tile_m, planner):
             reference = moe_reference_nvfp4(inputs.a[:rows], weights.w1_fp4, weights.w1_scale,
                 weights.w1_alpha, weights.w2_fp4, weights.w2_scale, weights.w2_alpha,
                 weights.a1_scale, weights.a2_scale, oracle_ids, oracle_weights,
-                num_experts, hidden, intermediate, quant_scale_math="dynamic_precise")
+                num_experts, hidden, intermediate, quant_scale_math="dynamic_fast" if fast_math else "dynamic_precise")
             addresses = tuple(t.data_ptr() for t in (*scratch, output, inputs.a, inputs.topk_ids))
             for _ in range(3):
                 output.fill_(float("nan"))
