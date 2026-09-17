@@ -6705,8 +6705,7 @@ class W4A16FusedMoeKernel:
                         fc1_trellis_lut_addr + Int64(chunk) * Int64(16),
                     )
             cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_threads()
+            # The first GEMM prefetch wait completes this group before lookup.
             table_addr = Int64(smem_base + Int32(self.iq2_xs_lut_off))
             fc1_phase_lut_addr = table_addr
             fc2_phase_lut_addr = table_addr
@@ -6807,6 +6806,9 @@ class W4A16FusedMoeKernel:
             fc1_emit_tile,
             fc2_emit_tile,
         )
+        if cutlass.const_expr(self.weight_layout == "iq2_xs"):
+            # CTAs with no local GEMM work still drain their table copies.
+            cute.arch.cp_async_wait_group(0)
 
     @cute.jit
     def _moe_body(
