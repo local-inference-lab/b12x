@@ -1128,7 +1128,9 @@ class W4A16GemmKernel:
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
-        self.small_m_splitk = _w4a16_small_m_splitk_enabled()
+        self.small_m_splitk = (
+            weight_layout == "iq2_xs" and moe_block_size == 8
+        ) or _w4a16_small_m_splitk_enabled()
         self.weight_layout_trellis256 = weight_layout == "trellis_t256"
         self.weight_layout_iq2_xs = weight_layout == "iq2_xs"
         self.iq2_xs_smem_lut = False
@@ -6003,7 +6005,9 @@ class W4A16FusedMoeKernel:
         # Stripe split-K spreads each mn-tile's K range across many CTAs for
         # decode-heavy small-M phases. It is incompatible with whole-tile
         # scheduling and grouped FC2 route subtiles.
-        self.small_m_splitk = _w4a16_small_m_splitk_enabled()
+        self.small_m_splitk = (
+            weight_layout == "iq2_xs" and moe_block_size == 8
+        ) or _w4a16_small_m_splitk_enabled()
         if self.small_m_splitk:
             schedule_whole_tiles = False
             fc2_schedule_route_block_factor = 1
@@ -10844,7 +10848,9 @@ def _w4a16_fused_persistent_grid_x(
     where the host cannot know route_blocks ahead of the launch.
     """
     cap = int(sms) * int(fused.blocks_per_sm)
-    if _w4a16_small_m_splitk_enabled():
+    if (
+        fused.weight_layout == "iq2_xs" and fused.moe_block_size == 8
+    ) or _w4a16_small_m_splitk_enabled():
         # Stripe split-K wants the full persistent grid: each small-M FC1
         # column's K range is fanned across many CTAs, so right-sizing the
         # grid to the mn-tile count would recreate the serialization the
