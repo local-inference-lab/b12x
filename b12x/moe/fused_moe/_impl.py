@@ -3458,6 +3458,7 @@ def _plan_core_workspace(
                     route_slots=scratch_route_slots,
                     moe_block_size=int(block_size),
                     sms=sms,
+                    weight_layout=weight_layout,
                 ),
             )
             fc2_c_tmp_elements = max(
@@ -3467,6 +3468,7 @@ def _plan_core_workspace(
                     route_slots=scratch_route_slots,
                     moe_block_size=int(block_size),
                     sms=sms,
+                    weight_layout=weight_layout,
                 ),
             )
         # Packed BF16 decode uses a direct top-k route for every supported
@@ -3505,6 +3507,7 @@ def _plan_core_workspace(
                         route_slots=direct_route_slots,
                         moe_block_size=direct_block_size,
                         sms=sms,
+                        weight_layout=weight_layout,
                     ),
                 )
                 fc2_c_tmp_elements = max(
@@ -3514,6 +3517,7 @@ def _plan_core_workspace(
                         route_slots=direct_route_slots,
                         moe_block_size=direct_block_size,
                         sms=sms,
+                        weight_layout=weight_layout,
                     ),
                 )
         intermediate_cache2_elements = routed_capacity * int(n)

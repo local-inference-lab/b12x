@@ -257,6 +257,7 @@ def packed_gemm_scratch_elements(
     route_slots: int,
     moe_block_size: int,
     sms: int,
+    weight_layout: str = "packed",
 ) -> int:
     elements = min(
         int(size_n) * int(route_slots),
@@ -264,6 +265,9 @@ def packed_gemm_scratch_elements(
     )
     if moe_block_size == 8:
         elements *= 2
+        if weight_layout == "iq2_xs":
+            # Parallel split-K retains one M8 partial per resident CTA.
+            elements = max(elements, int(sms) * 2 * 8 * 256)
     return max(elements, 1)
 
 
@@ -316,12 +320,14 @@ def plan_w4a16_buffers(
             route_slots=gemm_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
+            weight_layout=prepared.weight_layout,
         ),
         fc2_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=hidden_size,
             route_slots=gemm_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
+            weight_layout=prepared.weight_layout,
         ),
         intermediate_cache13_elements=routed_rows * max(fc1_cols, hidden_size),
         intermediate_cache2_elements=routed_rows * intermediate_size,

@@ -3133,7 +3133,7 @@ class W4A16GemmKernel:
     ):
         cta, _, _ = cute.arch.block_idx()
         active_threads = Int32(32 * self.tb_n_warps)
-        tile_elements = Int64(16 * self.tile_n)
+        tile_elements = Int64(8 * self.tile_n)
         lock_addr = get_ptr_as_int64(locks_i32_flat, Int64(lock_slot))
         # A stripe publishes at most its first partial tile. Its final partial
         # is the reducer, so one scratch slot per CTA remains live until read.
@@ -3142,7 +3142,7 @@ class W4A16GemmKernel:
                 for jj in cutlass.range_constexpr(4):
                     offset = (
                         Int64(cta) * tile_elements
-                        + (Int64(active_threads) * Int64(jj * 2) + Int64(tid)) * Int64(4)
+                        + (Int64(active_threads) * Int64(jj) + Int64(tid)) * Int64(4)
                     )
                     st_global_v4_f32(
                         get_ptr_as_int64(c_tmp_f32_flat, offset),
@@ -3170,7 +3170,7 @@ class W4A16GemmKernel:
                         source_cta = Int64(cta) + Int64(reduce_slice_count - Int32(1) - part)
                         offset = (
                             source_cta * tile_elements
-                            + (Int64(active_threads) * Int64(jj * 2) + Int64(tid)) * Int64(4)
+                            + (Int64(active_threads) * Int64(jj) + Int64(tid)) * Int64(4)
                         )
                         v0, v1, v2, v3 = ld_global_v4_f32(
                             get_ptr_as_int64(c_tmp_f32_flat, offset)
@@ -12884,6 +12884,7 @@ def run_w4a16_moe(
             route_slots=int(route_slots_for_scratch),
             moe_block_size=block_size_m,
             sms=sms,
+            weight_layout=weight_layout,
         ),
         device=a_input.device,
         scratch=fc1_c_tmp,
@@ -12894,6 +12895,7 @@ def run_w4a16_moe(
             route_slots=int(route_slots_for_scratch),
             moe_block_size=block_size_m,
             sms=sms,
+            weight_layout=weight_layout,
         ),
         device=a_input.device,
         scratch=fc2_c_tmp,
