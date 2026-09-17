@@ -318,6 +318,14 @@ class ModelProfile:
 
 
 MODEL_PROFILES = {
+    "qwen36-35b-nvfp4": ModelProfile(
+        label="Qwen3.6-35B-A3B NVFP4",
+        checkpoint_family="qwen",
+        default_layer_idx=0,
+        tp_size=1,
+        hf_repo_id="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        default_quant_mode="w4a16",
+    ),
     "qwen36-35b-iq2-xs": ModelProfile(
         label="Qwen3.6-35B-A3B IQ2_XS/NVFP4",
         checkpoint_family="qwen_iq2_xs",
