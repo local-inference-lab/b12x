@@ -66,12 +66,12 @@ class _DecodeProbe:
         other = descriptor ^ cutlass.Uint32(0xFFFF)
         q0 = descriptor | (other << 16)
         q1 = other | (descriptor << 16)
-        metadata = cutlass.Uint32(base) | (nibble << 16)
-        metadata1 = (cutlass.Uint32(base) ^ cutlass.Uint32(0x8000)) | (
-            (15 - nibble) << 16
+        base_pair = cutlass.Uint32(base) | (
+            (cutlass.Uint32(base) ^ cutlass.Uint32(0x8000)) << 16
         )
+        subscale_pair = nibble | ((15 - nibble) << 8)
         a, b, c, d = packed_decode_iq2_xs_to_bfloat2x4(
-            q0, q1, metadata, metadata1, table_addr, pair, shared_lut=self.shared_lut
+            q0, q1, base_pair, subscale_pair, table_addr, pair, shared_lut=self.shared_lut
         )
         out[row, 0], out[row, 1] = cutlass.Int32(a), cutlass.Int32(b)
         out[row, 2], out[row, 3] = cutlass.Int32(c), cutlass.Int32(d)

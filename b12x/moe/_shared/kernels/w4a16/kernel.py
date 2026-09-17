@@ -2947,15 +2947,15 @@ class W4A16GemmKernel:
 
         for jj in cutlass.range_constexpr(4):
             if cutlass.const_expr(self.weight_layout_iq2_xs):
-                q0, q1, metadata0, metadata1 = self._load_iq2_xs_fragment(
+                q0, q1, base_pair, subscale_pair = self._load_iq2_xs_fragment(
                     smem_base, tid, pipe, Int32(kk), jj
                 )
                 self._scaled_dequant_b_fragment_iq2_xs(
                     b_frag,
                     q0,
                     q1,
-                    metadata0,
-                    metadata1,
+                    base_pair,
+                    subscale_pair,
                     trellis_lut_addr,
                     tid,
                 )
@@ -3618,16 +3618,12 @@ class W4A16GemmKernel:
         )
         shift = (tc_col % Int32(2)) * Int32(16) + (kt_local % Int32(2)) * Int32(4)
         scale_pair = ld_shared_u32(scale_addr)
-        nibble0 = (scale_pair >> shift) & Uint32(15)
-        nibble1 = (scale_pair >> (shift + Int32(8))) & Uint32(15)
         base_pair = ld_shared_u32(base_addr)
-        base0 = base_pair & Uint32(0xffff)
-        base1 = base_pair >> Uint32(16)
         tile_base = (kt_local * Int32(self.cta_n_blocks) + local_n16) * Int32(16)
         q0, q1 = ld_shared_v2_u32(
             b_region + (tile_base + tc_col * Int32(2)) * Int32(4)
         )
-        return q0, q1, base0 | (nibble0 << Uint32(16)), base1 | (nibble1 << Uint32(16))
+        return q0, q1, base_pair, scale_pair >> shift
 
     @cute.jit
     def _load_b_scale_registers(
@@ -3847,8 +3843,8 @@ class W4A16GemmKernel:
         frag: cute.Tensor,
         q_row0: Uint32,
         q_row1: Uint32,
-        metadata_row0: Uint32,
-        metadata_row1: Uint32,
+        base_pair: Uint32,
+        subscale_pair: Uint32,
         execution_lut_addr: Int64,
         tid: Int32,
     ):
@@ -3856,8 +3852,8 @@ class W4A16GemmKernel:
         b0_0, b0_1, b1_0, b1_1 = packed_decode_iq2_xs_to_bfloat2x4(
             q_row0,
             q_row1,
-            metadata_row0,
-            metadata_row1,
+            base_pair,
+            subscale_pair,
             execution_lut_addr,
             pair_byte_offset,
             shared_lut=self.iq2_xs_smem_lut,

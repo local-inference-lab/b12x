@@ -7658,8 +7658,8 @@ def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
 def _packed_decode_iq2_xs_to_bfloat2x4(
     q_row0,
     q_row1,
-    metadata_row0,
-    metadata_row1,
+    base_pair,
+    subscale_pair,
     execution_lut_addr,
     pair_byte_offset,
     *,
@@ -7715,7 +7715,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
     asm = (
         """
         {
-            .reg .b16 dh0, dh1, unused0, unused1, p0, p1, p2, p3;
+            .reg .b16 dh0, dh1;
             .reg .b32 d0, d1, d2, d3, n0, n1;
             .reg .u32 u0, u1, u2, u3, xl0, xl1, xl2, xl3,
                       xh0, xh1, xh2, xh3;
@@ -7726,12 +7726,11 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             .reg .u32 sa0, sa1, sa2, sa3, so;
             .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
                       fh0, fh1, fh2, fh3;
-            mov.b32 {dh0, unused0}, $6;
-            mov.b32 {dh1, unused1}, $7;
+            mov.b32 {dh0, dh1}, $6;
             cvt.f32.f16 s0, dh0;
             cvt.f32.f16 s1, dh1;
-            bfe.u32 n0, $6, 16, 4;
-            bfe.u32 n1, $7, 16, 4;
+            bfe.u32 n0, $7, 0, 4;
+            bfe.u32 n1, $7, 8, 4;
             cvt.rn.f32.u32 fl0, n0;
             cvt.rn.f32.u32 fl1, n1;
             add.f32 fl0, fl0, 0f3f000000;
@@ -7751,8 +7750,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
         [
             Uint32(q_row0).ir_value(loc=loc, ip=ip),
             Uint32(q_row1).ir_value(loc=loc, ip=ip),
-            Uint32(metadata_row0).ir_value(loc=loc, ip=ip),
-            Uint32(metadata_row1).ir_value(loc=loc, ip=ip),
+            Uint32(base_pair).ir_value(loc=loc, ip=ip),
+            Uint32(subscale_pair).ir_value(loc=loc, ip=ip),
             Int64(execution_lut_addr).ir_value(loc=loc, ip=ip),
             Int32(pair_byte_offset).ir_value(loc=loc, ip=ip),
         ],
@@ -7774,8 +7773,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
 def packed_decode_iq2_xs_to_bfloat2x4(
     q_row0,
     q_row1,
-    metadata_row0,
-    metadata_row1,
+    base_pair,
+    subscale_pair,
     execution_lut_addr,
     pair_byte_offset,
     *,
@@ -7786,8 +7785,8 @@ def packed_decode_iq2_xs_to_bfloat2x4(
     return _packed_decode_iq2_xs_to_bfloat2x4(
         q_row0,
         q_row1,
-        metadata_row0,
-        metadata_row1,
+        base_pair,
+        subscale_pair,
         execution_lut_addr,
         pair_byte_offset,
         shared_lut=shared_lut,
