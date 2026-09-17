@@ -469,9 +469,8 @@ def _w4a16_num_regs(
         int(cta_k_blocks),
         bool(uses_m_block_8),
     )
+    # Bound occupancy conservatively until IQ2_XS compiled resources are qualified.
     if weight_layout == "iq2_xs":
-        if uses_m_block_8 and cta_threads == 128:
-            return 168
         return 255
     try:
         return _W4A16_REGS_SM121[key]
@@ -479,14 +478,6 @@ def _w4a16_num_regs(
         raise ValueError(
             f"missing W4A16 register count for NVFP4 BF16 specialization {key}"
         ) from exc
-
-
-def _iq2_xs_stage_bytes(tile_k: int, tile_n: int) -> int:
-    return (
-        tile_k * tile_n // 4
-        + _covering_count(tile_k, 256) * tile_n * 2
-        + tile_k // 32 * tile_n
-    )
 
 
 def _shared_memory_footprint(
@@ -505,8 +496,6 @@ def _shared_memory_footprint(
     sh_a_size = _STAGES * (cta_m * cta_k) * 2
     staged_weight_bits = int(weight_bits)
     sh_b_size = _STAGES * (cta_k * cta_n * staged_weight_bits // 8)
-    if weight_layout == "iq2_xs":
-        sh_b_size = _STAGES * _iq2_xs_stage_bytes(cta_k, cta_n)
     sh_red_size = cta_m * (cta_n + 8) * 2
     sh_bias_size = cta_n * 2
     tmp_size = min(sh_b_size, sh_red_size) + sh_bias_size
@@ -519,8 +508,7 @@ def _shared_memory_footprint(
             * 2
             * _STAGES
         )
-    lut_size = IQ2_XS_MAGNITUDE_LUT_BYTES if weight_layout == "iq2_xs" else 0
-    return tmp_size + sh_a_size + sh_s_size + sh_block_meta_size + lut_size
+    return tmp_size + sh_a_size + sh_s_size + sh_block_meta_size
 
 
 def _determine_blocks_per_sm(
@@ -572,17 +560,14 @@ def _determine_blocks_per_sm(
         # is numerically identical.
         blocks_per_sm_limit = 1
     elif uses_m_block_8:
-        blocks_per_sm_limit = max(min(blocks_per_sm_limit, 3), 1)
+        blocks_per_sm_limit = max(min(blocks_per_sm_limit, 2), 1)
     elif cta_m_blocks == 1:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 4), 1)
     else:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 2), 1)
 
     work_cta_count = (int(problem_n) // int(tile_n)) * int(problem_m) * int(top_k) * 4
-    if (
-        not (weight_layout == "iq2_xs" and uses_m_block_8)
-        and work_cta_count < int(sms) * blocks_per_sm_limit
-    ):
+    if work_cta_count < int(sms) * blocks_per_sm_limit:
         blocks_per_sm_limit = max(work_cta_count // int(sms), 1)
     return int(blocks_per_sm_limit)
 
@@ -1305,8 +1290,6 @@ class W4A16GemmKernel:
                         self.trellis_pair_low_bits + self.trellis_pair_high_bits
                     )
         self.b_sh_stage_bytes = self.b_sh_stage * self.b_unit_bytes
-        if self.weight_layout_iq2_xs:
-            self.b_sh_stage_bytes = _iq2_xs_stage_bytes(self.tile_k, self.tile_n)
         if self.b_region_variable:
             if self.b_sh_stage_bytes % 16 != 0:
                 raise ValueError(
