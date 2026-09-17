@@ -44,11 +44,11 @@ from b12x._lib.intrinsics import (
     half2_mul,
     ld_global_acquire_i32,
     ld_global_nc_u32,
-    ld_global_b16,
     ld_global_v4_f32,
     ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
+    ld_shared_u16_offset,
     ld_shared_v2_u32,
     ld_shared_v4_f32,
     ld_shared_v4_u32,
@@ -3481,23 +3481,37 @@ class W4A16GemmKernel:
             + Int32(self.sh_b_off * 16)
             + pipe * Int32(self.b_sh_stage_bytes)
         )
+        base_region = b_region + Int32(self.cta_k_blocks * self.cta_n_blocks * 64)
+        scale_region = base_region + Int32(
+            _covering_count(self.cta_k_blocks, 16) * self.cta_n_blocks * 32
+        )
         for jj in cutlass.range_constexpr(4):
             local_n16 = Int32(4) * warp_n + Int32(jj)
             tile_base = (
                 kt_local * Int32(self.cta_n_blocks) + local_n16
-            ) * Int32(32)
+            ) * Int32(16)
             regs[0, jj] = ld_shared_u32(
                 b_region + (tile_base + tc_col) * Int32(4)
             )
             regs[1, jj] = ld_shared_u32(
                 b_region + (tile_base + tc_col + Int32(8)) * Int32(4)
             )
-            regs[2, jj] = ld_shared_u32(
-                b_region + (tile_base + Int32(16) + tc_col) * Int32(4)
+            base_addr = base_region + (
+                (kt_local // Int32(16) * Int32(self.cta_n_blocks) + local_n16)
+                * Int32(16) + tc_col
+            ) * Int32(2)
+            scale_addr = scale_region + (
+                (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
+                * Int32(16) + tc_col // Int32(4) * Int32(4)
             )
-            regs[3, jj] = ld_shared_u32(
-                b_region
-                + (tile_base + Int32(24) + tc_col) * Int32(4)
+            shift = (tc_col % Int32(4)) * Int32(8) + (kt_local % Int32(2)) * Int32(4)
+            nibble0 = (ld_shared_u32(scale_addr) >> shift) & Uint32(15)
+            nibble1 = (ld_shared_u32(scale_addr + Int32(8)) >> shift) & Uint32(15)
+            regs[2, jj] = Uint32(ld_shared_u16_offset(base_addr, 0)) | (
+                nibble0 << Uint32(16)
+            )
+            regs[3, jj] = Uint32(ld_shared_u16_offset(base_addr, 16)) | (
+                nibble1 << Uint32(16)
             )
 
     @cute.jit
@@ -4535,33 +4549,44 @@ class W4A16GemmKernel:
                     * Int64(n16_total) + Int64(global_n16)
                 ) * Int64(16) + Int64(tile_chunk) * Int64(4)
                 cp_async4_shared_global_pred(
-                    b_region + local_tile * Int32(128) + tile_chunk * Int32(16),
+                    b_region + local_tile * Int32(64) + tile_chunk * Int32(16),
                     get_ptr_as_int64(b_i32_flat, source_u32),
                     (chunk < Int32(total_chunks)).to(Int32),
                 )
             metadata_addr = get_ptr_as_int64(scales_i32_flat, Int64(0))
             expert_count = Int64(cute.size(b_i32_flat)) // Int64(self.size_k * self.size_n // 16)
             base_plane_bytes = expert_count * Int64(self.size_k // 256 * self.size_n * 2)
-            metadata_rows = self.cta_k_blocks * self.cta_n_blocks * 16
-            for i in cutlass.range_constexpr(_covering_count(metadata_rows, self.cta_threads)):
-                row = Int32(i * self.cta_threads) + tid
-                if row < Int32(metadata_rows):
-                    local_tile = row // Int32(16)
-                    col = row % Int32(16)
-                    global_k16 = tile_idx * Int32(self.cta_k_blocks) + local_tile // Int32(self.cta_n_blocks)
+            base_chunks = _covering_count(self.cta_k_blocks, 16) * self.cta_n_blocks * 2
+            base_region = b_region + Int32(self.cta_k_blocks * self.cta_n_blocks * 64)
+            scale_region = base_region + Int32(base_chunks * 16)
+            for i in cutlass.range_constexpr(_covering_count(base_chunks, self.cta_threads)):
+                chunk = Int32(i * self.cta_threads) + tid
+                if chunk < Int32(base_chunks):
+                    local_tile = chunk // Int32(2)
+                    global_k256 = tile_idx * Int32(self.cta_k_blocks) // Int32(16) + local_tile // Int32(self.cta_n_blocks)
                     global_n16 = output_n_tile * Int32(self.cta_n_blocks) + local_tile % Int32(self.cta_n_blocks)
                     block = (
-                        (Int64(expert_idx) * Int64(self.size_k // 256) + Int64(global_k16 // Int32(16)))
+                        (Int64(expert_idx) * Int64(self.size_k // 256) + Int64(global_k256))
                         * Int64(n16_total) + Int64(global_n16)
                     )
-                    base_bits = ld_global_b16(metadata_addr + (block * Int64(16) + Int64(col)) * Int64(2))
-                    scale_byte = (block * Int64(8) + Int64((global_k16 % Int32(16)) // Int32(2))) * Int64(16) + Int64(col)
-                    packed_scales = ld_global_nc_u32(metadata_addr + base_plane_bytes + (scale_byte // Int64(4)) * Int64(4))
-                    shift = (col % Int32(4)) * Int32(8) + (global_k16 % Int32(2)) * Int32(4)
-                    nibble = (packed_scales >> shift) & Uint32(15)
-                    st_shared_u32(
-                        b_region + local_tile * Int32(128) + Int32(64) + col * Int32(4),
-                        base_bits | (nibble << Int32(16)),
+                    cp_async4_shared_global(
+                        base_region + chunk * Int32(16),
+                        metadata_addr + block * Int64(32) + Int64(chunk % Int32(2)) * Int64(16),
+                    )
+            scale_chunks = self.cta_k_blocks // 2 * self.cta_n_blocks
+            for i in cutlass.range_constexpr(_covering_count(scale_chunks, self.cta_threads)):
+                chunk = Int32(i * self.cta_threads) + tid
+                if chunk < Int32(scale_chunks):
+                    global_k32 = tile_idx * Int32(self.cta_k_blocks // 2) + chunk // Int32(self.cta_n_blocks)
+                    global_n16 = output_n_tile * Int32(self.cta_n_blocks) + chunk % Int32(self.cta_n_blocks)
+                    block = (
+                        (Int64(expert_idx) * Int64(self.size_k // 256) + Int64(global_k32 // Int32(8)))
+                        * Int64(n16_total) + Int64(global_n16)
+                    )
+                    cp_async4_shared_global(
+                        scale_region + chunk * Int32(16),
+                        metadata_addr + base_plane_bytes
+                        + (block * Int64(8) + Int64(global_k32 % Int32(8))) * Int64(16),
                     )
 
         if cutlass.const_expr(self.weight_layout_trellis256):
