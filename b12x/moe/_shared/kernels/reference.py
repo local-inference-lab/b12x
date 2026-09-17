@@ -279,6 +279,47 @@ def _quantize_vec_to_fp4_dequant(
     blocked = vals_f32.reshape(n_blocks, block_size)
     block_max = blocked.abs().amax(dim=-1)
 
+    if scale_math in {"micro", "dynamic_precise", "dynamic_fast"}:
+        # Keep the scale as a device tensor. Tensor / Python-scalar may lower
+        # to multiplication by a host-computed reciprocal, changing FP4 ties.
+        gs = torch.tensor(global_scale, dtype=torch.float32, device=vals_f32.device)
+        if scale_math == "micro":
+            raw_scale = (block_max.double() * gs.double() / 6.0).float()
+        elif scale_math == "dynamic_fast":
+            sixth = torch.tensor(1.0 / 6.0, dtype=torch.float32, device=vals_f32.device)
+            raw_scale = (block_max * sixth) * gs
+        else:
+            raw_scale = (block_max * gs) / 6.0
+        scale = raw_scale.clamp(max=fp8_e4m3_max).to(torch.float8_e4m3fn).float()
+        if global_scale == 0.0:
+            return torch.zeros_like(vals_f32)
+        effective = (scale / gs).clamp(min=1e-30).unsqueeze(-1)
+        if scale_math == "dynamic_precise":
+            # quantize_and_pack_16 compares against scaled thresholds; division
+            # followed by FP4 conversion is not equivalent at rounding ties.
+            mag = blocked.abs()
+            quant = torch.zeros_like(blocked)
+            for lo, hi, value, closed in (
+                (0.25, 0.75, 0.5, False),
+                (0.75, 1.25, 1.0, True),
+                (1.25, 1.75, 1.5, False),
+                (1.75, 2.5, 2.0, True),
+                (2.5, 3.5, 3.0, False),
+                (3.5, 5.0, 4.0, True),
+            ):
+                lower, upper = effective * lo, effective * hi
+                inside = ((mag >= lower) & (mag <= upper)) if closed else (
+                    (mag > lower) & (mag < upper)
+                )
+                quant = torch.where(inside, value, quant)
+            quant = torch.where(mag > effective * 5.0, 6.0, quant) * blocked.sign()
+        elif scale_math == "micro":
+            quant = fp4_quantize_values_torch(blocked * effective.reciprocal())
+        else:
+            inverse_scale = torch.where(scale == 0, torch.zeros_like(scale), scale.reciprocal())
+            quant = fp4_quantize_values_torch(blocked * (inverse_scale * gs).unsqueeze(-1))
+        return (quant * scale.unsqueeze(-1)).reshape(cols)
+
     raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
     sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
@@ -940,10 +981,14 @@ def moe_reference_nvfp4(
 ) -> torch.Tensor:
     """Evaluate the routed NVFP4 reference on the GPU.
 
-    ``quant_scale_math`` selects the floating-point evaluation order used by
-    activation quantization.  The dynamic kernel uses direct division while
-    the micro kernel computes a reciprocal once and multiplies each value;
-    callers comparing against micro must request ``"reciprocal_multiply"``.
+    ``quant_scale_math`` selects activation-quantization evaluation order.
+    Use ``"micro"`` for the compact kernel, ``"dynamic_precise"`` for dynamic
+    execution with fast math disabled, and ``"dynamic_fast"`` with fast math
+    enabled. The fast reference uses Torch reciprocals; hardware approximate
+    reciprocal and activation instructions can introduce small differences.
+    ``"direct_division"`` and ``"reciprocal_multiply"`` retain the mathematical
+    evaluation orders used by existing callers, without modeling every native
+    kernel's scale rounding and threshold comparisons.
     """
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
