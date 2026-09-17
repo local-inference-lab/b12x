@@ -62,7 +62,14 @@ def pack_iq2_xs_matrix(
                     .reshape((stop - row) // 16, 16, kb, 8)
                     .permute(2, 0, 3, 1)
                 )
-    return words.reshape(-1), metadata
+    # Research control: materialize the K16 metadata alongside each descriptor tile.
+    expanded = torch.empty((e, kb * 16, n // 16, 32), dtype=torch.int32, device=blocks.device)
+    expanded[..., :16].copy_(words)
+    base_bits = bases.view(torch.int16).to(torch.int32) & 0xFFFF
+    for subblock in range(16):
+        nibble = (scales[:, :, :, subblock // 2, :].to(torch.int32) >> (4 * (subblock % 2))) & 15
+        expanded[:, subblock::16, :, 16:].copy_(base_bits | (nibble << 16))
+    return expanded.reshape(-1), torch.zeros(4, dtype=torch.uint8, device=blocks.device)
 
 
 def prepare_iq2_xs_moe_weights(

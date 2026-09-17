@@ -4519,50 +4519,26 @@ class W4A16GemmKernel:
         if cutlass.const_expr(self.weight_layout_iq2_xs):
             n16_total = self.size_n // 16
             k16_total = self.size_k // 16
-            chunks_per_k16 = self.cta_n_blocks * 4
+            chunks_per_k16 = self.cta_n_blocks * 8
             total_chunks = self.cta_k_blocks * chunks_per_k16
             b_region = smem_base + Int32(self.sh_b_off * 16) + pipe * Int32(self.b_sh_stage_bytes)
             for i in cutlass.range_constexpr(_covering_count(total_chunks, self.cta_threads)):
                 chunk = Int32(i * self.cta_threads) + tid
-                local_tile = chunk // Int32(4)
+                local_tile = chunk // Int32(8)
                 local_k16 = local_tile // Int32(self.cta_n_blocks)
                 local_n16 = local_tile % Int32(self.cta_n_blocks)
-                tile_chunk = chunk % Int32(4)
+                tile_chunk = chunk % Int32(8)
                 global_k16 = tile_idx * Int32(self.cta_k_blocks) + local_k16
                 global_n16 = output_n_tile * Int32(self.cta_n_blocks) + local_n16
                 source_u32 = (
                     (Int64(expert_idx) * Int64(k16_total) + Int64(global_k16))
                     * Int64(n16_total) + Int64(global_n16)
-                ) * Int64(16) + Int64(tile_chunk) * Int64(4)
+                ) * Int64(32) + Int64(tile_chunk) * Int64(4)
                 cp_async4_shared_global_pred(
                     b_region + local_tile * Int32(128) + tile_chunk * Int32(16),
                     get_ptr_as_int64(b_i32_flat, source_u32),
                     (chunk < Int32(total_chunks)).to(Int32),
                 )
-            metadata_addr = get_ptr_as_int64(scales_i32_flat, Int64(0))
-            expert_count = Int64(cute.size(b_i32_flat)) // Int64(self.size_k * self.size_n // 16)
-            base_plane_bytes = expert_count * Int64(self.size_k // 256 * self.size_n * 2)
-            metadata_rows = self.cta_k_blocks * self.cta_n_blocks * 16
-            for i in cutlass.range_constexpr(_covering_count(metadata_rows, self.cta_threads)):
-                row = Int32(i * self.cta_threads) + tid
-                if row < Int32(metadata_rows):
-                    local_tile = row // Int32(16)
-                    col = row % Int32(16)
-                    global_k16 = tile_idx * Int32(self.cta_k_blocks) + local_tile // Int32(self.cta_n_blocks)
-                    global_n16 = output_n_tile * Int32(self.cta_n_blocks) + local_tile % Int32(self.cta_n_blocks)
-                    block = (
-                        (Int64(expert_idx) * Int64(self.size_k // 256) + Int64(global_k16 // Int32(16)))
-                        * Int64(n16_total) + Int64(global_n16)
-                    )
-                    base_bits = ld_global_b16(metadata_addr + (block * Int64(16) + Int64(col)) * Int64(2))
-                    scale_byte = (block * Int64(8) + Int64((global_k16 % Int32(16)) // Int32(2))) * Int64(16) + Int64(col)
-                    packed_scales = ld_global_nc_u32(metadata_addr + base_plane_bytes + (scale_byte // Int64(4)) * Int64(4))
-                    shift = (col % Int32(4)) * Int32(8) + (global_k16 % Int32(2)) * Int32(4)
-                    nibble = (packed_scales >> shift) & Uint32(15)
-                    st_shared_u32(
-                        b_region + local_tile * Int32(128) + Int32(64) + col * Int32(4),
-                        base_bits | (nibble << Int32(16)),
-                    )
 
         if cutlass.const_expr(self.weight_layout_trellis256):
             t256_n16 = self.size_n // 16
