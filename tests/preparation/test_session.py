@@ -1,16 +1,18 @@
 """Host state-machine boundaries, without substituting a serving kernel."""
 import gc
 from dataclasses import replace
+import threading
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from b12x.preparation import (
-    CollectiveRequirement, DetectedDevice, MemoryRequirements,
+    CollectiveBarrierTimeout, CollectiveRequirement, DetectedDevice, MemoryRequirements,
     PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
     current_prepared_state, plan_from_handle, require_prepared,
 )
+from b12x.preparation.session import PreparationJob
 from b12x.preparation._cache import SelectionCache
 from b12x.preparation.types import _CompositePlan
 from b12x._lib.scratch import ScratchBufferSpec
@@ -18,7 +20,69 @@ from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolu
 from .test_defaults import Config, Query, contract
 
 
+def test_collective_barrier_dispatch_contract(tmp_path):
+    """The barrier fires on authorization match only, with uniform error surfaces."""
+    calls = []
+
+    def barrier(key, ranks):
+        """Record each collective barrier invocation."""
+        calls.append((key, ranks))
+
+    barrier_session = session(tmp_path, collective_barrier=barrier)
+    job = PreparationJob.__new__(PreparationJob)
+    job.session = barrier_session
+    job._error = None
+    job._result = None
+    job._closed = False
+    requirement = CollectiveRequirement(key="comm.roce:7", ranks=(0, 1))
+    job._blocked = requirement
+    job._phase = "priming"
+    job._active_request = None
+    job._completed_requests = 0
+
+    def _gen():
+        """Provide an exhausted synthetic job iterator."""
+        return
+        yield
+
+    job._steps = _gen()
+    job._progress = lambda *args, **kwargs: SimpleNamespace()
+    job._timing = SimpleNamespace(add=lambda *a: None, record=lambda *a, **k: None)
+    job._total_requests = 1
+
+    job._advance(collective_key="other")
+    assert calls == [] and job._blocked is requirement
+
+    job._advance(collective_key="comm.roce:7")
+    assert calls == [("comm.roce:7", (0, 1))]
+    assert job._blocked is None
+
+    def barrier_job():
+        """Create a job shell for direct barrier callback checks."""
+        job = PreparationJob.__new__(PreparationJob)
+        job.session = barrier_session
+        return job
+
+    def refusing(key, ranks):
+        """Report a barrier timeout for the authorized collective."""
+        raise CollectiveBarrierTimeout(key, ranks, ())
+
+    barrier_session.collective_barrier = refusing
+    with pytest.raises(CollectiveBarrierTimeout) as info:
+        barrier_job()._collective_barrier(requirement)
+    assert info.value.key == "comm.roce:7"
+
+    def broken(key, ranks):
+        """Simulate a barrier backend store failure."""
+        raise OSError("store down")
+
+    barrier_session.collective_barrier = broken
+    with pytest.raises(RuntimeError, match="collective barrier.*store down"):
+        barrier_job()._collective_barrier(requirement)
+
+
 def session(tmp_path, **kwargs):
+    """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
     value._cache = SelectionCache(tmp_path, {"schema_version": 5, "tuning_cache_version": 1})
     return value
@@ -37,6 +101,7 @@ def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
 
 
 def declaration(*, tuning=None, pin=None, shared=False):
+    """Build a minimal arithmetic plan for preparation state-machine tests."""
     tuning = contract(values=(2,)) if tuning is None else tuning
     return Plan(
         contract=tuning, query=Query(3), override=pin, shared=shared,
@@ -95,6 +160,7 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
 
 
 def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
+    """Persistent allocations remain separate when their owner includes the plan."""
     buffers = {}
 
     def memory(config, device):
@@ -136,7 +202,9 @@ def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
 
 
 def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path):
+    """Stopped tuning installs defaults without enumerating optional candidates."""
     def no_optional(query, device, assignment):
+        """Reject materialization if stopped tuning enumerates an optional choice."""
         raise AssertionError("stopped session enumerated an optional candidate")
 
     tuning = replace(contract(), materialize=no_optional)
@@ -152,6 +220,7 @@ def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path
 
 
 def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_record(tmp_path):
+    """Cache-only mode permits fixed and explicit selections without cache records."""
     tuning = replace(contract(), equivalence_key=lambda query, device, config: {"same": True})
     calls = []
     with session(tmp_path, cache_only=True) as engine:
@@ -165,6 +234,7 @@ def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_recor
 
 
 def test_collective_requires_explicit_matching_authorization(tmp_path):
+    """Collective preparation resumes only after its exact key is authorized."""
     calls = []
     requirement = CollectiveRequirement("group/prime", (0, 1))
     req = request(name="collective", calls=calls, collective=requirement)
@@ -185,7 +255,91 @@ def test_collective_requires_explicit_matching_authorization(tmp_path):
         job.result()
 
 
+def test_collective_barrier_failure_closes_active_job(tmp_path):
+    """Barrier callback failure clears the active job before propagation."""
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def broken(key, ranks):
+        """Simulate a collective backend failure after authorization."""
+        raise OSError("store down")
+
+    with session(tmp_path, collective_barrier=broken) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(RuntimeError, match="collective barrier.*store down"):
+            job.advance(collective_key=requirement.key)
+        assert job._closed
+        assert engine._job is None
+        engine.begin(())
+
+
+def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
+    tmp_path, monkeypatch,
+):
+    """A timed-out callback holds the collective gate until it returns."""
+    from b12x.preparation import session as session_module
+
+    started, release = threading.Event(), threading.Event()
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def stalled(key, ranks):
+        """Block the embedder barrier until the test permits completion."""
+        started.set()
+        release.wait()
+
+    monkeypatch.setattr(session_module, "_BARRIER_TIMEOUT_SECONDS", 0.01)
+    with session(tmp_path, collective_barrier=stalled) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(CollectiveBarrierTimeout) as error:
+            job.advance(collective_key=requirement.key)
+        assert "callback timed out" in str(error.value)
+        assert "never entered" not in str(error.value)
+        assert error.value.arrived is None
+        assert started.is_set() and job._closed and engine._job is None
+        pending = engine._pending_collective_barrier
+        with pytest.raises(RuntimeError, match="previous collective barrier"):
+            engine.begin(())
+        release.set()
+        assert pending.wait(1)
+        engine.begin(()).close()
+
+
+def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkeypatch):
+    """Thread-start failure does not leave the session's collective gate set."""
+    from b12x.preparation import session as session_module
+
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def broken_start(self):
+        """Fail the barrier thread before it can run its cleanup."""
+        raise OSError("thread start failed")
+
+    monkeypatch.setattr(session_module.threading.Thread, "start", broken_start)
+    with session(tmp_path, collective_barrier=lambda key, ranks: None) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(RuntimeError, match="collective barrier.*thread start failed"):
+            job.advance(collective_key=requirement.key)
+        assert job._closed and engine._job is None
+        assert engine._pending_collective_barrier is None
+        engine.begin(())
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "inf", "nan"))
+def test_collective_barrier_timeout_rejects_nonpositive_or_nonfinite_values(
+    monkeypatch, value,
+):
+    """The collective wait deadline rejects values that Event.wait cannot honor."""
+    from b12x.preparation import session as session_module
+
+    monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", value)
+    with pytest.raises(ValueError, match="finite positive"):
+        session_module._barrier_timeout_seconds()
+
+
 def test_new_obligation_fails_after_freeze(tmp_path):
+    """Frozen sessions reject declarations that were not prepared beforehand."""
     with session(tmp_path) as engine:
         engine.prepare((request(name="ready"),))
         engine.freeze()

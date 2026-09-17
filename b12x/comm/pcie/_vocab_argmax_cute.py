@@ -5,6 +5,7 @@ from __future__ import annotations
 from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 
+from b12x._lib.compile_plan import attach_programs
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -597,6 +598,7 @@ def get_vocab_argmax_launcher(
         bias_row_stride: int,
         batch: int,
     ) -> None:
+        """Launch the compiled vocabulary argmax kernel with runtime arguments."""
         if len(slab_addresses) != world_size:
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
@@ -639,7 +641,7 @@ def get_vocab_argmax_launcher(
             current_cuda_stream(),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["SLAB_BYTES", "get_vocab_argmax_launcher"]

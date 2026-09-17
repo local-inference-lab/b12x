@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Sequence
 
+from b12x._lib.compile_plan import attach_programs
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -1864,6 +1865,7 @@ def _get_compiled_lse_reduce_scatter(
     threads: int,
     device_slot_selection: bool,
 ) -> Callable:
+    """Compile and retain one LSE reduce-scatter launcher specialization."""
     launch = _LseReduceScatterLaunch(
         world_size,
         rank,
@@ -1933,6 +1935,7 @@ def _get_compiled_lse_reduce_scatter(
         slot_delta_256b: int,
         blocks: int,
     ) -> None:
+        """Launch the compiled LSE reduce-scatter with runtime arguments."""
         stages = _pad_ptrs(staging_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
         raw(
@@ -1956,7 +1959,7 @@ def _get_compiled_lse_reduce_scatter(
         )
 
     _PREPARED_LSE_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _gather_launcher_key(
@@ -1965,6 +1968,7 @@ def _gather_launcher_key(
     threads: int,
     device_slot_selection: bool,
 ) -> tuple[object, ...]:
+    """Return the cache key for an all-gather-heads launcher."""
     return (
         int(world_size),
         int(rank),
@@ -1994,6 +1998,7 @@ def _get_compiled_all_gather_heads(
     threads: int,
     device_slot_selection: bool,
 ) -> Callable:
+    """Compile and retain one all-gather-heads launcher specialization."""
     launch = _AllGatherHeadsLaunch(
         world_size,
         rank,
@@ -2046,6 +2051,7 @@ def _get_compiled_all_gather_heads(
         slot_delta_256b: int,
         blocks: int,
     ) -> None:
+        """Launch the compiled all-gather-heads kernel with runtime arguments."""
         row_bytes = int(head_dim) * int(element_size)
         if row_bytes % 16:
             raise ValueError("DCP gather rows must be a multiple of 16 bytes")
@@ -2066,7 +2072,7 @@ def _get_compiled_all_gather_heads(
         )
 
     _PREPARED_GATHER_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _pair_launcher_key(
@@ -2076,6 +2082,7 @@ def _pair_launcher_key(
     device_slot_selection: bool,
     kimi_topk: bool,
 ) -> tuple[object, ...]:
+    """Return the cache key for a paired all-gather launcher."""
     return (
         int(world_size),
         int(rank),
@@ -2109,6 +2116,7 @@ def _get_compiled_all_gather_pair(
     device_slot_selection: bool,
     kimi_topk: bool = False,
 ) -> Callable:
+    """Compile and retain one paired all-gather launcher specialization."""
     launch = _AllGatherPairLaunch(
         world_size,
         rank,
@@ -2175,6 +2183,7 @@ def _get_compiled_all_gather_pair(
         second_packs: int,
         slot_delta_256b: int,
     ) -> None:
+        """Launch the compiled paired all-gather kernel with runtime arguments."""
         stages = _pad_ptrs(staging_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
         raw(
@@ -2198,15 +2207,17 @@ def _get_compiled_all_gather_pair(
         )
 
     _PREPARED_PAIR_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def is_kimi_topk16_prepared(threads: int = 256) -> bool:
+    """Report whether the Kimi top-16 launcher is prepared for ``threads``."""
     return int(threads) in _PREPARED_KIMI_TOPK_LAUNCHERS
 
 
 @functools.cache
 def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
+    """Compile and retain one Kimi top-16 launcher specialization."""
     normalized_threads = int(threads)
     if normalized_threads not in (128, 256, 512):
         raise ValueError("Kimi top-16 threads must be 128, 256, or 512")
@@ -2241,6 +2252,7 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
         output_ids_ptr: int,
         rows: int,
     ) -> None:
+        """Launch the compiled Kimi top-16 kernel for ``rows`` router rows."""
         raw(
             _f32_ptr(router_logits_ptr),
             _f32_ptr(correction_bias_ptr),
@@ -2251,7 +2263,7 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
         )
 
     _PREPARED_KIMI_TOPK_LAUNCHERS.add(normalized_threads)
-    return run
+    return attach_programs(run, raw)
 
 
 def lse_reduce_scatter(
@@ -2279,6 +2291,7 @@ def lse_reduce_scatter(
     blocks: int,
     launcher: Callable | None = None,
 ) -> None:
+    """Reduce attention LSE values across PCIe ranks using a prepared launcher."""
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
         launcher = _get_compiled_lse_reduce_scatter(
