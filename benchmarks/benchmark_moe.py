@@ -3601,7 +3601,7 @@ def bench_e2e() -> None:
         w4a16_native=args.w4a16_native,
     )
     precomputed_oracles: dict[int, torch.Tensor] = {}
-    if args.validate == "oracle" and getattr(weight_plan, "reuses_source_storage", False):
+    if args.validate == "oracle" and weight_plan._impl.reuses_source_storage:
         print(
             "  Precomputing oracle outputs before destructive weight "
             "preparation...",
