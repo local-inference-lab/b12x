@@ -42,6 +42,7 @@ def host_timing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", scope)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: SimpleNamespace(synchronize=lambda: None))
     monkeypatch.setattr(_measurement, "no_compilation", scope)
+    monkeypatch.setattr(_measurement, "ROUND_BUDGET_US", 0)
 
 
 def _race(timers):
@@ -59,6 +60,12 @@ def _measure(prepared, *, eliminate=True, **kwargs):
 
 def _rounds(timer):
     return timer.replays
+
+
+def test_stream_gate_rejects_blocking_launches_before_queuing_a_wait(monkeypatch):
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
+    with pytest.raises(RuntimeError, match="CUDA_LAUNCH_BLOCKING"):
+        _measurement._StreamGate()
 
 
 def test_trailing_candidates_stop_after_one_round_and_keep_their_median(host_timing):
@@ -173,6 +180,7 @@ class _QueuedTimer:
 
 @pytest.fixture
 def queued_timing(host_timing, monkeypatch):
+    monkeypatch.setattr(_measurement, "ROUND_BUDGET_US", 256)
     queue, order, synchronizations = [], [], []
 
     def synchronize(*_args):
@@ -185,12 +193,15 @@ def queued_timing(host_timing, monkeypatch):
     return queue, order, synchronizations
 
 
-def test_batched_replays_preserve_individual_timing_and_balanced_order(queued_timing):
+@pytest.mark.parametrize("capture_safe", [False, True])
+def test_batched_replays_preserve_individual_timing_and_balanced_order(queued_timing, capture_safe):
     queue, order, synchronizations = queued_timing
     timers = tuple(
         _QueuedTimer(name, latency, queue, order)
         for name, latency in (("fast", 8.0), ("middle", 15.0), ("slow", 50.0))
     )
+    for timer in timers:
+        timer.call.capture_safe = capture_safe
 
     measurement = _measure(PreparedRace(timers, None, 8), rounds=2, eliminate=False)
 

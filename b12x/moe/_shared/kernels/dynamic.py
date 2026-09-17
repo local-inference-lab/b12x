@@ -1448,10 +1448,11 @@ class MoEDynamicKernelBackend:
             # The token N-role must be a multiple of the fixed sm120 N
             # permutation atom (8,2,2)=32; a smaller tile (tile_shape_mnk[0] is
             # 16 here) makes the MMA address phantom N-positions and scrambles
-            # tokens. Round the token tile up to a 64 multiple (>=64, dense's FP4
-            # swap_ab floor) and mask the padding with valid_rows. The 128-row
-            # activation atom supplies the extra token slots.
-            self._fc1_tok_tile = max(64, ((self.tile_shape_mnk[0] + 63) // 64) * 64)
+            # tokens. Round to the permutation atom's 32-column boundary and
+            # mask padding with valid_rows. The 128-row activation atom supplies
+            # the extra slots without retaining unused 64-column accumulators
+            # for M16 and M32 compute tiles.
+            self._fc1_tok_tile = max(32, ((self.tile_shape_mnk[0] + 31) // 32) * 32)
             self.fc1_tile_shape_mnk = (
                 self._fc1_int_tile,
                 self._fc1_tok_tile,
@@ -1459,6 +1460,9 @@ class MoEDynamicKernelBackend:
             )
             fc1_m_warps = min(self.atom_shape[0], self._fc1_int_tile // 16)
             self.fc1_atom_shape = (fc1_m_warps, self.num_mma_warps // fc1_m_warps, 1)
+            self.fc1_direct_sfb = (
+                self.fc1_atom_shape[1] > 2 or self._fc1_tok_tile < 64
+            )
             fc1_perm = sm120_utils.get_permutation_mnk(
                 self.fc1_tile_shape_mnk,
                 self.sf_vec_size,
@@ -4808,8 +4812,9 @@ class MoEDynamicKernelBackend:
                 thr_mma_fc1,
                 tidx,
             )
-            if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
-                # Four N warps group N/K modes; expose them for MMA indexing.
+            if cutlass.const_expr(self.fc1_direct_sfb):
+                # Expose N/K modes for direct scale loads. Narrow N32 tiles
+                # cannot retile the generic SFB copy atom into this fragment.
                 tCrSFB_sw = cute.make_tensor(
                     tCrSFB_sw.iterator,
                     cute.make_layout(
@@ -4862,7 +4867,7 @@ class MoEDynamicKernelBackend:
             crA_sw = thr_ld_A_sw.retile(tCrA_sw)
             crB_sw = thr_ld_B_sw.retile(tCrB_sw)
             crSFA_sw = thr_ld_SFA_sw.retile(tCrSFA_sw)
-            if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+            if cutlass.const_expr(self.fc1_direct_sfb):
                 crSFB_sw = tCrSFB_sw
             else:
                 crSFB_sw = thr_ld_SFB_sw.retile(tCrSFB_sw)
@@ -5354,7 +5359,7 @@ class MoEDynamicKernelBackend:
                             sSFA_fc1, _tok_nslice, (_tok_tile_idx, 0, None)
                         )
                         _csB = thr_ld_B_sw.partition_S(sA_part_sw_t)
-                        if cutlass.const_expr(self.fc1_atom_shape[1] <= 2):
+                        if cutlass.const_expr(not self.fc1_direct_sfb):
                             _fz_csSFB = cute.filter_zeros(
                                 thr_ld_SFB_sw.partition_S(sSFA_fc1_t)
                             )
@@ -5370,7 +5375,7 @@ class MoEDynamicKernelBackend:
                                     _csB[None, None, _kb, _i],
                                     crB_sw[None, None, _kb],
                                 )
-                                if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+                                if cutlass.const_expr(self.fc1_direct_sfb):
                                     self._copy_fc1_sfb(
                                         sSFA_fc1_t[None, None, _i],
                                         tCrSFB_sw, thr_mma_fc1, tidx, _kb,
@@ -5449,7 +5454,7 @@ class MoEDynamicKernelBackend:
                                     _csB[None, None, _kb, _i],
                                     crB_sw[None, None, _kb],
                                 )
-                                if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+                                if cutlass.const_expr(self.fc1_direct_sfb):
                                     self._copy_fc1_sfb(
                                         sSFA_fc1_t[None, None, _i],
                                         tCrSFB_sw, thr_mma_fc1, tidx, _kb,

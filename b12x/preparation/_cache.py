@@ -38,6 +38,7 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
             raise RuntimeError("CUDA device name is unavailable")
         return {
             "schema_version": 5, "tuning_cache_version": version,
+            "measurement": "stream_gated_events_v1",
             "namespace": dict(namespace), "device_name": name,
         }
 

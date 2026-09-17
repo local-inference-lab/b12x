@@ -20,7 +20,6 @@ gathers may interleave with reductions of any size inside one CUDA graph.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -30,6 +29,8 @@ from cutlass import Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
@@ -284,7 +285,7 @@ def is_launcher_prepared(*key) -> bool:
     return _process_key(*key) in _PREPARED_LAUNCHERS
 
 
-@functools.cache
+@program_cache
 def get_launcher(
     world_size: int,
     rank: int,
@@ -379,7 +380,7 @@ def get_launcher(
         )
 
     _PREPARED_LAUNCHERS.add(process_key)
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]

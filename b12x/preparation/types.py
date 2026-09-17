@@ -308,6 +308,13 @@ class PreparationProgress:
 
 @dataclass(kw_only=True)
 class PreparedCall:
+    """Prepared operation; timed calls enqueue work on the current CUDA stream.
+
+    A benchmark call must return without waiting for device work or using
+    unjoined side streams. Reset and activation production run before its gate.
+    ``capture_safe`` describes caller capture support, not the timing method.
+    """
+
     run: Callable[[], object]
     output: object = None
     produce: Callable[[], None] | None = None

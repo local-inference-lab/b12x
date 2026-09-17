@@ -60,6 +60,18 @@ def test_decisions_remain_device_name_and_model_specific(cache_device):
     assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 2)
 
 
+def test_stream_gated_measurement_keeps_prior_choices_in_a_separate_cache(cache_device, tmp_path):
+    identity = cache_identity({}, 0)
+    assert identity["measurement"] == "stream_gated_events_v1"
+    previous = {key: value for key, value in identity.items() if key != "measurement"}
+    original = SelectionCache(tmp_path, previous)
+    _save_choice(original)
+    measured = SelectionCache(tmp_path, identity)
+    assert measured.path != original.path
+    assert measured.get("shape") is None
+    assert original.path.is_file()
+
+
 def test_cached_choices_survive_uuid_and_ordinal_changes(cache_device, tmp_path, monkeypatch):
     original = SelectionCache(tmp_path, cache_identity({"model": "a"}, 0))
     _save_choice(original)

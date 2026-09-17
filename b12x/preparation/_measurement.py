@@ -1,16 +1,17 @@
 """Representative activation-producing races owned by preparation."""
 from __future__ import annotations
 
-import gc
+import ctypes
 import math
+import os
 import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from b12x._lib.compile_plan import (
-    ProgramKey, forbid_lowering, observe_programs, record_program, retain_compiled_programs,
+    ProgramKey, forbid_lowering, observe_programs, record_program,
 )
-from .types import PreparedCall, _prime, _close_all
+from .types import _prime, _close_all
 
 # Surviving candidates complete three scored rounds within the leader margin.
 SURVIVOR_ROUNDS = 3
@@ -76,59 +77,74 @@ def no_compilation():
         observed.check()
 
 
-class _GraphPool:
-    """Keep CUDA and pinned-host allocator pools owned between candidate graphs."""
+class _StreamGate:
+    """Hold queued device work until the host finishes submitting a sample."""
 
-    def __init__(self, stream):
-        import torch
+    def __init__(self):
+        if os.environ.get("CUDA_LAUNCH_BLOCKING") == "1":
+            raise RuntimeError("stream-gated autotuning requires CUDA_LAUNCH_BLOCKING to be disabled")
+        from cuda.bindings import driver
 
-        # A bare pool token owns neither allocator's reference count. This graph
-        # holds both counts without allocating sample storage or being replayed.
-        self.graph = torch.cuda.CUDAGraph(keep_graph=True)
-        self.event = torch.cuda.Event(external=True)
-        with torch.cuda.stream(stream):
-            self.graph.capture_begin()
-            try:
-                self.event.record()
-            finally:
-                self.graph.capture_end()
-        self.id = self.graph.pool()
+        self.driver = driver
+        self.pointer = self._check(driver.cuMemHostAlloc(4, driver.CU_MEMHOSTALLOC_DEVICEMAP))
+        try:
+            self.device_pointer = self._check(driver.cuMemHostGetDevicePointer(self.pointer, 0))
+            self.flag = ctypes.c_uint32.from_address(int(self.pointer))
+            self.flag.value = 0
+        except BaseException:
+            driver.cuMemFreeHost(self.pointer)
+            raise
+        self.sequence = 0
+        self.streams = {}
+
+    def _check(self, result):
+        status, *values = result
+        if status != self.driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"CUDA autotuning stream gate failed: {status}")
+        return values[0] if values else None
+
+    @contextmanager
+    def hold(self, stream):
+        self.streams[stream.cuda_stream] = stream
+        self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+        target = self.sequence
+        self._check(self.driver.cuStreamWaitValue32(
+            stream.cuda_stream, self.device_pointer, target,
+            int(self.driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ),
+        ))
+        try:
+            yield
+        finally:
+            # A later release must also satisfy an earlier, still queued wait.
+            self.flag.value = target
 
     def close(self):
-        from ._memory import release_graph_pool_cache
-
-        self.graph.reset()
-        release_graph_pool_cache(self.id)
+        if self.pointer is None:
+            return
+        self.flag.value = self.sequence
+        for stream in self.streams.values():
+            stream.synchronize()
+        self._check(self.driver.cuMemFreeHost(self.pointer))
+        self.pointer = None
+        self.streams.clear()
 
 
 class _TimedCall:
-    def __init__(self, call, eviction, samples, capture_stream, *, pool=None):
+    def __init__(self, call, eviction, samples, gate):
         import torch
         self.call, self.eviction = call, eviction
-        self.events = tuple((torch.cuda.Event(enable_timing=True, external=True),
-                             torch.cuda.Event(enable_timing=True, external=True)) for _ in range(samples))
-        self.graph = None
-        with retain_compiled_programs() as self._retained:
-            if call.capture_safe:
-                self.graph = torch.cuda.CUDAGraph()
-                # A discarded CuTe executor can own a cyclic reference to its CUDA
-                # library. Finalizing that cycle during capture invalidates it.
-                collecting = gc.isenabled()
-                gc.disable()
-                try:
-                    with torch.cuda.stream(capture_stream):
-                        self.graph.capture_begin(pool=pool)
-                        try:
-                            self._invoke()
-                        finally:
-                            self.graph.capture_end()
-                finally:
-                    if collecting:
-                        gc.enable()
+        self.gate = gate
+        self.events = tuple((torch.cuda.Event(enable_timing=True),
+                             torch.cuda.Event(enable_timing=True)) for _ in range(samples))
+        for pair in self.events:
+            for event in pair:
+                event.record()
 
-    def _invoke(self):
+    def replay(self):
+        import torch
         from .types import call_scope
 
+        stream = torch.cuda.current_stream()
         with call_scope():
             for start, end in self.events:
                 self.eviction()
@@ -136,25 +152,17 @@ class _TimedCall:
                     self.call.reset()
                 if self.call.produce is not None:
                     self.call.produce()
-                start.record()
-                self.call.invoke()
-                end.record()
-
-    def replay(self):
-        if self.graph is None:
-            self._invoke()
-        else:
-            self.graph.replay()
+                with self.gate.hold(stream):
+                    start.record(stream)
+                    self.call.invoke()
+                    end.record(stream)
 
     def samples(self):
         return tuple(start.elapsed_time(end) * 1000.0 for start, end in self.events)
 
     def close(self):
-        if self.graph is not None:
-            self.graph.reset()
-        # CUDA graph nodes do not own their compiled libraries. Drop these
-        # references only after destroying the graph executable.
-        self._retained = None
+        self.call = self.eviction = self.gate = None
+        self.events = ()
 
 
 @dataclass
@@ -166,20 +174,15 @@ class PreparedRace:
     planned_rounds: int = 0
     active_count: int = 0
     latest_round_us: tuple[float, ...] = ()
-    release_pools: bool = True
+    gate: object = None
     _closed: bool = field(default=False, init=False)
-    pool_ids: tuple = field(default=(), init=False)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        from ._memory import release_graph_pool_cache
-
-        self.pool_ids = tuple(timer.graph.pool() for timer in self.timers if timer.graph is not None)
-        closers = [timer.close for timer in self.timers]
-        if self.release_pools:
-            closers.extend(lambda pool=pool: release_graph_pool_cache(pool) for pool in self.pool_ids)
+        closers = [] if self.gate is None else [self.gate.close]
+        closers.extend(timer.close for timer in self.timers)
         _close_all(closers)
 
 
@@ -211,27 +214,21 @@ def _l2_flush_fn(device: object, *, enabled: bool):
 
 
 def prepare_race_steps(
-    calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, graph_pools=None,
-    capture_stream=None, eviction=None,
+    calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, eviction=None,
 ):
-    """Capture a batch, optionally reusing pools after their graphs are destroyed.
-
-    Each position owns a separate pool: simultaneously live candidate graphs
-    must not share storage because the race changes their replay order.
-    """
+    """Prepare event pairs for asynchronous calls on the current CUDA stream."""
     import torch
     if not calls or type(samples) is not int or samples <= 0:
         raise ValueError("a race requires candidates and positive samples")
     if any(call.produce is None for call in calls):
         raise ValueError("candidate races require an activation-producing context")
     timers = []
+    gate = None
     completed = False
     try:
         with torch.cuda.device(device_ordinal), no_compilation():
             if eviction is None:
                 eviction = _l2_flush_fn(torch.device("cuda", device_ordinal), enabled=True)
-            if capture_stream is None:
-                capture_stream = torch.cuda.Stream(device=device_ordinal)
             try:
                 eviction()
                 if not primed:
@@ -239,21 +236,17 @@ def prepare_race_steps(
                         _prime(call)
             finally:
                 torch.cuda.current_stream(device_ordinal).synchronize()
+            gate = _StreamGate()
         yield
-        for index, call in enumerate(calls):
+        for call in calls:
             with torch.cuda.device(device_ordinal), no_compilation():
-                pool = None
-                if graph_pools is not None and call.capture_safe:
-                    while len(graph_pools) <= index:
-                        graph_pools.append(_GraphPool(capture_stream))
-                    pool = graph_pools[index].id
-                timers.append(_TimedCall(call, eviction, samples, capture_stream, pool=pool))
+                timers.append(_TimedCall(call, eviction, samples, gate))
             yield
         completed = True
-        return PreparedRace(tuple(timers), eviction, samples, release_pools=graph_pools is None)
+        return PreparedRace(tuple(timers), eviction, samples, gate=gate)
     finally:
         if not completed:
-            PreparedRace(tuple(timers), None, samples, release_pools=graph_pools is None).close()
+            PreparedRace(tuple(timers), None, samples, gate=gate).close()
 
 
 def _replay_timers(timers, *, device_ordinal, sample_count=0, compilation_active=None):
@@ -316,7 +309,7 @@ def measure_race_steps(
                 if not math.isfinite(latency) or latency <= 0:
                     raise RuntimeError("candidate race produced an invalid latency")
                 totals[index] += latency
-                if turn == 0 and repetition == 0 and prepared.timers[index].call.capture_safe:
+                if turn == 0 and repetition == 0:
                     # The first scored replay also sizes the remaining work.
                     repeats[index] = max(1, math.ceil(ROUND_BUDGET_US / (prepared.sample_count * latency)))
             repetition += 1
@@ -356,10 +349,9 @@ def _consume(steps):
             return finished.value
 
 
-def _prepare_race(calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, graph_pools=None, capture_stream=None):
+def _prepare_race(calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False):
     return _consume(prepare_race_steps(
-        calls, device_ordinal=device_ordinal, samples=samples, primed=primed, graph_pools=graph_pools,
-        capture_stream=capture_stream,
+        calls, device_ordinal=device_ordinal, samples=samples, primed=primed,
     ))
 
 

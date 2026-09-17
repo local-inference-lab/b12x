@@ -567,8 +567,7 @@ class PreparationJob:
         self._batch_index = self._batch_candidates = 0
         self._completed_rounds = self._total_rounds = self._active_count = 0
         self._latest_round_us = ()
-        self._graph_pools = []
-        self._race_stream = self._race_eviction = None
+        self._race_eviction = None
         self._compilations = 0
         self._stack_limit = None
         self._direct_ready = False
@@ -1079,12 +1078,8 @@ class PreparationJob:
         self._latest_round_us = race.latest_round_us
         self._active_count = race.active_count
 
-    def _release_graph_pools(self):
-        pools, self._graph_pools = self._graph_pools, []
-        try:
-            _close_all(pool.close for pool in pools)
-        finally:
-            self._race_stream = self._race_eviction = None
+    def _release_race_resources(self):
+        self._race_eviction = None
 
     def _measure(self, trials, *, champion):
         from ._measurement import _l2_flush_fn, prepare_race_steps, measure_race_steps
@@ -1093,17 +1088,15 @@ class PreparationJob:
         steps = measuring = None
         try:
             self._phase = "calibrating"
-            if self._race_stream is None and self.session.device.ordinal is not None:
+            if self._race_eviction is None and self.session.device.ordinal is not None:
                 import torch
                 with self.session._gpu_scope():
-                    self._race_stream = torch.cuda.Stream(device=self.session.device.ordinal)
                     self._race_eviction = _l2_flush_fn(
                         torch.device("cuda", self.session.device.ordinal), enabled=True,
                     )
             steps = prepare_race_steps(
                 calls, device_ordinal=self.session.device.ordinal, samples=self.session.samples,
-                primed=True, graph_pools=self._graph_pools,
-                capture_stream=self._race_stream, eviction=self._race_eviction,
+                primed=True, eviction=self._race_eviction,
             )
             while not self.session._stop.is_set():
                 try:
@@ -1251,7 +1244,7 @@ class PreparationJob:
             closers.extend(trial.close for trial in live)
             if carried is not None and carried not in live:
                 closers.append(carried.close)
-            closers.append(self._release_graph_pools)
+            closers.append(self._release_race_resources)
             _close_all(closers)
 
     def _publish(self, request, selection, state, call, retained, programs, variants=None):

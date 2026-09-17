@@ -1,7 +1,10 @@
 """Prepared launchers remain valid after compiler caches release their copies."""
 
 import gc
+import statistics
+import time
 
+import pytest
 import torch
 
 from b12x._lib import compiler
@@ -60,7 +63,7 @@ def test_graph_replay_survives_compiler_cache_eviction(monkeypatch):
             graph.reset()
 
 
-def test_candidate_graphs_preserve_outputs_without_global_allocator_flushes(monkeypatch):
+def test_candidate_timing_preserves_outputs_without_capture_or_allocator_flushes(monkeypatch):
     from b12x.gemm import bf16_gemv
     from b12x.preparation import _measurement
 
@@ -75,31 +78,34 @@ def test_candidate_graphs_preserve_outputs_without_global_allocator_flushes(monk
                 run=lambda: state.run(source, weight),
             ),
         )
-        for index, (source, plan) in enumerate(zip(sources, plans))
+        for index, (source, plan) in enumerate(zip(sources, plans, strict=True))
     ]
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         session.prepare(requests)
+        outputs = [torch.empty(source.shape[0], weight.shape[0], device=device, dtype=source.dtype)
+                   for source in sources]
         calls = [
             PreparedCall(
-                run=lambda source=source, plan=plan: bf16_gemv.mm(source, weight, plan=plan),
+                run=lambda source=source, plan=plan, output=output: bf16_gemv.mm(source, weight, plan=plan, out=output),
                 produce=lambda source=source: source.add_(0.125),
                 owners=(source, weight),
             )
-            for source, plan in zip(sources, plans)
+            for source, plan, output in zip(sources, plans, outputs, strict=True)
         ]
 
         def forbidden(*_args, **_kwargs):
-            raise AssertionError("candidate graph construction flushed the process allocator")
+            raise AssertionError("candidate timing captured a graph or flushed the process allocator")
 
         with monkeypatch.context() as guards:
             guards.setattr(torch.cuda, "empty_cache", forbidden)
             guards.setattr(torch._C, "_host_emptyCache", forbidden)
+            guards.setattr(torch.cuda, "CUDAGraph", forbidden)
             race = _measurement._prepare_race(calls, device_ordinal=torch.cuda.current_device(), samples=8)
         try:
             pointers = [call.output.data_ptr() for call in calls]
             assert len(set(pointers)) == len(calls)
             for initial in (1.0, 3.0):
-                for source, call in zip(sources, calls):
+                for source, call in zip(sources, calls, strict=True):
                     source.fill_(initial)
                     with torch.inference_mode():
                         call.output.fill_(float("nan"))
@@ -110,7 +116,7 @@ def test_candidate_graphs_preserve_outputs_without_global_allocator_flushes(monk
                 torch.cuda.synchronize(device)
                 assert torch.cuda.memory_allocated(device) == allocated
                 assert [call.output.data_ptr() for call in calls] == pointers
-                for source, call, timer in zip(sources, calls, race.timers):
+                for source, call, timer in zip(sources, calls, race.timers, strict=True):
                     torch.testing.assert_close(source, torch.full_like(source, initial + 1.0))
                     expected = source.float() @ weight.float().T
                     assert torch.isfinite(call.output).all()
@@ -121,7 +127,7 @@ def test_candidate_graphs_preserve_outputs_without_global_allocator_flushes(monk
             race.close()
 
 
-def test_retired_candidate_pools_do_not_accumulate_or_release_live_graphs(monkeypatch):
+def test_retired_candidate_timers_do_not_accumulate_or_release_live_graphs(monkeypatch):
     from b12x.preparation import _measurement
     from b12x.preparation._memory import release_graph_pool_cache
 
@@ -175,7 +181,7 @@ def test_retired_candidate_pools_do_not_accumulate_or_release_live_graphs(monkey
         release_graph_pool_cache(pool)
 
 
-def test_candidate_pool_reuse_preserves_carried_outputs_and_bounds_residency(monkeypatch):
+def test_candidate_timing_preserves_carried_outputs_and_bounds_residency(monkeypatch):
     from b12x.preparation import _measurement
     from b12x.preparation._memory import release_graph_pool_cache
     from b12x.preparation.types import _prime
@@ -183,8 +189,7 @@ def test_candidate_pool_reuse_preserves_carried_outputs_and_bounds_residency(mon
     device = require_b12x()
     ordinal = torch.cuda.current_device()
     source = torch.ones(1024, 1024, device=device)
-    stream = torch.cuda.Stream(device=device)
-    pools, reserved = [], []
+    reserved = []
     champion = None
     live_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(live_graph):
@@ -202,12 +207,15 @@ def test_candidate_pool_reuse_preserves_carried_outputs_and_bounds_residency(mon
             for batch in range(8):
                 calls = [] if champion is None else [champion]
                 while len(calls) < 2:
-                    call = PreparedCall(run=source.clone, produce=lambda: source.add_(0.125))
+                    output = torch.empty_like(source)
+                    call = PreparedCall(
+                        run=lambda output=output: output.copy_(source),
+                        produce=lambda: source.add_(0.125),
+                    )
                     _prime(call)
                     calls.append(call)
                 race = _measurement._prepare_race(
                     calls, device_ordinal=ordinal, samples=2, primed=True,
-                    graph_pools=pools, capture_stream=stream,
                 )
                 pointers = [call.output.data_ptr() for call in calls]
                 assert len(set(pointers)) == 2
@@ -225,7 +233,6 @@ def test_candidate_pool_reuse_preserves_carried_outputs_and_bounds_residency(mon
                 for position, index in enumerate(order):
                     torch.testing.assert_close(calls[index].output, torch.full_like(source, batch + 0.25 * (position + 1)))
                 race.close()
-                assert len(pools) == 2
                 champion = calls[batch % 2]
                 calls[1 - batch % 2].output = None
                 del race, calls, call
@@ -238,9 +245,56 @@ def test_candidate_pool_reuse_preserves_carried_outputs_and_bounds_residency(mon
     finally:
         if champion is not None:
             champion.output = None
-        for pool in pools:
-            pool.close()
         pool = live_graph.pool()
         live_graph.reset()
         del live_output
         release_graph_pool_cache(pool)
+
+
+@pytest.mark.parametrize("capture_safe", [False, True])
+def test_candidate_events_exclude_python_gaps_without_capture(monkeypatch, capture_safe):
+    from b12x.preparation import _measurement
+
+    device = require_b12x()
+    output = torch.empty(1024, device=device)
+
+    def run():
+        output.mul_(2)
+        time.sleep(0.02)
+        output.add_(3)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("candidate timing attempted CUDA graph capture")
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", forbidden)
+    call = PreparedCall(run=run, produce=lambda: output.fill_(1), capture_safe=capture_safe)
+    race = _measurement._prepare_race([call], device_ordinal=torch.cuda.current_device(), samples=4)
+    try:
+        _measurement._replay_timers(race.timers, device_ordinal=torch.cuda.current_device())
+        torch.testing.assert_close(output, torch.full_like(output, 5))
+        assert 0 < statistics.median(race.timers[0].samples()) < 5000
+    finally:
+        race.close()
+
+
+def test_stream_gate_releases_queued_work_when_a_call_raises():
+    from b12x.preparation._measurement import _StreamGate
+
+    device = require_b12x()
+    output = torch.zeros(1, device=device)
+    output.add_(1)
+    output.zero_()
+    torch.cuda.synchronize(device)
+    gate = _StreamGate()
+    stream = torch.cuda.current_stream()
+    try:
+        torch.cuda._sleep(100_000_000)
+        with gate.hold(stream):
+            output.add_(1)
+        with pytest.raises(RuntimeError, match="launch failed"), gate.hold(stream):
+            output.add_(2)
+            raise RuntimeError("launch failed")
+        gate.close()
+        torch.testing.assert_close(output, torch.full_like(output, 3))
+    finally:
+        gate.close()

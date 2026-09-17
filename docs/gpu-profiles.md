@@ -139,18 +139,23 @@ requires a host C++ compiler and CUDA headers located through `CUDA_HOME`.
 The extension uses PyTorch's extension cache (`TORCH_EXTENSIONS_DIR` when
 set). Preparation that performs no race does not build it.
 
-Each candidate is primed once. A batch captures two representative samples
+Each candidate is primed once. A batch times two representative samples
 per candidate by default, with L2 eviction and activation production before
-each timed invocation. The first scored replay also sizes a 256-microsecond
+each timed invocation. The first scored invocation also sizes a 256-microsecond
 kernel-time budget per round; there are no unscored calibration replays.
-Replay groups wait on their launch stream before reading or reusing events.
-Each candidate position has a separate graph pool and all positions reuse
-one capture stream and L2 buffer across batches. A retained, non-replayed
-owner graph keeps CUDA and pinned-host allocator pools live between batches.
-Candidate graphs are destroyed before their pools are reused; pool caches
-are released after the query's race and trial cleanup.
+Every sample queues a CUDA stream memory wait before its start event and
+releases the wait through mapped host memory after its end event is queued.
+Device execution therefore excludes Python launch gaps without graph capture
+or CUPTI. The interval includes device dispatch between kernels; no per-kernel
+marker cost is subtracted. Benchmark calls must enqueue asynchronous work on
+the current stream; host synchronization and unjoined side streams are not
+supported inside a scored call. Producers and resets execute before the gate.
+Groups wait on their launch stream before reading or reusing events, and
+the gate is drained before its host memory is freed. The L2 buffer is reused
+across batches. Tuning cache identities include `stream_gated_events_v1` so
+decisions measured with another method are retained separately.
 
-Within a batch every candidate is timed by CUDA-graph replay for at least one
+Within a batch every candidate is timed with stream-gated events for at least one
 round. After each round a candidate whose best round trails the batch leader
 by more than 10% stops being re-timed and keeps the median of the rounds it
 completed; the carried champion is re-timed in every round; survivors
