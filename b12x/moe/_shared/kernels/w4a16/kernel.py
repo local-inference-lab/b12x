@@ -3066,28 +3066,34 @@ class W4A16GemmKernel:
             )
 
         if reduce_slice_count > Int32(1):
-            self._wait_for_reduction_turn(
-                locks_i32_flat, lock_slot, reduce_slice_idx, tid
-            )
-            self._combine_splitk_accumulators(
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                c_tmp_f32_flat,
-                block_valid_rows,
-                lock_slot,
-                reduce_slice_idx,
-                reduce_slice_count,
-                tid,
-                uses_m_block_8,
-            )
-            self._publish_reduction_turn(
-                locks_i32_flat,
-                lock_slot,
-                reduce_slice_idx == reduce_slice_count - Int32(1),
-                tid,
-            )
+            if cutlass.const_expr(self.weight_layout_iq2_xs and uses_m_block_8):
+                self._combine_iq2_xs_splitk_partials(
+                    acc0, c_tmp_f32_flat, locks_i32_flat,
+                    lock_slot, reduce_slice_idx, reduce_slice_count, tid,
+                )
+            else:
+                self._wait_for_reduction_turn(
+                    locks_i32_flat, lock_slot, reduce_slice_idx, tid
+                )
+                self._combine_splitk_accumulators(
+                    acc0,
+                    acc1,
+                    acc2,
+                    acc3,
+                    c_tmp_f32_flat,
+                    block_valid_rows,
+                    lock_slot,
+                    reduce_slice_idx,
+                    reduce_slice_count,
+                    tid,
+                    uses_m_block_8,
+                )
+                self._publish_reduction_turn(
+                    locks_i32_flat,
+                    lock_slot,
+                    reduce_slice_idx == reduce_slice_count - Int32(1),
+                    tid,
+                )
 
         if reduce_slice_idx == reduce_slice_count - Int32(1):
             if cutlass.const_expr(uses_m_block_8):
@@ -3113,6 +3119,73 @@ class W4A16GemmKernel:
                     block_valid_rows,
                     global_scale_f32,
                 )
+
+    @cute.jit
+    def _combine_iq2_xs_splitk_partials(
+        self,
+        acc,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        lock_slot: Int32,
+        reduce_slice_idx: Int32,
+        reduce_slice_count: Int32,
+        tid: Int32,
+    ):
+        cta, _, _ = cute.arch.block_idx()
+        active_threads = Int32(32 * self.tb_n_warps)
+        tile_elements = Int64(16 * self.tile_n)
+        lock_addr = get_ptr_as_int64(locks_i32_flat, Int64(lock_slot))
+        # A stripe publishes at most its first partial tile. Its final partial
+        # is the reducer, so one scratch slot per CTA remains live until read.
+        if reduce_slice_idx != reduce_slice_count - Int32(1):
+            if tid < active_threads:
+                for jj in cutlass.range_constexpr(4):
+                    offset = (
+                        Int64(cta) * tile_elements
+                        + (Int64(active_threads) * Int64(jj * 2) + Int64(tid)) * Int64(4)
+                    )
+                    st_global_v4_f32(
+                        get_ptr_as_int64(c_tmp_f32_flat, offset),
+                        acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4) % _SCALAR_ACC_FRAGMENT_WIDTH],
+                        acc[(jj * 4 + 1) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 1) % _SCALAR_ACC_FRAGMENT_WIDTH],
+                        acc[(jj * 4 + 2) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 2) % _SCALAR_ACC_FRAGMENT_WIDTH],
+                        acc[(jj * 4 + 3) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH],
+                    )
+            cute.arch.sync_threads()
+            if tid == Int32(0):
+                red_add_global_release_i32(lock_addr, Int32(1))
+        else:
+            if tid == Int32(0):
+                arrived = Int32(-1)
+                while arrived != reduce_slice_count - Int32(1):
+                    arrived = ld_global_acquire_i32(lock_addr)
+            cute.arch.sync_threads()
+            if tid < active_threads:
+                for jj in cutlass.range_constexpr(4):
+                    s0 = cutlass.Float32(0.0)
+                    s1 = cutlass.Float32(0.0)
+                    s2 = cutlass.Float32(0.0)
+                    s3 = cutlass.Float32(0.0)
+                    for part in cutlass.range(reduce_slice_count - Int32(1), unroll=1):
+                        source_cta = Int64(cta) + Int64(reduce_slice_count - Int32(1) - part)
+                        offset = (
+                            source_cta * tile_elements
+                            + (Int64(active_threads) * Int64(jj * 2) + Int64(tid)) * Int64(4)
+                        )
+                        v0, v1, v2, v3 = ld_global_v4_f32(
+                            get_ptr_as_int64(c_tmp_f32_flat, offset)
+                        )
+                        s0 = v0 + s0
+                        s1 = v1 + s1
+                        s2 = v2 + s2
+                        s3 = v3 + s3
+                    acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4) % _SCALAR_ACC_FRAGMENT_WIDTH] += s0
+                    acc[(jj * 4 + 1) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 1) % _SCALAR_ACC_FRAGMENT_WIDTH] += s1
+                    acc[(jj * 4 + 2) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 2) % _SCALAR_ACC_FRAGMENT_WIDTH] += s2
+                    acc[(jj * 4 + 3) // _SCALAR_ACC_FRAGMENT_WIDTH][(jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH] += s3
+            cute.arch.sync_threads()
+            if tid == Int32(0):
+                st_global_i32(lock_addr, Int32(0))
 
     @cute.jit
     def _wait_for_reduction_turn(
