@@ -7680,26 +7680,16 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
         decode.append(
             f"""
             {extract}
-            shr.u32 signs{index}, d{index}, 9;
-            popc.b32 parity{index}, signs{index};
-            and.b32 parity{index}, parity{index}, 1;
-            shl.b32 parity{index}, parity{index}, 7;
-            or.b32 signs{index}, signs{index}, parity{index};
-            shr.u32 signs{index}, signs{index}, $9;
-            and.b32 d{index}, d{index}, 0x1ff;
             mad.wide.u32 a{index}, d{index}, 8, $8;
             add.u64 a{index}, a{index}, po;
             ld.global.nc.u16 p{index}, [a{index}];
             cvt.u32.u16 u{index}, p{index};
             and.b32 xl{index}, u{index}, 0xff;
             shr.u32 xh{index}, u{index}, 8;
-            cvt.rn.f32.u32 fl{index}, xl{index};
-            cvt.rn.f32.u32 fh{index}, xh{index};
-            shl.b32 sign_lo{index}, signs{index}, 31;
-            shl.b32 sign_hi{index}, signs{index}, 30;
-            and.b32 sign_hi{index}, sign_hi{index}, 0x80000000;
-            xor.b32 fl{index}, fl{index}, sign_lo{index};
-            xor.b32 fh{index}, fh{index}, sign_hi{index};
+            cvt.s32.s8 il{index}, xl{index};
+            cvt.s32.s8 ih{index}, xh{index};
+            cvt.rn.f32.s32 fl{index}, il{index};
+            cvt.rn.f32.s32 fh{index}, ih{index};
             mul.f32 fl{index}, fl{index}, s{row};
             mul.f32 fh{index}, fh{index}, s{row};
             cvt.rn.satfinite.bf16x2.f32 ${index}, fh{index}, fl{index};
@@ -7712,10 +7702,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             .reg .b32 d0, d1, d2, d3, n0, n1;
             .reg .u32 u0, u1, u2, u3, xl0, xl1, xl2, xl3,
                       xh0, xh1, xh2, xh3;
-            .reg .u32 signs0, signs1, signs2, signs3,
-                      parity0, parity1, parity2, parity3,
-                      sign_lo0, sign_lo1, sign_lo2, sign_lo3,
-                      sign_hi0, sign_hi1, sign_hi2, sign_hi3;
+            .reg .s32 il0, il1, il2, il3, ih0, ih1, ih2, ih3;
             .reg .u64 po, a0, a1, a2, a3;
             .reg .f32 s0, s1, fl0, fl1, fl2, fl3,
                       fh0, fh1, fh2, fh3;
