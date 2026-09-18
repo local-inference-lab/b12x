@@ -313,6 +313,18 @@ def plan_weights(
     else:
         raise TypeError("source must be a PackedSource, TrellisConfig or Exl3Source")
 
+    if (isinstance(source, PackedSource) and recipe == "w4a8_mx"
+            and constraints.required_packing is WeightPacking.SOURCE_NATIVE):
+        from .._shared.execution import (
+            PreparedWeightLayout, PreparedScaleLayout, WeightPreparationTransform,
+            WeightStoragePolicy,
+        )
+        raw_plan = replace(raw_plan,
+            transforms=frozenset({WeightPreparationTransform.W4A8_MX_NATIVE}),
+            weight_layouts=frozenset({PreparedWeightLayout.SOURCE_NATIVE}),
+            scale_layouts=frozenset({PreparedScaleLayout.MMA_PACKED}),
+            storage_policy=WeightStoragePolicy.KEEP_SOURCE)
+
     return WeightPlan(
         source=source,
         activation=activation,
@@ -336,6 +348,9 @@ def prepare_weights(
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
+    from .._shared.execution import WeightPreparationTransform
+    if WeightPreparationTransform.W4A8_MX_NATIVE in plan._impl.transforms:
+        raise ValueError("source-native MXFP4 A8 storage is materialized by a residency PreparationSession plan")
     if isinstance(plan.source, Exl3Source):
         if not isinstance(weights, Exl3Weights):
             raise TypeError("EXL3 preparation requires Exl3Weights")

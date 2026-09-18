@@ -38,6 +38,8 @@ from .planning import (
     prepare_weights as _prepare_weights,
 )
 from .source import Exl3Source, PackedSource, PackedSourceFormat, W13Layout, WeightSource
+from .residency import ExpertResidencyPlan, ExpertMemoryBudget, ExpertMemoryAccounting
+from ._residency_tuning import ResidencyConfig, ResidencyQuery
 from .weights import (
     Exl3Weights,
     PackedWeights,
@@ -78,13 +80,23 @@ def prepare_weights(
 
 def plan_execution(
     *,
-    experts: PreparedExperts,
+    experts: PreparedExperts | WeightPlan,
     capacity: ExecutionCapacity,
+    weights: PackedWeights | None = None,
+    placement: ExpertResidencyPlan | None = None,
+    memory_budget: ExpertMemoryBudget | None = None,
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
-    override: MoeDecodeConfig | None = None,
+    override: MoeDecodeConfig | ResidencyConfig | None = None,
 ):
     """Declare capacity variants; preparation publishes executable states."""
+    if placement is not None:
+        from ._residency_preparation import plan as residency_plan
+        return residency_plan(weight_plan=experts, weights=weights, capacity=capacity,
+            placement=placement, memory_budget=memory_budget, routing=routing,
+            invocation=invocation, override=override)
+    if weights is not None or memory_budget is not None:
+        raise ValueError("source weights and residency budgets require an expert placement")
     return _plan_execution(
         experts=experts,
         capacity=capacity,
@@ -116,13 +128,26 @@ def plan_fc2(
 
 def bind(plan: Plan, **kwargs: Any) -> Binding:
     """Bind live tensors within a session-prepared token capacity."""
-    state = require_prepared(plan, "moe.decode")
+    if plan.component_id == "moe.expert_residency" and plan.prepared is None:
+        raise RuntimeError("expert residency plan is not prepared; use PreparationSession before binding")
+    component = "moe.expert_residency" if plan.component_id == "moe.expert_residency" else "moe.decode"
+    state = require_prepared(plan, component)
     return replace(state.bind(**kwargs), plan=plan)
 
 
 def run(*, binding: Binding):
     """Run only a binding created from a prepared plan."""
     plan = binding.plan
+    if plan.component_id == "moe.expert_residency":
+        from ._residency_preparation import ResidencyBinding
+        if plan.prepared is None:
+            raise RuntimeError("expert residency plan is not prepared or has been released")
+        state = require_prepared(plan, "moe.expert_residency", binding.a.device)
+        if not isinstance(binding, ResidencyBinding):
+            raise TypeError("hierarchical execution requires its prepared binding")
+        if not binding.owners or binding.owners[0] is not state:
+            raise ValueError("binding belongs to another preparation of this plan")
+        return binding.run()
     require_prepared(plan, "moe.decode", binding.a.device)
     return _run(binding=binding)
 
@@ -196,6 +221,11 @@ __all__ = [
     "ActivationMode",
     "ActivationSpec",
     "ExecutionCapacity",
+    "ExpertResidencyPlan",
+    "ExpertMemoryBudget",
+    "ExpertMemoryAccounting",
+    "ResidencyConfig",
+    "ResidencyQuery",
     "Binding",
     "RouteBinding",
     "RouteTopKInvocation",

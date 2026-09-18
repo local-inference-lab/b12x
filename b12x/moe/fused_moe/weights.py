@@ -164,6 +164,8 @@ class PackedWeights:
     scales; ModelOpt NVFP4 A4/A8 preparation requires both scale tensors.
     ``immutable_input_scales`` promises that input scale values remain unchanged
     throughout prepared bindings and graph replay; reprepare after mutation.
+    Hierarchical placement requires matching ``checkpoint_fingerprint`` and
+    ``layer_name`` metadata. The loader supplies and verifies checkpoint identity.
     """
 
     w13: torch.Tensor
@@ -175,8 +177,14 @@ class PackedWeights:
     input_scale: torch.Tensor | None = None
     intermediate_scale: torch.Tensor | None = None
     immutable_input_scales: bool = False
+    checkpoint_fingerprint: str | None = None
+    layer_name: str | None = None
 
     def __post_init__(self) -> None:
+        for name in ("checkpoint_fingerprint", "layer_name"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"PackedWeights.{name} must be a nonempty string or None")
         if type(self.immutable_input_scales) is not bool:
             raise TypeError("immutable_input_scales must be boolean")
         for name in (

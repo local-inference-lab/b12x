@@ -142,6 +142,7 @@ class WeightPreparationTransform(_StringEnum):
     W4A16_TRELLIS = "w4a16_trellis"
     W4A16_IQ2_XS = "w4a16_iq2_xs"
     W4A8_QMMA = "w4a8_qmma"
+    W4A8_MX_NATIVE = "w4a8_mx_native"
     W4A8_TRELLIS = "w4a8_trellis"
     W6A8_MXFP6 = "w6a8_mxfp6"
 
@@ -588,6 +589,8 @@ class MoEWeightPreparationPlan:
             raise ValueError(
                 f"quant_mode={quant_mode!r} is absent from this preparation plan"
             )
+        if WeightPreparationTransform.W4A8_MX_NATIVE in self.transforms:
+            return PreparedWeightLayout.SOURCE_NATIVE
         if quant_mode == "w4a16":
             if WeightPreparationTransform.W4A16_IQ2_XS in self.transforms:
                 return PreparedWeightLayout.IQ2_XS_COMPACT
