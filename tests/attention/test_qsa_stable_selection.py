@@ -56,12 +56,14 @@ def test_stable_selection_exact_replay(budget, group_offset, pattern):
             expected_ids[row, :count] = global_ids[order]
         return expected_values, expected_ids
 
-    def run():
+    def run(live_rows=rows):
         launch_stabilize_topk(
-            scores=scores, merge_lengths=lengths, prior_ids=prior,
-            eligible_counts=eligible, topk_values=values, topk_group_ids=ids,
-            tie_counts=counts, greater_counts=other_counts, stable_values=stable_values,
-            stable_ids=stable_ids, thresholds=thresholds, greater_totals=totals,
+            scores=scores[:live_rows], merge_lengths=lengths[:live_rows],
+            prior_ids=prior[:live_rows], eligible_counts=eligible[:live_rows],
+            topk_values=values[:live_rows], topk_group_ids=ids[:live_rows],
+            tie_counts=counts[:live_rows], greater_counts=other_counts[:live_rows],
+            stable_values=stable_values[:live_rows], stable_ids=stable_ids[:live_rows],
+            thresholds=thresholds[:live_rows], greater_totals=totals[:live_rows],
             group_offset=group_offset, group_budget=budget)
 
     expected = produce()
@@ -69,20 +71,28 @@ def test_stable_selection_exact_replay(budget, group_offset, pattern):
     torch.testing.assert_close(values, expected[0], rtol=0, atol=0)
     assert torch.equal(ids, expected[1])
     resolved = dict(_CACHE)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
+    graphs = {}
+    with kernel_resolution_guard('Stable selection reuses prepared programs across live row counts'):
+        for live_rows in (1, 4, rows):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(live_rows)
+            graphs[live_rows] = graph
     for _ in range(3):
         lengths.copy_(lengths.roll(1))
         eligible.copy_(lengths if not group_offset else torch.where(lengths <= budget, lengths, lengths-budget+group_offset))
         expected = produce()
-        ids.fill_(-98765)
-        allocation = torch.cuda.memory_allocated()
-        with kernel_resolution_guard('Stable selection reuses one prepared callable across changed lengths'):
+        for live_rows, graph in graphs.items():
+            # Restore the radix threshold inputs before each in-place selection.
+            masked = scores.masked_fill(torch.arange(width, device=device)[None, :] >= lengths[:, None], -float('inf'))
+            values.copy_(masked.topk(budget, sorted=False).values)
+            ids.fill_(-98765)
+            allocation = torch.cuda.memory_allocated()
             graph.replay()
             torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocation
-        torch.testing.assert_close(values, expected[0], rtol=0, atol=0)
-        assert torch.equal(ids, expected[1])
+            assert torch.cuda.memory_allocated() == allocation
+            torch.testing.assert_close(values[:live_rows], expected[0][:live_rows], rtol=0, atol=0)
+            assert torch.equal(ids[:live_rows], expected[1][:live_rows])
+            assert torch.all(ids[live_rows:] == -98765)
         assert _CACHE.keys() == resolved.keys()
         assert all(_CACHE[key] is value for key, value in resolved.items())
