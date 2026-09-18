@@ -21,7 +21,7 @@ CASES = (
     *(f"mhc:{op}:{hidden}:{capacity}:{variant}"
       for op in ("pre", "post_pre") for hidden in (4096, 5120, 7168)
       for capacity in (8, 389) for variant in ("plain", "norm", "lagged")),
-    "mhc:post:5120:17:plain", "mhc:collapse:5120:17:plain", "mhc:pre:5120:17:broadcast", "moe:nvfp4", "moe:residency", "dsa:decode", "dsa:prefill",
+    "mhc:post:5120:17:plain", "mhc:collapse:5120:17:plain", "mhc:pre:5120:17:broadcast", "moe:nvfp4", "moe:residency", "moe:routing_profile", "dsa:decode", "dsa:prefill",
     "hyperconnection:grouped_rmsnorm", "hyperconnection:gate_mean",
 )
 
@@ -29,6 +29,10 @@ CASES = (
 def declare(case):
     import torch
     family, _, recipe = case.partition(":")
+    if case == "moe:routing_profile":
+        from b12x.moe import fused_moe as op
+        return op.plan_routing_profile(op.RoutingProfileQuery(layers=(("compile", 384),),
+            max_tokens=128, max_top_k=8, phases=("decode", "verify")))
     if case == "moe:residency":
         from b12x.moe import fused_moe as op
         weight_plan = op.plan_weights(

@@ -9,6 +9,10 @@ and physical performance are **not hardware-qualified**.
 `plan_weights -> plan_execution -> PreparationSession -> bind -> run` lifecycle.
 Original expert IDs remain independent of physical tier rows. Placement profiles
 are per-layer workload artifacts with versioned hashes and checkpoint identity.
+Opt-in [automatic residency](expert-residency-automatic.md) adds device counters,
+model-wide byte budgeting, convergence, profile reuse and restart signaling around
+these same static plans. The automatic guide includes SM103 startup, configuration,
+engine hooks, TP semantics, monitor mode and physical qualification commands.
 
 ## Supported contracts
 
@@ -125,8 +129,10 @@ plans/workspaces.
 and route-map bytes. Every slab offset includes alignment. `Plan` memory
 requirements report its owned HBM allocation. Admission checks declared budgets
 before allocating and free device/host memory during materialization. KV and
-safety reservations reduce available capacity. Integrations must apportion
-budgets across layers and avoid double-reserving a global KV pool.
+safety reservations reduce available capacity. `ModelExpertMemoryBudget` and `ResidencyController` can apportion model-wide
+budgets automatically; manual integrations must avoid double-reserving a global
+KV pool. All private workspaces remain charged. Shared-lane workspace estimates
+are diagnostic and do not authorize aliasing.
 
 For one expert, payload storage is `3*H*I/2` weight bytes plus `3*H*I/32` scale
 bytes. Workspace includes route indices/counts, route-major quantized activations,
@@ -193,8 +199,12 @@ The count in this example is a qualification choice, not a contract. The artifac
 contains each profile hash and selection counts; the command reports expected
 cold-selection fractions. Zero observed selections report an unknown fraction.
 `profiles_from_trace`, `profile_from_counts`, `read_profiles`, and `write_profiles`
-also support programmatic use. Static profiles are the default; no online
-telemetry operations are added to graph replay.
+also support programmatic use. Static profiles are the default. Automatic profiling uses explicit prepared
+counter nodes only in opted-in calibration or monitor graphs; normal serving
+adds no telemetry. Model artifact schema 2 adds geometry/recipe compatibility and
+atomic workload-specific storage. `read_profiles` can extract static layer plans
+from either artifact schema; automatic reuse performs the complete validation
+specified in the [automatic guide](expert-residency-automatic.md).
 
 ## Qualification commands
 
@@ -247,7 +257,9 @@ traces for a placement comparison. Synthetic controlled routing is not a
 workload benchmark. `--weights` accepts a CPU `PackedWeights` tensor bundle with
 `--checkpoint-sha256`; `--profile` additionally checks its model/layer identity.
 This is an operator probe, not an end-to-end checkpoint loader or quality harness.
-No vLLM integration is changed. Greedy checkpoint requests, layer probes, C2C
+Explicit worker hooks are provided in
+`b12x.integration.vllm.expert_residency`; the companion vLLM serving port and engine
+wiring remain required. Greedy checkpoint requests, layer probes, C2C
 traffic, achieved occupancy, tensor/TMA utilization, HBM throughput, stalls, power,
 and overlap are deferred to physical qualification. No performance benefit is
 claimed from compilation or portable tests.

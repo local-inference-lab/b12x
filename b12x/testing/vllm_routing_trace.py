@@ -4,6 +4,8 @@ Launch with ``--worker-extension-cls
 b12x.testing.vllm_routing_trace.RoutingTraceWorker``. The development RPCs
 ``begin_moe_routing_trace`` and ``end_moe_routing_trace`` delimit one request.
 Only TP rank zero records; instrumented runs are not throughput measurements.
+This diagnostic extension patches the worker and is never loaded by automatic
+residency. Placement calibration uses prepared counters instead.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ _RECORDS = 512
 _MAX_TOKENS = 8
 _owners = {}
 _enabled = None
+_trace_metadata = {}
 
 
 @triton.jit(do_not_specialize=["rows"])
@@ -119,7 +122,14 @@ class RoutingTraceWorker:
         return {"rank": self.rank, "verifier_rows": rows}
 
     @torch.inference_mode()
-    def begin_moe_routing_trace(self):
+    def begin_moe_routing_trace(self, workload="diagnostic", phase="unknown", checkpoint_fingerprint="unspecified"):
+        """Label a research capture; phase is explicit, never inferred from M."""
+        if phase not in ("unknown", "decode", "prefill", "verify", "draft", "mixed"):
+            raise ValueError("unknown diagnostic routing phase")
+        if not workload.strip() or not checkpoint_fingerprint.strip():
+            raise ValueError("routing trace labels must be nonempty")
+        _trace_metadata.clear()
+        _trace_metadata.update(workload=workload, phase=phase, checkpoint_fingerprint=checkpoint_fingerprint)
         if self.rank != 0:
             return {"rank": self.rank, "recording": False}
         if _enabled is None or not _owners:
@@ -148,13 +158,15 @@ class RoutingTraceWorker:
             prepared = owner._prepared()
             records.append({
                 "layer": owner._routing_trace_layer_name,
+                "trace_metadata": dict(_trace_metadata),
                 "num_experts": prepared.num_experts,
                 "hidden_size": prepared.hidden_size,
                 "intermediate_size": prepared.intermediate_size,
                 "total_calls": observed,
                 "truncated": observed > _RECORDS,
                 "calls": [
-                    {"tokens": rows, "ids": call_ids[:rows], "weights": call_weights[:rows]}
+                    {"tokens": rows, "ids": call_ids[:rows], "weights": call_weights[:rows],
+                     "unique_expert_ids": sorted({e for row in call_ids[:rows] for e in row if e >= 0})}
                     for rows, call_ids, call_weights in zip(lengths, captured_ids, captured_weights, strict=True)
                 ],
             })
