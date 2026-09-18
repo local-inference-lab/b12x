@@ -21,7 +21,7 @@ CASES = (
     *(f"mhc:{op}:{hidden}:{capacity}:{variant}"
       for op in ("pre", "post_pre") for hidden in (4096, 5120, 7168)
       for capacity in (8, 389) for variant in ("plain", "norm", "lagged")),
-    "mhc:post:5120:17:plain", "mhc:collapse:5120:17:plain", "mhc:pre:5120:17:broadcast", "moe:nvfp4", "dsa:decode", "dsa:prefill",
+    "mhc:post:5120:17:plain", "mhc:collapse:5120:17:plain", "mhc:pre:5120:17:broadcast", "moe:nvfp4", "moe:residency", "dsa:decode", "dsa:prefill",
     "hyperconnection:grouped_rmsnorm", "hyperconnection:gate_mean",
 )
 
@@ -29,6 +29,22 @@ CASES = (
 def declare(case):
     import torch
     family, _, recipe = case.partition(":")
+    if case == "moe:residency":
+        from b12x.moe import fused_moe as op
+        weight_plan = op.plan_weights(
+            source=op.PackedSource(format="fp4_e8m0_k32"),
+            activation=op.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16),
+            geometry=op.MoEGeometry(num_experts=4, hidden_size=256, intermediate_size=256),
+            constraints=op.WeightPlanConstraints(required_packing="source_native"))
+        weights = op.PackedWeights(torch.empty(4, 512, 128, dtype=torch.uint8),
+            torch.empty(4, 256, 128, dtype=torch.uint8),
+            torch.empty(4, 512, 8, dtype=torch.uint8), torch.empty(4, 256, 8, dtype=torch.uint8),
+            torch.ones(4), torch.ones(4), checkpoint_fingerprint="synthetic", layer_name="compile")
+        return op.plan_execution(experts=weight_plan, weights=weights,
+            capacity=op.ExecutionCapacity(max_tokens=17, top_k=3),
+            placement=op.ExpertResidencyPlan(total_experts=4, hbm_expert_ids=(0, 2), grace_expert_ids=(1, 3),
+                layer="compile", model_fingerprint="synthetic", workload="compile", provenance="compiler corpus"),
+            memory_budget=op.ExpertMemoryBudget(hbm_bytes=2**30, grace_bytes=2**30))
     if family == "dense":
         from b12x.gemm._preparation import plan
         from b12x.gemm._tuning import DenseGemmQuery

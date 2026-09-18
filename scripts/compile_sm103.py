@@ -1623,12 +1623,15 @@ def main():
     parser.add_argument("--capacity", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--gate-first", action="store_true")
+    parser.add_argument("--hot-experts", type=int, help="HBM expert rows for the residency component")
+    parser.add_argument("--swiglu-limit", type=float)
     parser.add_argument("--nvdisasm", type=Path)
     parser.add_argument("--cuobjdump", type=Path)
     parser.add_argument(
         "--component",
         choices=(
             "moe",
+            "residency",
             "roce",
             "trellis",
             "trellis_clamped",
@@ -1662,13 +1665,14 @@ def main():
     from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
     from b12x.moe.fused_moe._sm103 import query_for_weight_plan
     import torch
-    weight_plan = plan_b12x_fp4_moe_weights(
-        params_dtype=torch.bfloat16,
-        quant_modes="nvfp4", source_format="modelopt_nvfp4", activation="silu",
-        num_experts=args.experts, hidden_size=args.hidden, intermediate_size=args.intermediate,
-    )
-    heuristic(query_for_weight_plan(weight_plan, quant_mode="nvfp4",
-                                    num_tokens=args.capacity, num_topk=args.top_k))
+    if args.component != "residency":
+        weight_plan = plan_b12x_fp4_moe_weights(
+            params_dtype=torch.bfloat16,
+            quant_modes="nvfp4", source_format="modelopt_nvfp4", activation="silu",
+            num_experts=args.experts, hidden_size=args.hidden, intermediate_size=args.intermediate,
+        )
+        heuristic(query_for_weight_plan(weight_plan, quant_mode="nvfp4",
+                                        num_tokens=args.capacity, num_topk=args.top_k))
     out = args.output_dir.resolve()
     if out.exists() and any(out.iterdir()):
         parser.error(
@@ -1744,6 +1748,16 @@ def main():
         launches = {}
         if args.component in ("moe", "all"):
             launches.update(compile_launches(caps, offline=True, artifact_dir=out))
+        if args.component in ("residency", "all"):
+            from b12x.moe.fused_moe._residency_preparation import _compile_programs
+            from b12x.moe.fused_moe._residency_tuning import ResidencyQuery, TUNING
+            query = ResidencyQuery(hidden=args.hidden, intermediate=args.intermediate,
+                experts=args.experts, hot_experts=args.experts//2 if args.hot_experts is None else args.hot_experts,
+                max_tokens=args.capacity, max_top_k=args.top_k, profile_hash="0"*64,
+                model_fingerprint="synthetic-compile", gate_first=args.gate_first, swiglu_limit=args.swiglu_limit)
+            TUNING.validate_query(query, None)
+            manifest["residency_query"] = TUNING.encode_query(query)
+            launches.update(_compile_programs(query, offline_dir=out))
         if args.component in ("roce", "all"):
             launches.update(compile_roce(out))
         if args.component in ("trellis", "all"):

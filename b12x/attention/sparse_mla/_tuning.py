@@ -64,7 +64,7 @@ class SparseMlaConfig:
 
 
 def _default_config(query: SparseMlaQuery, device: DeviceIdentity | None):
-    if query.operation != "cache_writer" and device is not None and device.compute_capability == (10, 3):
+    if query.operation not in ("cache_writer", "pooled_selection") and device is not None and device.compute_capability == (10, 3):
         # Capacity alone determines the split schedule; live rows and selected
         # lengths never select another compiled callable during replay.
         splits = min(4, query.max_chunks_per_row, (query.max_width + 63) // 64)
@@ -81,9 +81,9 @@ def _validate(
 ):
     if not isinstance(config, SparseMlaConfig):
         raise TypeError("config must be SparseMlaConfig")
-    if query.operation == "cache_writer":
+    if query.operation in ("cache_writer", "pooled_selection"):
         if config != SparseMlaConfig(backend="native"):
-            raise ValueError("cache writers require the native backend without splits")
+            raise ValueError("cache writers and pooled selection require the native backend without splits")
         return
     if config.backend not in ("native", "warp"):
         raise ValueError(f"unsupported sparse MLA backend {config.backend!r}")
@@ -128,7 +128,7 @@ _KEY_FIELDS = frozenset(SparseMlaQuery.__dataclass_fields__) - {
 def _validate_query(query, device):
     if not isinstance(query, SparseMlaQuery):
         raise TypeError("query must be SparseMlaQuery")
-    if query.operation not in ("attention", "strided_attention", "cache_writer"):
+    if query.operation not in ("attention", "strided_attention", "cache_writer", "pooled_selection"):
         raise ValueError("unknown sparse MLA operation")
 
 
