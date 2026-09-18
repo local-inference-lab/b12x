@@ -32,7 +32,7 @@ def test_stable_selection_exact_replay(budget, group_offset, pattern):
     thresholds = torch.empty((rows,), dtype=torch.float32, device=device)
     totals = torch.empty_like(lengths)
 
-    def produce(seed):
+    def produce():
         if pattern == 'zero':
             scores.zero_()
         elif pattern == 'ties':
@@ -64,7 +64,7 @@ def test_stable_selection_exact_replay(budget, group_offset, pattern):
             stable_ids=stable_ids, thresholds=thresholds, greater_totals=totals,
             group_offset=group_offset, group_budget=budget)
 
-    expected = produce(0)
+    expected = produce()
     run()
     torch.testing.assert_close(values, expected[0], rtol=0, atol=0)
     assert torch.equal(ids, expected[1])
@@ -72,10 +72,10 @@ def test_stable_selection_exact_replay(budget, group_offset, pattern):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    for mutation in range(3):
+    for _ in range(3):
         lengths.copy_(lengths.roll(1))
         eligible.copy_(lengths if not group_offset else torch.where(lengths <= budget, lengths, lengths-budget+group_offset))
-        expected = produce(mutation+1)
+        expected = produce()
         ids.fill_(-98765)
         allocation = torch.cuda.memory_allocated()
         with kernel_resolution_guard('Stable selection reuses one prepared callable across changed lengths'):

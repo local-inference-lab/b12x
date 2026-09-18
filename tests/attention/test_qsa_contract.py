@@ -1801,7 +1801,7 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
             ready.record()
         return qsa.run(binding, **dynamic, index_ready=ready)
 
-    assert binding.plan.num_score_chunks == 4
+    assert binding.state.num_score_chunks == 4
     binding.main_k_cache.normal_()
     binding.main_v_cache.normal_()
     binding.main_block_table[0].copy_(torch.arange(64, device=device))
@@ -2120,8 +2120,8 @@ def test_qsa_forced_chunked_topk_is_exact_and_deterministic_on_ties(
         num_compressed_cache_pages=256,
     )
     planned = qsa.plan(caps)
-    assert planned.num_score_chunks == 4
     binding = _allocate_binding(caps, plan=planned)
+    assert binding.state.num_score_chunks == 4
     binding.main_block_table[0].copy_(
         torch.arange(caps.main_table_width, dtype=torch.int32, device=device)
     )

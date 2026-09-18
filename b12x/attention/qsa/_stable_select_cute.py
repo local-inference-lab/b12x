@@ -126,8 +126,7 @@ class StableSelectionKernel:
             ties_before += cute.arch.shuffle_sync(tp, Int32(31))
 
 
-def compile_stable_selection(budget):
-    device = torch.cuda.current_device()
+def compile_stable_selection(budget, device):
     key = (device, int(budget))
     raw = _CACHE.get(key)
     if raw is None:
@@ -143,13 +142,17 @@ def compile_stable_selection(budget):
 def launch_stable_selection(*, scores, merge_lengths, prior_ids, eligible_counts,
                             topk_values, stable_values, stable_ids, group_offset,
                             group_budget, prepared=None):
-    raw = prepared if prepared is not None else compile_stable_selection(group_budget)
-    if compile_only_launches_enabled():
-        for key in program_keys(raw):
-            record_program(key)
+    device = scores.device.index
+    if device is None:
+        device = torch.cuda.current_device()
+    with torch.cuda.device(device):
+        raw = prepared if prepared is not None else compile_stable_selection(group_budget, device)
+        if compile_only_launches_enabled():
+            for key in program_keys(raw):
+                record_program(key)
+            return raw
+        tensors = (scores, merge_lengths, prior_ids, eligible_counts, topk_values, stable_values, stable_ids)
+        pointers = tuple(make_ptr(t, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=t.width // 8)
+                         for t, tensor in zip(_TYPES, tensors, strict=True))
+        raw(pointers, Int64(scores.stride(0)), Int32(scores.shape[0]), Int32(group_offset), current_cuda_stream())
         return raw
-    tensors = (scores, merge_lengths, prior_ids, eligible_counts, topk_values, stable_values, stable_ids)
-    pointers = tuple(make_ptr(t, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=t.width // 8)
-                     for t, tensor in zip(_TYPES, tensors, strict=True))
-    raw(pointers, Int64(scores.stride(0)), Int32(scores.shape[0]), Int32(group_offset), current_cuda_stream())
-    return raw
