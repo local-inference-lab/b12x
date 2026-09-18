@@ -22,12 +22,13 @@ from b12x.preparation import PreparationSession, PreparedCall
 from scripts._sm103_source import package_source_sha256, source_identity
 
 
-def capture(run):
+def capture(run, *, repetitions=1):
     run()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run()
+        for _ in range(repetitions):
+            run()
     return graph
 
 
@@ -36,8 +37,7 @@ def time_graph(graph, iterations, samples):
     values = []
     for _ in range(samples):
         start.record()
-        for _ in range(iterations):
-            graph.replay()
+        graph.replay()
         end.record()
         end.synchronize()
         values.append(start.elapsed_time(end)*1000/iterations)
@@ -142,7 +142,7 @@ def run(args, receipt):
                 raise AssertionError("nonfinite or zero output cannot qualify a timing")
             graph = capture(lambda: moe.run(binding=binding))
             control_graph = capture(lambda: moe.run(binding=baseline))
-            stages = []
+            stages, timing_graphs = [], {}
             try:
                 # Mutation tests prevent a captured constant output from qualifying.
                 x.mul_(.75)
@@ -164,26 +164,31 @@ def run(args, receipt):
                 by_program = {id(program): name for name, program in state.programs.items()}
                 stage_results = {}
                 for program, params in binding.calls:
-                    stage = capture(lambda program=program, params=params: program(*params, stream))
+                    stage = capture(lambda program=program, params=params: program(*params, stream),
+                                    repetitions=args.iterations)
                     stages.append(stage)
                     stage_results[by_program[id(program)]] = time_graph(stage, args.iterations, args.samples)
                 # Balanced order retains each arm's raw samples and ratio direction.
+                timing_graphs = {"tiered": capture(binding.run, repetitions=args.iterations),
+                                 "all_hbm": capture(baseline.run, repetitions=args.iterations)}
                 gpu_before = gpu_snapshot()
                 arm = {"tiered": [], "all_hbm": []}
                 for order in (("all_hbm", "tiered"), ("tiered", "all_hbm")):
                     for name in order:
-                        arm[name].extend(time_graph(graph if name == "tiered" else control_graph, args.iterations, args.samples)["raw_us"])
+                        arm[name].extend(time_graph(timing_graphs[name], args.iterations, args.samples)["raw_us"])
                 record = {"tokens": m, "top_k": args.top_k,
                     "cold_fraction": sum(eid in profile.grace_expert_ids for eid in chosen)/len(chosen),
                     "correctness": "bitwise all-HBM parity; mutation replay; no allocator events",
                     "raw_us": arm, "stages": stage_results,
                     "gpu_before": gpu_before, "gpu_after": gpu_snapshot(),
-                    "stage_timing_scope": "isolated prepared CUDA graph per launch; sums include separate graph launch costs",
+                    "device_repetitions_per_graph": args.iterations,
+                    "stage_timing_scope": "isolated repeated stage inside one CUDA graph; excludes Python replay enqueue gaps; stage sums are not full-operator latency",
                     "tiered_over_all_hbm_latency": statistics.median(arm["tiered"])/statistics.median(arm["all_hbm"])}
                 receipt["measurements"].append(record)
                 print(json.dumps(record), flush=True)
             finally:
                 for stage in stages: stage.reset()
+                for timing in timing_graphs.values(): timing.reset()
                 graph.reset()
                 control_graph.reset()
     receipt["gpu_after"] = gpu_snapshot()

@@ -4,7 +4,7 @@ Status: **implemented prototype; physical SM103 execution unqualified**.
 SM103 support uses the declaration, preparation-session, binding and execution
 contracts described in [GPU preparation](gpu-profiles.md). Core compute uses
 CuTe DSL. Supporting packing and metadata kernels may use Triton.
-The working branch is based on master `8783519a3e42c22c0f395669ca4b20c69439c974`. The
+The working branch is based on master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. The
 [readiness report](sm103-readiness-report.md) separates source-bound validation,
 pending PR CI and physical-target qualification.
 
@@ -16,7 +16,7 @@ pending PR CI and physical-target qualification.
 | Quantized projections | [SM103 dense lowering](../b12x/gemm/_sm103_preparation.py) supplies NVFP4, MXFP4, MXFP8, both MXFP6 formats, W6A8 and ordinary tensor/block FP8 programs to preparation. [Packed linear adapters](../b12x/gemm/blockscaled/) preserve inline weight dequantization and bounded workspace. |
 | Native MoE | [NVFP4](../b12x/moe/fused_moe/_sm103.py) and [Trellis](../b12x/moe/fused_moe/_sm103_trellis.py) retain CuTe routing, tcgen05/TMEM projections and weighted reduction. Canonical Trellis weights cover uniform, coupled, mixed-rate and grouped-atom representations. `BtxSource` and `BtxWeights` expose paired BTX records through the same public weight and execution plans. |
 | Hierarchical MXFP4 expert residency | [Placement contracts](../b12x/moe/fused_moe/residency.py) and [preparation](../b12x/moe/fused_moe/_residency_preparation.py) add per-layer HBM/Grace profiles, checkpoint identity, memory budgets and owned slabs through the public `fused_moe` API. [Native CuTe kernels](../b12x/moe/_shared/kernels/sm103/residency.py) provide MXFP8/MXFP4 tcgen05 projections, compact tier-local routing and one ordered FP32 FMA finalizer over unweighted BF16 expert outputs. Checkpoint weights are not requantized. Physical SM103 execution and Grace-backed TMA remain unqualified. |
-| Automatic residency orchestration | [Typed controller and profile store](../b12x/moe/fused_moe/automatic.py) validate workload/checkpoint identity, budget the model once, derive per-layer hot membership, detect convergence/drift and report controlled restart. Source geometry and numerical contracts remain authoritative. |
+| Automatic residency orchestration | [Typed controller and profile store](../b12x/moe/fused_moe/automatic.py) validate workload/checkpoint identity, budget the model once, derive per-layer hot membership with joint HBM/Grace admission, balance bootstrap coverage, detect convergence/drift and separate saved experiments from accepted restart candidates. Source geometry and numerical contracts remain authoritative. |
 | Prepared routing counters | [CuTe counters](../b12x/moe/_shared/kernels/routing_profile.py) use preparation-owned uint64 storage, sampling and overflow detection. The disabled serving path has no observer. [Worker hooks](../b12x/integration/vllm/expert_residency.py) expose lifecycle operations without patching vLLM. |
 | Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
@@ -48,6 +48,11 @@ pending PR CI and physical-target qualification.
 | Separate tier finalization changes rounding | Expert outputs remain unweighted until one explicit `fma.rn.f32` reduction, with a single final BF16 cast. Arithmetic adversaries distinguish this contract from reordered sums and separately rounded tiers. |
 | Model-scale cold storage and workspace require explicit admission | HBM and exact-size mapped-host slabs include aligned weights/scales; accounting includes scratch, route maps, KV reservation and safety margins. Preparation verifies Grace coherency and matching checkpoint/layer identity. |
 | Residency binding must not trigger lazy preparation or retain stale execution | Bind/run require explicit session preparation and reject released or replaced state. Retained programs and fixed workspace serve changing live M/top-k without runtime resolution. |
+| Equal synthetic scores can concentrate bootstrap HBM in early layers | An observation-free bootstrap prioritizes equal resident fractions; learned selection-density placement remains unconstrained by that prior. |
+| A hard calibration limit is not evidence of convergence | `activation="converged"` admits converged profiles by default. Explicit `best_available` accepts sufficiently sampled limit artifacts. Separate latest/converged cache indexes preserve an accepted profile when bounded experiments are saved. |
+| Greedy density packing can strand HBM and exceed Grace | A bounded exact subset-sum fallback repairs joint byte feasibility under per-layer bounds. Search-size exhaustion reports unknown feasibility, not an impossible budget. |
+| Python replay loops contaminate tiny-stage timings | Physical operator timing graphs contain repeated device operations; correctness replay remains a separate gate. |
+| Master fixes 24-head sparse MLA shards | Rebase preserves the 16+8 TP3 partition and exact stable QSA winner construction; portable attention checks cover the rebased source. |
 | A global HBM budget cannot be reused independently by every layer | The model planner charges KV, safety, counter storage and each private workspace once, then passes exact layer budgets to ordinary residency preparation. |
 | A profile for another geometry or traffic class is unsafe to reuse | Schema-2 artifacts bind model/recipe/capacity and workload; startup validates hash, implementation version, hardware and memory fit. Auto invalidates incompatible artifacts with a reason. |
 | Cumulative history can hide a changed routing distribution | Convergence uses disjoint windows, per-layer membership and cold-rate stability, minimum coverage and agreement with the saved candidate. Monitor reports drift without modifying storage. |
@@ -89,7 +94,11 @@ The companion vLLM branch at `f6c6ac72c3` targets the preceding b12x API. Its GL
 pooling and loader fixes remain recorded in
 [historical evidence](sm103-glm-sparse-validation.json); that receipt does not
 qualify this preparation port or establish companion API compatibility.
-The companion must adopt these preparation contracts before serving validation.
+The maintained companion preparation branch at `ef1aeaf080` already uses
+`PreparationSession`. Its CPU expert-loading, model-wide admission, phase and
+control-plane boundaries still require residency integration. The
+[integration and workspace audit](expert-residency-integration.md) distinguishes
+that work from the older companion's API port.
 
 The [SM103 automatic residency guide](expert-residency-automatic.md) specifies the
 worker control-plane and routing hooks. They are implemented b12x APIs, not an

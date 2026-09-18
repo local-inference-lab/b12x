@@ -92,7 +92,7 @@ Compiler receipts bind the actual package hash independently of the Git base.
 
 Portable GPU: `ripper`, RTX PRO 4000 Blackwell, SM120,
 `GPU-47363510-b87a-13a5-4824-2542e97df76c`, driver `580.173.02`,
-Torch `2.13.0+cu130`, CUDA `13.0`, CUTLASS DSL `4.6.2`, Triton `3.7.1`.
+Torch `2.13.0+cu130`, Torch CUDA build `13.3`, CUTLASS DSL `4.6.2`, Triton `3.7.1`.
 Sanitizer uses isolated `cuda-bindings==13.0.3` and Compute Sanitizer `13.4.57`.
 The shared serving environment is unchanged. No serving service is stopped.
 The final portable suite covers both gate orders, invalid/sentinel and oversized
@@ -230,7 +230,7 @@ compile is retained in `production-acceptance/manifest.json`.
 
 GPU validation of the final package uses RTX PRO 4000 Blackwell SM120,
 `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`, driver `580.173.02`, Torch `2.13.0`,
-CUDA `13.0`, CUTLASS DSL `4.6.2`, Triton `3.7.1+gitf797708c.nv26.7` and isolated
+Torch CUDA build `13.3`, CUTLASS DSL `4.6.2`, Triton `3.7.1+gitf797708c.nv26.7` and isolated
 CUDA bindings `13.0.3`. Compute Sanitizer reports:
 
 - **5 passed, zero memcheck errors** (`gpu-acceptance/gpu-memcheck-acceptance.log`).
@@ -331,3 +331,132 @@ C2C bandwidth or overlap result is inferred from counters or cross-compilation.
 
 Tiny-M tcgen05 scheduling and HBM/Grace overlap remain the underlying backend's
 physical-measurement work; counter results cannot rank their whole-model gains.
+
+## Residency policy review evidence
+
+The review starts at `2de9d31ca6784916cba8867321db691a47fbe887` and rebases its
+70 commits onto master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. The rebase
+completes without conflicts; `git range-diff` reports the same patches for all
+70 commits. The prior branch is retained locally as
+`archive/sm103-before-review-20260918`. Master includes exact stable QSA winner
+construction and the sparse-MLA TP3 16+8 head-partition fix.
+
+The policy implementation binds package SHA256
+`6b1c98b0af787cfd0900d728732e9724c6a71bc4c4e2c57086355d00127f7f09`.
+Raw receipts and source archive are retained at
+`/home/jasonc/b12x-residency-review-20260918`; `completion.json` identifies the
+committed source, commands, file hashes and receipt hashes. Historical timing
+and qualification sections above continue to describe their original sources.
+No preceding timing measurement is attributed to this package.
+
+### Review dispositions
+
+| Feedback | Result and rationale |
+| --- | --- |
+| Bootstrap fairness | Implemented observation-free fractional coverage. Identical layers differ by at most one hot row, subject to bounds/budget. Synthetic counts are absent from bootstrap plans. Real counts still drive unequal learned placement. |
+| Hard-limit activation | Implemented default `activation="converged"` and deliberate `best_available` acceptance. Bounded experiments remain saveable. Latest and converged indexes are separate, so an experiment cannot replace the accepted cache entry. Pins do not bypass acceptance. |
+| Joint HBM/Grace constraints | Implemented a bounded exact byte-feasibility fallback after greedy density placement. It preserves bounds, identity and deterministic ties; it does not claim optimal varying-size selection score. Oversized searches report unknown feasibility explicitly. The allocator identity is `selection_density_joint_v2`. |
+| Master reconciliation | Rebased onto `0f3a8cbf`; source-bound host, full compiler and portable GPU validation repeated. No master changes were discarded. |
+| Companion integration | Reviewed retained SM103 source `f6c6ac72c3` and maintained preparation source `ef1aeaf080`. The maintained source already uses PreparationSession; CPU checkpoint ownership, SM103 component admission and lifecycle wiring remain missing. The [integration audit](expert-residency-integration.md) gives concrete integration points. No CLI or companion source change is claimed. |
+| Profiler overhead/fusion | Separate optional counters retained. Off has no observer; sampled monitoring still launches. An optional prepared fused variant remains possible without changing the unprofiled router. Physical full-MoE evidence is required before implementation. |
+| Serial partition | Retained deterministic scan and original route-index semantics. Portable growth motivates measuring this stage on B300; no speculative replacement. |
+| Shared scratch | Ownership design documented for lanes, streams, graphs, outputs, speculative branches and TP. Private workspaces remain fully admitted; no hypothetical saving is spent. |
+| Physical B300 priority | No B300 available. SM103 execution, Grace-backed TMA and full-model quality remain unqualified. |
+| Baseline/stage comparisons | Existing all-HBM vs hierarchical stages retained. Repetitions moved inside timing graphs to remove Python enqueue gaps. FlashInfer equivalence is a deferred physical comparison, not an implemented harness feature. |
+| Shared FC1 quantization | Deferred until physical quantization/stage evidence. Source-native recipe and route-major numerical boundaries unchanged. |
+| Sparse cold launches | Compact-count body guards retained. Grid/conditional/persistent scheduling and overlap require physical evidence. |
+| Monitor | Remains opt-in, static and advisory; no throughput forecast. Completed worker polls return the saved result without further counter reads. |
+| Unique-expert scoring | Selection frequency retained. Rich-trace uniqueness and versioned statistics remain the research path. |
+| Readiness/CI | Canonical docs reconciled with the master base and policy source. GitHub reports zero statuses/check runs on the reviewed `2de9d31c` source. PR CI remains a separate infrastructure gate; no workflow was added to the backend change. |
+
+### Changed files
+
+| Files | Change |
+| --- | --- |
+| `b12x/moe/fused_moe/_residency_allocation.py` | Balanced bootstrap, density ranking and exact bounded joint-byte feasibility repair |
+| `b12x/moe/fused_moe/automatic.py` | Activation acceptance, converged/latest cache publication, allocator identity and observation-free bootstrap |
+| `b12x/integration/vllm/expert_residency.py` | Terminal poll idempotence and completed-measurement reset rejection |
+| `benchmarks/moe/expert_residency.py` | Device-batched stage/full-operator timing graphs |
+| `tests/moe/test_automatic_residency.py` | Bootstrap, hard-limit/pin/cache semantics, real-slab adversary, exhaustive small-budget oracle and search-bound tests |
+| `tests/moe/test_routing_profile_gpu.py` | Verify seven device repetitions per replay and three timed samples produce exactly 21 observations |
+| `docs/expert-residency-integration.md` | Companion source audit, loader/control-plane sequence, workspace ownership and physical optimization gates |
+| `docs/expert-residency-automatic.md`, `docs/expert-residency.md` | Present-state policy, cache, budgeting and qualification contracts |
+| `docs/sm103-readiness-report.md`, `docs/sm103-change-summary.md`, `docs/expert-residency-ledger.md` | Master/source identity, validation scope, feature/fix map and retained failures |
+
+### Fresh validation
+
+Host acceptance command:
+
+```bash
+python -m pytest tests/moe/test_automatic_residency.py \
+  tests/moe/test_expert_residency.py tests/moe/test_sm103_residency.py \
+  tests/moe/test_fused_moe_variant_selection.py tests/preparation tests/architecture \
+  tests/attention/test_qsa_contract.py tests/attention/test_qsa_program_keys.py \
+  tests/attention/test_qsa_stable_selection.py \
+  tests/attention/test_compressed_sparse_mla_v41.py -q
+```
+
+Result: **1,001 passed, 225 skipped**, 41.90 seconds (`host-acceptance.log`). This
+includes 63 automatic-residency host tests. One test compares both learned and
+bootstrap allocation against exhaustive feasible counts for 400 deterministic
+small problems with differing sizes, bounds and tier budgets. GPU-only cases are
+skipped on the host and are not counted as passes.
+
+The same package cross-compiles **84 declarations / 241 distinct programs**, with
+235 required/native CuTe exports and CUDA uninitialized (`prepared/manifest.json`,
+`prepared/cases.jsonl`). The counter compiler emits **four entry points** for both
+ID widths at sampling intervals 1 and 128 (`counters/manifest.json`). Production
+residency emits **12 entry points** for H=5120, I=2304, E=384, HBM=295, capacity=128,
+top-k=6 and clamp=10 (`production/manifest.json`). The reproduction commands are
+in the [automatic guide](expert-residency-automatic.md) and
+[physical runbook](expert-residency.md#qualification-commands).
+
+Resource receipts retain 142/140 registers for FC1/FC2, 1,024 static and 51,328
+dynamic shared-memory bytes, and zero stack/local bytes. Every-call counters use
+14/13 registers for int32/int64 IDs; sampling every 128 calls uses 14 for both
+widths. All use 1,024 static plus 4 dynamic shared-memory bytes and no stack/local
+bytes. No compiler result establishes measured occupancy
+or performance.
+
+Portable validation runs on RTX PRO 4000 Blackwell SM120, driver `580.173.02`,
+Torch `2.13.0`, Torch CUDA build `13.3`, CUTLASS DSL `4.6.2`, Triton
+`3.7.1+gitf797708c.nv26.7` and isolated CUDA bindings `13.0.3`:
+
+| Command following `python -m pytest` | Result | Receipt and physical GPU |
+| --- | --- | --- |
+| `tests/moe/test_routing_profile_gpu.py tests/moe/test_sm103_residency.py -q`, under `compute-sanitizer --tool memcheck --error-exitcode 99` | **6 passed, 6 skipped, zero errors**, 356.45 s | `gpu-memcheck.log`; `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f` |
+| Same tests under `compute-sanitizer --tool synccheck --error-exitcode 99` | **6 passed, 6 skipped, zero errors**, 120.26 s | `gpu-synccheck.log`; `GPU-47363510-b87a-13a5-4824-2542e97df76c` |
+| `tests/moe/test_residency_kernels.py -q` | **8 passed**, three compiler optimization warnings, 6.07 s | `gpu-arithmetic.log`; `GPU-47363510-b87a-13a5-4824-2542e97df76c` |
+| `tests/attention/test_qsa_stable_selection.py tests/attention/test_compressed_sparse_mla_v41.py -q` | **49 passed**, eleven compiler optimization warnings, 46.00 s | `gpu-master-regression.log`; `GPU-47363510-b87a-13a5-4824-2542e97df76c` |
+
+The six skipped cases require physical SM103. The passing counter tests validate
+replay, changing routes, both ID widths, overflow, TP ownership, allocator
+stability, concurrent producers and restart/profile reuse. The arithmetic suite
+validates portable quantization/partition/finalization and mapped-host access;
+it executes no native SM103 expert MMA. The timing-graph test checks repetition
+accounting, not B300 latency. No performance benchmark was repeated or claimed.
+
+### Retained failures and limits
+
+- `host-focused-first.log`: **61 passed, one failure**. A fixture reduced expert
+  count with `dataclasses.replace` but retained the previous `maximum_hot=4`;
+  admission correctly rejected the inconsistent geometry. The fixture now
+  declares matching bounds. No implementation guard was relaxed.
+- An inspector smoke-test locator used an untruncated pytest-directory name and
+  found no artifact (`StopIteration`). A dedicated converged fixture supplies
+  the inspector input; `inspector.log` records its successful validation. The
+  collection failure is recorded in `audit-notes.txt`.
+- Runtime identity and the historical profiler JSON identify the Torch CUDA
+  build as 13.3, distinct from cuda-bindings 13.0.3. The preceding ledger
+  section's 13.0 Torch-build label is corrected from that raw receipt.
+- A general selection-score knapsack solver was rejected as unnecessary for
+  tier admission. The exact fallback solves byte feasibility only, with explicit
+  resource bounds. Uniform-cost placement keeps its ordinary greedy path.
+- A companion flag layered after GPU weight loading was rejected because it
+  cannot load a checkpoint larger than HBM. The source ownership prerequisite
+  is documented before CLI/control-loop wiring.
+
+Next backend work is physical all-HBM/all-Grace/mixed SM103 qualification and an
+equivalent FlashInfer baseline, followed by stage-directed optimization. The
+portable launch/partition evidence and exact scratch calculation justify
+investigation, not changing kernels or spending arena savings in advance.

@@ -61,6 +61,8 @@ class ExpertResidencyWorker:
     def begin_calibration(self, *, quiescent=False):
         if self.counter_plan is None:
             return False
+        if self.controller.progress.state not in ("calibrating", "monitoring"):
+            raise RuntimeError("completed calibration requires a new controller and preparation lifecycle")
         state = routing_profile_state(self.counter_plan)
         state.set_enabled(False, quiescent=quiescent)
         state.reset(quiescent=quiescent)
@@ -76,6 +78,8 @@ class ExpertResidencyWorker:
         """Engine control-plane hook; callers pause all graph producers first."""
         if self.counter_plan is None or self.rank != self.controller.owner_rank:
             return None
+        if self.controller.progress.state not in ("calibrating", "monitoring"):
+            return self.controller.progress
         snapshot = self.snapshot_counters(quiescent=quiescent)
         if self.controller.progress.state == "monitoring":
             return self.controller.monitor(snapshot)

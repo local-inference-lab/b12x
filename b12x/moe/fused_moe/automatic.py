@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from fractions import Fraction
 import hashlib
 import json
 import math
@@ -15,7 +14,7 @@ from .residency import ExpertMemoryBudget, ExpertResidencyPlan, _integer
 
 PROFILE_VERSION = 2
 IMPLEMENTATION_VERSION = 1
-ALGORITHM = "selection_density_greedy_v1"
+ALGORITHM = "selection_density_joint_v2"
 PHASES = ("decode", "prefill", "verify", "draft")
 
 
@@ -257,6 +256,7 @@ class AutomaticResidencyConfig:
     profile_path: str | None = None
     reuse_cache: bool = True
     refresh: str = "restart_required"
+    activation: str = "converged"
 
     def __post_init__(self):
         if self.mode not in ("off", "profile", "auto", "monitor"):
@@ -267,6 +267,8 @@ class AutomaticResidencyConfig:
             raise TypeError("calibration and monitor require typed configuration")
         if type(self.reuse_cache) is not bool or self.refresh != "restart_required":
             raise ValueError("only explicit cache reuse and restart-required activation are supported")
+        if self.activation not in ("converged", "best_available"):
+            raise ValueError("activation must be converged or best_available")
         if self.profile_path is not None:
             _text("profile_path", self.profile_path)
 
@@ -324,16 +326,9 @@ def _counts(model, snapshot, phase):
 
 
 def derive_placement(model, budget, counts, *, workload, provenance, phase):
-    """Deterministic selection-count/byte greedy allocation across layer rows.
-
-    Within each layer ties use original expert ID. Uniform byte costs maximize
-    observed hot selections. Varying costs use a density heuristic, not an exact
-    knapsack solution. A failed Grace admission is never silently relaxed.
-    """
+    """Rank real observations by density and admit both memory tiers jointly."""
     if set(counts) != {s.layer for s in model.layers}:
         raise ValueError("placement counts must cover exactly the declared layers")
-    capacity, grace = budget.expert_capacity(model)
-    hot, candidates = {}, []
     for s in model.layers:
         values = counts[s.layer]
         if len(values) != s.experts:
@@ -342,27 +337,19 @@ def derive_placement(model, budget, counts, *, workload, provenance, phase):
             _integer("selection count", value)
         if not sum(values):
             raise ValueError(f"layer {s.layer} has no routing observations")
-        ranking = sorted(range(s.experts), key=lambda e: (-values[e], e))
-        hot[s.layer] = set(ranking[:s.minimum_hot])
-        capacity -= s.minimum_hot*s.expert_bytes
-        for e in ranking[s.minimum_hot:s.maximum_hot]:
-            candidates.append((-Fraction(values[e], s.expert_bytes), s.layer, e, s.expert_bytes))
-    if capacity < 0:
-        raise ValueError("minimum hot placement exceeds HBM budget")
-    for _, layer, expert, size in sorted(candidates):
-        if size <= capacity:
-            hot[layer].add(expert)
-            capacity -= size
-    profiles = tuple(ExpertResidencyPlan(total_experts=s.experts,
+    return _allocate_placement(model, budget, counts, workload=workload,
+                               provenance=provenance, phase=phase)
+
+
+def _allocate_placement(model, budget, counts, *, workload, provenance, phase):
+    from ._residency_allocation import allocate_rows
+    hot = allocate_rows(model.layers, *budget.expert_capacity(model), counts)
+    return tuple(ExpertResidencyPlan(total_experts=s.experts,
         hbm_expert_ids=tuple(sorted(hot[s.layer])),
         grace_expert_ids=tuple(e for e in range(s.experts) if e not in hot[s.layer]),
         layer=s.layer, model_fingerprint=model.checkpoint_fingerprint, workload=workload,
-        provenance=provenance, selection_counts=tuple(counts[s.layer]),
+        provenance=provenance, selection_counts=tuple(counts[s.layer]) if counts is not None else (),
         phase=phase if phase in ("decode", "prefill", "all") else "all") for s in model.layers)
-    cold_bytes = sum(s.memory(len(p.hbm_expert_ids)).grace_expert_bytes for s, p in zip(model.layers, profiles, strict=True))
-    if cold_bytes > grace:
-        raise ValueError("greedy placement exceeds Grace budget; adjust budgets or hot bounds")
-    return profiles
 
 
 def placement_memory(model, profiles):
@@ -412,6 +399,8 @@ class ResidencyProfile:
         object.__setattr__(self, "placements", tuple(self.placements))
         if self.phase not in (*PHASES, "all") or type(self.converged) is not bool:
             raise ValueError("invalid profile phase or convergence state")
+        if self.termination not in ("converged", "limit") or self.converged != (self.termination == "converged"):
+            raise ValueError("profile convergence and termination reason disagree")
         for key in ("workload", "provenance", "created_at", "termination"):
             _text(key, getattr(self, key))
         for key in ("stable_windows", "request_count", "token_count"):
@@ -463,6 +452,12 @@ class ResidencyProfile:
             raise ValueError("residency profile integrity mismatch")
         return result
 
+    def validate_activation(self, config):
+        """Admission for automatic reuse is separate from artifact validity."""
+        if not self.converged and config.activation != "best_available":
+            raise ValueError("profile is not converged; automatic activation requires "
+                             "convergence or explicit activation='best_available'")
+
     def validate(self, *, model, config, budget, hardware):
         if self.model != model:
             raise ValueError("checkpoint, revision, layer geometry or numerical recipe mismatch")
@@ -508,7 +503,10 @@ class ResidencyProfileStore:
         directory = self._namespace(profile.model, profile.workload, profile.phase)
         path = directory/f"{profile.profile_hash}.json"
         _atomic_write(path, profile.to_dict())
-        _atomic_write(directory/"current.json", {"schema_version": PROFILE_VERSION, "profile_hash": profile.profile_hash})
+        index = {"schema_version": PROFILE_VERSION, "profile_hash": profile.profile_hash}
+        _atomic_write(directory/"latest.json", index)
+        if profile.converged:
+            _atomic_write(directory/"current.json", index)
         return path
 
     def read(self, *, model, config):
@@ -517,7 +515,12 @@ class ResidencyProfileStore:
             expected = None
         else:
             directory = self._namespace(model, config.workload, config.calibration.phase)
-            index = json.loads((directory/"current.json").read_text())
+            path = directory/("latest.json" if config.activation == "best_available" else "current.json")
+            if not path.exists() and config.activation == "converged":
+                # Surface the actual rejection reason when only an experiment
+                # exists. A bounded experiment cannot replace a converged index.
+                path = directory/"latest.json"
+            index = json.loads(path.read_text())
             if set(index) != {"schema_version", "profile_hash"} or index["schema_version"] != PROFILE_VERSION:
                 raise ValueError("unsupported profile store index")
             expected = index["profile_hash"]
@@ -595,6 +598,7 @@ class ResidencyController:
             try:
                 profile = self.store.read(model=self.model, config=c)
                 profile.validate(model=self.model, config=c, budget=self.budget, hardware=self.hardware)
+                profile.validate_activation(c)
                 self.active = profile
                 self.progress = ResidencyProgress(state="monitoring" if c.mode == "monitor" else "ready",
                     reason="compatible static profile found; prepare before serving", profile=profile,
@@ -620,19 +624,17 @@ class ResidencyController:
             rank=rank, owner_rank=self.owner_rank, tp_size=tp_size)
 
     def placements(self):
-        """Use a validated profile or a budget-admitted positional calibration map.
+        """Use a validated profile or a bootstrap with balanced resident fractions.
 
-        Bootstrap counts only choose deterministic storage rows; they are never
-        persisted as workload observations. Calibration still needs a working
-        hierarchical operator on the physical target.
+        Bootstrap chooses storage rows without synthetic workload observations.
+        Calibration still needs a working hierarchical operator on the target.
         """
         if self.active is not None:
             return self.active.placements
         if self.progress.state not in ("calibrating", "profile_saved", "restart_required", "insufficient"):
             raise RuntimeError("automatic placement is not active")
-        return derive_placement(self.model, self.budget,
-            {s.layer: (1,)*s.experts for s in self.model.layers}, workload=self.config.workload,
-            provenance="positional calibration bootstrap", phase=self.config.calibration.phase)
+        return _allocate_placement(self.model, self.budget, None, workload=self.config.workload,
+            provenance="balanced fractional calibration bootstrap", phase=self.config.calibration.phase)
 
     def plan_execution(self, *, layer, weight_plan, weights):
         """Declare the existing public execution Plan using apportioned storage."""
@@ -716,7 +718,8 @@ class ResidencyController:
                 sample_every=cfg.sample_every, termination="converged" if converged else "limit")
             profile.validate(model=self.model, config=self.config, budget=self.budget, hardware=self.hardware)
             path = self.store.write(profile)
-            self.progress = ResidencyProgress(state="profile_saved" if self.config.mode == "profile" else "restart_required",
+            activate = self.config.mode == "auto" and (converged or self.config.activation == "best_available")
+            self.progress = ResidencyProgress(state="restart_required" if activate else "profile_saved",
                 reason="calibration converged" if converged else "explicit calibration limit reached; convergence not established",
                 profile=profile, profile_path=str(path), stable_windows=self._stable,
                 similarities=similarities, cold_fractions=cold_rows, expected_cold_fraction=profile.expected_cold_fraction)

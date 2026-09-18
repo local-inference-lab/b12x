@@ -187,3 +187,24 @@ def test_worker_calibration_replay_to_static_artifact(tmp_path):
     next_worker = ExpertResidencyWorker(controller())
     assert next_worker.startup().state == "ready"
     assert next_worker.preparation_request() is None
+
+
+def test_operator_timing_graph_batches_device_repetitions():
+    """Timing graphs must contain their repetitions rather than Python gaps."""
+    from benchmarks.moe.expert_residency import capture, time_graph
+    plan, session, _ = prepare(RoutingProfileQuery(layers=(("a", 4),), max_tokens=1, max_top_k=1))
+    graph = None
+    try:
+        ids = torch.zeros((1, 1), dtype=torch.int64, device="cuda")
+        binding = bind_routing_profile(plan, layer="a", phase="decode", topk_ids=ids)
+        graph = capture(binding.run, repetitions=7)
+        state = routing_profile_state(plan)
+        state.reset(quiescent=True)
+        state.set_enabled(True, quiescent=True)
+        timing = time_graph(graph, iterations=7, samples=3)
+        snapshot = state.snapshot(quiescent=True).layers[0]
+        assert snapshot.counts == (21, 0, 0, 0) and snapshot.calls == 21
+        assert len(timing["raw_us"]) == 3 and timing["median_us"] > 0
+    finally:
+        if graph is not None: graph.reset()
+        session.close()

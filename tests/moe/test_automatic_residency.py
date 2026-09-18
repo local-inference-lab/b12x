@@ -190,12 +190,25 @@ def test_insufficient_routes_and_missing_decode_do_not_converge(tmp_path, phase)
     assert not list(tmp_path.rglob("*.json"))
 
 
-def test_limit_persists_nonconverged_with_label(tmp_path):
-    c = controller(tmp_path, cfg=ResidencyCalibrationConfig(minimum_observations=100,
+@pytest.mark.parametrize("mode,activation,state", [
+    ("auto", "converged", "profile_saved"),
+    ("auto", "best_available", "restart_required"),
+    ("profile", "converged", "profile_saved"),
+    ("profile", "best_available", "profile_saved"),
+])
+def test_limit_saves_without_implicit_activation(tmp_path, mode, activation, state):
+    c = controller(tmp_path, mode=mode, activation=activation, cfg=ResidencyCalibrationConfig(minimum_observations=100,
         convergence_window=100, stable_windows=4, token_limit=10))
     c.startup()
     p = c.observe(counts(), token_count=10)
-    assert p.state == "restart_required" and not p.profile.converged and p.profile.termination == "limit"
+    assert p.state == state and not p.profile.converged and p.profile.termination == "limit"
+    assert c.active is None
+    conservative = controller(tmp_path)
+    assert conservative.startup().state == "calibrating"
+    assert "not converged" in conservative.progress.reason
+    assert controller(tmp_path, activation="best_available").startup().state == "ready"
+    # A pin selects an artifact; it does not waive the activation policy.
+    assert controller(tmp_path, profile_path=p.profile_path).startup().state == "calibrating"
 
 
 def test_tp_owner_and_epoch_guard(tmp_path):
@@ -275,7 +288,8 @@ def test_auto_bootstrap_and_weight_plan_bridge_are_pure(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
     plan = c.plan_execution(layer="a", weight_plan=wp, weights=weights)
     assert plan.prepared is None and plan.component_id == "moe.expert_residency"
-    assert len(c.placements()[0].hbm_expert_ids) == 2
+    assert [len(p.hbm_expert_ids) for p in c.placements()] == [1, 1]
+    assert all(not p.selection_counts for p in c.placements())
     assert not list(tmp_path.rglob("*.json"))
 
 
@@ -355,3 +369,119 @@ def test_worker_rejects_unknown_phase_and_layer(tmp_path):
     with pytest.raises(ValueError, match="layer"):
         worker.bind_routes(layer="typo", phase="prefill", topk_ids=None)
     assert worker.bind_routes(layer="a", phase="prefill", topk_ids=None) is None
+
+
+def test_bounded_experiment_preserves_converged_cache(tmp_path):
+    _, accepted = completed(tmp_path)
+    c = controller(tmp_path, mode="profile", cfg=ResidencyCalibrationConfig(
+        minimum_observations=100, convergence_window=100, stable_windows=4, request_limit=1))
+    c.startup()
+    experiment = c.observe(counts((1, 4, 5, 90), (90, 5, 4, 1)), request_count=1).profile
+    assert not experiment.converged
+    assert controller(tmp_path).startup().profile == accepted
+    assert controller(tmp_path, activation="best_available").startup().profile == experiment
+
+
+def test_activation_config_and_profile_termination_fail_closed(tmp_path):
+    with pytest.raises(ValueError, match="activation"):
+        AutomaticResidencyConfig(activation="always")
+    _, p = completed(tmp_path)
+    with pytest.raises(ValueError, match="termination"):
+        replace(p, termination="limit")
+    with pytest.raises(ValueError, match="algorithm"):
+        replace(p, algorithm="selection_density_greedy_v1")
+
+
+def test_completed_worker_poll_does_not_read_counters_again(tmp_path, monkeypatch):
+    from b12x.integration.vllm.expert_residency import ExpertResidencyWorker
+    c, _ = completed(tmp_path)
+    worker = ExpertResidencyWorker(c)
+    worker.counter_plan = object()
+    def forbidden(**kwargs): pytest.fail("terminal control-plane poll read device counters")
+    monkeypatch.setattr(worker, "snapshot_counters", forbidden)
+    assert worker.poll() == c.progress
+    with pytest.raises(RuntimeError, match="completed calibration"):
+        worker.begin_calibration(quiescent=True)
+
+
+@pytest.mark.parametrize("hot_count", [0, 1, 3, 7, 13, 21, 28])
+def test_bootstrap_does_not_starve_identical_layers(tmp_path, hot_count):
+    m = replace(model(), layers=tuple(replace(model().layers[0], layer=f"layer.{i}") for i in range(7)))
+    c = controller(tmp_path, m=m)
+    c.budget = budget(m, hot_count)
+    c.startup()
+    p = c.placements()
+    totals = [len(row.hbm_expert_ids) for row in p]
+    assert sum(totals) == hot_count and max(totals)-min(totals) <= 1
+    assert all(not row.selection_counts and row.expected_cold_fraction is None for row in p)
+    assert c.placements() == p
+
+
+def test_bootstrap_balances_coverage_with_different_layer_sizes(tmp_path):
+    m = replace(model(varying=True), layers=(model().layers[0], replace(model(varying=True).layers[1], experts=8)))
+    c = controller(tmp_path, m=m)
+    c.budget = budget(m, hot=10)
+    c.startup()
+    a, b = c.placements()
+    assert (len(a.hbm_expert_ids), len(b.hbm_expert_ids)) == (2, 4)
+    assert placement_memory(m, (a, b))["hbm_expert_bytes"] == 10*m.layers[0].expert_bytes
+
+
+def test_joint_budget_repair_with_real_slab_sizes(tmp_path):
+    a = replace(model().layers[0], experts=1, maximum_hot=1, intermediate=768, max_top_k=1)
+    b = replace(model().layers[1], experts=2, maximum_hot=2, intermediate=512, max_top_k=1)
+    m = replace(model(), layers=(a, b))
+    unit = model().layers[0].expert_bytes
+    overhead = sum(s.memory(0).scratch_bytes+s.memory(0).route_map_bytes for s in m.layers)
+    envelope = ModelExpertMemoryBudget(hbm_bytes=overhead+4*unit, grace_bytes=3*unit)
+    # Greedy density takes the 3-unit row and strands one HBM unit. Two
+    # 2-unit rows are the feasible solution, even though their scores are lower.
+    p = derive_placement(m, envelope, {"a": (100,), "b": (1, 1)},
+        workload="agent", provenance="adversarial", phase="decode")
+    assert p[0].hbm_expert_ids == () and p[1].hbm_expert_ids == (0, 1)
+    assert placement_memory(m, p)["grace_expert_bytes"] == 3*unit
+    c = controller(tmp_path, m=m)
+    c.budget = envelope
+    c.startup()
+    assert [row.hbm_expert_ids for row in c.placements()] == [(), (0, 1)]
+
+
+def test_joint_feasibility_matches_exhaustive_small_oracle():
+    from itertools import product
+    import random
+    from types import SimpleNamespace
+    from b12x.moe.fused_moe._residency_allocation import allocate_rows
+    rng = random.Random(81)
+    for _ in range(400):
+        layers, counts = [], {}
+        for i in range(rng.randint(1, 4)):
+            experts = rng.randint(1, 5)
+            low = rng.randint(0, experts)
+            layers.append(SimpleNamespace(layer=str(i), experts=experts, expert_bytes=rng.randint(1, 11),
+                minimum_hot=low, maximum_hot=rng.randint(low, experts)))
+            counts[str(i)] = tuple(rng.randint(1, 100) for _ in range(experts))
+        total = sum(s.experts*s.expert_bytes for s in layers)
+        hbm, grace = rng.randrange(total+1), rng.randrange(total+1)
+        feasible = any(total-grace <= sum(n*s.expert_bytes for n, s in zip(ns, layers)) <= hbm
+            for ns in product(*(range(s.minimum_hot, s.maximum_hot+1) for s in layers)))
+        for observations in (counts, None):
+            if not feasible:
+                with pytest.raises(ValueError, match="budget"):
+                    allocate_rows(layers, hbm, grace, observations)
+                continue
+            hot = allocate_rows(layers, hbm, grace, observations)
+            used = sum(len(hot[s.layer])*s.expert_bytes for s in layers)
+            assert total-grace <= used <= hbm
+            for s in layers:
+                assert s.minimum_hot <= len(hot[s.layer]) <= s.maximum_hot
+                assert hot[s.layer] <= set(range(s.experts))
+            assert hot == allocate_rows(layers, hbm, grace, observations)
+
+
+def test_joint_search_limit_reports_unknown_not_infeasible():
+    from types import SimpleNamespace
+    from b12x.moe.fused_moe._residency_allocation import allocate_rows
+    layers = [SimpleNamespace(layer="a", experts=1, expert_bytes=20_000_001, minimum_hot=0, maximum_hot=1),
+              SimpleNamespace(layer="b", experts=2, expert_bytes=15_000_001, minimum_hot=0, maximum_hot=2)]
+    with pytest.raises(ValueError, match="feasibility is unknown"):
+        allocate_rows(layers, 30_000_002, 20_000_001, {"a": (100,), "b": (1, 1)})
