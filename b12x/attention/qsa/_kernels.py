@@ -1177,43 +1177,21 @@ def launch_stabilize_topk(
 ) -> None:
     """Make threshold ties exact and stable by retaining lower group IDs."""
     rows = int(scores.shape[0])
-    num_blocks = int(tie_counts.shape[1])
     block_k = triton.next_power_of_2(int(group_budget))
-    _launch_triton(_stable_topk_threshold_kernel, (rows,), topk_values,
-    merge_lengths,
-    thresholds,
-    greater_totals,
-    stable_values,
-    stable_ids,
-    GROUP_BUDGET=int(group_budget),
-    BLOCK_K=block_k,
-    num_warps=8,)
-    _launch_triton(_count_stable_topk_candidates_kernel, (rows, num_blocks), scores,
-    merge_lengths,
-    thresholds,
-    tie_counts,
-    greater_counts,
-    int(scores.stride(0)),
-    NUM_BLOCKS=num_blocks,
-    BLOCK_C=512,
-    num_warps=8,)
-    _launch_triton(_emit_stable_topk_kernel, (rows, num_blocks), scores,
-    merge_lengths,
-    prior_ids,
-    eligible_counts,
-    thresholds,
-    greater_totals,
-    tie_counts,
-    greater_counts,
-    stable_values,
-    stable_ids,
-    int(scores.stride(0)),
-    GROUP_OFFSET=int(group_offset),
-    GROUP_BUDGET=int(group_budget),
-    NUM_BLOCKS=num_blocks,
-    BLOCK_COUNTS=triton.next_power_of_2(num_blocks),
-    BLOCK_C=512,
-    num_warps=8,)
+    from ._stable_select_cute import launch_stable_selection
+
+    context = _support_launch_context.get()
+    prepared = None
+    if context is not None and not context[1]:
+        prepared = context[0]["stable_selection"]
+    raw = launch_stable_selection(
+        scores=scores, merge_lengths=merge_lengths, prior_ids=prior_ids,
+        eligible_counts=eligible_counts, topk_values=topk_values,
+        stable_values=stable_values, stable_ids=stable_ids,
+        group_offset=group_offset, group_budget=group_budget, prepared=prepared,
+    )
+    if context is not None and context[1]:
+        context[0]["stable_selection"] = raw
     _launch_triton(_copy_stable_topk_kernel, (rows,), stable_values,
     stable_ids,
     topk_values,
