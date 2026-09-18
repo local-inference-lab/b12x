@@ -39,6 +39,24 @@ from .planning import (
 )
 from .source import BtxSource, PackedSource, PackedSourceFormat, W13Layout, WeightSource
 from .residency import ExpertResidencyPlan, ExpertMemoryBudget, ExpertMemoryAccounting
+from .automatic import (
+    AutomaticResidencyConfig,
+    ResidencyCalibrationConfig,
+    ResidencyMonitorConfig,
+    ResidencyModelSpec,
+    ResidencyLayerSpec,
+    ModelExpertMemoryBudget,
+    ResidencyHardware,
+    ResidencyProfileStore,
+    ResidencyController,
+    ResidencyProfile,
+    RoutingSnapshot,
+    LayerRoutingCounts,
+)
+from .routing_profile import (
+    RoutingProfileQuery, RoutingProfileConfig, plan_routing_profile,
+    bind_routing_profile, routing_profile_state,
+)
 from ._residency_tuning import ResidencyConfig, ResidencyQuery
 from .weights import (
     BtxWeights,
@@ -215,6 +233,24 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "AutomaticResidencyConfig",
+    "ResidencyCalibrationConfig",
+    "ResidencyMonitorConfig",
+    "ResidencyModelSpec",
+    "ResidencyLayerSpec",
+    "ModelExpertMemoryBudget",
+    "ResidencyHardware",
+    "ResidencyProfileStore",
+    "ResidencyController",
+    "ResidencyProfile",
+    "RoutingSnapshot",
+    "LayerRoutingCounts",
+    "RoutingProfileQuery",
+    "RoutingProfileConfig",
+    "plan_routing_profile",
+    "bind_routing_profile",
+    "routing_profile_state",
+
     "BtxSource",
     "BtxWeights",
     "ActivationMode",

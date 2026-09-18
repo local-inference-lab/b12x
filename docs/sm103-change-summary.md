@@ -4,8 +4,7 @@ Status: **implemented prototype; physical SM103 execution unqualified**.
 SM103 support uses the declaration, preparation-session, binding and execution
 contracts described in [GPU preparation](gpu-profiles.md). Core compute uses
 CuTe DSL. Supporting packing and metadata kernels may use Triton.
-Implementation commit `78a8704f7d571b9869b29f3f3d5a03831d160152` is rebased onto
-master `8783519a3e42c22c0f395669ca4b20c69439c974`. The
+The working branch is based on master `8783519a3e42c22c0f395669ca4b20c69439c974`. The
 [readiness report](sm103-readiness-report.md) separates source-bound validation,
 pending PR CI and physical-target qualification.
 
@@ -17,6 +16,8 @@ pending PR CI and physical-target qualification.
 | Quantized projections | [SM103 dense lowering](../b12x/gemm/_sm103_preparation.py) supplies NVFP4, MXFP4, MXFP8, both MXFP6 formats, W6A8 and ordinary tensor/block FP8 programs to preparation. [Packed linear adapters](../b12x/gemm/blockscaled/) preserve inline weight dequantization and bounded workspace. |
 | Native MoE | [NVFP4](../b12x/moe/fused_moe/_sm103.py) and [Trellis](../b12x/moe/fused_moe/_sm103_trellis.py) retain CuTe routing, tcgen05/TMEM projections and weighted reduction. Canonical Trellis weights cover uniform, coupled, mixed-rate and grouped-atom representations. `BtxSource` and `BtxWeights` expose paired BTX records through the same public weight and execution plans. |
 | Hierarchical MXFP4 expert residency | [Placement contracts](../b12x/moe/fused_moe/residency.py) and [preparation](../b12x/moe/fused_moe/_residency_preparation.py) add per-layer HBM/Grace profiles, checkpoint identity, memory budgets and owned slabs through the public `fused_moe` API. [Native CuTe kernels](../b12x/moe/_shared/kernels/sm103/residency.py) provide MXFP8/MXFP4 tcgen05 projections, compact tier-local routing and one ordered FP32 FMA finalizer over unweighted BF16 expert outputs. Checkpoint weights are not requantized. Physical SM103 execution and Grace-backed TMA remain unqualified. |
+| Automatic residency orchestration | [Typed controller and profile store](../b12x/moe/fused_moe/automatic.py) validate workload/checkpoint identity, budget the model once, derive per-layer hot membership, detect convergence/drift and report controlled restart. Source geometry and numerical contracts remain authoritative. |
+| Prepared routing counters | [CuTe counters](../b12x/moe/_shared/kernels/routing_profile.py) use preparation-owned uint64 storage, sampling and overflow detection. The disabled serving path has no observer. [Worker hooks](../b12x/integration/vllm/expert_residency.py) expose lifecycle operations without patching vLLM. |
 | Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
 | Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |
@@ -47,6 +48,9 @@ pending PR CI and physical-target qualification.
 | Separate tier finalization changes rounding | Expert outputs remain unweighted until one explicit `fma.rn.f32` reduction, with a single final BF16 cast. Arithmetic adversaries distinguish this contract from reordered sums and separately rounded tiers. |
 | Model-scale cold storage and workspace require explicit admission | HBM and exact-size mapped-host slabs include aligned weights/scales; accounting includes scratch, route maps, KV reservation and safety margins. Preparation verifies Grace coherency and matching checkpoint/layer identity. |
 | Residency binding must not trigger lazy preparation or retain stale execution | Bind/run require explicit session preparation and reject released or replaced state. Retained programs and fixed workspace serve changing live M/top-k without runtime resolution. |
+| A global HBM budget cannot be reused independently by every layer | The model planner charges KV, safety, counter storage and each private workspace once, then passes exact layer budgets to ordinary residency preparation. |
+| A profile for another geometry or traffic class is unsafe to reuse | Schema-2 artifacts bind model/recipe/capacity and workload; startup validates hash, implementation version, hardware and memory fit. Auto invalidates incompatible artifacts with a reason. |
+| Cumulative history can hide a changed routing distribution | Convergence uses disjoint windows, per-layer membership and cold-rate stability, minimum coverage and agreement with the saved candidate. Monitor reports drift without modifying storage. |
 | Master includes pooled selection alongside sparse attention | The sparse-MLA tuning contract preserves native pooled-selection eligibility. The cached-restart ownership test enables tuning selection, preserving the separate disabled-autotuning default contract. |
 
 The native kernels retain explicit TMEM completion waits, X-axis routing grids,
@@ -64,18 +68,15 @@ is claimed.
 
 ## Validation and PR acceptance
 
-The source-bound preparation corpus covers **83 declarations and 239 distinct
-SM103 programs**. Host gates report **930 passed, 63 skipped**. Portable residency
-gates report **8 SM120 passes with zero Compute Sanitizer errors**, and W4A16 and
-pooled-selection GPU regressions report **2 passes**. The
-[engineering ledger](expert-residency-ledger.md) binds these results to the
-package hash and retains failures, compiler resources and deferred commands.
+The [readiness report](sm103-readiness-report.md) gives the validation totals for
+the automation source. The [engineering ledger](expert-residency-ledger.md)
+separates that evidence from the static-residency baseline at `78a8704f` and
+retains failed runs. Counter overhead measurements on SM120 describe only the
+partition/counter stage; they establish no B300 or whole-model throughput.
 
-These results are local evidence. Commit `78a8704f` has no GitHub statuses or check
-runs as of September 18, 2026, and the repository's wheel-release workflow has no
-pull-request trigger. PR test CI must be enabled and pass for the reviewed source
-as an independent acceptance gate. Physical SM103 execution and checkpoint
-qualification remain separate requirements.
+Validation remains source-bound local evidence. The wheel-release workflow has
+no pull-request trigger, so PR test CI must be enabled and pass independently.
+Physical SM103 execution and checkpoint qualification remain separate gates.
 
 ## Integration compatibility
 
@@ -89,3 +90,9 @@ pooling and loader fixes remain recorded in
 [historical evidence](sm103-glm-sparse-validation.json); that receipt does not
 qualify this preparation port or establish companion API compatibility.
 The companion must adopt these preparation contracts before serving validation.
+
+The [SM103 automatic residency guide](expert-residency-automatic.md) specifies the
+worker control-plane and routing hooks. They are implemented b12x APIs, not an
+installed vLLM serving feature. Engine configuration, phase classification,
+quiescent polling, rank coordination and restart still belong to the integration.
+The hooks do not port the older companion branch implicitly.

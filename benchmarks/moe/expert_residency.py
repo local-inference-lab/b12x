@@ -81,6 +81,15 @@ def run(args, receipt):
     weights = replace(weights, checkpoint_fingerprint=fingerprint, layer_name=args.layer)
     receipt["checkpoint_fingerprint"] = fingerprint
     if args.profile:
+        payload = json.loads(args.profile.read_text())
+        if isinstance(payload, dict) and payload.get("schema_version") == 2:
+            from b12x.moe.fused_moe.automatic import ResidencyProfile
+            artifact = ResidencyProfile.from_dict(payload)
+            spec = next(s for s in artifact.model.layers if s.layer == args.layer)
+            if (spec.experts != e or spec.hidden != h or spec.intermediate != i
+                    or spec.gate_first != args.gate_first or spec.swiglu_limit != args.swiglu_limit
+                    or spec.max_tokens < max(args.tokens) or spec.max_top_k < args.top_k):
+                raise ValueError("profile recipe or prepared capacity differs from benchmark geometry")
         profiles = [p for p in read_profiles(args.profile) if p.layer == args.layer]
         if len(profiles) != 1 or profiles[0].model_fingerprint != fingerprint:
             raise ValueError("profile layer or model fingerprint differs from checkpoint bundle")

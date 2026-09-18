@@ -192,6 +192,11 @@ def write_profiles(path: str | Path, profiles: Iterable[ExpertResidencyPlan]):
 
 def read_profiles(path: str | Path) -> tuple[ExpertResidencyPlan, ...]:
     payload = json.loads(Path(path).read_text())
+    if isinstance(payload, dict) and payload.get("schema_version") == 2:
+        # The model artifact verifies its complete hash before exposing static
+        # layer plans. Automatic reuse additionally requires profile.validate().
+        from .automatic import ResidencyProfile
+        return ResidencyProfile.from_dict(payload).placements
     if set(payload) != {"version", "layers"} or payload["version"] != 1:
         raise ValueError("unsupported placement artifact")
     profiles = tuple(ExpertResidencyPlan.from_dict(p) for p in payload["layers"])
