@@ -1841,9 +1841,14 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
 
     scalar_launch = kernel_module.launch_score_representatives
     cute_launch = cute_module.launch_score_representatives
+
+    def scalar_reference(*, _prepared=None, **kwargs):
+        # The independent scalar oracle resolves its own Triton programs;
+        # the binding's prepared scorer belongs to the CuTe implementation.
+        return scalar_launch(**kwargs)
+
     with monkeypatch.context() as patch:
-        patch.setattr(kernel_module, "launch_score_representatives", scalar_launch)
-        patch.setattr(cute_module, "launch_score_representatives", scalar_launch)
+        patch.setattr(cute_module, "launch_score_representatives", scalar_reference)
         reset()
         expected_output = invoke().clone()
         expected_positions = binding.selected_positions.clone()
@@ -1851,7 +1856,6 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
     assert torch.isfinite(expected_output[0]).all()
     assert expected_output[0].abs().max() > 0
     with monkeypatch.context() as patch:
-        patch.setattr(kernel_module, "launch_score_representatives", cute_launch)
         patch.setattr(cute_module, "launch_score_representatives", cute_launch)
         reset()
         invoke()
