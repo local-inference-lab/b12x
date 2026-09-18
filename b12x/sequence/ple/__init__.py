@@ -34,6 +34,7 @@ META = OpMeta(
         "run_decode",
         "run_mixed",
         "run_prefill",
+        "export_checkpoint",
         "is_supported",
     ),
     dtypes=("bf16", "int64"),
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
         run_decode,
         run_mixed,
         run_prefill,
+        export_checkpoint,
     )
 
 install_lazy_api(globals(), META)

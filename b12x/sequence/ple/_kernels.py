@@ -410,6 +410,64 @@ def _update_state_kernel(
 
 
 
+@triton.jit(do_not_specialize=["max_state_slots"])
+def _export_checkpoint_kernel(
+    normalized_u_ptr, gathered_state_ptr, query_start_loc_ptr,
+    checkpoint_offsets_ptr, checkpoint_slots_ptr, request_is_prefill_ptr,
+    num_seqs_ptr, state_slot_ids_ptr, conv_state_ptr, max_state_slots,
+    CHANNELS: tl.constexpr, STATE_LENGTH: tl.constexpr,
+    STATE_CAPACITY: tl.constexpr, STATE_STRIDE: tl.constexpr,
+    MAX_SEQS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Copy an internal prefill window into an independent state slot."""
+    request = tl.program_id(0)
+    element = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    num_seqs = tl.load(num_seqs_ptr)
+    live = request < num_seqs
+    offset = tl.load(checkpoint_offsets_ptr + request, live, other=0)
+    slot = tl.load(checkpoint_slots_ptr + request, live, other=-1).to(tl.int64)
+    prefill = tl.load(request_is_prefill_ptr + request, live, other=False)
+    start = tl.load(query_start_loc_ptr + request, live, other=0)
+    end = tl.load(query_start_loc_ptr + request + 1, live, other=0)
+    valid = live & prefill & (slot >= 0) & (slot < max_state_slots) & (offset > 0) & (offset < end - start)
+    # Check runtime ownership in every copying program so conflicting rows
+    # cannot race, including when metadata changes during graph replay.
+    peers = tl.arange(0, triton.next_power_of_2(MAX_SEQS))
+    peer_live = (peers < MAX_SEQS) & (peers < num_seqs)
+    live_slots = tl.load(state_slot_ids_ptr + peers, peer_live, other=-1)
+    peer_slots = tl.load(checkpoint_slots_ptr + peers, peer_live, other=-1)
+    peer_offsets = tl.load(checkpoint_offsets_ptr + peers, peer_live, other=0)
+    peer_prefill = tl.load(request_is_prefill_ptr + peers, peer_live, other=False)
+    peer_start = tl.load(query_start_loc_ptr + peers, peer_live, other=0)
+    peer_end = tl.load(query_start_loc_ptr + peers + 1, peer_live, other=0)
+    peer_enabled = peer_prefill & (peer_offsets > 0) & (peer_offsets < peer_end - peer_start)
+    conflicts = peer_live & (
+        (slot == live_slots)
+        | (peer_enabled & (peers != request) & (slot == peer_slots))
+    )
+    valid = valid & (tl.sum(conflicts.to(tl.int32), 0) == 0)
+    channel = element // STATE_CAPACITY
+    position = element % STATE_CAPACITY
+    relative = offset - STATE_LENGTH + position
+    payload = (channel < CHANNELS) & (position < STATE_LENGTH)
+    token = start.to(tl.int64) + relative.to(tl.int64)
+    query = tl.load(
+        normalized_u_ptr + token * CHANNELS + channel.to(tl.int64),
+        valid & payload & (relative >= 0), other=0,
+    )
+    history = tl.load(
+        gathered_state_ptr
+        + (request.to(tl.int64) * CHANNELS + channel.to(tl.int64)) * STATE_LENGTH
+        + (offset + position).to(tl.int64),
+        valid & payload & (relative < 0), other=0,
+    )
+    value = tl.where(relative >= 0, query, history)
+    tl.store(
+        conv_state_ptr + slot * STATE_STRIDE + element.to(tl.int64),
+        value, valid & (element < CHANNELS * STATE_CAPACITY),
+    )
+
+
 @torch.library.custom_op(
     "b12x::ple_layer_pipeline",
     mutates_args=(
