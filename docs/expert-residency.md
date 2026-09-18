@@ -16,6 +16,10 @@ engine hooks, TP semantics, monitor mode and physical qualification commands.
 An independently opted-in [quiescent slot exchange](expert-residency-slots.md)
 replaces payloads and updates this map at an engine-owned pause while retaining
 captured addresses. Static plans and automatic-profile activation remain unchanged.
+An experimental [recent-frequency policy](expert-residency-cache.md) composes the
+existing counters and exchange: Grace serves a miss in the observed window,
+then a selected promotion makes later executions use HBM. The engine still owns
+every pause; no policy or observer is added to static serving.
 
 ## Supported contracts
 
@@ -41,7 +45,7 @@ checkpoint row-block scale broadcasting into this existing K32 contract without
 changing values. Checkpoint FP4 bytes are copied unchanged. Global/activation
 scale metadata must be unit-valued for this MXFP4 recipe. Nonunit values fail
 preparation. Biases, SITU, FP16 output, router-weight-on-input, logits routing,
-expert parallelism, and online adaptation are unsupported in this variant.
+expert parallelism, and concurrent adaptation are unsupported in this variant.
 
 ## Declaration and preparation
 

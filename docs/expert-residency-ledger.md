@@ -626,3 +626,146 @@ then full pause/copy/map timings and a controlled changing-workload comparison.
 Only those measurements can justify spare backing, event overlap or an adaptive
 policy. Existing measured tiny-M counter/partition cost and calculated scratch
 savings remain separate optimization questions.
+
+## Grace-served cache policy evidence
+
+This evidence records a host-only recent-frequency controller atop branch
+`94639562d1b9ff54545c0a69aadad0bd0c9ff7d3`, based on master
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. Live fetch on September 18, 2026
+found both refs unchanged. The tested package SHA256 is
+`12217a30f50be813bbbf7c5b95253b1af12fde5d29ae41d7f101c5700d9f587a`.
+Master was not edited.
+
+Raw evidence lives at `/home/jasonc/b12x-cache-policy-evidence-20260918/`.
+`source-manifest.json` hashes the implementation, test and tooling files;
+`source-final.tar.gz` preserves the tested export. The remote worktree is
+`/home/jasonc/b12x-cache-policy-20260918` on ripper. `gpu-identity.log` verifies
+its package hash independently. Compiler manifests retain the starting commit,
+working-tree edits and package hash. Test durations below are validation wall
+times, not cache-performance measurements.
+
+### Implementation and boundaries
+
+Existing canonical counters are sufficient to classify misses while one
+placement generation remains fixed. The controller differences cumulative
+snapshots at an engine pause, ranks cold candidates and hot victims by recent
+counts, and proposes disjoint pairs. Explicit count, score-margin, hot-residency
+age and batch limits constrain replacement. Empty polls do not age the guard.
+An acknowledgement accepts only unchanged placement or the exact committed pair
+permutation; rollback/decline does not claim promotion. Post-promotion hit counts
+exclude the observations that motivated promotion.
+
+No routing kernel, slot-copy mechanism, slab layout, preparation contract,
+numerical boundary or static-profile rule changed. Normal static serving does
+not instantiate this controller or add an observer. Policy decisions remain
+host-side; engine pause, snapshot, exchange, TP coordination and resume remain
+explicit. Counts cannot establish per-iteration unique touches or time to first
+reuse. Sampled observations are not extrapolated into total traffic or throughput.
+
+The [cache guide](expert-residency-cache.md) documents API composition, diagnostics,
+backing-store tradeoffs, exact native test commands and the required three-arm
+serving experiment. Native policy-loop tests exist but require physical B300.
+No serving-engine wiring or adaptive throughput harness is claimed.
+
+### Files changed
+
+| File | Purpose |
+| --- | --- |
+| `b12x/moe/fused_moe/residency_cache.py` | Typed explicit policy, generation-bound counter windows, decisions, acknowledgements and diagnostics |
+| `b12x/moe/fused_moe/api.py` | Public policy exports |
+| `b12x/moe/fused_moe/__init__.py` | Lazy API metadata for those exports |
+| `tests/moe/test_residency_cache.py` | Host decisions, safeguards, lifecycle rejection, rank/phase/sampling and rollback acknowledgement |
+| `tests/moe/test_residency_cache_gpu.py` | Prepared-counter policy loop through unchanged graphs; portable byte oracle and physical-only native all-HBM parity |
+| `docs/expert-residency-cache.md` | SM103 policy contract, examples, diagnostics and physical experiment |
+| `docs/expert-residency.md` | Overview and capability boundary |
+| `docs/expert-residency-slots.md` | Exchange remains independent; link to the separate policy |
+| `docs/expert-residency-automatic.md` | Automatic static activation remains separate |
+| `docs/expert-residency-integration.md` | Engine-owned observation/exchange/acknowledgement boundary |
+| `docs/sm103-readiness-report.md` | Fresh source-bound tests and focused compilation, with historical census identity |
+| `docs/sm103-change-summary.md` | Feature/fix map and qualification limits |
+| `docs/expert-residency-ledger.md` | This evidence and rejected alternatives |
+
+### Host and compiler validation
+
+```bash
+python -m pytest tests/moe/test_residency_cache.py \
+  tests/moe/test_residency_updates.py tests/moe/test_automatic_residency.py \
+  tests/moe/test_expert_residency.py tests/moe/test_sm103_residency.py \
+  tests/moe/test_fused_moe_variant_selection.py tests/preparation tests/architecture -q
+python scripts/compile_sm103_prepared.py --output-dir RECEIPTS/prepared \
+  --case moe:residency --case moe:residency_updates \
+  --case moe:routing_profile --workers 2
+```
+
+`host-final.log`: **1,037 passed, 66 skipped**, 30.81 seconds, including 16 policy
+cases. Focused intermediate receipts retain 14 passes (`host-first.log`) and 40
+policy/exchange passes (`host-second.log`) before additional independence and
+acknowledgement cases. No pytest failure occurred in this change.
+
+`prepared/manifest.json` and `prepared/cases.jsonl`: **3 declarations, 14 distinct
+programs, 14 native CuTe exports**, zero failures, CUDA uninitialized, source
+unchanged. Local packages are Torch 2.14.0, CUTLASS DSL 4.6.2 and Triton 3.8.0.
+The full inventory remains 85 declarations/241 programs, whose preceding full
+receipt belongs to `94639562` and package `dbc81a14…`. Host-only policy code adds
+no GPU program; a full production resource census was not repeated or attributed
+to the policy source.
+
+### Portable and sanitizer validation
+
+The remote image is
+`sha256:955e088a85b5378b00275842bc839eea8cb04ca0782ed79eaa3a967d11fd22e5`.
+Tests use Torch 2.13.0, Torch CUDA build 13.3, CUTLASS DSL 4.6.2, Triton 3.7.1 and
+isolated cuda-bindings 13.0.3 through `PYTHONPATH=/workspace:/cuda-bindings`.
+Both GPUs are physical RTX PRO 4000 Blackwell SM120, driver 580.173.02, default
+compute mode. No service was stopped or SM103 capability spoofed.
+
+```bash
+python -m pytest tests/moe/test_residency_cache_gpu.py \
+  tests/moe/test_residency_updates_gpu.py tests/moe/test_residency_kernels.py \
+  tests/moe/test_routing_profile_gpu.py tests/moe/test_sm103_residency.py -q
+compute-sanitizer --tool memcheck --error-exitcode 91 \
+  python -m pytest tests/moe/test_residency_cache_gpu.py -q
+compute-sanitizer --tool synccheck --error-exitcode 91 \
+  python -m pytest tests/moe/test_residency_cache_gpu.py -q
+```
+
+| Receipt | Result | Physical GPU |
+| --- | --- | --- |
+| `gpu-first.log` | 2 passed, 2 SM103 skips, 6.38 s | `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f` |
+| `gpu-final.log` | **22 passed, 11 SM103 skips**, 13.57 s | `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f` |
+| `memcheck.log` | **2 passed, 2 SM103 skips, zero errors**, 125.19 s | `GPU-47363510-b87a-13a5-4824-2542e97df76c` |
+| `synccheck.log` | **2 passed, 2 SM103 skips, zero errors**, 48.61 s | `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f` |
+
+Compiler warnings concern the existing 128-iteration static scale-padding loop.
+The passing policy cases test both ID widths, duplicate and invalid routes,
+seven traffic windows, three promotions, observed post-promotion HBM reuse,
+canonical byte outputs, stable pointers, frozen resolution and unchanged Torch
+allocator counters. They combine the actual prepared counter program, production
+partitioner and existing slot transaction with a test-only byte reader. Native
+SM103 expert arithmetic and Grace-backed TMA are not exercised by that reader.
+
+### Rejected scope and retained failures
+
+- Three documentation patches used incomplete line contexts and applied no
+  changes. The full existing line was used on retry. Source/test artifacts were
+  unaffected; no guard or validation was weakened.
+- A miss-specific GPU counter/bitset was unnecessary for windows with constant
+  placement. Counter deltas plus the existing host map supply the observation
+  without changing production kernels. Per-step touch statistics remain a rich
+  trace research question.
+- Immediate promotion on every cold access was rejected as the default. All
+  policy thresholds are explicit, positive score gain is required and admission
+  remains bounded. No threshold is advertised as a measured production choice.
+- Asynchronous promotion/spare-slot retirement was deferred. An HBM spare alone
+  does not protect the reused Grace row in the exclusive-tier model. Both tiers'
+  readers and publication need a complete lifetime protocol.
+- Canonical Grace backing was not added. Its additional hot-expert copies would
+  materially change memory admission; eviction-copy savings require measurement.
+- A CPU synthetic hit-rate improvement was not reported as performance evidence.
+  B300 native correctness precedes full pause/copy measurements; a serving
+  experiment additionally requires the engine's pause and rank callbacks.
+
+Next evidence, in order: native static and same-graph policy correctness on B300;
+full-MoE observer overhead and actual exchange pauses/C2C traffic; then balanced
+static, observed-static and adaptive lanes on fixed and shifting traffic. Only
+those measurements can justify a cost model, spare backing or concurrent work.

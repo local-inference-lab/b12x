@@ -18,6 +18,9 @@ fixed rows when explicitly declared and controlled by an engine pause. This
 controller does not enable it, budget its rollback journals or invoke it when
 calibration/monitoring completes. Automatic activation still requires restart or
 repreparation; counter IDs remain canonical under optional slot exchanges.
+The [experimental cache controller](expert-residency-cache.md) can consume those
+same counter contracts at quiescent boundaries. It has an independent, explicit
+lifecycle and does not change automatic discovery, monitoring or profile reuse.
 
 ## Startup and activation
 

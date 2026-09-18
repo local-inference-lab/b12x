@@ -18,6 +18,7 @@ pending PR CI and physical-target qualification.
 | Hierarchical MXFP4 expert residency | [Placement contracts](../b12x/moe/fused_moe/residency.py) and [preparation](../b12x/moe/fused_moe/_residency_preparation.py) add per-layer HBM/Grace profiles, checkpoint identity, memory budgets and owned slabs through the public `fused_moe` API. [Native CuTe kernels](../b12x/moe/_shared/kernels/sm103/residency.py) provide MXFP8/MXFP4 tcgen05 projections, compact tier-local routing and one ordered FP32 FMA finalizer over unweighted BF16 expert outputs. Checkpoint weights are not requantized. Physical SM103 execution and Grace-backed TMA remain unqualified. |
 | Quiescent fixed-slot exchange | [Journaled exchange](../b12x/moe/fused_moe/_residency_updates.py) preserves canonical expert IDs and captured slab/map addresses. Preparation reserves bounded rollback storage; the engine owns the pause. Batch commit, rollback, poisoning and stale-generation guards leave static defaults unchanged. The [slot guide](expert-residency-slots.md) gives the synchronization contract and physical gates. |
 | Automatic residency orchestration | [Typed controller and profile store](../b12x/moe/fused_moe/automatic.py) validate workload/checkpoint identity, budget the model once, derive per-layer hot membership with joint HBM/Grace admission, balance bootstrap coverage, detect convergence/drift and separate saved experiments from accepted restart candidates. Source geometry and numerical contracts remain authoritative. |
+| Grace-served cache policy | The [host controller](../b12x/moe/fused_moe/residency_cache.py) classifies counter deltas against one placement generation, proposes frequency-ranked pairs with explicit safeguards and acknowledges committed/restored snapshots. Existing Grace execution serves observed misses; exchange changes later accesses. The [policy guide](expert-residency-cache.md) defines integration and measurement limits. |
 | Prepared routing counters | [CuTe counters](../b12x/moe/_shared/kernels/routing_profile.py) use preparation-owned uint64 storage, sampling and overflow detection. The disabled serving path has no observer. [Worker hooks](../b12x/integration/vllm/expert_residency.py) expose lifecycle operations without patching vLLM. |
 | Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
@@ -47,6 +48,7 @@ pending PR CI and physical-target qualification.
 | Dense MXFP4 support does not provide routed MXFP4 execution | A source-native A8/MXFP4 preparation contract and mixed FP8/FP4 tcgen05 backend supply the hierarchical routed path without changing SM120/SM121 dispatch. |
 | Tier-local storage rows differ from original route ranks | One CuTe partition pass retains both local expert rows and original route indices. Projection addressing uses the original route row; finalization consumes original top-k order. Invalid int64 IDs are checked before narrowing. |
 | A stable pointer does not make in-place payload replacement safe | Exchanges require paused producers, device draining, complete payload journaling and copy completion before publishing the map. Failed publication restores both payloads and map; failed rollback keeps the lane stopped. |
+| Cumulative counts cannot identify misses after an unrelated placement change | Cache windows bind counter deltas to one preparation/generation; external exchanges and reset/regressing counters invalidate the baseline. No new kernel or static-path observer is added. |
 | Separate tier finalization changes rounding | Expert outputs remain unweighted until one explicit `fma.rn.f32` reduction, with a single final BF16 cast. Arithmetic adversaries distinguish this contract from reordered sums and separately rounded tiers. |
 | Model-scale cold storage and workspace require explicit admission | HBM and exact-size mapped-host slabs include aligned weights/scales; accounting includes scratch, route maps, KV reservation and safety margins. Preparation verifies Grace coherency and matching checkpoint/layer identity. |
 | Residency binding must not trigger lazy preparation or retain stale execution | Bind/run require explicit session preparation and reject released or replaced state. Retained programs and fixed workspace serve changing live M/top-k without runtime resolution. |
@@ -68,7 +70,7 @@ dequantization; it has no activation-scale multiplication.
 The [residency API guide](expert-residency.md) specifies supported formats and
 ownership. The hierarchical variant supports BF16 I/O, native MXFP4/E8M0 K32
 weights, A8 activations and SiLU with an optional clamp. Biases, SITU, FP16 output,
-router-weight-on-input, logits routing, expert parallelism and online adaptation
+router-weight-on-input, logits routing, expert parallelism and concurrent adaptation
 are unsupported in that variant. Compact-count guards skip inactive expert work;
 mixed placements still launch both tiers. No overlap benefit or B300 performance
 is claimed.
@@ -76,8 +78,9 @@ is claimed.
 ## Validation and PR acceptance
 
 The [readiness report](sm103-readiness-report.md) gives the validation totals for
-the slot-exchange source: 85 declarations, 241 programs, 1,021 host passes
-and 20 portable GPU passes. Physical-only skips remain separate. The [engineering ledger](expert-residency-ledger.md)
+the cache-policy source: 1,037 host passes, 22 portable GPU passes and three
+fresh focused SM103 declarations covering 14 programs. The full 85-declaration,
+241-program receipt remains tied to `94639562`. Physical-only skips remain separate. The [engineering ledger](expert-residency-ledger.md)
 separates that evidence from the static-residency baseline at `78a8704f` and
 retains failed runs. Counter overhead measurements on SM120 describe only the
 partition/counter stage; they establish no B300 or whole-model throughput.
