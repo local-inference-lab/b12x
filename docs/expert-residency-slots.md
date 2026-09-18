@@ -3,8 +3,9 @@
 Status: **implemented opt-in control-plane prototype**. Portable SM120 tests
 validate fixed-address replacement, mapped-host byte access, rollback and reuse
 of the same CUDA graph. Physical SM103 expert execution and Grace-backed TMA
-remain **unqualified**. No adaptive policy or serving-engine integration is
-installed by this feature.
+remain **unqualified**. The separate [experimental policy](expert-residency-cache.md)
+can propose exchanges from existing counters. No serving-engine integration is
+installed by either feature.
 
 ## Logical identity and physical placement
 
@@ -193,9 +194,9 @@ fallback. The automatic controller still requires restart/reprepare to activate
 a learned profile. It does not invoke slot exchange, mutate its saved profile or
 silently treat runtime generation as a new profile artifact.
 
-Existing optional routing counters continue counting canonical IDs. A future
-control-plane policy can use their out-of-band snapshots to choose disjoint
-pairs. No extra per-token observation mechanism is needed. Monitor stays opt-in,
+Existing optional routing counters continue counting canonical IDs. The
+experimental `ResidencyCacheController` uses generation-bound window deltas to
+choose disjoint pairs. No extra per-token observation mechanism is needed. Monitor stays opt-in,
 reports routing estimates and performs no migration. Its measured portable
 launch overhead remains relevant; it is not free telemetry.
 
@@ -203,8 +204,8 @@ The map answers where each logical expert resides independently of materialized
 FC1/FC2, future grouped/persistent kernels or shared-token quantization. A future
 backend must continue reading that map at execution time; baking rows into a
 captured descriptor would require a different update contract. Concurrent spare
-slot retirement, event-coordinated copies, demand-cache policy and adaptive
-benefit remain research work requiring physical evidence.
+slot retirement, event-coordinated copies and adaptive benefit remain research
+work requiring physical evidence.
 
 ## Validation and physical acceptance
 

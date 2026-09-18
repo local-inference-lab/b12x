@@ -42,6 +42,9 @@ from .residency import ExpertResidencyPlan, ExpertMemoryBudget, ExpertMemoryAcco
 from ._residency_updates import (
     ResidencySlotSnapshot, ResidencyUpdateError, residency_slot_snapshot, exchange_expert_slots,
 )
+from .residency_cache import (
+    ResidencyCacheConfig, ResidencyCacheController, ResidencyCacheDecision, ResidencyCacheOutcome,
+)
 from .automatic import (
     AutomaticResidencyConfig,
     ResidencyCalibrationConfig,

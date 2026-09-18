@@ -102,6 +102,15 @@ Python health check. No cross-rank or cross-layer atomic commit is supplied.
 Budget each layer's journal before preparation. Reusing a paused counter-polling
 boundary is possible only after proving it excludes every graph submitter.
 
+The [recent-frequency controller](expert-residency-cache.md) adds host-only
+`observe` and `finish` hooks around this boundary. The engine supplies one
+cumulative counter snapshot per model window, runs per-layer policies only on
+the authoritative TP rank, coordinates the proposed exchanges, and acknowledges
+the actual committed or restored snapshots before resuming. It must discard
+policy baselines after counter reset/repreparation or unrelated placement
+changes. A static lane without this opt-in declares no observer. This hook does
+not supply scheduler integration or a serving throughput benchmark implicitly.
+
 ## Workspace ownership
 
 Status: **design constraint; no shared arena implemented**. Every layer's private
