@@ -45,7 +45,15 @@ def accounting(query):
     cold = tier_layout(query.experts - query.hot_experts, query.hidden, query.intermediate)[1]
     return ExpertMemoryAccounting(hbm_expert_bytes=hot, grace_expert_bytes=cold,
                                   scratch_bytes=workspace_layout(query)[1],
-                                  route_map_bytes=align(query.experts * 2 * 4))
+                                  route_map_bytes=align(query.experts * 2 * 4),
+                                  update_host_bytes=update_host_bytes(query))
+
+
+def update_host_bytes(query):
+    if not query.max_swap_pairs:
+        return 0
+    payload = tier_layout(2 * query.max_swap_pairs, query.hidden, query.intermediate)[1]
+    return payload + 2 * align(query.experts * 8)
 
 
 def validate_source(weights, query):

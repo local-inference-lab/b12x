@@ -14,6 +14,15 @@ def _integer(name, value, minimum=0):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ResidencyUpdateCapacity:
+    """Opt-in quiescent exchanges with preparation-owned rollback storage."""
+    max_pairs: int
+
+    def __post_init__(self):
+        _integer("max_pairs", self.max_pairs, 1)
+
+
+@dataclass(frozen=True, kw_only=True)
 class ExpertResidencyPlan:
     """Storage rows for one layer; expert identity remains the checkpoint index.
 
@@ -105,7 +114,7 @@ class ExpertMemoryBudget:
     def admit(self, memory: ExpertMemoryAccounting):
         if memory.hbm_total_bytes + self.hbm_safety_bytes + self.kv_reserved_bytes > self.hbm_bytes:
             raise ValueError("expert placement, scratch, and reservations exceed the HBM budget")
-        if memory.grace_expert_bytes + self.grace_safety_bytes > self.grace_bytes:
+        if memory.grace_total_bytes + self.grace_safety_bytes > self.grace_bytes:
             raise ValueError("expert placement and safety reserve exceed the Grace budget")
 
 
@@ -116,10 +125,15 @@ class ExpertMemoryAccounting:
     grace_expert_bytes: int
     scratch_bytes: int
     route_map_bytes: int
+    update_host_bytes: int = 0
 
     @property
     def hbm_total_bytes(self):
         return self.hbm_expert_bytes + self.scratch_bytes + self.route_map_bytes
+
+    @property
+    def grace_total_bytes(self):
+        return self.grace_expert_bytes + self.update_host_bytes
 
 
 def profile_from_counts(*, counts: Iterable[int], hot_count: int | None = None,

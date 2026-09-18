@@ -19,7 +19,7 @@ def placement(hot=(0, 2), cold=(1, 3)):
         layer="layer.7", model_fingerprint="sha256:test", workload="agent", provenance="trace:seed7")
 
 
-def declaration(*, max_tokens=8, top_k=3, profile=None, memory_budget=None):
+def declaration(*, max_tokens=8, top_k=3, profile=None, memory_budget=None, updates=None):
     e, h, i = 4, 256, 256
     weight_plan = moe.plan_weights(source=moe.PackedSource(format="fp4_e8m0_k32"),
         activation=moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16),
@@ -32,7 +32,7 @@ def declaration(*, max_tokens=8, top_k=3, profile=None, memory_budget=None):
         checkpoint_fingerprint="sha256:test", layer_name="layer.7")
     plan = moe.plan_execution(experts=weight_plan, weights=weights,
         placement=profile or placement(), memory_budget=memory_budget or ExpertMemoryBudget(hbm_bytes=2**30, grace_bytes=2**30),
-        capacity=moe.ExecutionCapacity(max_tokens=max_tokens, top_k=top_k))
+        capacity=moe.ExecutionCapacity(max_tokens=max_tokens, top_k=top_k), updates=updates)
     return plan, weights
 
 

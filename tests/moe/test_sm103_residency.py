@@ -117,3 +117,56 @@ def test_public_preparation_split_parity_and_graph_replay(id_dtype, hot, tmp_pat
                         assert ptrs == (state.slab.data_ptr(), state.mapping.data_ptr(), *(t.slab.data_ptr() for t in state.tiers if t))
                 finally:
                     graph.reset()
+
+
+@pytest.mark.parametrize("hot", [(0, 1, 2, 3), (0, 2), ()])
+def test_quiescent_slot_exchange_replays_native_graph(hot, tmp_path):
+    """Physical TMA/MMA gate against freshly prepared equivalent placement."""
+    device = require_device(grace=len(hot) < 4)
+    initial = placement(hot=hot, cold=tuple(e for e in range(4) if e not in hot))
+    plan, source = declaration(profile=initial, updates=moe.ResidencyUpdateCapacity(max_pairs=2))
+    randomize(source)
+    a = torch.randn(2, 256, dtype=torch.bfloat16, device=device)*.1
+    ids = torch.tensor([[0, 1, 2], [3, 0, -1]], dtype=torch.int64, device=device)
+    weights = torch.tensor([[.3, -.2, .7]]*2, device=device)
+    with PreparationSession(device=device, autotune=False, cache_dir=tmp_path, compile_workers=0) as session:
+        prepare(session, plan, a, ids, weights, "exchange")
+        session.freeze()
+        binding = moe.bind(plan, a=a, topk_ids=ids, topk_weights=weights)
+        state = plan.prepared.state
+        buffers = (state.mapping, state.slab, a, ids, weights, *(t.slab for t in state.tiers if t))
+        pointers = tuple(t.data_ptr() for t in buffers)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph): moe.run(binding=binding)
+        try:
+            for iteration in range(3):
+                snapshot = moe.residency_slot_snapshot(plan)
+                updated = moe.exchange_expert_slots(plan, ((0, 1), (2, 3)), expected=snapshot, quiescent=True)
+                rows = tuple(tuple(e for _, e in sorted((row, e) for e, (t, row) in enumerate(updated.expert_map) if t == tier))
+                             for tier in (0, 1))
+                profile = placement(hot=rows[0], cold=rows[1])
+                fresh, fresh_source = declaration(profile=profile)
+                randomize(fresh_source)
+                with PreparationSession(device=device, autotune=False, cache_dir=tmp_path, compile_workers=0) as reference_session:
+                    prepare(reference_session, fresh, a, ids, weights, "fresh")
+                    reference_session.freeze()
+                    ids.copy_(torch.tensor([[iteration, 3, 2], [0, 0, 2**40]], dtype=torch.int64))
+                    a.mul_(.75)
+                    expected = moe.run(binding=moe.bind(fresh, a=a, topk_ids=ids, topk_weights=weights)).clone()
+                    binding.output.fill_(float("nan"))
+                    before = torch.cuda.memory_stats()
+                    with kernel_resolution_guard("native residency exchange replay"):
+                        graph.replay()
+                    torch.cuda.synchronize()
+                    after = torch.cuda.memory_stats()
+                    for key in ("allocated_bytes.all.current", "allocation.all.allocated", "allocation.all.freed"):
+                        assert after[key] == before[key]
+                    torch.testing.assert_close(binding.output, expected, rtol=0, atol=0)
+                    assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+                    assert pointers == tuple(t.data_ptr() for t in buffers)
+                    torch.testing.assert_close(moe.run(binding=binding), expected, rtol=0, atol=0)
+        finally:
+            graph.reset()
+        session.release(plan)
+        with pytest.raises(RuntimeError): moe.run(binding=binding)
+        with pytest.raises(RuntimeError): moe.residency_slot_snapshot(plan)

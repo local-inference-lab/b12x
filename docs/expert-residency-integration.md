@@ -90,6 +90,18 @@ keeps placement math, artifact policy and storage admission in b12x. A CLI can
 expose those typed contracts once the loader and worker path exist. An automatic
 engine restart is optional; a reliable explicit boundary is sufficient.
 
+## Optional slot exchange boundary
+
+The [quiescent exchange API](expert-residency-slots.md) supplies an independent
+mechanism for plans that declare rollback capacity. It does not install an engine
+pause or change automatic profile activation. An integration must stop all slab
+users, coordinate the same transaction across TP ranks, retain all owners and
+keep submissions stopped through successful commit or complete rollback. A
+nonresumable error requires worker recovery; raw CUDA graphs cannot enforce the
+Python health check. No cross-rank or cross-layer atomic commit is supplied.
+Budget each layer's journal before preparation. Reusing a paused counter-polling
+boundary is possible only after proving it excludes every graph submitter.
+
 ## Workspace ownership
 
 Status: **design constraint; no shared arena implemented**. Every layer's private

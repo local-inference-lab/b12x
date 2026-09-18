@@ -13,6 +13,9 @@ Opt-in [automatic residency](expert-residency-automatic.md) adds device counters
 model-wide byte budgeting, convergence, profile reuse and restart signaling around
 these same static plans. The automatic guide includes SM103 startup, configuration,
 engine hooks, TP semantics, monitor mode and physical qualification commands.
+An independently opted-in [quiescent slot exchange](expert-residency-slots.md)
+replaces payloads and updates this map at an engine-owned pause while retaining
+captured addresses. Static plans and automatic-profile activation remain unchanged.
 
 ## Supported contracts
 
@@ -126,7 +129,8 @@ therefore requires serialized execution; concurrent streams require separate
 plans/workspaces.
 
 `ExpertMemoryAccounting` reports HBM expert bytes, mapped expert bytes, scratch,
-and route-map bytes. Every slab offset includes alignment. `Plan` memory
+route-map bytes and optional exchange rollback bytes. `grace_total_bytes` includes
+that rollback storage; static plans charge zero. Every slab offset includes alignment. `Plan` memory
 requirements report its owned HBM allocation. Admission checks declared budgets
 before allocating and free device/host memory during materialization. KV and
 safety reservations reduce available capacity. `ModelExpertMemoryBudget` and `ResidencyController` can apportion model-wide

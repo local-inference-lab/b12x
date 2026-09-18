@@ -18,6 +18,7 @@ class ResidencyQuery:
     gate_first: bool
     swiglu_limit: float | None = None
     numerical_mode: str = "mxfp8_fp32_activation_bf16_expert_ordered_fma"
+    max_swap_pairs: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -35,6 +36,8 @@ def _validate_query(query, device):
         raise ValueError("native MXFP4 residency requires H and I divisible by 128")
     if type(query.hot_experts) is not int or not 0 <= query.hot_experts <= query.experts:
         raise ValueError("HBM expert count is outside the layer geometry")
+    if type(query.max_swap_pairs) is not int or not 0 <= query.max_swap_pairs <= query.experts // 2:
+        raise ValueError("swap capacity must fit disjoint expert pairs")
     if query.max_tokens * query.max_top_k >= 2**31 or query.experts >= 2**31:
         raise ValueError("route capacity and expert count must fit signed int32")
     if query.hidden // 128 > 65535 or 2 * query.intermediate // 128 > 65535:
@@ -56,7 +59,7 @@ def _validate(query, config, device):
 
 
 TUNING = TuningContract(
-    component_id="moe.expert_residency", query_schema_version=1, config_schema_version=1,
+    component_id="moe.expert_residency", query_schema_version=2, config_schema_version=1,
     query_fields=frozenset(ResidencyQuery.__dataclass_fields__),
     config_fields=frozenset(ResidencyConfig.__dataclass_fields__),
     encode_query=asdict, encode_config=asdict,

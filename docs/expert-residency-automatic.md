@@ -13,6 +13,12 @@ to capture individual expert IDs, construct JSONL traces or choose a fixed hot
 expert count. This is an integration API; an unmodified vLLM installation does
 not acquire an automatic residency command-line flag by importing b12x.
 
+The separate [quiescent slot mechanism](expert-residency-slots.md) can exchange
+fixed rows when explicitly declared and controlled by an engine pause. This
+controller does not enable it, budget its rollback journals or invoke it when
+calibration/monitoring completes. Automatic activation still requires restart or
+repreparation; counter IDs remain canonical under optional slot exchanges.
+
 ## Startup and activation
 
 ```mermaid
