@@ -1919,3 +1919,81 @@ def test_contiguous_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
     assert torch.isneginf(actual[1023, torch.tensor([31743], device=device)]).all()
     assert torch.isneginf(actual[1]).all()
     assert torch.isneginf(actual[64]).all()
+
+
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_mxfp4_caps_accept_qualified_and_experimental_topk(topk: int) -> None:
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4,
+        topk=topk, cache_format="mxfp4",
+    )
+    assert caps.topk == topk
+
+
+@pytest.mark.parametrize("topk", [1, 256, 768, 4096])
+def test_mxfp4_caps_reject_unqualified_topk(topk: int) -> None:
+    with pytest.raises(ValueError, match="top-k"):
+        dsa_indexer.Caps(
+            device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4,
+            topk=topk, cache_format="mxfp4",
+        )
+
+@pytest.mark.parametrize("topk", [1024, 2048])
+def test_mxfp4_public_plan_carries_qualified_and_experimental_topk(topk: int) -> None:
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4,
+        topk=topk, cache_format="mxfp4",
+    )
+    declaration = dsa_indexer.plan(
+        caps,
+        invocation=dsa_indexer.invocation_from_tensors(
+            caps, **_public_dsa_inputs(topk=topk)
+        ),
+    )
+    assert declaration.query.top_k == topk
+
+
+def _mxfp4_query(topk: int):
+    from b12x.attention.dsa_indexer._tuning import DsaIndexerQuery
+    from b12x.preparation import FrozenMapping
+
+    return DsaIndexerQuery(
+        source_layout="paged", mode="decode", dtype="bfloat16", kv_dtype="uint8",
+        num_q_heads=4, num_idx_heads=1, max_q_rows=2, max_k_rows=64,
+        top_k=topk, page_size=64, score_mode="dsa", shared_page_table=False,
+        max_page_table_width=4, route="auto", output_physical_slots=False,
+        supertile_k=0, prefill_block_k=256, reserve_paged_logits=False,
+        paged_logits_k_rows=0, operands=FrozenMapping(), cache_format="mxfp4",
+    )
+
+
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_mxfp4_query_validation_accepts_qualified_and_experimental_topk(topk: int) -> None:
+    from b12x.attention.dsa_indexer._tuning import _validate_query
+
+    _validate_query(_mxfp4_query(topk), None)
+
+
+@pytest.mark.parametrize("topk", [1, 256, 768, 4096])
+def test_mxfp4_query_validation_rejects_unqualified_topk(topk: int) -> None:
+    from b12x.attention.dsa_indexer._tuning import _validate_query
+
+    with pytest.raises(ValueError, match="top-k"):
+        _validate_query(_mxfp4_query(topk), None)
+
+
+def test_mxfp4_query_validation_rejects_physical_output_slots() -> None:
+    from b12x.attention.dsa_indexer._tuning import _validate_query
+
+    query = replace(_mxfp4_query(1024), output_physical_slots=True)
+    with pytest.raises(ValueError, match="logical"):
+        _validate_query(query, None)
+
+
+@pytest.mark.parametrize("page_size", [1, 4, 12])
+def test_mxfp4_query_validation_rejects_unaligned_page_size(page_size: int) -> None:
+    from b12x.attention.dsa_indexer._tuning import _validate_query
+
+    query = replace(_mxfp4_query(1024), page_size=page_size)
+    with pytest.raises(ValueError, match="multiple of eight"):
+        _validate_query(query, None)
