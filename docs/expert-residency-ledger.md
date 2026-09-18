@@ -460,3 +460,169 @@ Next backend work is physical all-HBM/all-Grace/mixed SM103 qualification and an
 equivalent FlashInfer baseline, followed by stage-directed optimization. The
 portable launch/partition evidence and exact scratch calculation justify
 investigation, not changing kernels or spending arena savings in advance.
+
+## Quiescent slot exchange evidence
+
+This evidence records fixed-address replacement atop branch revision
+`2a45657f949ef6f06587bd403c6faf1c2f237239`, already based on master
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. Fetching both refs on September 18,
+2026 found no additional master or working-branch changes. Master was not edited.
+The tested package SHA256 is
+`dbc81a149394350c3b3db79aa0172b9b397211230c51e0df5c93e9cf04846034`.
+
+Raw evidence is retained outside the repository at
+`/home/jasonc/b12x-slot-exchange-evidence-20260918/`. `source-manifest.json`
+binds individual implementation/test/tooling files and the package hash;
+`source-final.tar.gz` preserves the tested export. Compiler manifests record the
+starting commit, dirty source paths and the authoritative package hash. The GPU
+export is `/home/jasonc/b12x-slot-exchange-20260918` on ripper;
+`gpu-identity.log` independently confirms the same package hash there.
+
+### Result and rationale
+
+The existing map is sufficient for fixed-address replacement at a quiescent
+boundary. The implementation retains canonical router IDs and tensor-major
+slabs, journals all four fields of both members of every pair, synchronizes
+payload completion before map publication, and restores both payloads and map on
+failure. A failed rollback poisons state and requires the engine to keep raw
+graph submissions stopped. Snapshot identity includes the preparation instance
+as well as generation. Static plans allocate no journal and retain the same
+programs and captured operation sequence.
+
+The [slot contract](expert-residency-slots.md) documents engine ownership,
+nonresumable failure, TP coordination, exact byte costs and deferred native
+qualification. Placement policy, automatic-profile activation, routing counters,
+quantization and ordered-FMA semantics are unchanged. This is a mechanism for
+explicit paused epochs, not a running adaptive cache or a vLLM serving feature.
+
+### Files changed
+
+| File | Purpose |
+| --- | --- |
+| `b12x/moe/fused_moe/residency.py` | Typed update capacity and explicit host-journal admission |
+| `b12x/moe/fused_moe/_residency_updates.py` | Generation snapshots, CUDA transfers, quiescent batch transaction, rollback and poison state |
+| `b12x/moe/fused_moe/_residency_storage.py` | Aligned journal/map memory formula |
+| `b12x/moe/fused_moe/_residency_tuning.py` | Query schema 2 and declared pair capacity |
+| `b12x/moe/fused_moe/_residency_preparation.py` | Journal materialization/ownership and eager health guards |
+| `b12x/moe/fused_moe/api.py` | Optional declaration argument and exchange API exports |
+| `b12x/moe/fused_moe/__init__.py` | Lazy public API metadata |
+| `scripts/_sm103_preparation_corpus.py` | Update-enabled declaration with unchanged kernel corpus |
+| `tests/moe/test_residency_updates.py` | Host fault injection, stale requests, capacity/accounting and lifecycle guards |
+| `tests/moe/test_residency_updates_gpu.py` | Same-graph byte probes, stream drain, rollback and allocator/pointer invariants |
+| `tests/moe/test_expert_residency.py` | Shared declaration fixture supports explicit updates |
+| `tests/moe/test_sm103_residency.py` | Physical-only same-graph native parity against freshly prepared placement |
+| `docs/expert-residency-slots.md` | Full SM103 slot contract, examples and deferred commands |
+| `docs/expert-residency.md` | Storage/admission overview and exchange entry point |
+| `docs/expert-residency-automatic.md` | Static activation remains independent of exchange |
+| `docs/expert-residency-integration.md` | Engine/rank pause ownership |
+| `docs/sm103-readiness-report.md` | Source-bound qualification status and totals |
+| `docs/sm103-change-summary.md` | Feature and failure-handling map |
+| `docs/expert-residency-ledger.md` | This evidence and rejected alternatives |
+
+### Host and compiler gates
+
+```bash
+python -m pytest tests/moe/test_residency_updates.py \
+  tests/moe/test_automatic_residency.py tests/moe/test_expert_residency.py \
+  tests/moe/test_sm103_residency.py tests/moe/test_fused_moe_variant_selection.py \
+  tests/preparation tests/architecture -q
+python scripts/compile_sm103_prepared.py --output-dir RECEIPTS/prepared --workers 2
+python scripts/compile_sm103.py --component residency \
+  --hidden 5120 --intermediate 2304 --experts 384 --hot-experts 295 \
+  --capacity 128 --top-k 6 --swiglu-limit 10 \
+  --nvdisasm /path/to/nvdisasm --cuobjdump /path/to/cuobjdump \
+  --output-dir RECEIPTS/production
+```
+
+Host result: **1,021 passed, 66 skipped**, 30.77 seconds (`host-final.log`). The
+suite includes completion failures at every synchronization boundary, copy
+failures after destination writes, rollback failure, externally corrupted maps,
+stale generation/preparation, duplicate/invalid pairs, declaration purity and
+host-budget rejection. The previous review's additional QSA/MLA suite was not
+included in this invocation; its results remain tied to its own source.
+
+Offline compilation: **85 declarations, 241 distinct programs, 235 native CuTe
+exports**, no failures and CUDA uninitialized (`prepared/manifest.json` and
+`prepared/cases.jsonl`). The update-enabled declaration reuses the same compiled
+program identities as its static equivalent. The package was unchanged during
+compilation. Production geometry compiles **12 entries**. FC1/FC2 retain 142/140
+registers, 1,024 static plus 51,328 dynamic SMEM bytes and zero stack/local memory.
+No new copy kernel is compiled. CUDA runtime transfers implement the transaction.
+
+Local compiler packages: Torch 2.14.0, CUTLASS DSL 4.6.2 and Triton 3.8.0. Exact
+commands, disassembler versions, object hashes, PTX, SASS and resource reports
+are retained in `production/`. These results establish compilation and resource
+usage, not measured occupancy, B300 legality or performance.
+
+### Portable graph and sanitizer gates
+
+The export runs in container image
+`sha256:955e088a85b5378b00275842bc839eea8cb04ca0782ed79eaa3a967d11fd22e5`,
+with `PYTHONPATH=/workspace:/cuda-bindings`. It uses Torch 2.13.0, Torch CUDA build
+13.3, CUTLASS DSL 4.6.2, Triton 3.7.1 and isolated cuda-bindings 13.0.3. Both
+physical GPUs are RTX PRO 4000 Blackwell SM120 in default compute mode, driver
+580.173.02. No service was stopped and no architecture capability was spoofed.
+
+```bash
+python -m pytest tests/moe/test_residency_updates_gpu.py \
+  tests/moe/test_residency_kernels.py tests/moe/test_routing_profile_gpu.py \
+  tests/moe/test_sm103_residency.py -q
+compute-sanitizer --tool memcheck --error-exitcode 91 \
+  python -m pytest tests/moe/test_residency_updates_gpu.py -q
+compute-sanitizer --tool synccheck --error-exitcode 91 \
+  python -m pytest tests/moe/test_residency_updates_gpu.py -q
+```
+
+`gpu-final.log`: **20 passed, 9 skipped**, four existing static-loop compiler
+warnings, 12.25 seconds on `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`. The nine
+skips require physical SM103. Six passing cases use the actual partitioner and a
+test-only CuTe byte reader, inspect every payload field, exercise HBM/mapped-host
+copies and reuse the same graph after repeated slot exchange. They check both ID
+widths, invalid/duplicate routes, completed side-stream consumers, injected
+publication rollback, stable addresses, frozen resolution and unchanged Torch
+allocator allocation/free counters during replay. Eight other tests cover
+portable residency arithmetic; six cover prepared routing counters.
+
+`synccheck.log`: **6 passed, zero errors**, 9.11 seconds on
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`. `memcheck.log`: **6 passed, zero errors**,
+312.91 seconds on `GPU-47363510-b87a-13a5-4824-2542e97df76c`.
+
+No latency benchmark or adaptive-benefit measurement was performed. Test run
+durations are validation wall times. Physical SM103 all-HBM/all-Grace/mixed
+operator parity, TMA legality, repeated same-graph exchange and sanitizers remain
+explicit deferred gates in the slot guide.
+
+### Retained failures and rejected alternatives
+
+- `host-first.log`: **94 passed, one failure**. The capacity type was imported
+  into the API but omitted from lazy `META.entry_points`. Registration was fixed;
+  `host-second.log` records **95 passed** before adding completion-failure cases.
+- `gpu-first.log`: **5 passed, one failure** in a replay allocator check. Delayed
+  Python collection of an earlier test's graph/buffers changed allocator counts
+  inside the measurement window. Explicit collection before the window removes
+  unrelated frees; no allocator assertion was relaxed. `gpu-second.log` records
+  **6 passed**. Final tests additionally verify side-stream draining.
+- A documentation patch targeted a nonmatching heading and applied no changes.
+  It was corrected using the file's actual heading; source and test receipts
+  were unaffected.
+- Router-row swapping was rejected: the existing map already preserves physical
+  addresses while keeping router, profile and checkpoint identity canonical.
+- Full canonical Grace backing was deferred: the qualification example would
+  add 206.612 GiB across 40 layers for hot-expert copies. The explicitly budgeted
+  journal preserves the existing exclusive-tier capacity contract.
+- Map-only rollback was rejected because fixed slots may already contain
+  replacement payloads. Both sides are journaled before the first overwrite.
+- Atomic map encoding, spare-slot retirement and concurrent replacement were
+  deferred. A proven engine pause removes torn-read exposure without adding
+  device-side protocol work. The pause requirement cannot be inferred from
+  pointer stability or a device synchronization alone.
+
+GitHub exposes zero status contexts and zero check runs for starting source
+`2a45657f` (`github-starting-status.json`, `github-starting-checks.json`). Local
+source-bound validation does not replace an independent PR CI gate.
+
+The next evidence is physical native static correctness and same-graph exchange,
+then full pause/copy/map timings and a controlled changing-workload comparison.
+Only those measurements can justify spare backing, event overlap or an adaptive
+policy. Existing measured tiny-M counter/partition cost and calculated scratch
+savings remain separate optimization questions.

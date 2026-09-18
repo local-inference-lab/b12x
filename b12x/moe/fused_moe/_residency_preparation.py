@@ -10,7 +10,7 @@ from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan, current_plan
 from ._residency_tuning import ResidencyQuery, TUNING
 from ._residency_storage import accounting, materialize_tier, validate_source, workspace_layout
-from .residency import ExpertMemoryBudget, ExpertResidencyPlan
+from .residency import ExpertMemoryBudget, ExpertResidencyPlan, ResidencyUpdateCapacity
 
 
 @program_cache
@@ -85,6 +85,8 @@ class ResidencyBinding:
     plan: object = None
 
     def run(self):
+        if self.owners[0].updates is not None:
+            self.owners[0].updates.require_healthy()
         import cuda.bindings.driver as cuda
         stream = cuda.CUstream(torch.cuda.current_stream(self.a.device).cuda_stream)
         for program, args in self.calls:
@@ -102,8 +104,11 @@ class _ResidencyState:
     slab: torch.Tensor
     workspace: dict
     memory: object
+    updates: object = None
 
     def bind(self, *, a, topk_ids, topk_weights, output=None):
+        if self.updates is not None:
+            self.updates.require_healthy()
         import cutlass
         from b12x.moe._shared.kernels.sm103.launch import pointer
         q, v = self.query, self.workspace
@@ -172,7 +177,7 @@ class _ResidencyState:
         return ResidencyBinding(a, tuple(calls), output, (self, a, topk_ids, topk_weights, output))
 
 
-def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, invocation, override):
+def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, invocation, override, updates=None):
     from .planning import WeightPlan, ActivationMode
     from .source import PackedSource, PackedSourceFormat
     from .execution import ExecutionCapacity, RoutingSpec
@@ -182,6 +187,8 @@ def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, i
         raise TypeError("hierarchical execution requires placement and memory budget contracts")
     if not isinstance(capacity, ExecutionCapacity):
         raise TypeError("capacity must be ExecutionCapacity")
+    if updates is not None and not isinstance(updates, ResidencyUpdateCapacity):
+        raise TypeError("updates requires ResidencyUpdateCapacity")
     from .weights import WeightPacking
     if weight_plan.prepared_format.packing is not WeightPacking.SOURCE_NATIVE:
         raise ValueError("hierarchical execution requires a source_native weight packing declaration")
@@ -202,7 +209,8 @@ def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, i
         intermediate=weight_plan.geometry.intermediate_size, experts=placement.total_experts,
         hot_experts=len(placement.hbm_expert_ids), max_tokens=capacity.max_tokens, max_top_k=capacity.top_k,
         profile_hash=placement.profile_hash, model_fingerprint=placement.model_fingerprint,
-        gate_first=weight_plan.source.w13_layout.value == "w31", swiglu_limit=activation.swiglu_limit)
+        gate_first=weight_plan.source.w13_layout.value == "w31", swiglu_limit=activation.swiglu_limit,
+        max_swap_pairs=0 if updates is None else updates.max_pairs)
     TUNING.validate_query(q, None)
     validate_source(weights, q)
     if weights.checkpoint_fingerprint != placement.model_fingerprint or weights.layer_name != placement.layer:
@@ -226,11 +234,11 @@ def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, i
             raise ValueError("expert placement exceeds free HBM after declared reservations")
         import os
         host_free = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        if memory.grace_expert_bytes + memory_budget.grace_safety_bytes > host_free:
+        if memory.grace_total_bytes + memory_budget.grace_safety_bytes > host_free:
             raise ValueError("expert placement exceeds available host memory after safety reservation")
         programs = compile_programs(FrozenMapping(asdict(q)), device.ordinal)
         load_programs(programs)
-        tiers = []
+        tiers, slot_updates = [], None
         try:
             for index, ids in enumerate((placement.hbm_expert_ids, placement.grace_expert_ids)):
                 tiers.append(materialize_tier(ids, weights, q, target, grace=index == 1))
@@ -241,9 +249,13 @@ def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, i
             slab = torch.empty(nbytes, dtype=torch.uint8, device=target)
             workspace = {name: slab[offset:offset+math.prod(shape)*dtype.itemsize].view(dtype).view(shape)
                          for name, offset, shape, dtype in layout}
-            state = _ResidencyState(q, target, programs, tuple(tiers), mapping, slab, workspace, memory)
+            from ._residency_updates import materialize_updates
+            slot_updates = materialize_updates(q, tuple(tiers), mapping, placement, target)
+            state = _ResidencyState(q, target, programs, tuple(tiers), mapping, slab, workspace, memory, slot_updates)
             return attach_programs(state, *programs.values())
         except BaseException:
+            if slot_updates is not None:
+                slot_updates.owner.close()
             for tier in tiers:
                 if tier is not None and tier.owner is not None:
                     tier.owner.close()

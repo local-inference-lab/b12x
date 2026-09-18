@@ -38,7 +38,10 @@ from .planning import (
     prepare_weights as _prepare_weights,
 )
 from .source import BtxSource, PackedSource, PackedSourceFormat, W13Layout, WeightSource
-from .residency import ExpertResidencyPlan, ExpertMemoryBudget, ExpertMemoryAccounting
+from .residency import ExpertResidencyPlan, ExpertMemoryBudget, ExpertMemoryAccounting, ResidencyUpdateCapacity
+from ._residency_updates import (
+    ResidencySlotSnapshot, ResidencyUpdateError, residency_slot_snapshot, exchange_expert_slots,
+)
 from .automatic import (
     AutomaticResidencyConfig,
     ResidencyCalibrationConfig,
@@ -102,6 +105,7 @@ def plan_execution(
     weights: PackedWeights | None = None,
     placement: ExpertResidencyPlan | None = None,
     memory_budget: ExpertMemoryBudget | None = None,
+    updates: ResidencyUpdateCapacity | None = None,
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | ResidencyConfig | None = None,
@@ -111,8 +115,8 @@ def plan_execution(
         from ._residency_preparation import plan as residency_plan
         return residency_plan(weight_plan=experts, weights=weights, capacity=capacity,
             placement=placement, memory_budget=memory_budget, routing=routing,
-            invocation=invocation, override=override)
-    if weights is not None or memory_budget is not None:
+            invocation=invocation, override=override, updates=updates)
+    if weights is not None or memory_budget is not None or updates is not None:
         raise ValueError("source weights and residency budgets require an expert placement")
     return _plan_execution(
         experts=experts,

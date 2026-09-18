@@ -22,7 +22,7 @@ CASES = (
       for op in ("pre", "post_pre") for hidden in (4096, 5120, 7168)
       for capacity in (8, 389) for variant in ("plain", "norm", "lagged")),
     "mhc:post:5120:17:plain", "mhc:collapse:5120:17:plain", "mhc:pre:5120:17:broadcast", "moe:nvfp4", "moe:residency", "moe:routing_profile", "dsa:decode", "dsa:prefill",
-    "hyperconnection:grouped_rmsnorm", "hyperconnection:gate_mean",
+    "hyperconnection:grouped_rmsnorm", "hyperconnection:gate_mean", "moe:residency_updates",
 )
 
 
@@ -33,7 +33,7 @@ def declare(case):
         from b12x.moe import fused_moe as op
         return op.plan_routing_profile(op.RoutingProfileQuery(layers=(("compile", 384),),
             max_tokens=128, max_top_k=8, phases=("decode", "verify")))
-    if case == "moe:residency":
+    if case in ("moe:residency", "moe:residency_updates"):
         from b12x.moe import fused_moe as op
         weight_plan = op.plan_weights(
             source=op.PackedSource(format="fp4_e8m0_k32"),
@@ -48,7 +48,8 @@ def declare(case):
             capacity=op.ExecutionCapacity(max_tokens=17, top_k=3),
             placement=op.ExpertResidencyPlan(total_experts=4, hbm_expert_ids=(0, 2), grace_expert_ids=(1, 3),
                 layer="compile", model_fingerprint="synthetic", workload="compile", provenance="compiler corpus"),
-            memory_budget=op.ExpertMemoryBudget(hbm_bytes=2**30, grace_bytes=2**30))
+            memory_budget=op.ExpertMemoryBudget(hbm_bytes=2**30, grace_bytes=2**30),
+            updates=op.ResidencyUpdateCapacity(max_pairs=2) if case.endswith("_updates") else None)
     if family == "dense":
         from b12x.gemm._preparation import plan
         from b12x.gemm._tuning import DenseGemmQuery
