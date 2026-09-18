@@ -174,4 +174,4 @@ def test_qsa_multi_chunk_programs_are_retained(tmp_path) -> None:
         "_remap_topk_group_ids_kernel", "_stable_topk_threshold_kernel",
         "_count_stable_topk_candidates_kernel", "_emit_stable_topk_kernel",
     })
-    assert any("stable_selection" in program[1] for program in reference)
+    assert any(program[2] == "attention.qsa.stable_selection" for program in reference)
