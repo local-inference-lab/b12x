@@ -21,30 +21,40 @@ flowchart TD
     B -->|off| C[Ordinary serving without observers]
     B -->|auto or monitor| D[Look up and validate workload profile]
     D -->|compatible| E[Prepare static HBM and Grace placement]
-    D -->|missing or invalid in auto| F[Prepare positional calibration placement]
+    D -->|missing or invalid in auto| F[Prepare balanced calibration placement]
     B -->|profile| F
     F --> G[Collect prepared routing counters]
     G --> H[Quiescent snapshot and convergence check]
     H -->|more observations needed| G
     H -->|converged or explicit limit| I[Atomically persist placement artifact]
-    I --> J[Report restart required or profile saved]
-    J --> A
+    I --> J{Activation policy admits artifact?}
+    J -->|auto and admitted| R[Report restart required]
+    J -->|profile or not admitted| S[Report profile saved for inspection]
+    R --> A
     E --> K[Serve with fixed expert addresses]
     K -->|monitor only| L[Sample counters and report drift]
 ```
 
 The controller never reconfigures live storage. On a cache miss, it produces a
-budget-admitted positional bootstrap map using deterministic equal scores. The
-bootstrap fits the same HBM/Grace envelope as a learned placement; it is not
-saved as measured routing data. The physical hierarchical backend must already
-work for calibration to serve requests. Profiling does not provide a fallback
+budget-admitted bootstrap map that balances resident fractions across layers.
+After mandatory minimums, it prioritizes each layer's next row by
+`already_hot / total_experts`, with deterministic layer/ID ties. Otherwise
+identical layers differ by at most one hot row; larger layers receive
+proportional coverage when capacity permits. Constraints and row sizes can
+prevent exact balance. No synthetic selection counts are recorded. Joint byte
+feasibility takes precedence over this prior. Learned placement remains free
+to allocate HBM unequally from real routing evidence. The physical hierarchical
+backend must already work for calibration to serve requests. Profiling does not provide a fallback
 around unqualified Grace TMA or an unsupported source format.
 
-After calibration, `auto` reports `restart_required`; `profile` reports
-`profile_saved`. Both disable counting at the worker's quiescent boundary. The
-old expert placement stays active until the engine drains requests, releases
-captured graphs and prepared owners, and reloads. The next startup validates the
-saved artifact and declares ordinary static residency plans. There is no default
+After convergence, `auto` reports `restart_required`; `profile` always reports
+`profile_saved`. A sufficiently sampled but unconverged hard-limit result is
+saved as `profile_saved` by default, including in auto mode. It is inspectable
+but ineligible for automatic reuse. `activation="best_available"` explicitly
+permits such a result to request restart and be reused. Both outcomes disable
+counting at the worker's quiescent boundary. The existing placement stays active until the engine drains requests, releases
+captured graphs and prepared owners, and reloads. On restart, an accepted artifact declares ordinary static residency plans;
+a rejected artifact returns auto mode to calibration. There is no default
 live migration, engine restart from inside b12x, or public prewarm/policy API.
 
 ## Typed configuration
@@ -53,7 +63,7 @@ The public types are exported by `b12x.moe.fused_moe`.
 
 | Contract | Purpose |
 | --- | --- |
-| `AutomaticResidencyConfig` | Mode, workload name, provenance, explicit profile pin, cache reuse and restart policy |
+| `AutomaticResidencyConfig` | Mode, workload name, provenance, explicit profile pin, cache reuse, activation acceptance and restart mechanism |
 | `ResidencyCalibrationConfig` | Phase, sampling interval, minimum observations, window size, convergence thresholds and optional request/token limits |
 | `ResidencyMonitorConfig` | Sampling interval, minimum observations and drift threshold |
 | `ResidencyModelSpec` / `ResidencyLayerSpec` | Checkpoint/revisions, per-layer geometry, source/numerical recipe, capacities and optional hot-count bounds |
@@ -75,7 +85,10 @@ Calibration defaults are `phase="decode"`, `sample_every=1`, 10,000 minimum
 selections per layer, a 2,000-selection window per layer, four consecutive stable
 comparisons, Jaccard similarity at least 0.99, and per-layer cold-fraction change
 at most 0.002. Request and token limits default to `None`. Explicit limits can
-produce a profile marked **not converged**; they do not waive minimum coverage.
+produce a profile marked **not converged**; they do not waive minimum coverage
+or the default convergence requirement for activation. Saving and activation
+are separate decisions. A pinned path also requires the configured acceptance
+policy; pinning alone does not accept an unconverged artifact.
 Counts and limits are evaluated when the engine polls, so a limit can be exceeded
 between polls.
 
@@ -85,7 +98,10 @@ configuration defaults, not evidence of acceptable overhead or representative
 traffic. `sample_every` is deterministic periodic sampling of complete calls;
 it can alias periodic workloads. It does not claim unbiased random sampling.
 
-`refresh="restart_required"` is the only supported activation policy. Setting
+`refresh="restart_required"` is the only supported activation mechanism.
+`activation="converged"` is the default acceptance policy;
+`activation="best_available"` accepts sufficiently sampled limit results as well.
+Monitor uses the same acceptance policy and never modifies placement. Setting
 `reuse_cache=False` forces calibration in auto mode. An explicit `profile_path`
 is still validated and takes precedence over cache discovery.
 
@@ -139,10 +155,31 @@ by selection count divided by resident byte cost. Ties prefer layer name, then
 original expert ID. Within a layer this is selection-count order. It satisfies
 per-layer minimum hot counts first, then fills fitting candidates up to each
 layer's maximum. Uniform row costs maximize observed hot selections. Varying
-costs use a deterministic density heuristic, not an exact knapsack solver. Grace
-admission is checked after placement; a greedy failure may require different
-budgets/bounds even when another packing could be feasible. No over-budget
-placement is accepted.
+costs use a deterministic density heuristic. HBM and Grace impose a joint
+interval on resident expert bytes:
+
+```text
+total_expert_bytes - usable_Grace <= resident_bytes <= usable_HBM
+```
+
+When greedy packing leaves too much cold storage, an exact bounded subset-sum
+fallback groups optional rows by byte size, divides sizes by their greatest
+common divisor, and finds a reachable byte total in that interval. It respects
+mandatory minimums and maximums. The fallback prefers the fullest feasible
+packing and then the highest-priority rows within each size class. It proves
+byte feasibility, not maximum selection-score optimality for varying sizes.
+Within its search bound, it does not reject a feasible complement merely because
+greedy left HBM fragmented.
+
+The host search is capped at 8,000,001 reachable-bit positions and 512,000,000
+retained history bits (about 61 MiB, plus temporary bitsets and Python objects).
+A larger search fails with **feasibility unknown**, distinct from proven
+infeasibility; explicit hot-count bounds or a validated static map can resolve
+that unsupported case. This avoids unbounded startup memory/CPU work without
+requiring an external solver. The common uniform-size case never needs this
+fallback. Exact slab accounting and all reservations remain unchanged.
+The algorithm identity is `selection_density_joint_v2`; automatic startup
+invalidates profiles generated by the preceding allocator identity.
 
 `minimum_hot` and `maximum_hot` are optional operational constraints; setting both
 to the same value gives a debugging override. The normal path derives different
@@ -253,9 +290,16 @@ worker does not pause vLLM by itself.
 Use `worker.inspect()` for progress and active profile metadata. `end_calibration`
 stops an observer at a quiescent boundary. A disabled observer remains a graph
 node with launch cost; reload/recapture without an observer to recover the plain
-serving path. Existing companion vLLM branches still need their PreparationSession
-port and explicit wiring of these hooks. No old API is restored and no
-`sitecustomize` or production monkeypatch is installed.
+serving path. Polling a completed worker returns its terminal result without
+reading counters again. Restarting its measurement requires a new controller
+and preparation lifecycle.
+
+The maintained companion preparation branch already uses `PreparationSession`;
+the older SM103 companion does not. Neither wires automatic residency into its
+loader and serving loop. The [integration audit](expert-residency-integration.md)
+identifies the concrete engine hooks and CPU checkpoint ownership needed for a
+model larger than HBM. No old API is restored and no `sitecustomize` or production
+monkeypatch is installed.
 
 ## Counter and phase semantics
 
@@ -329,7 +373,7 @@ and controlled restart.
 ## Artifact identity and store
 
 The model artifact uses schema 2 and records implementation version 1,
-`selection_density_greedy_v1`, and `statistics="selection_counts"`. Its hash covers
+`selection_density_joint_v2`, and `statistics="selection_counts"`. Its hash covers
 checkpoint/model/tokenizer identity, every layer's recipe/geometry/capacity and
 bounds, workload, phase, provenance, timestamp, sample interval, selections,
 convergence/termination state and request/token totals. Derived memory totals and
@@ -339,6 +383,9 @@ not authentication of checkpoint bytes or signatures from a trusted publisher.
 Startup requires exact model metadata, workload and phase compatibility, the
 supported schema/implementation/algorithm, SM103 hardware, verified Grace
 coherency for a nonempty cold tier, and fit within the current memory envelope.
+Automatic activation additionally checks convergence unless the user explicitly
+selects `activation="best_available"`. Artifact integrity and inspectability do
+not imply permission to activate it.
 Malformed or incompatible artifacts produce an explicit reason. Auto then
 calibrates; monitor fails closed. Schema-1 trace profiles remain usable through
 the static API, but are not sufficient for automatic reuse because they lack the
@@ -346,7 +393,12 @@ full model recipe and capacity contract.
 
 The default store is `~/.cache/b12x/expert_residency`. Its deterministic namespace
 hashes checkpoint identity, workload and model/phase identity. Each complete
-artifact has a content-hash filename; `current.json` points to the selected hash.
+artifact has a content-hash filename. `current.json` points to the last converged
+artifact; `latest.json` points to the last saved artifact, including bounded
+experiments. Default discovery uses the converged index. Best-available discovery
+uses the latest index. If only an unconverged experiment exists, default startup
+reports that rejection explicitly and calibrates. Saving an unconverged
+experiment cannot displace an existing converged index.
 Temporary-file writes, `fsync` and atomic replacement publish the artifact before
 the index. Interrupted publication preserves the previous index. Different
 workloads and checkpoints cannot overwrite each other's index; competing writers
@@ -359,7 +411,7 @@ python scripts/inspect_expert_residency_profile.py /profiles/HASH.json \
 ```
 
 The inspector verifies integrity and requested identity labels. Runtime reuse
-still validates geometry, hardware and budgets through the controller. The
+still validates geometry, hardware, budgets and activation policy through the controller. The
 static `read_profiles` helper can extract layer plans from either schema, and the
 physical operator benchmark accepts generated model artifacts with geometry and
 capacity checks.
@@ -388,6 +440,8 @@ One sequential arena would save 2,022,209,280 bytes, about 1.88 GiB. These are
 layout calculations, not measured HBM savings. A shared arena requires explicit
 lane, stream, captured-graph and output-lifetime ownership. Concurrent lanes need
 separate arenas; silent cross-plan aliasing is unsupported.
+The [integration and ownership audit](expert-residency-integration.md#workspace-ownership)
+defines the conditions required before an arena can change admission accounting.
 
 Portable counter validation and overhead diagnostics:
 

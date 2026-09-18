@@ -202,7 +202,9 @@ cold-selection fractions. Zero observed selections report an unknown fraction.
 also support programmatic use. Static profiles are the default. Automatic profiling uses explicit prepared
 counter nodes only in opted-in calibration or monitor graphs; normal serving
 adds no telemetry. Model artifact schema 2 adds geometry/recipe compatibility and
-atomic workload-specific storage. `read_profiles` can extract static layer plans
+atomic workload-specific storage. Automatic placement uses balanced cold-start
+coverage, joint HBM/Grace feasibility and convergence-required activation by
+default; bounded experiments are saved separately from accepted profiles. `read_profiles` can extract static layer plans
 from either artifact schema; automatic reuse performs the complete validation
 specified in the [automatic guide](expert-residency-automatic.md).
 
@@ -246,7 +248,8 @@ hardware, verifies bitwise agreement against an all-HBM placement, mutates
 activations/routes across replay, checks allocator events, then records total
 and per-launch graph samples. Stage results separate partition, input quantization,
 hot/cold FC1, activation quantization, hot/cold FC2, and finalization. Isolated
-stage graph costs are explicitly distinct from full-operator time. Ratios are
+stage graphs contain repeated device operations to exclude Python enqueue
+gaps; isolated stage sums remain distinct from full-operator time. Ratios are
 **tiered latency / all-HBM latency**. Source hashes, worktree/commit, device UUID,
 driver/mode, toolchain, checkpoint identity, memory, and actual cold fraction are
 recorded; failed attempts retain a receipt.
@@ -263,3 +266,9 @@ wiring remain required. Greedy checkpoint requests, layer probes, C2C
 traffic, achieved occupancy, tensor/TMA utilization, HBM throughput, stalls, power,
 and overlap are deferred to physical qualification. No performance benefit is
 claimed from compilation or portable tests.
+
+The [serving integration and workspace audit](expert-residency-integration.md)
+identifies the maintained companion PreparationSession hooks, CPU checkpoint
+ownership required for greater-than-HBM loading, and execution-lane conditions
+for future scratch sharing. Those integrations and shared arenas are not
+implemented by the orchestration API; private scratch remains fully charged.
