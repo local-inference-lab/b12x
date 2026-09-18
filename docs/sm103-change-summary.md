@@ -4,6 +4,10 @@ Status: **implemented prototype; physical SM103 execution unqualified**.
 SM103 support uses the declaration, preparation-session, binding and execution
 contracts described in [GPU preparation](gpu-profiles.md). Core compute uses
 CuTe DSL. Supporting packing and metadata kernels may use Triton.
+Implementation commit `78a8704f7d571b9869b29f3f3d5a03831d160152` is rebased onto
+master `8783519a3e42c22c0f395669ca4b20c69439c974`. The
+[readiness report](sm103-readiness-report.md) separates source-bound validation,
+pending PR CI and physical-target qualification.
 
 ## Implemented features
 
@@ -12,9 +16,11 @@ CuTe DSL. Supporting packing and metadata kernels may use Triton.
 | Architecture admission and compilation | [Architecture descriptors](../b12x/_lib/architecture.py), component capability metadata and [compiler](../b12x/_lib/compiler.py) admit SM103 and retain architecture-specific artifact identity. |
 | Quantized projections | [SM103 dense lowering](../b12x/gemm/_sm103_preparation.py) supplies NVFP4, MXFP4, MXFP8, both MXFP6 formats, W6A8 and ordinary tensor/block FP8 programs to preparation. [Packed linear adapters](../b12x/gemm/blockscaled/) preserve inline weight dequantization and bounded workspace. |
 | Native MoE | [NVFP4](../b12x/moe/fused_moe/_sm103.py) and [Trellis](../b12x/moe/fused_moe/_sm103_trellis.py) retain CuTe routing, tcgen05/TMEM projections and weighted reduction. Canonical Trellis weights cover uniform, coupled, mixed-rate and grouped-atom representations. `BtxSource` and `BtxWeights` expose paired BTX records through the same public weight and execution plans. |
+| Hierarchical MXFP4 expert residency | [Placement contracts](../b12x/moe/fused_moe/residency.py) and [preparation](../b12x/moe/fused_moe/_residency_preparation.py) add per-layer HBM/Grace profiles, checkpoint identity, memory budgets and owned slabs through the public `fused_moe` API. [Native CuTe kernels](../b12x/moe/_shared/kernels/sm103/residency.py) provide MXFP8/MXFP4 tcgen05 projections, compact tier-local routing and one ordered FP32 FMA finalizer over unweighted BF16 expert outputs. Checkpoint weights are not requantized. Physical SM103 execution and Grace-backed TMA remain unqualified. |
 | Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
 | Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |
+| Static placement profiles and operator qualification | [Offline profiling](../scripts/build_expert_residency_profile.py) ranks expert selections independently per layer and emits versioned workload artifacts with expected cold fractions. The [residency benchmark](../benchmarks/moe/expert_residency.py) requires physical SM103 and records all-HBM parity, graph invariants, total latency and isolated per-stage samples. |
 | Reproducible validation | [Preparation compiler](../scripts/compile_sm103_prepared.py), [kernel corpus compiler](../scripts/compile_sm103.py), resource auditors and the [qualification launcher](../scripts/qualify_sm103.py) preserve source and artifact identity. |
 
 ## Fixes required by preparation and execution
@@ -36,11 +42,40 @@ CuTe DSL. Supporting packing and metadata kernels may use Triton.
 | Full-rotation Trellis launch records carry broadcast metadata | The runtime selector unpacks and matches the retained broadcast field before launching the weighted reduction. |
 | Large pools and vocabularies exceed 32-bit offsets | Scaled page, state and vocabulary-row addresses use Int64. GPU tests park live data beyond the signed 32-bit offset boundary. |
 | Artifact loading can modify an ELF | Verified temporary copies protect manifest-bound cached objects while preserving raw hashes and launch-resource checks. |
+| Dense MXFP4 support does not provide routed MXFP4 execution | A source-native A8/MXFP4 preparation contract and mixed FP8/FP4 tcgen05 backend supply the hierarchical routed path without changing SM120/SM121 dispatch. |
+| Tier-local storage rows differ from original route ranks | One CuTe partition pass retains both local expert rows and original route indices. Projection addressing uses the original route row; finalization consumes original top-k order. Invalid int64 IDs are checked before narrowing. |
+| Separate tier finalization changes rounding | Expert outputs remain unweighted until one explicit `fma.rn.f32` reduction, with a single final BF16 cast. Arithmetic adversaries distinguish this contract from reordered sums and separately rounded tiers. |
+| Model-scale cold storage and workspace require explicit admission | HBM and exact-size mapped-host slabs include aligned weights/scales; accounting includes scratch, route maps, KV reservation and safety margins. Preparation verifies Grace coherency and matching checkpoint/layer identity. |
+| Residency binding must not trigger lazy preparation or retain stale execution | Bind/run require explicit session preparation and reject released or replaced state. Retained programs and fixed workspace serve changing live M/top-k without runtime resolution. |
+| Master includes pooled selection alongside sparse attention | The sparse-MLA tuning contract preserves native pooled-selection eligibility. The cached-restart ownership test enables tuning selection, preserving the separate disabled-autotuning default contract. |
 
 The native kernels retain explicit TMEM completion waits, X-axis routing grids,
 compiled occupancy bounds, distinct Trellis input-scale halves and global
 transform coordinates. W4A16 remains BF16 activations with inline FP4 weight
 dequantization; it has no activation-scale multiplication.
+
+The [residency API guide](expert-residency.md) specifies supported formats and
+ownership. The hierarchical variant supports BF16 I/O, native MXFP4/E8M0 K32
+weights, A8 activations and SiLU with an optional clamp. Biases, SITU, FP16 output,
+router-weight-on-input, logits routing, expert parallelism and online adaptation
+are unsupported in that variant. Compact-count guards skip inactive expert work;
+mixed placements still launch both tiers. No overlap benefit or B300 performance
+is claimed.
+
+## Validation and PR acceptance
+
+The source-bound preparation corpus covers **83 declarations and 239 distinct
+SM103 programs**. Host gates report **930 passed, 63 skipped**. Portable residency
+gates report **8 SM120 passes with zero Compute Sanitizer errors**, and W4A16 and
+pooled-selection GPU regressions report **2 passes**. The
+[engineering ledger](expert-residency-ledger.md) binds these results to the
+package hash and retains failures, compiler resources and deferred commands.
+
+These results are local evidence. Commit `78a8704f` has no GitHub statuses or check
+runs as of September 18, 2026, and the repository's wheel-release workflow has no
+pull-request trigger. PR test CI must be enabled and pass for the reviewed source
+as an independent acceptance gate. Physical SM103 execution and checkpoint
+qualification remain separate requirements.
 
 ## Integration compatibility
 
