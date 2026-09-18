@@ -168,9 +168,10 @@ def test_qsa_multi_chunk_programs_are_retained(tmp_path) -> None:
     reference = next(iter(keys.values()))
     for programs in keys.values():
         assert programs == reference
-    for name in (
-        "_stage_topk_carry_kernel",
-        "_remap_topk_group_ids_kernel",
-        "_emit_stable_topk_kernel",
-    ):
-        assert sum(program[2] == name for program in reference) > 1, name
+    assert sum(program[2] == "_stage_topk_carry_kernel" for program in reference) > 1
+    names = {program[2] for program in reference}
+    assert not names.intersection({
+        "_remap_topk_group_ids_kernel", "_stable_topk_threshold_kernel",
+        "_count_stable_topk_candidates_kernel", "_emit_stable_topk_kernel",
+    })
+    assert any(program[2] == "attention.qsa.stable_selection" for program in reference)

@@ -568,152 +568,6 @@ def _remap_topk_group_ids_kernel(
 
 
 @triton.jit
-def _stable_topk_threshold_kernel(
-    topk_values,
-    merge_lengths,
-    thresholds,
-    greater_totals,
-    stable_values,
-    stable_ids,
-    GROUP_BUDGET: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    row = tl.program_id(0)
-    columns = tl.arange(0, BLOCK_K)
-    selected_count = tl.minimum(tl.load(merge_lengths + row), GROUP_BUDGET)
-    active = columns < selected_count
-    values = tl.load(
-        topk_values + row * GROUP_BUDGET + columns,
-        mask=active,
-        other=float("inf"),
-    ).to(tl.float32)
-    threshold = tl.min(values, axis=0)
-    greater = tl.sum((active & (values > threshold)).to(tl.int32), axis=0)
-    tl.store(thresholds + row, threshold)
-    tl.store(greater_totals + row, greater)
-    tl.store(
-        stable_values + row * GROUP_BUDGET + columns,
-        -float("inf"),
-        mask=columns < GROUP_BUDGET,
-    )
-    tl.store(
-        stable_ids + row * GROUP_BUDGET + columns,
-        -1,
-        mask=columns < GROUP_BUDGET,
-    )
-
-
-@triton.jit
-def _count_stable_topk_candidates_kernel(
-    scores,
-    merge_lengths,
-    thresholds,
-    tie_counts,
-    greater_counts,
-    score_row_stride,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    row = tl.program_id(0)
-    block = tl.program_id(1)
-    columns = block * BLOCK_C + tl.arange(0, BLOCK_C)
-    length = tl.load(merge_lengths + row)
-    active = columns < length
-    values = tl.load(
-        scores + row * score_row_stride + columns,
-        mask=active,
-        other=-float("inf"),
-    ).to(tl.float32)
-    threshold = tl.load(thresholds + row)
-    ties = tl.sum((active & (values == threshold)).to(tl.int32), axis=0)
-    greater = tl.sum((active & (values > threshold)).to(tl.int32), axis=0)
-    tl.store(tie_counts + row * NUM_BLOCKS + block, ties)
-    tl.store(greater_counts + row * NUM_BLOCKS + block, greater)
-
-
-@triton.jit
-def _emit_stable_topk_kernel(
-    scores,
-    merge_lengths,
-    prior_ids,
-    eligible_counts,
-    thresholds,
-    greater_totals,
-    tie_counts,
-    greater_counts,
-    stable_values,
-    stable_ids,
-    score_row_stride,
-    GROUP_OFFSET: tl.constexpr,
-    GROUP_BUDGET: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK_COUNTS: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    row = tl.program_id(0)
-    block = tl.program_id(1)
-    count_columns = tl.arange(0, BLOCK_COUNTS)
-    prior_blocks = (count_columns < block) & (count_columns < NUM_BLOCKS)
-    ties_before = tl.sum(
-        tl.load(
-            tie_counts + row * NUM_BLOCKS + count_columns,
-            mask=prior_blocks,
-            other=0,
-        ),
-        axis=0,
-    )
-    greater_before = tl.sum(
-        tl.load(
-            greater_counts + row * NUM_BLOCKS + count_columns,
-            mask=prior_blocks,
-            other=0,
-        ),
-        axis=0,
-    )
-
-    columns = block * BLOCK_C + tl.arange(0, BLOCK_C)
-    length = tl.load(merge_lengths + row)
-    active = columns < length
-    values = tl.load(
-        scores + row * score_row_stride + columns,
-        mask=active,
-        other=-float("inf"),
-    ).to(tl.float32)
-    threshold = tl.load(thresholds + row)
-    greater = active & (values > threshold)
-    ties = active & (values == threshold)
-    selected_count = tl.minimum(length, GROUP_BUDGET)
-    tie_needed = selected_count - tl.load(greater_totals + row)
-    tie_rank = ties_before + tl.cumsum(ties.to(tl.int32), axis=0) - 1
-    selected = greater | (ties & (tie_rank < tie_needed))
-    selected_before = greater_before + tl.minimum(ties_before, tie_needed)
-    output_columns = selected_before + tl.cumsum(selected.to(tl.int32), axis=0) - 1
-
-    eligible = tl.load(eligible_counts + row)
-    carry_count = tl.minimum(tl.minimum(eligible, GROUP_OFFSET), GROUP_BUDGET)
-    carried = tl.load(
-        prior_ids + row * GROUP_BUDGET + columns,
-        mask=active & (columns < carry_count),
-        other=-1,
-    )
-    global_ids = tl.where(
-        columns < carry_count,
-        carried,
-        GROUP_OFFSET + columns - carry_count,
-    )
-    tl.store(
-        stable_values + row * GROUP_BUDGET + output_columns,
-        values,
-        mask=selected,
-    )
-    tl.store(
-        stable_ids + row * GROUP_BUDGET + output_columns,
-        global_ids,
-        mask=selected,
-    )
-
-
-@triton.jit
 def _copy_stable_topk_kernel(
     stable_values,
     stable_ids,
@@ -806,9 +660,6 @@ _SUPPORT_KERNEL_KEYS = {
     _score_representatives_kernel: "score_representatives",
     _stage_topk_carry_kernel: "stage_topk_carry",
     _remap_topk_group_ids_kernel: "remap_topk_group_ids",
-    _stable_topk_threshold_kernel: "stable_topk_threshold",
-    _count_stable_topk_candidates_kernel: "stable_topk_count",
-    _emit_stable_topk_kernel: "stable_topk_emit",
     _copy_stable_topk_kernel: "stable_topk_copy",
     _expand_selected_groups_kernel: "expand_selected_groups",
 }
@@ -1177,43 +1028,21 @@ def launch_stabilize_topk(
 ) -> None:
     """Make threshold ties exact and stable by retaining lower group IDs."""
     rows = int(scores.shape[0])
-    num_blocks = int(tie_counts.shape[1])
     block_k = triton.next_power_of_2(int(group_budget))
-    _launch_triton(_stable_topk_threshold_kernel, (rows,), topk_values,
-    merge_lengths,
-    thresholds,
-    greater_totals,
-    stable_values,
-    stable_ids,
-    GROUP_BUDGET=int(group_budget),
-    BLOCK_K=block_k,
-    num_warps=8,)
-    _launch_triton(_count_stable_topk_candidates_kernel, (rows, num_blocks), scores,
-    merge_lengths,
-    thresholds,
-    tie_counts,
-    greater_counts,
-    int(scores.stride(0)),
-    NUM_BLOCKS=num_blocks,
-    BLOCK_C=512,
-    num_warps=8,)
-    _launch_triton(_emit_stable_topk_kernel, (rows, num_blocks), scores,
-    merge_lengths,
-    prior_ids,
-    eligible_counts,
-    thresholds,
-    greater_totals,
-    tie_counts,
-    greater_counts,
-    stable_values,
-    stable_ids,
-    int(scores.stride(0)),
-    GROUP_OFFSET=int(group_offset),
-    GROUP_BUDGET=int(group_budget),
-    NUM_BLOCKS=num_blocks,
-    BLOCK_COUNTS=triton.next_power_of_2(num_blocks),
-    BLOCK_C=512,
-    num_warps=8,)
+    from ._stable_select_cute import launch_stable_selection
+
+    context = _support_launch_context.get()
+    prepared = None
+    if context is not None and not context[1]:
+        prepared = context[0]["stable_selection"]
+    raw = launch_stable_selection(
+        scores=scores, merge_lengths=merge_lengths, prior_ids=prior_ids,
+        eligible_counts=eligible_counts, topk_values=topk_values,
+        stable_values=stable_values, stable_ids=stable_ids,
+        group_offset=group_offset, group_budget=group_budget, prepared=prepared,
+    )
+    if context is not None and context[1]:
+        context[0]["stable_selection"] = raw
     _launch_triton(_copy_stable_topk_kernel, (rows,), stable_values,
     stable_ids,
     topk_values,

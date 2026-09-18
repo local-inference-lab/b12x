@@ -2300,7 +2300,6 @@ def _qsa_decode_impl(
         launch_compress_completed_groups,
         launch_expand_selected_groups,
         launch_prepare_index_query,
-        launch_remap_topk_group_ids,
         launch_stabilize_topk,
         launch_stage_topk_carry,
         launch_topk_groups,
@@ -2419,15 +2418,6 @@ def _qsa_decode_impl(
                 eligible_counts=chunk_merge_lengths,
                 topk_values=output_values,
                 topk_group_ids=output_ids,
-                group_budget=group_budget,
-                _prepared=None if programs is None else programs.support,
-            )
-            launch_remap_topk_group_ids(
-                local_ids=output_ids,
-                prior_ids=prior_ids,
-                eligible_counts=chunk_eligible,
-                merge_lengths=chunk_merge_lengths,
-                group_offset=group_offset,
                 group_budget=group_budget,
                 _prepared=None if programs is None else programs.support,
             )
