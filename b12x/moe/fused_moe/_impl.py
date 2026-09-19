@@ -11335,9 +11335,11 @@ def _launch_dynamic_flat(
             )
         effective_mac = min(effective_mac, direct_task_count)
     if (
-        (external_route_plan or w4a8_n64_repacked)
+        (external_route_plan or w4a8_n64_repacked
+         or (w4a8_repacked and n % 128 == 0 and selected_tile_m <= 32))
         and policy_max_active_clusters > 0
         and _first_env(
+            f"B12X_{mac_backend.upper()}_MAX_ACTIVE_CLUSTERS",
             "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
             "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
         )
