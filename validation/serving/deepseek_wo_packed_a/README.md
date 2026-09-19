@@ -4,6 +4,8 @@ The prepared B12X attention-output projection preserves loader-owned tiled
 weights and replicated block scales, selects the existing small-row grouped
 GEMM, and binds caller-owned workspace without scale-padding writes.
 Quantization, checkpoint values and the mathematical operation are unchanged.
+The first grouped projection is called WO-A; the following projection into
+the model's hidden width is called WO-B.
 
 Status: **implemented and qualified** for the checks below. This is not a
 claim that every DS4 serving regression is resolved.
@@ -22,7 +24,7 @@ validation results and GPU telemetry. Model responses are omitted.
 
 ## Result
 
-| Five-window median | WO-B/storage repair and MoE grid tuning | Plus packed WO-A repair |
+| Five-window median | Prepared second projection, caller-owned scratch, MoE grid tuning | Also preserve packed first projection |
 |---|---:|---:|
 | Uncached 32K prefill, tokens/s | 11,395 | 11,427 |
 | C1 output, tokens/s | 191.045 | 196.171 |
@@ -34,20 +36,42 @@ validation results and GPU telemetry. Model responses are omitted.
 All functional checks and measured cells pass. Verifier changes are +0.30%
 C1 and +0.21% C8. Acceptance varies in these unseeded requests; output changes
 do not establish a distribution change or guaranteed token-rate improvement.
-The separate [WO-B/storage comparison](../deepseek_wo_layout/results.json)
+The separate [second-projection/scratch comparison](../deepseek_wo_layout/results.json)
 shows a 1.61% C1 verifier gain.
 
-A four-step rank-zero trace identifies 184 first-projection calls by their
+A [committed trace extract](projection-traces.json) identifies 184
+first-projection calls in four rank-zero verifier steps by their
 position after inverse-RoPE quantization and before the second projection.
 The repaired first projection uses 96 threads, 48,128 bytes of shared memory,
 and averages 11.02 microseconds. The saved community reference is 11.23
-microseconds; the frozen KK implementation is 13.41 microseconds with 288
+microseconds; Karmic Kraken without these repairs is 13.41 microseconds with 288
 threads and 78,848 bytes. The binding's two padding fills are also absent.
 Kernel times can overlap other work and are not an unprofiled speed estimate.
+The extract includes every projection duration, launch geometry, original
+trace SHA-256, immutable image IDs/digests, commands, GPU identities, and
+the corresponding unprofiled decode windows. The companion extraction script
+locates each projection by stream order, not its generated kernel name.
 
 The repaired image still measures 71.899 versus the saved reference's 73.217
 C1 verifier steps/s, a 1.80% deficit. Its cause remains outside this qualified
 projection repair.
+
+## Benchmark admission budget
+
+The first-projection comparison records 1,301,782 versus 1,301,500 logical KV
+tokens. These are the capacities discovered from the server, not different
+request lengths. The client's `--kv-budget` only controls admission of
+oversized cells and display metadata; it is not sent as a serving parameter.
+The recorded client never skips context-zero C1/C8 within eight request slots.
+Even eight maximum-length responses use only 65,536 tokens, below either
+budget. No recorded cell is capacity-limited, underfilled, or failed.
+
+`uv run python validation/serving/deepseek_wo_packed_a/audit_evidence.py /path/to/llm_decode_bench.py`
+checks both records and executes the exact recorded client's admission rule.
+It requires the client SHA-256 recorded in `results.json`. Reproduce that
+client from the public commit named there by changing only `VERSION` from
+`0.6.1` to `0.6.2`; this change does not affect request generation.
+This does not establish equivalence for long contexts close to capacity.
 
 ## Correctness
 

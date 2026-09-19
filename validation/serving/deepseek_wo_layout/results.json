@@ -1019,8 +1019,8 @@
       "methodology": {
         "prefill": {
           "name": "Prefill",
-          "present": false,
-          "mode": "skipped",
+          "present": true,
+          "mode": "standalone",
           "formula": "prompt_tokens / TTFT",
           "notes": "Default mode records the required decode scout request for each non-zero decode context, so normal runs do not pay for a separate prefill phase. Standalone mode repeats cold-prefill samples. Prometheus prefill counters, when available and uncontaminated, are stored as validation."
         },
@@ -2078,8 +2078,8 @@
       "methodology": {
         "prefill": {
           "name": "Prefill",
-          "present": false,
-          "mode": "skipped",
+          "present": true,
+          "mode": "standalone",
           "formula": "prompt_tokens / TTFT",
           "notes": "Default mode records the required decode scout request for each non-zero decode context, so normal runs do not pay for a separate prefill phase. Standalone mode repeats cold-prefill samples. Prometheus prefill counters, when available and uncontaminated, are stored as validation."
         },
