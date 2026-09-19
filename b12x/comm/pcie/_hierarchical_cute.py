@@ -14,6 +14,7 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
@@ -914,7 +915,7 @@ def get_hierarchical_launcher(
             current_cuda_stream(),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["get_hierarchical_launcher"]
