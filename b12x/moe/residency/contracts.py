@@ -85,9 +85,12 @@ class ResidencyExchangeSpec:
     fixed_address_quiescent_exchange: bool
     payload_copy_bytes_per_pair: int
     map_copy_bytes_per_transaction: int
+    backing_mode: str = "exclusive"
 
     def __post_init__(self):
         _text("backend", self.backend)
+        if self.backing_mode not in ("exclusive", "canonical"):
+            raise ValueError("backing_mode must be exclusive or canonical")
         for name in ("direct_backing_execution", "fixed_address_quiescent_exchange"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

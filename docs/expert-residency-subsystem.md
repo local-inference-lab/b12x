@@ -9,7 +9,7 @@ W4A16 execution with mapped host slots over PCIe and this same host policy.
 It is a single-layer research harness, not another public serving backend.
 
 The shared subsystem represents canonical expert identity, physical placement,
-cumulative routing observations and recent-frequency exchange decisions. It
+cumulative routing observations and experimental exchange decisions. It
 imports only the Python standard library. It has no checkpoint recipe, hidden
 dimension constraint, CUDA counter query or device allocator dependency.
 
@@ -25,6 +25,12 @@ For SM103, these backend responsibilities remain under `b12x.moe.fused_moe`.
 `plan_execution` and `PreparationSession` remain the preparation interface.
 The shared namespace is not a separately registered GPU operation and has no
 alternate preparation lifecycle.
+
+The [model-wide epoch coordinator](expert-residency-epochs.md) retains separate
+layer controllers and admits proposals under a global pair/copy-byte budget.
+It imports no engine or device backend. The vLLM adapter owns RPC sequencing
+around an engine-owned pause; partial rank/layer failure requires reload.
+Full-model adaptive serving is not qualified.
 
 ## Shared contracts
 
@@ -71,6 +77,10 @@ transaction. The shared policy does not assume a weight format, four copies,
 int32 maps or a particular journal layout. These counts describe successful API
 copies, excluding rollback attempts; they are not measured bus traffic or latency.
 The descriptor is not a hardware probe or a replacement for preparation checks.
+Its `backing_mode` distinguishes exclusive-row swaps from canonical backing
+where cold expert E always resolves to row E. This does not change
+`ExpertPlacement`'s exclusive static profile representation. Canonical runtime
+maps require a backend that verifies and retains every source expert.
 
 ## Policy composition
 

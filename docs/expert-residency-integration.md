@@ -1,10 +1,18 @@
 # SM103 serving integration and workspace ownership
 
-Status: **design reviewed; companion serving integration unsupported**. The
+Status: **control-plane adapter implemented; companion serving integration unsupported**. The
 b12x [automatic residency API](expert-residency-automatic.md) is implemented and
 portable-counter tested. This document identifies engine changes still required
 to serve a checkpoint larger than HBM. It does not qualify SM103 execution or
 install a serving option.
+
+The [model-wide epoch adapter](expert-residency-epochs.md) uses supported vLLM
+worker extensions and public AsyncLLM pause/RPC methods. It coordinates all
+participating layers and replicated TP ranks, admits a bounded movement batch,
+and requires coordinated reload after partial failure. The maintained loader
+does not register prepared residency runtimes. Backend registration and
+CPU-source loading remain prerequisites; the adapter alone is not a cache
+serving option.
 
 ## Companion source boundaries
 
@@ -23,6 +31,12 @@ already has these production integration points:
 | Runtime selected routes | The same expert provider's `apply` receives original `topk_ids` and weights and binds a retained plan | Bind the optional observer at this boundary with engine-supplied phase and valid rows. Cache-hit static serving has no observer. |
 | Pause and quiescence | `vllm/v1/engine/core.py`: `pause_scheduler`, `_finish_pause`, `resume_scheduler`, `collective_rpc`; pause completion synchronizes workers | Complete the pause before counter RPCs and resume afterward. Honor runner/DP/async-output semantics. An in-process engine rejects `wait` mode, so it is not a universal drain primitive. |
 | Warmup and graph construction | `vllm/v1/worker/gpu_worker.py`: preparation stages followed by `compile_or_warm_up_model` | Discard primer/capture counters and enable calibration after all warmup, before workload traffic. |
+
+The epoch adapter selects the existing `keep` pause, preserving requests and KV
+state. At the inspected revision, `AsyncLLM.pause_generation` adds a fixed 20 ms
+delay after core pause completion. Complete control-plane receipts must include
+it. No claim of a low-cost four-token serving epoch follows from offline
+four-invocation policy windows.
 
 Both `b12x_native_supported` and the MoE backend's `_supports_current_device`
 currently admit the SM120 family on this companion branch. Extending those

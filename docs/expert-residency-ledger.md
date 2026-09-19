@@ -5,6 +5,89 @@ correctness, and deferred SM103 qualification. Raw receipts are retained outside
 the repository at `/home/jasonc/b12x-residency-evidence-20260918` on the development
 host and `/home/jasonc/b12x-residency-20260918` on the portable GPU host.
 
+## Model-wide epoch control, September 19, 2026
+
+The implementation starts from `6d3cf32322a2566ad6c8dec9f5a0a9e3967c2fc8` on
+`work/sm103-bringup`. Live master is
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`; the branch is 79 commits ahead and
+zero behind before this change. No rebase or master modification is needed.
+The companion audit confirms vLLM main at `47ccf6c57d92f03630ebcbad3809450545825488`,
+the PreparationSession branch at `ef1aeaf080879865febd27a92c5644233d157987`,
+the Spark lane source at `76061de4bff2adc741cb25018ca79991263228be`, and the retained
+SM103 companion at `f6c6ac72c3`. SGLang main remains
+`c662a9fd6e35c2548c45c09ece8d3f47846d61f2`. No companion engine checkout or live
+serving lane is changed.
+
+Implemented: layer-scoped experimental decayed LFU, explicit canonical/exclusive
+map transitions, subset acknowledgement, a globally bounded model epoch, one
+counter-slab snapshot, prepared SM103 binding adaptation, and a vLLM
+pause/worker-extension protocol. Rank-wide preflight precedes copies; partial
+rank/layer failure requires coordinated reload. Static serving defaults and
+numerical kernels remain unchanged. The
+[epoch guide](expert-residency-epochs.md) specifies configuration, memory,
+ownership, diagnostics and the missing loader/backend integration.
+
+Final implementation/test files are frozen in `source-03.tar.gz`, SHA256
+`9f73c4ac64dcf09e490d8f08deb7c70d6d3edb4a055c82ca07223c51c596b05e`.
+Raw evidence is retained at
+`/home/jasonc/b12x-model-epoch-evidence-20260919` and
+`ripper:/home/jasonc/b12x-model-epoch-results-20260919`. Source manifests bind
+every implementation/test file; documentation is completed after measurement.
+Earlier source-01/source-02 logs remain attached to their own archives.
+
+| Validation | Exact result and limit |
+| --- | --- |
+| Focused host suite | 199 passed, 10 GPU skips in 3.04 s; `host-final-02.log`. Includes per-layer and global budgets, full/partial acknowledgements, canonical maps, stable/shifted traffic, disabled path, stale generation, rank/layer failure, cancellation, JSON round-trip and actual engine parallel-config checks. |
+| Portable SM120 suite | 20 passed, 2 native-SM103 skips in 12.54 s; `gpu-final.log`. Full two-layer cases use one graph for 16 policy windows, plus bounded cases and existing counter/metadata tests. Payload identity, exact counts, addresses and zero replay allocations pass. This is not vLLM model execution. |
+| Bounded memcheck | One two-layer int64 case passed; zero reported errors. Full payload checks remain in the unsanitized full case. |
+| Bounded synccheck | One two-layer int64 case passed; zero reported errors. This does not qualify SM103 TMA. |
+| SM103 counter cross-compilation | Two sampling queries, four int32/int64 programs; CUDA remains uninitialized. No GPU operation, preparation declaration or core compute specialization is added by the coordinator. The historical 85-declaration/241-program census is not rerun or relabeled. |
+| Checkpoint storage audit | Header hashes and exact serialized byte totals in `checkpoint-memory.json`. Research payload arithmetic requires 31.641 GiB resident plus 63.281 GiB canonical backing at 256/512 across 48 layers, before other model reservations. This is not whole-model admission. |
+| Serving and B300 | Deferred. No throughput, TTFT, ITL, full-model quality, scheduler-pause benchmark or physical SM103 result is claimed. |
+
+The portable GPU is RTX PRO 4000 Blackwell UUID
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`, driver 580.173.02, CUDA 13.3,
+Torch 2.13.0, CUTLASS DSL 4.6.2, Triton 3.7.1+gitf797708c.nv26.7,
+cuda-bindings 13.0.3. The receipt records PCIe Gen4 x16 and a 145 W power limit.
+These correctness runs use ordinary dynamic clocks and make no timing comparison.
+The final counter compiler manifest binds package SHA256
+`744f8280e711989eae7f1ff4677a58e7d57636e6646c335f8a651d236e847b33`
+and records the separate host toolchain: Torch 2.14.0, CUTLASS DSL 4.6.2 and
+Triton 3.8.0. Its four programs compile with CUDA uninitialized; this is not a
+physical SM103 result.
+
+Retained failures and rejected approaches:
+
+- The full epoch test under memcheck reaches the explicit 180 s timeout without
+  a test result (`memcheck-01.log`, exit 124). The bounded scale-reader case
+  completes under memcheck and synccheck; it does not erase that timeout.
+- The first host admission assertion expected 760 bytes from categories that
+  sum to 660. The test oracle is corrected; admission arithmetic is unchanged.
+  The failure is recorded in `initial-host-failure.txt`.
+- Ruff passes for all added Python files. A broader check reports the unchanged
+  `RoutingProfileConfig` import and non-strict candidate/victim `zip` already
+  present at the starting commit. `lint-baseline.log` reproduces both findings
+  on that source; they are not silently reported as a passing repository lint.
+- Cumulative counts cannot implement the ordering-dependent offline LRU policy.
+  LRU remains trace research; recent-frequency remains the default and decayed
+  LFU is explicitly selected.
+- The vLLM public async pause includes a fixed 20 ms sleep. The adapter uses the
+  supported boundary and includes its cost; no private scheduler bypass or
+  unmeasured four-token serving pause is introduced.
+- Research SM120 fills are not imported into a production quantization method.
+  Public prepared storage, CPU-source checkpoint loading, real phase hooks and
+  whole-model memory admission must exist before a serving A/B is valid.
+- An individually resumable copy error is not model-wide rollback. Distributed
+  automatic recovery is deferred; all ranks must reload after partial failure.
+
+The next integration gate is a CPU-source loader and a public SM120 prepared
+cache backend with preserved numerical recipe. Then wire counter bindings and
+runtime registration through the maintained PreparationSession lifecycle and
+measure learned-static versus adaptive serving, including all pauses. Timeline
+evidence must precede asynchronous replacement, shared scratch admission or
+policy-default changes. Earlier 141/181-fixture and held-out replay receipts
+remain immutable.
+
 ## Source and upstream evidence
 
 The working branch is rebased onto master

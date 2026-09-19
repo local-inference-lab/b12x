@@ -11,6 +11,11 @@ from .contracts import (
 from .policy import (
     ResidencyCacheConfig, ResidencyCacheController, ResidencyCacheDecision,
     ResidencyCacheOutcome,
+    updated_slot_map,
+)
+from .epoch import (
+    ResidencyEpochBudget, ResidencyEpochCoordinator, ResidencyEpochDecision,
+    ResidencyLayerDecision,
 )
 
 __all__ = [
@@ -18,4 +23,6 @@ __all__ = [
     "ResidencySlotSnapshot", "ResidencyUpdateCapacity", "ResidencyUpdateError",
     "RoutingObservationSpec", "RoutingSnapshot", "ResidencyCacheConfig",
     "ResidencyCacheController", "ResidencyCacheDecision", "ResidencyCacheOutcome",
+    "updated_slot_map", "ResidencyEpochBudget", "ResidencyEpochCoordinator",
+    "ResidencyEpochDecision", "ResidencyLayerDecision",
 ]

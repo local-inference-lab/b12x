@@ -5,6 +5,7 @@ owns the pause, counter snapshots, exchange and acknowledgement; this module
 allocates no device state and performs no execution or storage mutation.
 """
 from dataclasses import dataclass
+import math
 
 from .contracts import (
     PHASES, ResidencySlotSnapshot, RoutingSnapshot, RoutingObservationSpec,
@@ -20,6 +21,8 @@ class ResidencyCacheConfig:
     minimum_score_gain: int
     minimum_residency_windows: int
     phase: str = "decode"
+    scoring: str = "recent_frequency"
+    decay: float = 0.5
 
     def __post_init__(self):
         for name in ("max_pairs", "minimum_cold_selections", "minimum_score_gain"):
@@ -27,6 +30,10 @@ class ResidencyCacheConfig:
         _integer("minimum_residency_windows", self.minimum_residency_windows)
         if self.phase not in PHASES:
             raise ValueError("cache policy requires one explicit routing phase")
+        if self.scoring not in ("recent_frequency", "decayed_lfu"):
+            raise ValueError("unsupported cache scoring rule")
+        if type(self.decay) not in (int, float) or not math.isfinite(self.decay) or not 0 < self.decay < 1:
+            raise ValueError("decay must be finite and strictly between zero and one")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -47,6 +54,7 @@ class ResidencyCacheDecision:
     protected_hot_experts: tuple[int, ...]
     unpaired_candidates: int
     observed_hits_since_promotion: tuple[tuple[int, int], ...]
+    scores: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -62,7 +70,7 @@ class ResidencyCacheOutcome:
     committed_map_copy_bytes: int
 
 
-def _validate_slots(slots, experts):
+def _validate_slots(slots, experts, backing_mode="exclusive"):
     if not isinstance(slots, ResidencySlotSnapshot) or not slots.healthy:
         raise ValueError("cache decisions require a healthy residency snapshot")
     if len(slots.expert_map) != experts or not slots.preparation_id:
@@ -70,10 +78,31 @@ def _validate_slots(slots, experts):
     _integer("generation", slots.generation)
     for tier in (0, 1):
         rows = sorted(row for t, row in slots.expert_map if t == tier)
-        if rows != list(range(len(rows))):
+        if tier == 1 and backing_mode == "canonical":
+            if any(row != e for e, (t, row) in enumerate(slots.expert_map) if t == 1):
+                raise ValueError("canonical backing rows must equal logical expert IDs")
+        elif rows != list(range(len(rows))):
             raise ValueError("slot snapshot must contain every physical row exactly once")
     if any(type(t) is not int or t not in (0, 1) or type(row) is not int for t, row in slots.expert_map):
         raise ValueError("slot snapshot requires integer tier and row IDs")
+
+
+def updated_slot_map(slots, pairs, *, backing_mode="exclusive"):
+    """Describe a complete generation without performing storage mutation."""
+    _validate_slots(slots, len(slots.expert_map), backing_mode)
+    if backing_mode not in ("exclusive", "canonical"):
+        raise ValueError("unsupported backing mode")
+    mapping = list(slots.expert_map)
+    used = set()
+    for cold, hot in pairs:
+        if (type(cold) is not int or type(hot) is not int
+                or not 0 <= cold < len(mapping) or not 0 <= hot < len(mapping)
+                or cold in used or hot in used or cold == hot
+                or mapping[cold][0] != 1 or mapping[hot][0] != 0):
+            raise ValueError("promotion pairs require disjoint cold and resident expert IDs")
+        used.update((cold, hot))
+        mapping[cold], mapping[hot] = mapping[hot], ((1, hot) if backing_mode == "canonical" else mapping[cold])
+    return tuple(mapping)
 
 
 class ResidencyCacheController:
@@ -95,7 +124,7 @@ class ResidencyCacheController:
             raise ValueError("cache policy requires direct backing execution and fixed-address quiescent exchange")
         if observations.rank != observations.owner_rank or observations.phase != config.phase:
             raise ValueError("cache policy requires the authoritative rank and declared phase")
-        _validate_slots(slots, observations.experts)
+        _validate_slots(slots, observations.experts, exchange.backing_mode)
         if not isinstance(baseline, RoutingSnapshot):
             raise TypeError("cache baseline requires RoutingSnapshot")
         self.config, self.observations, self.exchange = config, observations, exchange
@@ -108,6 +137,7 @@ class ResidencyCacheController:
         self._hits = {}
         self._promotions = 0
         self._total_hits = 0
+        self._scores = (0.0,) * observations.experts
 
     def _row(self, snapshot):
         if not isinstance(snapshot, RoutingSnapshot):
@@ -119,8 +149,8 @@ class ResidencyCacheController:
             raise ValueError("counter snapshot is missing the declared layer/phase geometry")
         return matches[0]
 
-    def observe(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot):
-        """Propose pairs from completed requests; never perform an exchange."""
+    def validate_observation(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot):
+        """Check a window without advancing policy state."""
         if self._pending is not None:
             raise RuntimeError("finish the pending cache decision before observing another window")
         if slots != self._slots:
@@ -137,19 +167,28 @@ class ResidencyCacheController:
                 or sum(counts) > sampled_tokens*self.observations.max_top_k
                 or (sum(counts) and not sampled_calls)):
             raise ValueError("counter window has inconsistent selection/sampling totals")
+        return row, counts, metadata
+
+    def observe(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot):
+        """Propose pairs from completed requests; never perform an exchange."""
+        row, counts, metadata = self.validate_observation(snapshot, slots=slots)
+        calls, sampled_calls, tokens, sampled_tokens = metadata
+        scores = counts
+        if self.config.scoring == "decayed_lfu":
+            scores = tuple(a*self.config.decay+b for a, b in zip(self._scores, counts, strict=True)) if sum(counts) else self._scores
         # Empty/unsampled windows and repeated polls do not age eviction guards.
         window = self._window + bool(sum(counts))
         hot = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 0)
         cold = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 1 and counts[e])
         protected = tuple(e for e in hot if window-self._entered[e] < self.config.minimum_residency_windows)
         candidates = sorted((e for e in cold if counts[e] >= self.config.minimum_cold_selections),
-                            key=lambda e: (-counts[e], e))
-        victims = sorted((e for e in hot if e not in protected), key=lambda e: (counts[e], e))
+                            key=lambda e: (-scores[e], e))
+        victims = sorted((e for e in hot if e not in protected), key=lambda e: (scores[e], e))
         pairs, hysteresis = [], 0
         for candidate, victim in zip(candidates, victims):
             if len(pairs) == self.config.max_pairs:
                 break
-            if counts[candidate]-counts[victim] < self.config.minimum_score_gain:
+            if scores[candidate]-scores[victim] < self.config.minimum_score_gain:
                 # Remaining candidates score no higher and victims no lower.
                 hysteresis = min(len(candidates), len(victims))-len(pairs)
                 break
@@ -164,30 +203,39 @@ class ResidencyCacheController:
             counterfactual_cold_fraction=remaining/sum(counts) if sum(counts) else None,
             below_threshold=len(cold)-len(candidates), below_hysteresis=hysteresis,
             protected_hot_experts=protected, unpaired_candidates=len(candidates)-len(pairs)-hysteresis,
-            observed_hits_since_promotion=tuple(sorted(hits.items())))
+            observed_hits_since_promotion=tuple(sorted(hits.items())), scores=tuple(scores))
         self._baseline, self._window, self._hits = row, window, hits
+        self._scores = tuple(scores)
         self._total_hits += sum(counts[e] for e in hits)
         self._pending = decision
         return decision
 
-    def finish(self, decision: ResidencyCacheDecision, *, slots: ResidencySlotSnapshot):
-        """Acknowledge a committed exchange, or the unchanged placement on decline.
-
-        After a resumable exchange error, acknowledge the restored snapshot.
-        An unhealthy state or partial/unrelated transaction cannot be accepted.
-        """
+    def validate_completion(self, decision, *, slots, accepted_pairs=None):
+        """Validate acknowledgement before a model coordinator commits any layer."""
         if self._pending is None or decision is not self._pending:
             raise ValueError("cache decision is stale or belongs to another controller")
-        _validate_slots(slots, self.observations.experts)
+        _validate_slots(slots, self.observations.experts, self.exchange.backing_mode)
+        selected = decision.pairs if accepted_pairs is None else tuple(accepted_pairs)
+        if len(set(selected)) != len(selected) or any(pair not in decision.pairs for pair in selected):
+            raise ValueError("accepted pairs must be a subset of the pending decision")
         pairs = ()
         if slots != self._slots:
-            expected_map = list(self._slots.expert_map)
-            for cold, hot in decision.pairs:
-                expected_map[cold], expected_map[hot] = expected_map[hot], expected_map[cold]
-            if (not decision.pairs or slots.preparation_id != self._slots.preparation_id
-                    or slots.generation != self._slots.generation+1 or slots.expert_map != tuple(expected_map)):
+            expected_map = updated_slot_map(self._slots, selected, backing_mode=self.exchange.backing_mode)
+            if (not selected or slots.preparation_id != self._slots.preparation_id
+                    or slots.generation != self._slots.generation+1 or slots.expert_map != expected_map):
                 raise ValueError("completed exchange differs from the pending cache decision")
-            pairs = decision.pairs
+            pairs = selected
+        elif accepted_pairs is not None and selected:
+            raise ValueError("accepted pairs have not been committed")
+        return pairs
+
+    def finish(self, decision: ResidencyCacheDecision, *, slots: ResidencySlotSnapshot, accepted_pairs=None):
+        """Acknowledge a complete selected subset, or unchanged state on decline.
+
+        An explicit subset must be fully committed. Omitting it retains the
+        single-layer contract: either all proposed pairs or a declined decision.
+        """
+        pairs = self.validate_completion(decision, slots=slots, accepted_pairs=accepted_pairs)
         evicted_hits = tuple((hot, self._hits[hot]) for _, hot in pairs if hot in self._hits)
         for cold, hot in pairs:
             self._entered.pop(hot)

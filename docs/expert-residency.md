@@ -27,6 +27,11 @@ An experimental [recent-frequency policy](expert-residency-cache.md) composes th
 existing counters and exchange: Grace serves a miss in the observed window,
 then a selected promotion makes later executions use HBM. The engine still owns
 every pause; no policy or observer is added to static serving.
+The [model-wide epoch contract](expert-residency-epochs.md) bounds decisions
+across layers and coordinates one engine pause with rank-wide preflight and
+acknowledgement. Its vLLM control-plane adapter is implemented; CPU-source loader
+wiring and full-model adaptive serving remain unsupported. Static SM103 plans
+and physical qualification requirements are unchanged.
 
 ## Supported contracts
 

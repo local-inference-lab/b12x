@@ -131,9 +131,13 @@ class _CounterState:
     def snapshot(self, *, quiescent=False):
         self._quiesce(quiescent)
         rows = []
+        # One slab transfer snapshots the model at a quiescent boundary. Reading
+        # each layer separately would add one synchronous D2H operation per row.
+        host = self.storage.cpu() if self.storage is not None else None
         for (layer, phase), value in self.rows.items():
             experts = dict(self.query.layers)[layer]
-            data = value.cpu().tolist()
+            offset = value.data_ptr() - self.storage.data_ptr()
+            data = host[offset:offset + value.numel()*8].view(torch.uint64).tolist()
             if data[experts+4]:
                 raise OverflowError("routing counters overflowed; discard this epoch and reset")
             rows.append(LayerRoutingCounts(layer=layer, phase=phase, counts=tuple(data[:experts]),
