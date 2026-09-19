@@ -44,6 +44,41 @@ def test_shared_40_workload_reuses_experts_across_distinct_topk_rows(
         )
 
 
+@pytest.mark.parametrize(
+    "tokens,topk,experts,expected_unique",
+    ((2, 6, 256, [12, 10, 7, 6, 6]),
+     (6, 6, 256, [36, 29, 22, 14, 7]),
+     (8, 6, 256, [48, 38, 29, 19, 10]),
+     (6, 6, 6, [6, 6, 6, 6, 6]),
+     (6, 6, 12, [12, 12, 12, 12, 7])),
+)
+def test_verifier_tuning_corpus_spans_sharing_without_duplicate_token_routes(
+    tokens, topk, experts, expected_unique,
+):
+    """A fixed mean must not collapse every trial to the same expert count."""
+    from b12x.moe.fused_moe.workloads import make_tuning_routes
+
+    ids = make_tuning_routes(tokens, topk, experts, device="cpu")
+    assert ids.shape == (5, tokens, topk)
+    assert ids.dtype == torch.int32
+    assert [pattern.unique().numel() for pattern in ids] == expected_unique
+    assert all(row.unique().numel() == topk for pattern in ids for row in pattern)
+    assert ids.min() >= 0 and ids.max() < experts
+    torch.testing.assert_close(
+        ids, make_tuning_routes(tokens, topk, experts, device="cpu"),
+    )
+
+
+@pytest.mark.parametrize("tokens", (1, 9, 128))
+def test_nonverifier_tuning_routes_retain_cyclic_coverage(tokens):
+    from b12x.moe.fused_moe.workloads import make_routing_ids, make_tuning_routes
+
+    torch.testing.assert_close(
+        make_tuning_routes(tokens, 6, 256, device="cpu"),
+        make_routing_ids(tokens, 6, 256, workload="disjoint").unsqueeze(0),
+    )
+
+
 def test_variant_for_preserves_exact_counts_and_reuses_prefill_capacity():
     variants = {count: _Variant(count) for count in (1, 2, 4, 8, 125, 128)}
     assert variant_for(variants, 4) is variants[4]
