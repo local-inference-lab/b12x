@@ -9,6 +9,7 @@ from b12x.preparation import Plan
 from ..._lib.gating import default_is_supported
 from . import META
 from ._preparation import plan
+from ._tuning import ProjectionQuery
 
 Mxfp8Weight: TypeAlias = tuple[torch.Tensor, torch.Tensor]
 MlaQueryWeight: TypeAlias = torch.Tensor | Mxfp8Weight
@@ -18,7 +19,12 @@ def run(q_nope: torch.Tensor, weight: MlaQueryWeight, q_pe: torch.Tensor,
         out: torch.Tensor, *, plan: Plan,
         q_scale: Optional[torch.Tensor] = None,
         stream: Optional[object] = None) -> torch.Tensor:
-    """Assemble the admitted exact-M MLA query into caller-owned ``out``."""
+    """Assemble the MLA query into caller-owned ``out``.
+
+    Declare capacity with ``plan(ProjectionQuery(max_rows=capacity, ...))``.
+    ``plan.query.served_rows`` reports the admitted live counts: any M up to
+    ``max_rows`` for BF16, and exactly ``max_rows`` for MXFP8.
+    """
     if isinstance(weight, torch.Tensor):
         from . import _bf16
         return _bf16.run(q_nope, weight, q_pe, out, plan=plan, q_scale=q_scale, stream=stream)
@@ -57,4 +63,7 @@ def clear_caches() -> None:
     mxfp8_bmm.clear_mla_query_projection_caches()
 
 
-__all__ = ["Mxfp8Weight", "MlaQueryWeight", "plan", "run", "can_implement", "is_supported"]
+__all__ = [
+    "Mxfp8Weight", "MlaQueryWeight", "ProjectionQuery", "plan", "run",
+    "can_implement", "is_supported",
+]
