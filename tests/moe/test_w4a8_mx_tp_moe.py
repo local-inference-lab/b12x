@@ -1007,7 +1007,17 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
             activation="silu",
         ) for rows in counts
     }
-    experts = _prepare(weights)
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w13"),
+        activation=fused_moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16),
+        geometry=fused_moe.MoEGeometry(num_experts=_E, hidden_size=_K, intermediate_size=_N),
+    )
+    experts = fused_moe.prepare_weights(plan=weight_plan, weights=fused_moe.PackedWeights(
+        w13=weights["w13_fp4"], w2=weights["w2_fp4"],
+        w13_block_scales=weights["w13_mx"], w2_block_scales=weights["w2_mx"],
+        w13_global_scales=weights["alphas"], w2_global_scales=weights["alphas"],
+        input_scale=weights["input_scale"], intermediate_scale=weights["input_scale"],
+    ))
     plan = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=_TOPK),
