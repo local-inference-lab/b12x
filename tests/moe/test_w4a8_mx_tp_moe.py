@@ -1062,11 +1062,12 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
             output=output, input_scales_static=True,
         )
         calls.clear()
-        fused_moe.run(binding=binding)
+        session.freeze()
+        with session.capture():
+            fused_moe.run(binding=binding)
         torch.cuda.synchronize()
         assert calls and {grid for _, grid in calls} == {expected_grid}
         prepared_callable = calls[-1][0]
-        session.freeze()
         for rows in counts:
             binding = fused_moe.bind(
                 plan, scratch=scratch, a=x[:rows], topk_ids=ids[:rows],
