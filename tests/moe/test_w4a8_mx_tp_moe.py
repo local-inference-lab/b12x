@@ -975,8 +975,9 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
 
 @pytest.mark.parametrize("tile_m", (16, 32))
 @pytest.mark.parametrize("max_active_clusters", (None, 1, 64, 128))
+@pytest.mark.parametrize("capacity", (1, 8))
 def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
-    monkeypatch, tile_m: int, max_active_clusters: int | None,
+    monkeypatch, tile_m: int, max_active_clusters: int | None, capacity: int,
 ) -> None:
     _skip_if_unavailable()
     from b12x.preparation import PreparationSession, PreparedCall
@@ -995,8 +996,7 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
     ):
         monkeypatch.delenv(name, raising=False)
     _impl.clear_tp_moe_caches()
-    capacity = 8
-    counts = (1, 2, 6, capacity)
+    counts = tuple(sorted({rows for rows in (1, 2, 6, capacity) if rows <= capacity}))
     weights = _weights(seed=281)
     x, ids, scales = _routed_inputs(capacity, 282)
     references = {
