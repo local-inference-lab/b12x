@@ -7,6 +7,10 @@ It measures real native W4A16 execution on checkpoint expert weights. Activation
 and routing distributions are synthetic; no complete model or serving engine is
 executed.
 
+The [cost diagnosis](expert-residency-sm120-costs.md) identifies unnecessary
+Trellis-table reads in the NVFP4 path and CPU reads from write-combined journals.
+It records corrected-source measurements separately from the baseline below.
+
 ## Reproduce
 
 The runner writes an immutable output directory containing `manifest.json` and
@@ -31,6 +35,12 @@ operator inputs, not recommended model configuration changes. Both tiers must
 contain at least top-k distinct experts. The default layer prefix selects
 `model.language_model.layers.0.mlp.experts`; `--prefix` selects another compatible
 exported layer.
+
+Host allocation experiments select `--backing-memory cached` and
+`--journal-memory cached` explicitly. Both default to `write_combined`, preserving
+the original exchange storage choice. The manifest records each choice. Exact
+reproduction of the original kernel also requires its source revision; the
+corrected kernel does not stage an unused Trellis table for NVFP4.
 
 Every capacity is declared and prepared before graph capture. Live counts select
 views within that capacity; they do not compile additional programs. Keep the

@@ -6048,7 +6048,8 @@ class W4A16FusedMoeKernel:
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
         self.sqg_xor_cheb_t12_smem = (
-            self.trellis_codebook == SQG_E4M3
+            self.weight_layout == "trellis_t256"
+            and self.trellis_codebook == SQG_E4M3
             and _sqg_xor_cheb_t12_smem_enabled()
         )
         self.sqg_xor_cheb_t12_smem_off = 0

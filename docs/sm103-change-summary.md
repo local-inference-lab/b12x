@@ -10,6 +10,9 @@ pending PR CI and physical-target qualification.
 The [SM120 cache proof of concept](expert-residency-sm120-poc.md) reuses the
 shared host policy and exchange transaction with native NVFP4 W4A16 operations.
 It adds no SM103 kernel, component registration or production serving lane.
+The [SM120 cost diagnosis](expert-residency-sm120-costs.md) restricts shared
+W4A16 lookup staging to Trellis payloads and adds an explicit cacheable option
+to mapped-host allocation. Existing SM103 storage defaults remain unchanged.
 
 ## Implemented features
 

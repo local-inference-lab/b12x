@@ -1125,3 +1125,80 @@ Recorded limitations and rejected extrapolations:
 - No kernel, migration-policy or serving-engine optimization was added during
   the sweep. The next work is to isolate empty-cold and exchange costs, then
   validate promising conditions with real routing traces.
+
+## SM120 empty-tier and exchange cost evidence
+
+The targeted cost work inspects branch `d4eb33e86740b01285d4558eb1e9b941933cb6a0`
+and master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`; master is already an
+ancestor, so no rebase is needed. The [cost report](expert-residency-sm120-costs.md)
+documents the implemented correction, copy directions, activation of explicit
+cacheable allocations, complete spectrum and scope limits.
+
+The final implementation export is `qualified-source-03.tar.gz`, SHA256
+`4a715986f3d9963e3f05155e456a284ffa3279c157c250ce0e6fd52c8be6a200`.
+All eight spectrum manifests match the unchanged package and experiment source
+files. Documentation annotations follow measurement. No preparation declaration,
+component registration, cache policy or production storage default is added.
+
+Evidence resides in `/home/jasonc/b12x-sm120-cost-evidence-20260918/`, with original
+remote files at `ripper:/home/jasonc/b12x-sm120-cost-results-20260918/`. Retained
+files include source exports, exact shell commands, Torch profiler traces,
+Nsight Compute reports/SASS, per-copy API/event times, topology, test output,
+raw spectrum JSONL, derived CSV and source-integrity checks. Earlier
+`b12x-sm120-spectrum-evidence-20260918` receipts remain unchanged.
+The complete bundle is `cost-records.tar.gz` in the local evidence directory,
+SHA256 `778b5f9c7b3a08b04b4c16f729f4b51a34966b51c1b290035b69cbaaed339065`.
+
+| Receipt | Result and attribution |
+| --- | --- |
+| `diagnostic-01/`, `empty-cold-ncu.ncu-rep`, `empty-cold-sass.csv` | Baseline unused LUT staging dominates the empty cold kernel. The first diagnostic export and separate NCU source export retain the exact instrumented wrappers. |
+| `fixed-write_combined-write_combined/`, `fixed-write_combined-cached/`, `fixed-cached-write_combined/`, `fixed-cached-cached/` | Four allocation combinations on `diagnostic-source-02.tar.gz`; changing only one allocation leaves one slow CPU-read pass. |
+| `remote/costs-cached-final/`, `remote/costs-wc-final/` | Six uninstrumented and two instrumented exchanges per mode on the final implementation. Median pauses: 0.860 ms cacheable, 45.926 ms write-combined. Twelve alternating samples per contiguous transport arm retain explicit staging and completion timing. |
+| `remote/spectrum-main/` | 74 fixtures pass: 38 latency and 36 policy. |
+| `remote/spectrum-hot-128/`, `remote/spectrum-hot-384/`, `remote/spectrum-topk-2/`, `remote/spectrum-topk-6/` | 12 fixtures pass per sweep. |
+| `remote/spectrum-reuse-512/` | 10 fixtures pass, including four longer-reuse policy cases. |
+| `remote/spectrum-second-card/` | Nine latency fixtures pass on the second physical card. |
+| `remote/spectrum-break-even/` | 40 additional fixtures pass: periods 2/4/8 for all four workloads at M=1/8/32, plus four latency controls. |
+| `host-final.log` | 82 passed, 11 CUDA skips, 3.05 s. Includes transaction faults, shared contracts, policy, loader, native-layout planning and LUT-staging guards. |
+| `remote/gpu-tests.log` | 23 passed, 21.77 s. Includes both allocation modes, int32/int64 IDs, native numerical/graph tests, rollback after three failure points and source-format staging guards. |
+| `host-initial.log` | Two test-fixture failures retained: the Trellis constructor correctly rejected the fixture's NVFP4 scale format. The fixture now supplies E4M3 K32 for Trellis and all six staging cases pass. |
+| `remote/memcheck.log`, `remote/synccheck.log`, corresponding `.exit` files | Both native policy tests reach the 240-second limit, exit 124. Memcheck emits no completed-test marker; synccheck emits one without a final summary. Both gates remain incomplete; no clean sanitizer result is claimed. |
+| `remote/empty-cold-fixed.ncu-rep`, `.txt`, `-sass.csv`, `remote/ncu-fixed/` | Corrected empty kernel: 7.94 µs under Nsight, 147 registers/thread, 54,272 dynamic SMEM bytes, zero reported spilling, one CTA/SM and 16.67% theoretical occupancy. The unused table-load prologue is absent. Baseline Nsight time is 191.81 µs; graph timing is reported separately. |
+
+The spectrum totals **181 passed fixtures**: 105 latency cases with warm/scrubbed
+conditions and 76 policy cases. At M=1 the corrected static all-hot graph costs
+63.9 µs, compared with the historical 234.9 µs and a 50.0 µs all-VRAM control.
+The repeated-cold policy's period-four wall ratio is 0.849 with 14 subsequent
+VRAM selections per promotion; period two has ratio 1.056 with seven. These
+ratios compare adaptive/static within the same physical device. Rotating traffic
+earns no later hits and remains unfavorable. All raw outcomes are retained.
+
+The environment uses the same real checkpoint field hash, Torch 2.13.0/CUDA
+13.3, CUTLASS DSL 4.6.2, Triton `3.7.1+gitf797708c.nv26.7`, cuda-bindings 13.0.3,
+container image and driver 580.173.02 as the preceding spectrum. GPU UUID
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f` runs the main spectrum and diagnostics;
+`GPU-47363510-b87a-13a5-4824-2542e97df76c` runs the second-card and shorter-period
+supplement. Runs are serialized across cards. Both negotiate Gen4 ×16 under
+load, share NUMA node zero and retain the 145 W power limit. The host exposes
+one NUMA node, so remote-node allocation testing is unavailable. The control
+thread permits CPUs 0–63; no CPU affinity pin or production service change is
+made. Per-round GPU mode snapshots are retained. Dynamic-clock results remain
+diagnostic, with Nsight instrumentation reported separately.
+
+Rejected or deferred changes:
+
+- Conditional graphs and host-selected hot-only graphs are unnecessary to fix
+  the measured unused-LUT defect. Residual empty-tier work remains visible.
+- Changing only journal or backing memory leaves an expensive write-combined
+  CPU read. Both allocation choices are explicit; defaults remain compatible.
+- Removing rollback is unnecessary to obtain the measured exchange reduction.
+  The generic transaction remains unchanged.
+- A contiguous one-way H2D probe is not a canonical-cache transaction. No new
+  promotion API, complete promotion latency or break-even claim is derived from
+  that lower bound. Field copies, recovery and a pageable-backing miss service
+  remain required work before such an API can be qualified.
+- The 146→147 register increase is preserved in resource accounting. The
+  unneeded 4 KiB shared-memory region is removed; launch geometry is unchanged.
+- No cache admission constants are tuned from the synthetic break-even curves.
+  Profiler/control overhead remains material on already-hot tiny-M traffic.
+- PCIe results do not choose a Grace allocation policy or qualify SM103 TMA.

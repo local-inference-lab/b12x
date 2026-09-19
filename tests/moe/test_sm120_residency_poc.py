@@ -68,13 +68,21 @@ def test_checkpoint_missing_or_wrong_scales_fail_closed(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires physical SM120")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_native_policy_exchange_same_graph(dtype, tmp_path):
+@pytest.mark.parametrize("write_combined", [False, True])
+def test_native_policy_exchange_same_graph(dtype, write_combined, tmp_path):
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
     write_layer(tmp_path, checkpoint_fields())
     source, _ = load_layer(tmp_path, "layer.experts", 4)
     experiment = Experiment(
-        source, hot=2, capacity=4, topk=4, id_dtype=dtype, cache_dir=tmp_path / "cache"
+        source,
+        hot=2,
+        capacity=4,
+        topk=4,
+        id_dtype=dtype,
+        cache_dir=tmp_path / "cache",
+        backing_write_combined=write_combined,
+        journal_write_combined=write_combined,
     )
     try:
         from tests._reference.w4a16_reference import (
@@ -140,3 +148,55 @@ def test_ordered_sum_rounding_and_invalid_routes():
     torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)
     separate = values[:2].float().sum().bfloat16() + values[2]
     assert separate.item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires physical SM120")
+@pytest.mark.parametrize("failure_call", [2, 14, 26])
+def test_cacheable_host_exchange_failure_preserves_graph(
+    failure_call, tmp_path, monkeypatch
+):
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("requires SM120")
+    from b12x.moe.residency import ResidencyUpdateError
+    from benchmarks.moe.sm120_residency_spectrum import Graphs
+
+    write_layer(tmp_path, checkpoint_fields())
+    source, _ = load_layer(tmp_path, "layer.experts", 4)
+    e = Experiment(
+        source,
+        hot=2,
+        capacity=4,
+        topk=4,
+        backing_write_combined=False,
+        journal_write_combined=False,
+        cache_dir=tmp_path / "cache",
+    )
+    graphs = None
+    try:
+        graphs = Graphs(e, 1)
+        graphs.inputs(torch.arange(4).reshape(1, 4))
+        graphs.validate(allocator=True)
+        expected, pointers = e.updates.snapshot(), e.pointers()
+        copy = e.updates.transfer.copy
+        calls = 0
+
+        def fail_after_write(destination, source):
+            nonlocal calls
+            calls += 1
+            copy(destination, source)
+            if calls == failure_call:
+                raise OSError("injected failure after a submitted copy")
+
+        monkeypatch.setattr(e.updates.transfer, "copy", fail_after_write)
+        with pytest.raises(ResidencyUpdateError) as caught:
+            e.updates.exchange(((0, 2),), expected=expected, quiescent=True)
+        assert caught.value.resumable
+        assert expected == e.updates.snapshot()
+        graphs.validate(allocator=True)
+        assert pointers == e.pointers()
+        e.updates.exchange(((0, 2),), expected=expected, quiescent=True)
+        graphs.validate(allocator=True)
+    finally:
+        if graphs:
+            graphs.close()
+        e.close()

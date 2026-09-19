@@ -23,6 +23,10 @@ contracts/policy from the SM103 execution adapter.
 The [SM120 NVFP4 cache experiment](expert-residency-sm120-poc.md) composes another
 numerical recipe and PCIe storage topology at benchmark scope. Its native SM120
 results do not qualify SM103 kernels or Grace-backed TMA.
+Its [PCIe cost diagnosis](expert-residency-sm120-costs.md) corrects unused lookup
+staging in the shared W4A16 kernel and compares host allocation modes. SM103
+residency preparation retains its existing memory policy and physical gates;
+the SM120 measurements are not attributed to Grace.
 
 | State | Evidence and limits |
 | --- | --- |

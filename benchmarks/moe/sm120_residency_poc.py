@@ -122,13 +122,19 @@ def load_layer(checkpoint: Path, prefix: str, count: int):
     return {name: torch.stack(row) for name, row in rows.items()}, digest.hexdigest()
 
 
-def make_tier(source, ids, device, *, mapped):
+def make_tier(source, ids, device, *, mapped, write_combined=True):
     layout, size = [], 0
     for name, value in source.items():
         shape = (len(ids), *value.shape[1:])
         layout.append((name, size, shape))
         size = align(size + math.prod(shape))
-    owner = MappedHostAllocation((size,), torch.uint8, device) if mapped else None
+    owner = (
+        MappedHostAllocation(
+            (size,), torch.uint8, device, write_combined=write_combined
+        )
+        if mapped
+        else None
+    )
     slab = (
         owner.device_view
         if mapped
@@ -187,7 +193,16 @@ class Experiment:
     """Own one serialized experimental lane; close only after graph release."""
 
     def __init__(
-        self, source, *, hot, capacity, topk, id_dtype=torch.int64, cache_dir=None
+        self,
+        source,
+        *,
+        hot,
+        capacity,
+        topk,
+        id_dtype=torch.int64,
+        cache_dir=None,
+        backing_write_combined=True,
+        journal_write_combined=True,
     ):
         self.tiers, self.graphs, self.journal_owner, self.session = [], [], None, None
         try:
@@ -198,12 +213,25 @@ class Experiment:
                 topk=topk,
                 id_dtype=id_dtype,
                 cache_dir=cache_dir,
+                backing_write_combined=backing_write_combined,
+                journal_write_combined=journal_write_combined,
             )
         except BaseException:
             self.close()
             raise
 
-    def _initialize(self, source, *, hot, capacity, topk, id_dtype, cache_dir):
+    def _initialize(
+        self,
+        source,
+        *,
+        hot,
+        capacity,
+        topk,
+        id_dtype,
+        cache_dir,
+        backing_write_combined,
+        journal_write_combined,
+    ):
         from .sm120_residency_support import compile_support, invoke
 
         self.invoke = invoke
@@ -230,7 +258,15 @@ class Experiment:
         for t, ids in enumerate(
             (self.placement.resident_expert_ids, self.placement.backing_expert_ids)
         ):
-            self.tiers.append(make_tier(source, ids, self.device, mapped=t == 1))
+            self.tiers.append(
+                make_tier(
+                    source,
+                    ids,
+                    self.device,
+                    mapped=t == 1,
+                    write_combined=backing_write_combined,
+                )
+            )
         self.control_tier = make_tier(source, range(self.e), self.device, mapped=False)
         self.mapping = torch.tensor(
             self.placement.expert_map, dtype=torch.int32, device=self.device
@@ -249,7 +285,10 @@ class Experiment:
         self.refresh(capacity)
         journal_bytes = sum(align(2 * v[0].numel()) for v in source.values())
         self.journal_owner = MappedHostAllocation(
-            (journal_bytes + 2 * align(self.e * 8),), torch.uint8, self.device
+            (journal_bytes + 2 * align(self.e * 8),),
+            torch.uint8,
+            self.device,
+            write_combined=journal_write_combined,
         )
         host, offset, journal = self.journal_owner.host_view, 0, {}
         for name, value in source.items():

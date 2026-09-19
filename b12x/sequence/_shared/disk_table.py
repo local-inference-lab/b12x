@@ -59,7 +59,8 @@ class MappedHostAllocation:
     """Own a mapped page-locked allocation and its CPU/CUDA tensor aliases."""
 
     def __init__(
-        self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+        self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device,
+        *, write_combined: bool = True,
     ) -> None:
         from cuda.bindings import runtime as cudart
 
@@ -77,8 +78,13 @@ class MappedHostAllocation:
         self.device = device
         self.nbytes = nbytes
         with torch.cuda.device(device):
+            # CPU-readable journals/backing need cacheable pages. Write-combined
+            # pages retain the default for streaming host-write/GPU-read users.
+            flags = cudart.cudaHostAllocMapped
+            if write_combined:
+                flags |= cudart.cudaHostAllocWriteCombined
             error, pointer = cudart.cudaHostAlloc(
-                nbytes, cudart.cudaHostAllocMapped | cudart.cudaHostAllocWriteCombined
+                nbytes, flags
             )
             _check_cuda(error, "cudaHostAlloc")
             self._host_pointer = int(pointer)

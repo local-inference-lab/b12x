@@ -522,6 +522,16 @@ def main():
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument(
+        "--backing-memory",
+        choices=("write_combined", "cached"),
+        default="write_combined",
+    )
+    parser.add_argument(
+        "--journal-memory",
+        choices=("write_combined", "cached"),
+        default="write_combined",
+    )
     args = parser.parse_args()
     if min(
         *args.live, args.rounds, args.repeats, args.epochs, *args.periods
@@ -538,6 +548,8 @@ def main():
     )
     manifest = dict(
         source_revision=args.source_revision,
+        backing_memory=args.backing_memory,
+        journal_memory=args.journal_memory,
         command=sys.argv,
         source_files={
             str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -562,7 +574,12 @@ def main():
         source, checksum = load_layer(args.checkpoint, args.prefix, args.experts)
         manifest["checkpoint_fields_sha256"] = checksum
         experiment = Experiment(
-            source, hot=args.hot_experts, capacity=max(args.live), topk=args.top_k
+            source,
+            hot=args.hot_experts,
+            capacity=max(args.live),
+            topk=args.top_k,
+            backing_write_combined=args.backing_memory == "write_combined",
+            journal_write_combined=args.journal_memory == "write_combined",
         )
         timer = Timer(experiment)
         manifest.update(

@@ -7,6 +7,8 @@ a production residency backend, automatic calibration or a vLLM serving lane.
 The [recorded test spectrum](expert-residency-sm120-spectrum.md) compares static
 and adaptive execution across token counts, residency budgets, cold-route
 fractions and reuse windows, including transaction pauses and retained raw data.
+The [cost diagnosis](expert-residency-sm120-costs.md) documents the NVFP4 lookup
+staging correction and explicit cacheable-host allocation experiments.
 
 The runner is
 [`benchmarks/moe/sm120_residency_poc.py`](../benchmarks/moe/sm120_residency_poc.py).
