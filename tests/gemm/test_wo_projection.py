@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from itertools import permutations
 
 import pytest
 import torch
@@ -284,13 +285,55 @@ def test_decode_projection_replays_with_poisoned_caller_scratch(groups, width, r
                 graph.reset()
 
 
+def _assert_wo_b_quantized_reduction(actual, binding, state):
+    """Accept only the declared split-K arithmetic, including BF16 atomics.
+
+    Four atomic partials can arrive in any order. Comparing two native runs
+    as if they promised a fixed order rejects valid results near cancellation.
+    Enumerate all orders of the independently calculated quantized partials
+    and retain the same pointwise tolerance for the nearest valid result.
+    """
+    state.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+    left = dequantize_mxfp8_rows_torch(binding.tmp_q.values, binding.tmp_q.scale_rows)
+    right = dequantize_mxfp8_rows_torch(binding.weights.wo_b.values, binding.weights.wo_b.scale_rows)
+    policy = state.fused_b.lowering.policy
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        if policy.split_k_slices == 1 or not policy.split_k_atomic_bf16:
+            reference = (left @ right.T).to(actual.dtype)
+        else:
+            slices = policy.split_k_slices
+            assert slices in (2, 4) and left.shape[1] % slices == 0
+            width = left.shape[1] // slices
+            partials = [
+                (left[:, index * width:(index + 1) * width]
+                 @ right[:, index * width:(index + 1) * width].T).bfloat16()
+                for index in range(slices)
+            ]
+            reference = torch.zeros_like(actual)
+            distance = torch.full_like(actual.float(), float("inf"))
+            for order in permutations(range(slices)):
+                candidate = torch.zeros_like(actual)
+                for index in order:
+                    candidate = (candidate.float() + partials[index].float()).bfloat16()
+                error = (actual.float() - candidate.float()).abs()
+                reference = torch.where(error < distance, candidate, reference)
+                distance = torch.minimum(distance, error)
+        torch.testing.assert_close(actual, reference, rtol=0.01, atol=0.002)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+@pytest.mark.parametrize("seed", [20260919, 31005, 0])
 @pytest.mark.parametrize("rows", [1, 6, 8])
 @torch.no_grad()
-def test_packed_decode_layout_matches_generic_projection(rows):
+def test_packed_decode_layout_matches_generic_projection(rows, seed):
     """Packed checkpoint metadata must change storage access, not quantization."""
     require_b12x()
     from b12x.preparation._measurement import no_compilation
 
+    torch.manual_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
     groups, width, rank, hidden = 4, 4096, 1024, 4096
     source = torch.randn(rows, groups, width, device=device, dtype=torch.bfloat16) / 8
@@ -329,7 +372,19 @@ def test_packed_decode_layout_matches_generic_projection(rows):
                 torch.cuda.synchronize(device)
                 assert torch.cuda.memory_allocated(device) == allocated and actual.data_ptr() == pointer
                 assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
-                torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+                # Layout/provenance flags must preserve input quantization and
+                # WO-A exactly, independently of WO-B atomic arrival order.
+                for field in ("values", "scale_rows"):
+                    torch.testing.assert_close(
+                        getattr(bindings["packed"].x_q, field).view(torch.uint8),
+                        getattr(bindings["generic"].x_q, field).view(torch.uint8),
+                        rtol=0, atol=0,
+                    )
+                torch.testing.assert_close(bindings["packed"].tmp, bindings["generic"].tmp, rtol=0, atol=0)
+                if packed.policy.split_k_slices <= 2:
+                    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+                for name, output in (("packed", actual), ("generic", expected)):
+                    _assert_wo_b_quantized_reduction(output, bindings[name], plans[name].prepared.state)
                 assert torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0) > 0.99999
         finally:
             graph.reset()
