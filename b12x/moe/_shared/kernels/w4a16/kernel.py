@@ -9659,6 +9659,7 @@ def compile_w4a16_fused_moe(
     fast_math: bool = True,
     sms: int,
     max_shared_mem: int,
+    direct_token_capacity: int | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -10086,9 +10087,14 @@ def compile_w4a16_fused_moe(
             "count before capturing"
         )
 
+    # Packed routes use rounded storage capacity; native direct launches use
+    # the exact planned row count, which may be smaller than that bucket.
+    direct_m = size_m if direct_token_capacity is None else int(direct_token_capacity)
+    if not 0 < direct_m <= size_m:
+        raise ValueError("direct token capacity must be within packed capacity")
     small_m_direct_launches = []
     if (not collect_activation_amax) and _small_m_direct_supported(
-        m=size_m,
+        m=direct_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -10105,7 +10111,7 @@ def compile_w4a16_fused_moe(
     ):
         for ids_dtype in (torch.int32, torch.int64):
             direct = _compile_w4a16_small_m_direct(
-                m=size_m,
+                m=direct_m,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 num_experts=num_experts,
