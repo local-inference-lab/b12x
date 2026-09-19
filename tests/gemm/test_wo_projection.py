@@ -242,7 +242,7 @@ def test_prefill_chunk_remainders_reuse_launchers_and_replay():
             state._check_tokens(capacity + 1)
 
 
-@pytest.mark.parametrize("groups,width,rank,hidden", [(4, 512, 1024, 4096), (2, 4096, 1024, 5120)])
+@pytest.mark.parametrize("groups,width,rank,hidden", [(4, 4096, 1024, 4096), (2, 4096, 1024, 5120)])
 @torch.no_grad()
 def test_decode_projection_replays_with_poisoned_caller_scratch(groups, width, rank, hidden):
     """Prepared decode must not depend on padding from an earlier invocation."""
@@ -292,7 +292,7 @@ def test_packed_decode_layout_matches_generic_projection(rows):
     from b12x.preparation._measurement import no_compilation
 
     device = torch.device("cuda", torch.cuda.current_device())
-    groups, width, rank, hidden = 4, 512, 1024, 4096
+    groups, width, rank, hidden = 4, 4096, 1024, 4096
     source = torch.randn(rows, groups, width, device=device, dtype=torch.bfloat16) / 8
     weights = wo.pack_weights(
         (torch.randn(groups * rank, width, device=device) / width**0.5).to(torch.float8_e4m3fn),
