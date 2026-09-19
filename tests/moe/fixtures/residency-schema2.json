@@ -1,0 +1,107 @@
+{
+  "model": {
+    "checkpoint_fingerprint": "sha256:model",
+    "layers": [
+      {
+        "layer": "a",
+        "experts": 4,
+        "hidden": 256,
+        "intermediate": 256,
+        "max_tokens": 8,
+        "max_top_k": 3,
+        "gate_first": false,
+        "swiglu_limit": null,
+        "source_format": "fp4_e8m0_k32",
+        "numerical_mode": "mxfp8_fp32_activation_bf16_expert_ordered_fma",
+        "minimum_hot": 0,
+        "maximum_hot": 4
+      },
+      {
+        "layer": "b",
+        "experts": 4,
+        "hidden": 256,
+        "intermediate": 256,
+        "max_tokens": 8,
+        "max_top_k": 3,
+        "gate_first": false,
+        "swiglu_limit": null,
+        "source_format": "fp4_e8m0_k32",
+        "numerical_mode": "mxfp8_fp32_activation_bf16_expert_ordered_fma",
+        "minimum_hot": 0,
+        "maximum_hot": 4
+      }
+    ],
+    "model_revision": "unspecified",
+    "tokenizer_revision": "unspecified"
+  },
+  "workload": "default",
+  "phase": "decode",
+  "provenance": "integration routing counters",
+  "placements": [
+    {
+      "total_experts": 4,
+      "hbm_expert_ids": [
+        0
+      ],
+      "grace_expert_ids": [
+        1,
+        2,
+        3
+      ],
+      "layer": "a",
+      "model_fingerprint": "sha256:model",
+      "workload": "default",
+      "provenance": "integration routing counters",
+      "selection_counts": [
+        270,
+        15,
+        12,
+        3
+      ],
+      "phase": "decode",
+      "version": 1
+    },
+    {
+      "total_experts": 4,
+      "hbm_expert_ids": [
+        3
+      ],
+      "grace_expert_ids": [
+        0,
+        1,
+        2
+      ],
+      "layer": "b",
+      "model_fingerprint": "sha256:model",
+      "workload": "default",
+      "provenance": "integration routing counters",
+      "selection_counts": [
+        3,
+        12,
+        15,
+        270
+      ],
+      "phase": "decode",
+      "version": 1
+    }
+  ],
+  "created_at": "2026-09-18T00:00:00+00:00",
+  "converged": true,
+  "stable_windows": 2,
+  "request_count": 3,
+  "token_count": 30,
+  "sample_every": 1,
+  "termination": "converged",
+  "schema_version": 2,
+  "implementation_version": 1,
+  "algorithm": "selection_density_joint_v2",
+  "statistics": "selection_counts",
+  "profile_hash": "8caba63d5cb849f10adef4be25e7269b9047e9069cf50f56c384445a402a2685",
+  "memory": {
+    "hbm_expert_bytes": 208896,
+    "grace_expert_bytes": 626688,
+    "scratch_bytes": 255488,
+    "route_map_bytes": 512
+  },
+  "expected_cold_fraction": 0.1
+}

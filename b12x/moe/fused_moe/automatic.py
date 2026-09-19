@@ -10,12 +10,13 @@ import os
 from pathlib import Path
 import tempfile
 
+from ..residency.contracts import PHASES, LayerRoutingCounts, RoutingSnapshot
 from .residency import ExpertMemoryBudget, ExpertResidencyPlan, _integer
 
 PROFILE_VERSION = 2
 IMPLEMENTATION_VERSION = 1
 ALGORITHM = "selection_density_joint_v2"
-PHASES = ("decode", "prefill", "verify", "draft")
+
 
 
 def _text(name, value):
@@ -272,43 +273,6 @@ class AutomaticResidencyConfig:
         if self.profile_path is not None:
             _text("profile_path", self.profile_path)
 
-
-@dataclass(frozen=True, kw_only=True)
-class LayerRoutingCounts:
-    layer: str
-    phase: str
-    counts: tuple[int, ...]
-    calls: int = 0
-    sampled_calls: int = 0
-    tokens: int = 0
-    sampled_tokens: int = 0
-
-    def __post_init__(self):
-        _text("layer", self.layer)
-        if self.phase not in PHASES:
-            raise ValueError("routing statistics require an explicit engine phase")
-        object.__setattr__(self, "counts", tuple(self.counts))
-        for n in (*self.counts, self.calls, self.sampled_calls, self.tokens, self.sampled_tokens):
-            _integer("routing observation", n)
-            if n >= 2**64:
-                raise ValueError("routing counter overflow")
-        if self.sampled_calls > self.calls or self.sampled_tokens > self.tokens:
-            raise ValueError("sampled observations exceed total observations")
-
-
-@dataclass(frozen=True, kw_only=True)
-class RoutingSnapshot:
-    """Cumulative counters in one reset epoch, copied at a quiescent boundary."""
-    epoch: int
-    rank: int
-    layers: tuple[LayerRoutingCounts, ...]
-
-    def __post_init__(self):
-        _integer("epoch", self.epoch)
-        _integer("rank", self.rank)
-        object.__setattr__(self, "layers", tuple(self.layers))
-        if len({(x.layer, x.phase) for x in self.layers}) != len(self.layers):
-            raise ValueError("snapshot contains duplicate layer/phase records")
 
 
 def _counts(model, snapshot, phase):

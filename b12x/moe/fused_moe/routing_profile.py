@@ -9,7 +9,7 @@ from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan, current_plan
 from ._routing_profile_tuning import RoutingProfileQuery, RoutingProfileConfig, TUNING
-from .automatic import LayerRoutingCounts, RoutingSnapshot
+from ..residency.contracts import LayerRoutingCounts, RoutingSnapshot
 
 
 def _compile(query, *, target, offline_dir=None):

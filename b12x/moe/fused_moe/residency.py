@@ -8,18 +8,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 
-def _integer(name, value, minimum=0):
-    if type(value) is not int or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}")
-
-
-@dataclass(frozen=True, kw_only=True)
-class ResidencyUpdateCapacity:
-    """Opt-in quiescent exchanges with preparation-owned rollback storage."""
-    max_pairs: int
-
-    def __post_init__(self):
-        _integer("max_pairs", self.max_pairs, 1)
+from ..residency.contracts import ExpertPlacement, ResidencyUpdateCapacity, _integer
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -46,9 +35,7 @@ class ExpertResidencyPlan:
             raise ValueError("unsupported expert placement version")
         for name in ("hbm_expert_ids", "grace_expert_ids", "selection_counts"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
-        ids = self.hbm_expert_ids + self.grace_expert_ids
-        if any(type(x) is not int for x in ids) or sorted(ids) != list(range(self.total_experts)):
-            raise ValueError("placement must partition every expert exactly once")
+        self.placement  # Validate the shared exclusive-tier partition contract.
         if self.selection_counts:
             if len(self.selection_counts) != self.total_experts:
                 raise ValueError("selection counts must cover every expert")
@@ -61,13 +48,15 @@ class ExpertResidencyPlan:
             raise ValueError("profile phase must be all, decode, or prefill")
 
     @property
+    def placement(self) -> ExpertPlacement:
+        """Shared identity/row view; serialized profile fields remain unchanged."""
+        return ExpertPlacement(total_experts=self.total_experts,
+            resident_expert_ids=self.hbm_expert_ids, backing_expert_ids=self.grace_expert_ids)
+
+    @property
     def expert_map(self) -> tuple[tuple[int, int], ...]:
         """Original expert -> (tier, row), with HBM=0 and Grace=1."""
-        rows = [None] * self.total_experts
-        for tier, ids in enumerate((self.hbm_expert_ids, self.grace_expert_ids)):
-            for row, expert in enumerate(ids):
-                rows[expert] = (tier, row)
-        return tuple(rows)
+        return self.placement.expert_map
 
     @property
     def profile_hash(self) -> str:

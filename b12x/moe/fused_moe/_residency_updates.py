@@ -3,7 +3,7 @@
 This control-plane mechanism requires the engine to stop every producer using
 these slabs, including raw CUDA graph replay. It is not a concurrent cache.
 """
-from dataclasses import dataclass
+from ..residency.contracts import ResidencySlotSnapshot, ResidencyUpdateError
 import math
 from threading import Lock
 from uuid import uuid4
@@ -11,21 +11,6 @@ from uuid import uuid4
 import torch
 
 from ._residency_storage import align, tier_layout, update_host_bytes
-
-
-@dataclass(frozen=True, kw_only=True)
-class ResidencySlotSnapshot:
-    preparation_id: str
-    generation: int
-    expert_map: tuple[tuple[int, int], ...]
-    healthy: bool
-
-
-class ResidencyUpdateError(RuntimeError):
-    """An exchange failed; resumable is true only after successful rollback."""
-    def __init__(self, message, *, resumable):
-        super().__init__(message)
-        self.resumable = resumable
 
 
 class _CudaTransfer:

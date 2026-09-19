@@ -1,5 +1,10 @@
 # Hierarchical expert residency
 
+The [shared residency subsystem](expert-residency-subsystem.md) owns canonical
+placement and optional host cache policy. This guide specifies its SM103
+HBM/Grace execution adapter and preparation contracts.
+
+
 Status: **implemented prototype**. Host contracts, portable Blackwell metadata and
 quantization kernels, mapped-host reads, and SM103 cross-compilation are qualified.
 The SM103 expert GEMMs, Grace-backed TMA operands, complete operator arithmetic,

@@ -18,7 +18,7 @@ class RoutingProfileQuery:
     expert_parallel: bool = False
 
     def __post_init__(self):
-        from .automatic import PHASES
+        from ..residency.contracts import PHASES
         object.__setattr__(self, "layers", tuple(tuple(x) for x in self.layers))
         object.__setattr__(self, "phases", tuple(self.phases))
         if not self.layers or len({n for n, _ in self.layers}) != len(self.layers):
