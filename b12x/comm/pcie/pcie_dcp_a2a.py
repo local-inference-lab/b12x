@@ -37,7 +37,7 @@ from .pcie_oneshot import (
 )
 
 
-SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
+SUPPORTED_WORLD_SIZES = (2, 4, 8, 9, 10, 12, 16)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
 SUPPORTED_PAIR_DTYPES = (*SUPPORTED_GATHER_DTYPES, torch.float32)
