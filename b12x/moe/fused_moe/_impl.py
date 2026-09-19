@@ -13219,7 +13219,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 else decode_config.max_active_clusters
             ),
             planned_tile_m=planned_tile_m,
-            planned_num_tokens=plan.max_tokens_per_launch,
+            planned_num_tokens=plan.routed_rows // plan.num_topk,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
                 (
