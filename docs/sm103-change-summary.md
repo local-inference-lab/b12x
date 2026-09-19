@@ -20,6 +20,11 @@ benchmark scope. It leaves shared policy and static SM103 preparation unchanged.
 Cheaper PCIe fills do not establish profitable adaptation or Grace-backed TMA
 legality; physical B300 qualification remains required.
 
+The [held-out policy evaluation](expert-cache-policy-evaluation.md) compares
+offline replacement policies and native SM120 replay beyond layer zero. It adds
+benchmark selection and validation only; public residency contracts, serving
+defaults and SM103 program counts remain unchanged.
+
 ## Implemented features
 
 | Feature | Implementation |

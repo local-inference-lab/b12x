@@ -1,6 +1,6 @@
 """Replay real canonical routes through one native SM120 operator.
 
-Activations are synthetic. Decisions come from causal offline b12x replay, with
+Activations are synthetic. Decisions come from causal offline policy replay, with
 one static learned initial population. Timing adds graph event intervals and
 complete transaction wall time; it excludes trace loading, route H2D, policy
 calculation and engine scheduling. It is not full-model or serving latency.
@@ -22,6 +22,26 @@ from .sm120_residency_poc import Experiment, load_layer
 from .sm120_residency_spectrum import Graphs, gpu_snapshot
 
 
+def prepare_policy(trace, *, hot, window, policy):
+    """Select causal decisions and a training-only initial population.
+
+    Comparison policies remain offline experiments. The physical backend receives
+    canonical candidate/victim IDs, independent of its backing-row representation.
+    """
+    calls = [c for c in trace.calls if c.split == "test"]
+    if not calls or any(
+        len(c.ids) != 1 or len(c.ids[0]) != len(calls[0].ids[0]) for c in calls
+    ):
+        raise ValueError("this paired physical replay requires C1 and fixed top-k")
+    result = replay(trace, budget=hot, window=window, policy=policy)
+    train = Counter()
+    for c in trace.calls:
+        if c.split == "train":
+            train.update(c.counts)
+    initial = tuple(sorted(range(trace.experts), key=lambda e: (-train[e], e))[:hot])
+    return calls, initial, result
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", type=Path, required=True)
@@ -30,22 +50,38 @@ def main():
     p.add_argument("--prefix", default="model.language_model.layers.0.mlp.experts")
     p.add_argument("--hot", type=int, default=256)
     p.add_argument("--window", type=int, default=16)
+    p.add_argument(
+        "--policy", choices=["b12x", "lru", "lfu", "decayed_lfu"], default="b12x"
+    )
+    p.add_argument(
+        "--transports",
+        nargs="+",
+        choices=["exchange", "canonical"],
+        default=["exchange", "canonical"],
+        help="adaptive transports; a matched static arm is always included",
+    )
+    p.add_argument(
+        "--expected-fields-sha256",
+        help="independently verified source-layer fingerprint, when available",
+    )
+    p.add_argument(
+        "--static-backing",
+        choices=["exclusive", "canonical"],
+        default="exclusive",
+        help="match canonical backing to isolate policy from backing-row geometry",
+    )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(0)
     trace = next(t for t in read_trace(a.trace) if t.layer == a.trace_layer)
-    calls = [c for c in trace.calls if c.split == "test"]
-    if any(len(c.ids) != 1 or len(c.ids[0]) != len(calls[0].ids[0]) for c in calls):
-        raise ValueError("this paired physical replay requires C1 and fixed top-k")
-    policy = replay(trace, budget=a.hot, window=a.window)
+    calls, initial, policy = prepare_policy(
+        trace, hot=a.hot, window=a.window, policy=a.policy
+    )
     changes = {w["end"]: w["pairs"] for w in policy["windows"] if w["pairs"]}
-    train = Counter()
-    for c in trace.calls:
-        if c.split == "train":
-            train.update(c.counts)
-    initial = tuple(sorted(range(trace.experts), key=lambda e: (-train[e], e))[: a.hot])
     source, digest = load_layer(a.checkpoint, a.prefix, trace.experts)
+    if a.expected_fields_sha256 and digest != a.expected_fields_sha256:
+        raise ValueError("checkpoint fields differ from independent source fingerprint")
     if (source["w2"].shape[1], source["w13"].shape[1] // 2) != (
         trace.hidden,
         trace.intermediate,
@@ -57,8 +93,10 @@ def main():
         status="running",
         trace_sha256=trace_digest(a.trace),
         checkpoint_fields_sha256=digest,
+        static_backing=a.static_backing,
         scope=__doc__,
         gpu_before=gpu_snapshot(),
+        gpu_samples=[],
         initial_hot=initial,
         policy=policy,
         source_sha256={
@@ -75,14 +113,15 @@ def main():
     path = a.output / "results.json"
     path.write_text(json.dumps(record, indent=2))
     try:
-        for name in ("static", "exchange", "canonical"):
+        for name in ("static", *dict.fromkeys(a.transports)):
             e = Experiment(
                 source,
                 hot=a.hot,
                 capacity=128,
                 topk=len(calls[0].ids[0]),
                 initial_hot=initial,
-                canonical_backing=name == "canonical",
+                canonical_backing=name == "canonical"
+                or (name == "static" and a.static_backing == "canonical"),
                 backing_write_combined=False,
                 journal_write_combined=False,
                 cache_dir=a.output / "cache",
@@ -91,6 +130,7 @@ def main():
             gs[name] = Graphs(e, 1)
         for e in es.values():
             e.a.copy_(es["static"].a)
+        captured_pointers = {name: e.pointers() for name, e in es.items()}
         pairs = {
             name: (
                 torch.cuda.Event(enable_timing=True),
@@ -132,6 +172,8 @@ def main():
                     if changes.get(i + 1)
                     else None
                 )
+                if e.pointers() != captured_pointers[name]:
+                    raise AssertionError("captured addresses changed across promotions")
                 row = dict(
                     arm=name,
                     invocation=i,
@@ -141,6 +183,7 @@ def main():
                     graph_us=graph_us,
                     transaction_us=transaction_us,
                     pairs=moved,
+                    generation=e.updates.snapshot().generation,
                     validation=validation,
                 )
                 rows.append(row)
@@ -148,6 +191,8 @@ def main():
                     out.write(json.dumps(row) + "\n")
             if i % 128 == 0:
                 print("invocations", i, flush=True)
+            if i % 512 == 0:
+                record["gpu_samples"].append(dict(invocation=i, gpu=gpu_snapshot()))
         totals = {}
         for name in es:
             arm = [r for r in rows if r["arm"] == name]
@@ -158,6 +203,13 @@ def main():
             totals[name]["operator_plus_transaction_us"] = (
                 totals[name]["graph_us"] + totals[name]["transaction_us"]
             )
+            expected_cold = policy["totals"][
+                "static_cold_selections" if name == "static" else "cold_selections"
+            ]
+            if totals[name]["cold_selections"] != expected_cold:
+                raise AssertionError(
+                    "physical residency differs from causal offline replay"
+                )
         record.update(status="passed", totals=totals, gpu_after=gpu_snapshot())
     except BaseException:
         record.update(status="failed", failure=traceback.format_exc())

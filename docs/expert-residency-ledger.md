@@ -1293,3 +1293,100 @@ replay implementations are unchanged by the offline comparison correction.
 The immutable evidence bundle is `evidence.tar.gz`, SHA256
 `e36af6f16eb618ee763baf6542571570dcf529834d4dce6cfe5c4c92c751ceb9`.
 All 166 member files in its receipt manifest were hash-verified after packaging.
+
+## Held-out policy and matched-backing replay evidence
+
+Status: **research-only; completed SM120 diagnostics**. The
+[policy evaluation report](expert-cache-policy-evaluation.md) records longer
+checkpoint-derived routing traces and additional-layer physical replay without
+changing shared policies, kernels, preparation contracts or serving defaults.
+Master `0f3a8cbf` remains an ancestor of the branch; no reconciliation is needed.
+
+The corpus contains 24 authored requests across six workload classes. Twelve
+train the initial placement and twelve are held out, totaling 12,276 training
+and 11,447 held-out decode invocations per layer. One code response ends early
+without completing its requested implementation. It is retained with proper
+horizon censoring; this is routing evidence, not a quality evaluation. Native
+vLLM export supplies canonical IDs under C1/no-speculation. Physical replay uses
+native checkpoint weights, synthetic activations and uniform route weights.
+
+The 2,592 offline policy fixtures cover all 48 layers, budgets 128/256/384,
+windows 4/16 and learned/positional starts. At 256 resident experts, learned
+static placement has a 20.14% cold-selection rate versus 48.21% positional.
+Decayed LFU/window-4 reduces cold selections to 8.29%, LRU/window-4 to 8.38%,
+and cumulative LFU/window-16 to 17.40%. Recent-frequency/window-16 increases
+the rate to 21.91%. The evaluation does not tune policy constants against these
+held-out requests or install alternative policies in production.
+
+Eight paired physical trials cover layers 12/24/47 and a second-GPU layer-24
+repeat. The static and adaptive arms both retain canonical backing to hold
+cold-row geometry fixed. This is an explicit benchmark option; the original
+exclusive static control remains the CLI default. All trials include complete
+fill transaction wall time. Decayed LFU/window-4 reduces the operator-plus-fill
+total by 25.8–35.3%; LFU/window-16 by 8.4–22.3%. The layer-24 LFU ratio is
+0.7890 on GPU 1 and 0.7966 on GPU 0, adaptive/static. These are single-layer
+diagnostics, excluding observation, policy computation and serving scheduling.
+
+The shorter physical prose-to-code schedule also shows why scope matters:
+recent-frequency improves layer 24 by 7.6% here despite losing cold selections
+on the complete six-class schedule. Layer-12 LFU wins in aggregate while losing
+its code interval. These unfavorable outcomes remain in the report.
+
+Evidence roots:
+
+- Administration copy: `/home/jasonc/b12x-cache-policy-evidence-20260919/`.
+- Physical host: `ripper:/home/jasonc/b12x-cache-policy-results-20260919/`.
+- `protocol.json` and `protocol-amendment.json`: selection fixed before physical
+  results, including matched canonical backing and the second-GPU repeat.
+- `routing-capture/`: exact prompts, responses, import manifest, original lane
+  scripts, capture logs and restoration checks. `physical-trace.json` records
+  its parent trace and selected requests.
+- `offline-{0,1,2,3}/`: 48 locality records and 2,592 replay fixtures.
+  `shifts.jsonl` retains the 15 selected-layer workload-shift analyses.
+- `physical-*/`: eight source-bound records and all 32,736 raw timed replays.
+  The 964 promotions retain generation, pair and complete wall-time records.
+- `audit.json`: 1,960 passing numerical checks, 32 zero-allocation measurements,
+  exact ordered reduction, lifetime pointer checks, source hashes and cold-count
+  agreement. Maximum relative L2 is 0.00120905; minimum cosine is 0.999999225.
+- `host.log`: 53 passed, 3 CUDA skips. `gpu.log`: 41 passed on SM120.
+  `host-source02.log`: 9 focused schedule tests passed.
+- `topology.txt`, `environment.txt`, `hardware-after.txt`: physical topology,
+  container/toolchain identity and both GPUs released idle after testing.
+
+The offline and initial test archive `source-01.tar.gz` has SHA256
+`56e363514b3df7dcc4880d591d805337bf3f590979dddfa383bf86ae8b90bba3`.
+The physical archive `source-02.tar.gz` has SHA256
+`9f3ca9c044247933414cff5b9a8b5926dcb1d785367a7216fe79b518fe16c391`.
+The latter adds the optional matched static-backing selector. Native kernels,
+fill transactions, shared policy and offline analyzer are identical between
+archives. Per-file hashes bind every physical and offline receipt.
+
+Decisions, limitations and retained failures:
+
+- The initial summary command raced an in-progress physical record before its
+  replay file existed. `summary-first-failure.txt` retains the failure. The
+  aggregator skips unfinished records; the acceptance audit independently
+  requires all eight experiments to pass. No benchmark is dropped.
+- Full canonical backing in both arms removes a geometry confound from the
+  policy comparison. It does not establish that canonical backing fits a
+  complete model or that pinning the full checkpoint is desirable.
+- In-loop fills have 0.320–0.385 ms medians under these conditions. The fill
+  implementation is unchanged; this is not an optimization claim against the
+  preceding standalone transport measurements.
+- Per-promotion zero-hit rates and earned hits are retained, but individual
+  causal profit is not invented from a constant cost per route. Policy-level
+  totals include both eviction harm and transaction time.
+- LRU is close to decayed LFU offline but remains physically unmeasured.
+  No production LRU/decayed-LFU controller, asynchronous fill, spare slot or
+  fused-MoE change is added.
+- Captured invocation order has no GPU scheduling timestamps. Overlap and
+  complete-model performance remain unmeasured. Physical B300 qualification is
+  still required; SM120 PCIe results do not qualify Grace-backed TMA.
+- Historical 141/181-fixture spectra, bounded sanitizer successes and full-suite
+  sanitizer timeouts retain their original sources. No compiler census or
+  sanitizer rerun is claimed for benchmark-only edits.
+
+The immutable `evidence.tar.gz` bundle has SHA256
+`8a940b27a23fcf47cc334209ac41c339c5c1a8e51494c47940673d01c52d8e79`.
+Its 164 receipt files are verified both inside the archive and against the
+administration copy. No raw benchmark evidence is added to the repository.

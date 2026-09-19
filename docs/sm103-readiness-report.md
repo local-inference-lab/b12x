@@ -34,6 +34,11 @@ benchmark scope. It leaves shared policy and static SM103 preparation unchanged.
 Cheaper PCIe fills do not establish profitable adaptation or Grace-backed TMA
 legality; physical B300 qualification remains required.
 
+The [held-out policy evaluation](expert-cache-policy-evaluation.md) retains
+longer routing traces and additional-layer SM120 comparisons separately from
+the compiler and SM103 qualification receipts below. It adds no native kernel
+or preparation contract and does not qualify Grace-backed execution.
+
 | State | Evidence and limits |
 | --- | --- |
 | Implemented and compiled through preparation | The full corpus at `94639562` covers 85 declarations and 241 distinct SM103 programs with CUDA uninitialized. The shared-residency source rechecks its three composing declarations and 14 programs. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |

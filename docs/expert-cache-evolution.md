@@ -11,6 +11,11 @@ canonical fill costs less than a reversible exchange. Nevertheless, the measured
 layer-zero adaptive replay loses to its learned static initial placement because
 the chosen victims cause more misses than the promoted experts avoid.
 
+The [held-out policy evaluation](expert-cache-policy-evaluation.md) records a
+separate longer corpus and physical comparisons on layers 12, 24 and 47. Its
+explicit offline policy selector extends the same replay harness; the results
+below retain their original source and corpus identities.
+
 ## Routing evidence and its limits
 
 The corpus contains 18 sequential requests to the Qwen3.8-Flash-Next-NVFP4
@@ -45,6 +50,8 @@ field SHA256:
 The layer-zero physical replay uses H=2560, I=640, E=512, top-k=10, full expert
 rows and synthetic activations. TP4 route observation does not turn this into a
 TP4 kernel benchmark or complete-model quality evaluation.
+The native response export contains expert IDs, not gate weights; physical
+replay uses uniform `1/top_k` route weights in both arms.
 
 ## Locality and policy replay
 
