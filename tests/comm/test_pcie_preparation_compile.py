@@ -12,6 +12,37 @@ from b12x.comm.pcie._tuning import PcieQuery, TUNING
 from b12x.preparation import FrozenMapping
 
 
+@pytest.mark.parametrize("world", [9, 10, 12])
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+@pytest.mark.parametrize("operation", ["all_gather_heads", "lse_reduce_scatter"])
+def test_dcp_attention_accepts_non_power_of_two_groups(world, owner, operation):
+    from b12x.comm.pcie.pcie_dcp_a2a import _staging_layout
+
+    query = PcieQuery(
+        surface=f"{owner}.{operation}", world_size=world, rank=world - 1,
+        topology="pcie_ipc", call=FrozenMapping(), setup=FrozenMapping(),
+    )
+    TUNING.validate_query(query, None)
+    layout = _staging_layout(
+        signal_bytes=4096, world_size=world, max_batch_size=8,
+        total_heads=world * 10, head_dim=512, query_head_dim=576,
+    )
+    assert layout.staging1_offset == layout.staging0_offset + layout.slot_bytes
+
+
+@pytest.mark.parametrize("world", [9, 10, 12])
+@pytest.mark.parametrize("operation", [
+    "all_gather_pair", "all_gather_pair_kimi_topk", "kimi_topk16",
+])
+def test_attention_group_support_does_not_enable_kimi_projection_shards(world, operation):
+    query = PcieQuery(
+        surface=f"DcpAllToAll.{operation}", world_size=world, rank=0,
+        topology="pcie_ipc", call=FrozenMapping(), setup=FrozenMapping(),
+    )
+    with pytest.raises(ValueError, match="supports world sizes"):
+        TUNING.validate_query(query, None)
+
+
 def test_prepared_pair_call_executes_both_output_bindings():
     from b12x.comm.pcie._dcp_preparation import _DcpExecutionState, prepare_call
     runtime = Mock()
