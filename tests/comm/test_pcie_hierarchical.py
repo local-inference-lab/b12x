@@ -31,6 +31,36 @@ from b12x.comm.pcie.pcie_hierarchical import (
 from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
 
 
+@pytest.mark.parametrize("strided", [False, True])
+def test_hierarchical_query_preserves_tensor_metadata(strided: bool) -> None:
+    from b12x.comm.pcie import _owner_preparation
+    from b12x.preparation import FrozenMapping
+
+    runtime = SimpleNamespace(
+        rank=0, world_size=16, threads=256, wait_nanosleep_cycles=0,
+        double_buffered=True, deferred_consumption=False,
+        vectorized_bf16x2=True, vectorized_bf16x2_max_elements=7168,
+        max_elements=8192, blocks=None, slab_bytes=65536,
+        mapped_peers=(1, 2, 3, 4, 8, 12),
+    )
+    inp = torch.empty((2, 64), dtype=torch.bfloat16)
+    if strided:
+        inp = inp[:, ::2]
+    out = torch.empty_like(inp)
+    query = _owner_preparation.query_from_runtime(
+        runtime, surface="PCIeHierarchicalAllReduce.all_reduce",
+        call={"inp": inp, "out": out},
+    )
+    encoded = query.call["inp"]
+    assert isinstance(encoded, FrozenMapping)
+    assert encoded["shape"] == tuple(inp.shape)
+    assert encoded["stride"] == tuple(inp.stride())
+    assert encoded["dtype"] == str(inp.dtype)
+    assert encoded["alignment"] >= 4
+    assert query.call["output"]["shape"] == tuple(out.shape)
+    assert hash(query.call) == hash(FrozenMapping(query.call.to_dict()))
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
 def test_allreduce_uses_direct_path_for_peer_safe_worlds(world_size: int) -> None:
     assert _algorithm_for_world_size(world_size) == "oneshot"
