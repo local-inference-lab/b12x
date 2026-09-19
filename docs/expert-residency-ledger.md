@@ -1035,3 +1035,93 @@ qualification gates. This experiment shows that the shared policy and fixed-slot
 transaction compose with a different native recipe and memory topology. Any
 further SM120 work should first measure complete-operator PCIe miss cost and
 exchange pause cost on shifting traffic before adding serving integration.
+
+## SM120 residency spectrum evidence
+
+Status: **recorded single-layer diagnostics**, collected 2026-09-19 UTC
+(2026-09-18 America/New_York). The [spectrum guide and results](expert-residency-sm120-spectrum.md)
+specify the method, numerical gates, selected tables, interpretation limits and
+measured follow-up priorities. Production kernels, residency mechanisms and
+policy defaults are unchanged.
+
+The runner is `benchmarks/moe/sm120_residency_spectrum.py`; route-fixture tests
+are in `tests/moe/test_sm120_residency_spectrum.py`. Source export
+`source-01.tar.gz` is based on `f7d1c5329314d6e30393211b3f9b8643dac0eb8b`, SHA256
+`5b174e0cc54e716ac217469cc53da9696e0aeb8c565628d63d88b374d63751dd`.
+Each run's manifest hashes the package and all SM120 residency experiment
+modules. Every manifest was checked against the final unchanged implementation.
+Documentation annotations were added after measurement.
+
+The complete evidence bundle is
+`/home/jasonc/b12x-sm120-spectrum-evidence-20260918/spectrum-records.tar.gz`, SHA256
+`de5f37cde469081f9fe5749d87749e73ae9a2cf9aa1e37b651869ff58f53dd67`.
+Its contents include the frozen source export, exact launch commands, per-case
+raw samples, source/device/toolchain manifests, all stdout logs, derived
+`latency.csv`/`policy.csv`, a summary generator and receipt hashes. Original
+remote receipts remain at
+`ripper:/home/jasonc/b12x-sm120-spectrum-results-20260918/`.
+
+| Receipt or directory | Result |
+| --- | --- |
+| `host-final.log` | **40 passed, 3 CUDA skips**, 2.81 s; routing fixtures, loader, shared contracts and cache policy |
+| `remote/second-card.log` | **12 passed**, 16.30 s; fixture tests plus native graph exchange, independent reference and ordered-reduction tests on physical SM120 |
+| `remote/main-01/` | **74 fixtures passed**: 38 latency cases and 36 policy cases |
+| `remote/hot-128/`, `remote/hot-384/` | **12 fixtures passed each**, covering resident budgets below and above the half-resident control |
+| `remote/topk-2/`, `remote/topk-6/` | **12 fixtures passed each**, preserving checkpoint H/I and source quantization |
+| `remote/reuse-512/` | **10 fixtures passed**: longer reuse windows and latency controls |
+| `remote/second-card/` | **9 latency fixtures passed** on the other physical RTX PRO 4000 |
+| `remote/pilot-01/` | **17 preliminary fixtures passed**, retained separately from the seven recorded sweeps |
+| `lint-final.log` | Runner and test module pass Ruff; whitespace checks pass |
+
+The seven recorded sweeps total **141 fixtures**, including **202 cache-condition
+latency comparisons** and **40 policy fixtures**. Each latency condition measures
+all-VRAM, static and profiled operators plus five isolated stages. Policy
+fixtures execute three static/adaptive pairs of eight epochs. Numerical,
+counter-delta, frozen-program, pointer and replay-allocator gates pass. No failed
+benchmark fixture was removed. The earlier proof-of-concept's incomplete native
+sanitizer attempt remains incomplete; this suite does not replace it.
+
+All runs load the same 512-expert layer from
+`/models/Qwen3.8-Flash-Next-NVFP4`: H=2560, I=640, native NVFP4 weights and BF16
+activations. Loaded fields hash to
+`05384d5b0bbe71843464786f15391673847f5eaa9fa08e2a2e8309ab80c6c90e`.
+Routing/activation fixtures are synthetic. Top-k=2/6/10, live M=1–128,
+resident counts 128/256/384, warm/scrubbed cache conditions, and policy periods
+1/16/128/512 vary explicitly. The prepared capacity remains 128 in all recorded
+sweeps. The queried L2 is 50,331,648 bytes; the scrub writes 100,663,296 bytes.
+
+Main and supplemental measurements use
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`; the second-card check uses
+`GPU-47363510-b87a-13a5-4824-2542e97df76c`. Both report RTX PRO 4000 Blackwell,
+SM120, default compute mode, driver 580.173.02 and 145 W power limit. Runs are
+serialized across cards to avoid competing PCIe traffic. No service was stopped.
+The source runs in container image
+`sha256:955e088a85b5378b00275842bc839eea8cb04ca0782ed79eaa3a967d11fd22e5`,
+Torch 2.13.0/CUDA 13.3, CUTLASS DSL 4.6.2, Triton
+`3.7.1+gitf797708c.nv26.7`, cuda-bindings 13.0.3. The isolated binding mount and
+`PYTHONPATH=/workspace:/cuda-bindings` are preserved in launch receipts.
+
+Measurements use default dynamic clocks. Main/supplemental snapshots are P1,
+memory clock 13,365 MHz, SM clocks 2,047–2,475 MHz, and throttle masks `0x0` or
+software-power-cap `0x4`. These are exploratory data, not release tuning
+acceptance. Small profiler deltas are unresolved under these conditions.
+
+Recorded limitations and rejected extrapolations:
+
+- A sub-selection cold fraction cannot be represented in one tiny-M invocation.
+  Actual integer counts and fractions are retained; a one-cold C1/top-k=10 case
+  is labeled 10%, never 1.5625%.
+- Three warmup replays and dynamic clocks do not isolate a few microseconds of
+  instrumentation overhead. Some profiled medians are lower than static medians;
+  those raw results are retained and are not described as free profiling.
+- The roughly 46 ms exchange pause and positive results after sufficient reuse
+  concern the journaled PCIe prototype. No PCIe byte counter, DMA-only rate,
+  complete-model throughput, learned-static-profile comparison or B300 behavior
+  was measured.
+- Cache scrubbing is a controlled proxy. It does not prove a particular physical
+  weight-fetch count; raw route hits and unique expert touches remain distinct.
+- Per-step exchange can lose dramatically, and never-reused promotions lose at
+  every tested period. Both outcomes remain in the published tables and receipts.
+- No kernel, migration-policy or serving-engine optimization was added during
+  the sweep. The next work is to isolate empty-cold and exchange costs, then
+  validate promising conditions with real routing traces.

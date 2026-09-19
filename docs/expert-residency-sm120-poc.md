@@ -4,6 +4,9 @@ Status: **research-only, single-layer prototype**. The experiment composes
 native prepared SM120 W4A16 operators, fixed VRAM and mapped-host slots, prepared
 routing counters and the shared recent-frequency cache policy. It does not add
 a production residency backend, automatic calibration or a vLLM serving lane.
+The [recorded test spectrum](expert-residency-sm120-spectrum.md) compares static
+and adaptive execution across token counts, residency budgets, cold-route
+fractions and reuse windows, including transaction pauses and retained raw data.
 
 The runner is
 [`benchmarks/moe/sm120_residency_poc.py`](../benchmarks/moe/sm120_residency_poc.py).
