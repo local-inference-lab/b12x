@@ -29,9 +29,11 @@ Each cell contains five warmed 30-second decode windows or five uncached
 
 All functional checks and timed cells pass. Verifier changes are -0.014%
 C1 and -0.313% C8. Output varies with acceptance in these unseeded requests;
-these samples do not establish a distribution change. The automatic choice
-changes the target grid from 376 to 188 blocks, without resolving the serving
-gap by itself. No GPU-specific grid is pinned by this change.
+these samples do not establish a distribution change. The
+[resolved launch records](launch-grids.json) show the automatic target grid
+changing from 376 to 188 blocks: 172 target calls on each rank in each arm.
+The 12 draft calls per rank retain 240 blocks. This does not resolve the
+serving gap by itself. No GPU-specific grid is pinned by this change.
 
 [Raw evidence](results.json) includes every window, complete launch and
 benchmark commands, immutable image/source identities, checkpoint revision,
@@ -41,6 +43,14 @@ difference from that commit is recorded explicitly. The client's KV budget
 is an admission limit; both recorded capacities exceed the 65,536 tokens
 needed for eight maximum-length context-zero responses. No cell is
 capacity-limited or underfilled.
+
+`launch-grids.json` links each rank's trace SHA-256 and ordered launch records
+to the same image/source identities as `results.json`. Reproduce extraction
+with [extract_launch_grids.py](extract_launch_grids.py), passing the two rank
+traces for each arm as repeated `--trace baseline=path` and
+`--trace candidate=path`, plus `--results results.json --output launch-grids.json`.
+The extractor checks the four-step, 43-target/3-draft layer geometry; it does
+not convert profiled durations into throughput claims.
 
 ## Numerical and capture contract
 
