@@ -311,11 +311,23 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
     assert sorted(trial_closed) == [3, 6, 12, 24]
 
 
-def test_two_ranks_measure_disjoint_candidate_halves_and_install_global_winner(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("cached_ranks", ((), (0,), (1,), (0, 1)))
+def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
+    tmp_path, monkeypatch, cached_ranks,
 ):
     _deterministic_timer(monkeypatch)
     tuning = contract(values=(1, 2, 4, 8))
+    for rank in cached_ranks:
+        with session(tmp_path / f"rank-{rank}") as engine:
+            engine.prepare((request(
+                name="cached", tuning=tuning,
+                benchmark=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+            ),))
+            # Simulate another completed race choosing a different winner.
+            if rank == 1 and len(cached_ranks) == 2:
+                key, record = next(iter(engine._cache.records.items()))
+                engine._cache.save(key, assignment={"width": 4}, config={"width": 4},
+                                   coverage=record["coverage"], programs=())
     engines = [session(tmp_path / f"rank-{rank}") for rank in range(2)]
     requests = []
     jobs = []
@@ -329,17 +341,25 @@ def test_two_ranks_measure_disjoint_candidate_halves_and_install_global_winner(
                 produce=lambda: None,
             ),
         )
-        requests.append(req)
-        jobs.append(engine.begin((req,)))
+        fresh = replace(req, name="fresh", dependencies=("shared",),
+                        plan=replace(req.plan, query=Query(5)))
+        requests.append((req, fresh))
+        jobs.append(engine.begin((req, fresh)))
 
     authorizations = [None, None]
+    caches = [None, None]
     progress = [None, None]
     for _ in range(100):
         progress = [
-            job.advance(tuning=authorization)
-            for job, authorization in zip(jobs, authorizations)
+            job.advance(tuning=authorization, cache=cache)
+            for job, authorization, cache in zip(jobs, authorizations, caches, strict=True)
         ]
         authorizations = [None, None]
+        caches = [None, None]
+        if any(state.ready_cache is not None for state in progress):
+            snapshots = tuple(state.ready_cache for state in progress)
+            assert all(snapshot is not None for snapshot in snapshots)
+            caches = [snapshots, snapshots]
         contributions = [
             item
             for state in progress
@@ -360,10 +380,16 @@ def test_two_ranks_measure_disjoint_candidate_halves_and_install_global_winner(
 
     results = [job.result() for job in jobs]
     try:
-        assert [result.benchmarked_candidates for result in results] == [2, 2]
+        assert [result.benchmarked_candidates for result in results] == ([2, 2] if cached_ranks else [4, 4])
         assert [result.selections["shared"].config.width for result in results] == [2, 2]
+        assert [result.selections["shared"].source for result in results] == (["cached"] * 2 if cached_ranks else ["tuned"] * 2)
+        assert all(result.selections["fresh"].source == "tuned" for result in results)
         assert [result.coverage["shared"]["measured_count"] for result in results] == [4, 4]
-        assert [req.plan.selection.config.width for req in requests] == [2, 2]
+        assert [req[0].plan.selection.config.width for req in requests] == [2, 2]
+        # Saving the fresh choice must not restore a conflicting local winner.
+        for engine in engines:
+            result = engine.prepare((request(name="again", tuning=tuning),))
+            assert result.selections["again"].config.width == 2
     finally:
         for engine in engines:
             engine.close()
@@ -929,14 +955,15 @@ def test_gpu_steps_share_a_bounded_advance_without_changing_order(tmp_path, monk
         job.result()
 
 
-@pytest.mark.parametrize("boundary", ("compile", "collective", "tuning"))
+@pytest.mark.parametrize("boundary", ("compile", "collective", "tuning", "cache"))
 def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
-    from b12x.preparation.types import PreparationResult, TuningRequirement
+    from b12x.preparation.types import PreparationResult, TuningCacheRequirement, TuningRequirement
 
     seen = []
     collective = CollectiveRequirement("ready/collective", (0, 1))
     tuning = TuningRequirement("ready/tuning", (0, 1), {"width": 2}, 1.0, 0)
-    signals = {"compile": "compile", "collective": collective, "tuning": tuning}
+    cache = TuningCacheRequirement((0, 1), {}, {})
+    signals = {"compile": "compile", "collective": collective, "tuning": tuning, "cache": cache}
 
     def steps():
         for index in range(2):
@@ -963,11 +990,33 @@ def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
             assert job.advance().ready_tuning == (tuning,)
             assert seen == [0, 1]
             progress = job.advance(tuning=tuning)
+        elif boundary == "cache":
+            assert progress.ready_cache == cache
+            assert job.advance().ready_cache == cache
+            assert seen == [0, 1]
+            progress = job.advance(cache=(cache, cache))
         else:
             assert progress.pending_compilation
             progress = job.advance()
         assert progress.done
-        assert seen == [0, 1, tuning if boundary == "tuning" else None]
+        expected = tuning if boundary == "tuning" else (cache, cache) if boundary == "cache" else None
+        assert seen == [0, 1, expected]
+        job.result()
+
+
+def test_cancelled_cache_agreement_continues_with_required_defaults(tmp_path):
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        req = request(name="cancelled-cache", tuning=contract())
+        job = engine.begin((req,))
+        assert job.advance().ready_cache is not None
+        engine.cancel_tuning()
+        progress = job.advance(cache=())
+        while not progress.done:
+            progress = job.advance()
+        assert req.plan.selection.source == "default"
+        assert req.plan.selection.config.width == 7
+        assert engine._cache.records == {}
         job.result()
 
 
@@ -1115,6 +1164,8 @@ def test_sharded_races_exchange_after_independent_work_and_release_trials(
             req = replace(req, plan=replace(req.plan, query=Query(i + 3)))
             requests.append(req)
         job = engine.begin(requests)
+        snapshot = job.advance().ready_cache
+        job.advance(cache=(snapshot, snapshot))
         exchanges = []
         tuning = None
         for _ in range(100):
@@ -1150,6 +1201,8 @@ def test_cancelled_pending_races_prepare_defaults_without_caching(tmp_path, monk
             for i in range(2)
         )
         job = engine.begin(requests)
+        snapshot = job.advance().ready_cache
+        job.advance(cache=(snapshot, snapshot))
         for _ in range(100):
             progress = job.advance()
             if progress.ready_tuning:
@@ -1181,6 +1234,8 @@ def test_fixed_collective_without_dependents_does_not_split_race_results(tmp_pat
         collective = request(name="comm", collective=CollectiveRequirement("comm", (0, 1)))
         collective = replace(collective, plan=replace(collective.plan, query=Query(99)))
         job = engine.begin((races[0], collective, races[1]))
+        snapshot = job.advance().ready_cache
+        job.advance(cache=(snapshot, snapshot))
         tuning = key = None
         boundaries = []
         for _ in range(100):

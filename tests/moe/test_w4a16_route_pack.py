@@ -5,6 +5,8 @@ import math
 import pytest
 import torch
 
+from b12x._lib.compile_plan import load_programs
+from b12x._lib.runtime_control import kernel_resolution_guard
 import b12x.moe._shared.kernels.w4a16.route_pack as route_pack_module
 from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
 from b12x.moe._shared.kernels.w4a16.host import (
@@ -154,7 +156,8 @@ def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("capacity", (128, 8192))
 @pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
-def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, ids_dtype):
+@pytest.mark.parametrize("mapped", (False, True))
+def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, ids_dtype, mapped):
     launches = route_pack_module.compile_w4a16_route_pack_launches(
         tokens=capacity, topk=2, block_size=8, num_experts=32,
         ordinal=torch.cuda.current_device(),
@@ -167,18 +170,53 @@ def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, ids_
         expert_counts=torch.empty(32, dtype=torch.int32, device="cuda"),
     )
     ids = torch.arange(capacity * 2, dtype=ids_dtype, device="cuda").remainder_(32).reshape(capacity, 2)
-    for rows in (1, 3, 17, capacity):
-        routes, blocks, count = route_pack_module.pack_topk_routes_by_expert(
-            ids[:rows], 8, 32, launches=launches, **buffers,
+    expert_map = None
+    if mapped:
+        expert_map = torch.arange(31, -1, -1, dtype=torch.int32, device="cuda")
+        expert_map[::3] = -1
+    load_programs(launches.carriers())
+
+    def run(rows):
+        return route_pack_module.pack_topk_routes_by_expert(
+            ids[:rows], 8, 32, expert_map=expert_map, launches=launches, **buffers,
         )
-        _, valid, expected_count, expected_blocks = _expected_route_pack(ids[:rows], 8, 32)
+
+    def check(rows, output):
+        routes, blocks, count = output
+        expected_ids, valid, expected_count, expected_blocks = _expected_route_pack(
+            ids[:rows], 8, 32, expert_map,
+        )
         torch.testing.assert_close(count.cpu(), expected_count, rtol=0, atol=0)
         torch.testing.assert_close(blocks[:len(expected_blocks)].cpu(), expected_blocks, rtol=0, atol=0)
         assert (blocks[len(expected_blocks):] == -1).all()
-        payload = routes[routes < rows * 2].cpu().to(torch.int64)
-        torch.testing.assert_close(payload.sort().values, torch.arange(int(valid.sum())), rtol=0, atol=0)
-        assert routes.data_ptr() == buffers["packed_route_indices"].data_ptr()
+        assert (routes[int(expected_count.item()):] == rows * 2).all()
+        host_routes = routes.cpu().to(torch.int64)
+        payload = host_routes[host_routes < rows * 2]
+        expected_payload = torch.nonzero(valid).flatten()
+        torch.testing.assert_close(payload.sort().values, expected_payload, rtol=0, atol=0)
+        for block, expert in enumerate(expected_blocks.tolist()):
+            block_routes = host_routes[block * 8:(block + 1) * 8]
+            block_payload = block_routes[block_routes < rows * 2]
+            assert (expected_ids[block_payload] == expert).all()
+        for tensor, name in zip(
+            output, ("packed_route_indices", "block_expert_ids", "packed_route_count"), strict=True,
+        ):
+            assert tensor.data_ptr() == buffers[name].data_ptr()
         assert routes.numel() == launches.max_packed_routes
+
+    run(capacity)
+    torch.cuda.synchronize()
+    with kernel_resolution_guard("prepared route packing reuses fixed geometry"):
+        for rows in (1, 3, 17, capacity):
+            check(rows, run(rows))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = run(rows)
+            for tensor in buffers.values():
+                tensor.fill_(-999)
+            ids.add_(5).remainder_(32)
+            graph.replay()
+            check(rows, output)
 
 
 def test_small_prefix_reuses_fixed_arena_numel_capacity(monkeypatch) -> None:

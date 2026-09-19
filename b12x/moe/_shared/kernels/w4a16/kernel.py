@@ -784,6 +784,7 @@ class W4A16FusedMoeCompileResult:
     cta_threads: int = -1
     shared_memory_bytes: int = -1
     broadcast_suh: bool = False
+    small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -9499,18 +9500,7 @@ def compile_w4a16_fused_moe(
         kernel.__cache_key__,
     )
     cached = _FUSED_CACHE.get(cache_key)
-    if cached is not None:
-        return attach_programs(
-            replace(
-                cached,
-                size_m=size_m,
-                num_experts=num_experts,
-                max_m_blocks=max_m_blocks,
-                blocks_per_sm=kernel.blocks_per_sm,
-            ),
-            cached,
-        )
-    if _require_cached:
+    if cached is None and _require_cached:
         raise RuntimeError(
             "W4A16 fused MoE launch is not resolved for CUDA graph capture "
             f"(m={size_m}, moe_block_size={moe_block_size}, "
@@ -9518,7 +9508,7 @@ def compile_w4a16_fused_moe(
             "count before capturing"
         )
 
-    compiled_dependencies = []
+    small_m_direct_launches = []
     if (not collect_activation_amax) and _small_m_direct_supported(
         m=size_m,
         hidden_size=hidden_size,
@@ -9552,7 +9542,21 @@ def compile_w4a16_fused_moe(
                 w13_layout=w13_layout,
                 device=torch.device("cuda", device) if device is not None else None,
             )
-            compiled_dependencies.append(direct.compiled)
+            small_m_direct_launches.append(direct)
+
+    if cached is not None:
+        return attach_programs(
+            replace(
+                cached,
+                size_m=size_m,
+                num_experts=num_experts,
+                max_m_blocks=max_m_blocks,
+                blocks_per_sm=kernel.blocks_per_sm,
+                small_m_direct_launches=tuple(small_m_direct_launches),
+            ),
+            cached.compiled,
+            *(launch.compiled for launch in small_m_direct_launches),
+        )
 
     compile_size_m = _fake_m_for_specialization(size_m)
     compile_routed_rows = int(compile_size_m) * int(top_k)
@@ -9763,8 +9767,9 @@ def compile_w4a16_fused_moe(
         cta_threads=kernel.cta_threads,
         shared_memory_bytes=kernel.shared_words * 4,
         broadcast_suh=bool(broadcast_suh),
+        small_m_direct_launches=tuple(small_m_direct_launches),
     )
-    attach_programs(result, compiled, *compiled_dependencies)
+    attach_programs(result, compiled, *(launch.compiled for launch in small_m_direct_launches))
     _FUSED_CACHE[cache_key] = result
     return result
 
@@ -10014,9 +10019,11 @@ def _w4a16_small_m_direct_launch_flat(
     swiglu_beta: float,
     w13_layout: str,
     stream_int: int,
+    *,
+    launcher: _W4A16SmallMDirectLaunch | None = None,
 ) -> None:
     swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
-    direct_launch = _compile_w4a16_small_m_direct(
+    direct_launch = launcher if launcher is not None else _compile_w4a16_small_m_direct(
         m=m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -12160,7 +12167,15 @@ def run_w4a16_moe(
         barrier_epoch = prepared.workspace[-1:]
         if _small_m_direct_host_barrier_reset_enabled():
             prepared.workspace[-2:].zero_()
-        torch.ops.b12x.w4a16_small_m_direct_launch(
+        direct_launch = None
+        if fused_launch is not None:
+            direct_launch = next((
+                launch for launch in fused_launch.small_m_direct_launches
+                if launch.topk_ids_dtype == topk_ids.dtype
+            ), None)
+            if direct_launch is None or direct_launch.m != m:
+                raise RuntimeError("native W4A16 direct launch was not prepared for this token count and route dtype")
+        launch_args = (
             a_input,
             prepared.w13.view(torch.uint8),
             micro_w13_scale,
@@ -12189,6 +12204,10 @@ def run_w4a16_moe(
             w13_layout,
             int(stream),
         )
+        if direct_launch is None:
+            torch.ops.b12x.w4a16_small_m_direct_launch(*launch_args)
+        else:
+            _w4a16_small_m_direct_launch_flat(*launch_args, launcher=direct_launch)
         return output
 
     # TC-decode: small-M packed decode that folds the top-k sum into the FC2

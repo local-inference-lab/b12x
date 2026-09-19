@@ -240,6 +240,25 @@ class CollectiveRequirement:
 
 
 @dataclass(frozen=True)
+class TuningCacheRequirement:
+    """Rank-local completed selections to reconcile before sharding candidates."""
+
+    ranks: tuple[int, ...]
+    identity: FrozenMapping
+    records: FrozenMapping
+
+    def __post_init__(self):
+        ranks = tuple(self.ranks)
+        if not ranks or any(type(rank) is not int or rank < 0 for rank in ranks):
+            raise ValueError("tuning cache agreement requires nonnegative ranks")
+        if ranks != tuple(sorted(set(ranks))):
+            raise ValueError("tuning cache ranks must be sorted and unique")
+        object.__setattr__(self, "ranks", ranks)
+        object.__setattr__(self, "identity", FrozenMapping(self.identity))
+        object.__setattr__(self, "records", FrozenMapping(self.records))
+
+
+@dataclass(frozen=True)
 class TuningRequirement:
     """One rank's winner from its disjoint share of a tuning race."""
 
@@ -304,6 +323,7 @@ class PreparationProgress:
     total_candidates: int | None = None
     global_candidate_count: int = 0
     selection_counts: tuple[tuple[str, int], ...] = ()
+    ready_cache: TuningCacheRequirement | None = None
 
 
 @dataclass(kw_only=True)
@@ -323,6 +343,7 @@ class PreparedCall:
     owners: tuple[object, ...] = ()
     close: Callable[[], None] | None = None
     capture_safe: bool = True
+    benchmark_producers: tuple[Callable[[], None], ...] = ()
 
     def invoke(self):
         result = self.run()

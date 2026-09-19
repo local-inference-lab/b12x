@@ -321,9 +321,6 @@ def run_unified_prefill(
             raise ValueError(
                 f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
             )
-        if model_type == ModelType.DSV41:
-            # Heterogeneous 544-byte staging permits only one head group.
-            partitions = ((1, heads, 0),)
         launches = []
         for partition_index, (mg_n_hg, active_heads, head_offset) in enumerate(
             partitions

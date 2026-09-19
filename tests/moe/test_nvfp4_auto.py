@@ -107,3 +107,127 @@ def test_uniform_nvfp4_a16_does_not_retain_source_scales():
     assert all(ref() is None for ref in source_scales)
 
 
+@pytest.mark.parametrize("num_experts,hidden_size,intermediate_size,topk", (
+    (8, 256, 256, 2), (256, 6144, 256, 8),
+))
+def test_auto_native_decode_retains_launches_and_replays_shared_storage(
+    tmp_path, monkeypatch, num_experts, hidden_size, intermediate_size, topk,
+):
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.moe._shared.kernels.w4a16 import kernel
+    from tests._reference.helpers import require_b12x
+    from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
+    from .test_fused_moe import make_modelopt_weights
+
+    require_b12x()
+    torch.manual_seed(4196)
+    raw = make_modelopt_weights(
+        experts=num_experts, hidden_size=hidden_size, intermediate_size=intermediate_size,
+    )
+    w13, s13, g13, w2, s2, g2 = raw
+    scales = torch.ones(num_experts, device="cuda")
+    plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=fused_moe.ActivationSpec(mode="auto", nonlinearity="silu", io_dtype=torch.bfloat16),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=num_experts, hidden_size=hidden_size, intermediate_size=intermediate_size,
+        ),
+    )
+    experts = fused_moe.prepare_weights(plan=plan, weights=fused_moe.PackedWeights(
+        w13=w13, w2=w2, w13_block_scales=s13, w2_block_scales=s2,
+        w13_global_scales=g13, w2_global_scales=g2,
+        input_scale=scales, intermediate_scale=scales,
+    ))
+    native = experts._impl.representation_for("w4a16")
+    for tensor, original in (
+        (native.w13, w13), (native.w2, w2), (native.w13_scale, s13), (native.w2_scale, s2),
+        (native.micro_w13_scale, s13), (native.micro_w2_scale, s2),
+    ):
+        assert tensor.data_ptr() == original.data_ptr()
+    originals = [tensor.clone() for tensor in raw]
+    counts = (1, 2, 4, 8)
+    x = torch.randn(8, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.25
+    ids = torch.stack([torch.randperm(num_experts, device="cuda")[:topk] for _ in range(8)])
+    probabilities = torch.softmax(torch.randn(8, topk, device="cuda"), dim=-1)
+    execution = fused_moe.plan_execution(
+        experts=experts, capacity=fused_moe.ExecutionCapacity(
+            max_tokens=8, top_k=topk, warmup_token_counts=counts,
+        ),
+    )
+
+    def make_call(m):
+        def call(state):
+            scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                            for spec in state.scratch.scratch_specs())
+            binding = state.bind(scratch=scratch, a=x[:m], topk_ids=ids[:m],
+                                 topk_weights=probabilities[:m], output=torch.empty_like(x[:m]))
+            assert state.config.backend == "w4a16" and state.config.w4a16_route_mode == "direct"
+            assert binding.route_pack_launches is None
+            return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+        return call
+
+    with PreparationSession(device=x.device, autotune=False, compile_workers=2, cache_dir=tmp_path) as session:
+        session.prepare((execution.request(
+            name="native-auto", prepare_calls={m: make_call(m) for m in counts},
+        ),))
+        bindings = []
+        for m in (*counts, 3):
+            state = execution.variants[m if m in counts else 8].prepared.state
+            scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                            for spec in state.scratch.scratch_specs())
+            for dtype in (torch.int32, torch.int64):
+                binding = fused_moe.bind(
+                    execution, scratch=scratch, a=x[:m], topk_ids=ids[:m].to(dtype),
+                    topk_weights=probabilities[:m], output=torch.empty_like(x[:m]),
+                )
+                assert (binding.route_pack_launches is None) is (m in counts)
+                bindings.append((m, binding, scratch))
+
+        launched = []
+        launch_flat = kernel._w4a16_small_m_direct_launch_flat
+
+        def retained_launch(*args, launcher=None, **kwargs):
+            assert launcher is not None
+            launched.append((launcher.m, launcher.topk_ids_dtype))
+            return launch_flat(*args, launcher=launcher, **kwargs)
+
+        def forbidden_resolution(*args, **kwargs):
+            raise AssertionError("prepared replay resolved a kernel through a module cache")
+
+        kernel.clear_w4a16_kernel_cache()
+        monkeypatch.setattr(kernel, "_compile_w4a16_small_m_direct", forbidden_resolution)
+        monkeypatch.setattr(kernel, "compile_w4a16_fused_moe", forbidden_resolution)
+        monkeypatch.setattr(kernel, "_w4a16_small_m_direct_launch_flat", retained_launch)
+        session.freeze()
+        for m, binding, scratch in bindings:
+            expected = moe_reference_w4a16(
+                x[:m], *raw, binding.topk_ids, probabilities[:m],
+                num_experts, hidden_size, intermediate_size,
+            )
+            actual = fused_moe.run(binding=binding)
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+            assert compare_to_reference(actual, expected).cos > 0.9999
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fused_moe.run(binding=binding)
+            pointers = tuple(tensor.data_ptr() for tensor in (*scratch, binding.a, actual))
+            for replay in range(3):
+                if replay == 1:
+                    binding.a.neg_()
+                    binding.topk_ids.add_(1).remainder_(num_experts)
+                    expected = moe_reference_w4a16(
+                        binding.a, *raw, binding.topk_ids, probabilities[:m],
+                        num_experts, hidden_size, intermediate_size,
+                    )
+                actual.fill_(float("nan"))
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                assert tuple(tensor.data_ptr() for tensor in (*scratch, binding.a, actual)) == pointers
+                assert torch.isfinite(actual).all()
+                assert compare_to_reference(actual, expected).cos > 0.9999
+            graph.reset()
+        assert set(launched) == {(m, dtype) for m in counts for dtype in (torch.int32, torch.int64)}
+        for tensor, original in zip(raw, originals):
+            torch.testing.assert_close(tensor.view(torch.uint8), original.view(torch.uint8), rtol=0, atol=0)

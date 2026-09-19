@@ -152,6 +152,8 @@ class W4A8MaterializedPhase2Kernel:
         grid_z = max_active_clusters * Int32(2)
         if cutlass.const_expr(self.direct_routes):
             grid_z = num_pairs * packed_output_tiles * Int32(256 // self.tile_n)
+            if max_active_clusters > Int32(0):
+                grid_z = cutlass.min(grid_z, max_active_clusters * Int32(2))
         self.kernel(
             intermediate_u32,
             down_rp,

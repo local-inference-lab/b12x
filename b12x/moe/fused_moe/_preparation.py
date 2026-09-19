@@ -273,6 +273,18 @@ class _W4A16PrimaryLaunches:
                 "W4A16 execution exceeds its prepared capacity: "
                 f"requested={int(tokens)}, prepared={self.tokens}"
             )
+        native_direct = (
+            int(tokens) == self.tokens
+            and self.route_mode != "packed"
+            and not has_route_map
+            and activation_amax is None
+            and any(
+                launch.topk_ids_dtype == route_ids_dtype
+                for launch in getattr(self.packed, "small_m_direct_launches", ())
+            )
+        )
+        if native_direct:
+            return self.packed, self.topk_sum, None
         direct = (
             int(tokens) == self.tokens
             and self.route_mode != "packed"
@@ -503,7 +515,6 @@ class _CompactLaunches:
     kernels: object
     quantize: object
     topk_sum: object
-    sm_count: int
 
 
 def _compact_launches(plan, caps):
@@ -531,7 +542,7 @@ def _compact_launches(plan, caps):
         ) for dtype in (torch.int32, torch.int64)
     }
     topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
-    return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum, sms),
+    return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
                            tuple(kernels.values()), quantize, topk_sum)
 
 

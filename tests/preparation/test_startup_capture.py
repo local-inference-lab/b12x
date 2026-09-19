@@ -127,6 +127,56 @@ def test_candidate_timing_preserves_outputs_without_capture_or_allocator_flushes
             race.close()
 
 
+def test_candidate_samples_visit_the_complete_workload_mix():
+    from b12x.preparation import _measurement
+
+    device = require_b12x()
+    source = torch.empty(1, device=device)
+    output = torch.empty_like(source)
+    observed = torch.empty(6, device=device)
+    recording = False
+    index = 0
+
+    def run():
+        nonlocal index
+        output.copy_(source)
+        if recording:
+            observed[index:index + 1].copy_(output)
+            index += 1
+        return output
+
+    producers = tuple(lambda value=value: source.fill_(value) for value in (1, 2, 3))
+    call = PreparedCall(
+        run=run, produce=producers[0], benchmark_producers=producers,
+        reset=lambda: source.fill_(float("nan")),
+    )
+    race = _measurement._prepare_race(
+        [call], device_ordinal=torch.cuda.current_device(), samples=2,
+    )
+    try:
+        recording = True
+        race.timers[0].replay()
+        torch.cuda.synchronize(device)
+        assert race.sample_count == 6
+        assert len(race.timers[0].samples()) == 6
+        torch.testing.assert_close(observed, torch.tensor([1, 2, 3, 1, 2, 3], device=device).float())
+    finally:
+        race.close()
+
+
+def test_candidate_races_reject_incomparable_workload_counts():
+    from b12x.preparation import _measurement
+
+    def producer():
+        pass
+    calls = [
+        PreparedCall(run=lambda: None, produce=producer),
+        PreparedCall(run=lambda: None, produce=producer, benchmark_producers=(producer,) * 3),
+    ]
+    with pytest.raises(ValueError, match="same workload count"):
+        _measurement._prepare_race(calls, device_ordinal=0)
+
+
 def test_retired_candidate_timers_do_not_accumulate_or_release_live_graphs(monkeypatch):
     from b12x.preparation import _measurement
     from b12x.preparation._memory import release_graph_pool_cache

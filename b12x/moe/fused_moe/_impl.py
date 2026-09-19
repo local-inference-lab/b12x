@@ -2577,7 +2577,7 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
     weight_layout = (
         "modelopt"
         if query.quant_mode == "nvfp4_auto"
-        else _w4a16_weight_layout_for_source(
+        else query.w4a16_weight_layout or _w4a16_weight_layout_for_source(
             query.source_format,
             intermediate_size=query.intermediate_size,
         )
@@ -2586,16 +2586,26 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
         return False
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _MAX_DIRECT_TOPK_ROUTE_M,
-        _TC_DECODE_MAX_M,
         _small_m_direct_supported,
     )
 
     if weight_layout == "modelopt":
-        # The W4A16 launch routes direct top-k only for packed serving
-        # weights; ModelOpt weights take the small-M direct micro kernel by
-        # shape, independent of the configured route mode, so a "direct"
-        # route mode is never a launchable configuration for them.
-        return False
+        return not query.collect_activation_amax and _small_m_direct_supported(
+            m=query.num_tokens,
+            hidden_size=query.hidden_size,
+            intermediate_size=query.intermediate_size,
+            num_experts=query.num_experts,
+            topk=query.top_k,
+            activation=query.activation,
+            apply_router_weight_on_input=query.apply_router_weight_on_input,
+            swiglu_limit=query.swiglu_limit,
+            swiglu_alpha=query.swiglu_alpha,
+            swiglu_beta=query.swiglu_beta,
+            element_dtype="bf16" if query.io_dtype == "bfloat16" else "fp16",
+            weight_layout=weight_layout,
+            w13_layout=query.w13_layout,
+            scale_format=query.w4a16_scale_format or _w4a16_scale_format_for_source(query.source_format),
+        )
     # Planned launches carry the unmapped direct top-k kernel only up to
     # _MAX_DIRECT_TOPK_ROUTE_M rows; the TC-decode variant that would serve
     # larger small-M calls is not a planned launch, so a declaration above
@@ -11325,7 +11335,7 @@ def _launch_dynamic_flat(
             )
         effective_mac = min(effective_mac, direct_task_count)
     if (
-        external_route_plan
+        (external_route_plan or w4a8_n64_repacked)
         and policy_max_active_clusters > 0
         and _first_env(
             "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
@@ -13098,7 +13108,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             scratch=s.micro_intermediate,
             _prepared_kernel=compact.kernels[topk_ids.dtype],
             _prepared_quantize=compact.quantize,
-            _sm_count=compact.sm_count,
+            max_active_clusters=plan.decode_config.max_active_clusters,
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,

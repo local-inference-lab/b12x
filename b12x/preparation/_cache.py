@@ -55,6 +55,7 @@ class SelectionCache:
             raise ValueError("selection cache requires a positive tuning_cache_version")
         self.path = Path(root) / f"{digest(self.identity)}.json"
         self.records = self._read()
+        self._agreed_records = None
 
     def _validate(self, records):
         if not isinstance(records, dict):
@@ -98,8 +99,24 @@ class SelectionCache:
         return self._validate(payload["records"])
 
     def get(self, key):
-        record = self.records.get(key)
+        records = self.records if self._agreed_records is None else self._agreed_records
+        record = records.get(key)
         return None if record is None else FrozenMapping(record)
+
+    def reconcile(self, snapshots):
+        """Use the first completed record in rank order for this session.
+
+        Executable artifacts remain local. Only selection metadata is shared;
+        preparation still compiles and primes each selected configuration locally.
+        """
+        agreed = {}
+        for snapshot in snapshots:
+            if snapshot.identity.to_dict() != self.identity:
+                raise ValueError("tuning cache identities differ across ranks")
+            records = self._validate(snapshot.records.to_dict())
+            for key, record in records.items():
+                agreed.setdefault(key, record)
+        self._agreed_records = agreed
 
     def save(self, key, *, assignment, config, coverage, programs):
         update = {
@@ -132,3 +149,5 @@ class SelectionCache:
                 if temporary is not None and os.path.exists(temporary):
                     os.unlink(temporary)
             self.records = records
+            if self._agreed_records is not None:
+                self._agreed_records.update(update)

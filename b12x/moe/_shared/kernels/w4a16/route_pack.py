@@ -405,6 +405,7 @@ def compile_w4a16_route_pack_launches(
 
 
 def _launch_prepared(program: object, grid: tuple[int, ...], *args: object) -> object:
+    # Compiled Triton launchers require the full signature, including constexprs.
     return program[tuple((*grid, 1, 1)[:3])](*args)
 
 
@@ -610,6 +611,10 @@ def pack_topk_routes_by_expert(
                 (1,), topk_ids, expert_map_tensor, packed_route_indices,
                 block_expert_ids, packed_route_count, expert_offsets,
                 expert_counts, numel,
+                numel_capacity, int(block_size), int(num_experts),
+                max_packed_routes, max_route_blocks, expert_map is not None,
+                block_e, _COUNT_BLOCK_T, block_route_init, block_m,
+                block_e.bit_length(), counts_alias_packed,
             )
     else:
         # Parallel path for shapes above the single-launch caps: atomic
@@ -642,10 +647,12 @@ def pack_topk_routes_by_expert(
                 launches.program("count", topk_ids, expert_map is not None),
                 (triton.cdiv(numel, _FAST_COUNT_BLOCK_T),),
                 topk_ids, expert_map_tensor, expert_counts, numel,
+                int(num_experts), expert_map is not None, _FAST_COUNT_BLOCK_T,
             )
             _launch_prepared(
                 launches.programs[("prefix", torch.int32, False)], (1,),
                 expert_counts, packed_route_count, expert_offsets,
+                int(block_size), int(num_experts), block_e,
             )
         post_prefix_grid = (
             max(
@@ -666,6 +673,8 @@ def pack_topk_routes_by_expert(
                 launches.programs[("post_prefix", torch.int32, False)],
                 post_prefix_grid, packed_route_indices, block_expert_ids,
                 expert_offsets, numel,
+                int(block_size), int(num_experts), max_packed_routes,
+                max_route_blocks, _POST_PREFIX_BLOCK_T, block_e.bit_length(),
             )
     if launches is None:
         launch_triton(_pack_topk_routes_sort_kernel, sort_grid,
@@ -677,6 +686,7 @@ def pack_topk_routes_by_expert(
         _launch_prepared(
             launches.program("sort", topk_ids, expert_map is not None), sort_grid,
             topk_ids, expert_map_tensor, packed_route_indices, expert_offsets, numel,
+            int(num_experts), expert_map is not None, _SORT_BLOCK_T,
         )
     return packed_route_indices, block_expert_ids, packed_route_count
 

@@ -88,6 +88,20 @@ The current kernel families map onto those axes as follows:
 | native NVFP4 W4A16 decode | direct top-k | inline | persistent grid | source-native payload and block scales |
 | W4A16 tensor-core | sorted/padded; direct at small M for MMA-packed weights | precomputed; inline at small M | persistent grid | native payload and scales for AUTO; MMA-packed payload and scales for uniform A16 |
 
+## Compact W4A8 tails
+
+Native E8M0/K32 weights with a local intermediate width of `128k + 64`
+retain their exact storage extent. The decode tuner races direct micro and
+internal grouped M16 execution, including a runtime `max_active_clusters`
+ladder up to the device SM count. On GB10 the ladder is 1, 2, 4, 8, 16, 24,
+32, 36, and 48, plus the original default (`None`).
+
+The grouped front-end keeps at most that many cooperative CTAs; its separate
+projection kernels use twice that grid width. Direct micro caps both projection
+grids at twice the selected value and strides over the remaining work. Its
+default retains one CTA per tile. Grid limits do not specialize the compiled
+program or alter weight storage, scratch capacity, or quantization.
+
 ## Sharing NVFP4 storage across activation precisions
 
 **Implemented:** both ModelOpt NVFP4 W4A16 consumers read the same packed
@@ -96,62 +110,40 @@ activation inputs and raw weight global scales. It does not quantize activation
 operands to FP4 or convert weight scales to an MXFP8 representation.
 
 Create an `ActivationMode.AUTO` weight plan and separate execution-capacity
-plans over its prepared owner. Prewarm each execution plan before freezing
-kernel resolution and capturing graphs. A `moe.decode` policy override can
-select A4 or A16 explicitly for a capacity. `PackedWeights` accepts raw weight
+plans over its prepared owner. Prepare each execution plan before freezing
+kernel resolution and capturing graphs. A `moe.decode` configuration override
+can select A4 or A16 explicitly for a capacity. `PackedWeights` accepts raw weight
 global scales; A4 preparation derives its runtime alphas from those globals and
 the reciprocal activation scales. A16 retains raw weight globals and supplies
 unit activation scales.
 
 **Implemented:** `ActivationMode.AUTO` prepares both consumers from one
 `PackedWeights` bundle and selects precision through `moe.decode` during
-`plan_execution`. It requires ModelOpt NVFP4, BF16 IO, SiLU, source-native
+`PreparationSession.prepare`. It requires ModelOpt NVFP4, BF16 IO, SiLU, source-native
 packing, and up/gate (`W13Layout.W13`) row order. Supply raw weight globals
 and both reciprocal activation scales. The A16 consumer retains raw weight
 globals and performs no activation-scale arithmetic.
 
-Precision is fixed for each `ExecutionCapacity.max_tokens`; it is exposed as
-`ExecutionPlan.activation_mode`, with policy provenance in
-`ExecutionPlan.precision_resolution`. Separate decode and prefill capacity
-plans can share one prepared expert owner. Binding and replay perform no
-precision policy lookup. AUTO prewarming compiles the declared warmup counts
-for both route-ID dtypes before kernel resolution is frozen. Explicit A4 and
-A16 modes retain their requested precision.
+Each declared capacity in the composite plan's `variants` retains its selected
+backend and route configuration. Separate decode and prefill capacity plans can share
+one prepared expert owner. Binding and replay perform no precision search.
+Explicit A4 and A16 modes retain their requested precision.
 
-The offline generator races real A4 and native A16 plans. Every candidate must
-pass its precision-specific oracle, poisoned-output graph replay, and allocation
-and clock checks. The reducer scores the geometric mean of route-pattern
-medians. A16 is eligible when its aggregate is no slower than every qualified
-A4 candidate in both the initial paired race and an independent confirmation.
-Exact ties favor A16; there is no five-percent promotion margin.
-Confidence intervals and raw samples remain in local evidence. Precision
-choices cover exact measured capacities. For uncovered queries on SM120 and
-SM121, the heuristic selects native A16 direct decode at capacities 1–8 when
-the kernel supports the geometry, and A4 otherwise. Candidate losses at one
-capacity do not prune other capacities.
+With autotuning enabled, preparation races eligible A4 and native A16
+configurations using the supplied benchmark calls. The lowest median latency
+wins; exact ties favor A16. A16 remains eligible at larger capacities through
+expert-packed routing. Without autotuning, the default on SM120 and SM121 is
+native A16 direct decode at capacities 1–8 when the kernel supports the geometry,
+and A4 otherwise. `moe.decode` candidate contract revision 5 invalidates
+selections made without the native direct candidate and the A16 tie preference.
 
-**Qualified:** for GLM-5.2 layer 3, TP8 (H=6144, I=256, E=256, top-k=8),
-the embedded RTX PRO 6000 Blackwell Max-Q and GB10 profiles select A16 at
-capacities 1–8. RTX uses direct routes; GB10 uses packed routes. Both consume
-the same native weight and scale allocations as A4. The
-checkpoint benchmark uses synthetic activations/routes and precision-specific
-oracles, rather than measuring full-model inference.
-
-The GB10 profile follows cold-L2 generation. Callers qualifying a workload
-with cached weights can override the route configuration. No runtime
-cache-residency prediction participates in precision selection.
-
-The existing GB10 dynamic A4 configuration failed the checkpoint NVFP4 cosine
-gate at M=2–8 (0.999868–0.999529 versus 0.9999). Those candidates are excluded
-from checkpoint timing qualification. Passing A4 micro and A16 candidates
-retain their measured comparison; the fixed-A4 profile is unchanged.
-
-The direct native decode kernel supports one through eight tokens subject to its
-model-geometry contract. Plan an A16 decode capacity within that range. The
-canonical scratch plan retains the routing policy selected for its capacity; a
-larger capacity can select expert-packed routing even when the bound input has
-one token. A4 prefill can use a separate, larger execution capacity over the same
-weight storage.
+The direct native decode kernel supports one through eight tokens subject to
+its model-geometry contract. Declare the required counts in
+`ExecutionCapacity.warmup_token_counts`; preparation retains direct launches
+for both int32 and int64 route IDs. A bound count without an exact prepared
+variant uses the capacity plan's expert-packed route. Mapped routes and
+activation-amax collection also use expert-packed routing. Direct launches
+remain available after module caches are cleared and kernel resolution is frozen.
 
 Native A16 preparation aliases the source block scales for direct and
 tensor-core execution. The tensor-core consumer stages native scale bytes into
@@ -163,8 +155,6 @@ reuses the input weight storage and retains only the permuted block scales.
 Release the caller's source bundle after transferring ownership to reclaim its
 source-scale allocations. Uniform A16 cannot request source-native packing;
 use AUTO for precision switching over shared NVFP4 storage.
-Uniform NVFP4 A16 uses heuristic route selection; native-layout measurements
-are excluded from its embedded profile coverage.
 
 `benchmarks/benchmark_w4a16_nvfp4_layouts.py` compares both A16 layouts through
 public planned execution, with checkpoint provenance, pointer and byte-identity
@@ -332,3 +322,31 @@ The code now has:
 The remaining specialization is intentional: precision selects operand
 transport and MMA instructions; availability constrains legal schedulers; and
 measured cost variance selects among those schedulers.
+
+## Verification routing workload
+
+`b12x.moe.fused_moe.workloads.make_routing_ids` provides the `shared_40`
+workload. Sharing means `1 - distinct_experts / (tokens * top_k)` across the
+batch; each token still routes to distinct experts. Counts round to the nearest
+realizable value: top-6 batches of 4, 6, and 8 tokens use 14, 22, and 29 experts.
+Single-token batches cannot share, and a small expert pool can force more reuse.
+The deterministic generator spreads IDs across the expert pool and favors
+already popular experts when reusing them.
+
+The vLLM preparation adapter uses four seeded realizations for 2–8 token
+batches. Every candidate sees the same inputs and is scored over the complete
+mix before elimination. Other batch sizes retain cyclic, maximally spread
+routing. `shared_40_v1` versions selection-cache inputs; compiled kernels do not
+change when the tuning workload changes. This is a simple assumed workload,
+not a claim that all models or every layer have the same routing distribution.
+
+The assumption is informed by DSV4.1 TP4 serving observations on GB10: 179,600
+target-layer calls from short/medium-context reasoning and code requests showed
+36–42% reuse at observed 5/7/8-row verification sizes. The separate drafter was
+more concentrated (about 62% reuse). Raw traces are diagnostic artifacts, not
+runtime dependencies.
+
+Use `benchmarks/benchmark_moe.py --routing-workload shared_40 --batch-sizes 4 6 8`
+with the usual checkpoint, quantization, and validation arguments to exercise
+this workload in the pre-routed single-operation benchmark. Input generation
+and routing remain outside the timed region.

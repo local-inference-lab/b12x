@@ -11,7 +11,7 @@ import torch
 from b12x._lib import compiler
 from b12x._lib.compile_plan import ProgramKey, record_program
 from b12x._lib.compile_pool import CompilationPlan, CompileJob
-from b12x.preparation import DetectedDevice, PreparationSession, PreparedCall
+from b12x.preparation import DetectedDevice, PreparationSession, PreparedCall, TuningCacheRequirement
 from b12x.preparation._cache import SelectionCache, cache_identity
 from .test_defaults import contract
 from .test_session import _deterministic_timer, declaration
@@ -141,6 +141,25 @@ def test_matching_malformed_decision_still_fails_closed(cache_device, tmp_path):
     cache.path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="only completed exhaustive"):
         SelectionCache(tmp_path, identity)
+
+
+@pytest.mark.parametrize("failure", ("identity", "incomplete"))
+def test_cache_agreement_rejects_incompatible_or_incomplete_peer_results(
+    cache_device, tmp_path, failure,
+):
+    identity = cache_identity({}, 0)
+    cache = SelectionCache(tmp_path, identity)
+    _save_choice(cache)
+    peer = json.loads(json.dumps(cache.records))
+    if failure == "identity":
+        identity = {**identity, "device_name": "Another GPU"}
+        message = "identities differ"
+    else:
+        peer["shape"]["coverage"]["measured_count"] = 1
+        message = "only completed exhaustive"
+    with pytest.raises(ValueError, match=message):
+        cache.reconcile((TuningCacheRequirement((0, 1), identity, peer),))
+    assert cache.get("shape")["assignment"]["width"] == 2
 
 
 def test_cached_choice_rebuilds_changed_program_without_racing(cache_device, tmp_path, monkeypatch):

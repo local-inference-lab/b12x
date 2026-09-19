@@ -541,6 +541,36 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
             space.validate({**triton, "max_active_clusters": outside})
 
 
+def test_compact_w4a8_races_runtime_grids_for_both_backends():
+    from b12x.moe.fused_moe import _tuning as component
+
+    _, original = _contract_and_query(
+        "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
+    )
+    query = replace(
+        original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32", num_experts=384, hidden_size=5120,
+        intermediate_size=576, top_k=6, num_tokens=8, routed_rows=48,
+        route_num_experts=None, route_logits_dtype=None,
+        w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    configuration = component.TUNING.configure(query, device=device)
+    candidates = tuple(component.TUNING.iterate(configuration))
+    for backend in ("micro", "dynamic"):
+        configs = [config for _, config in candidates if config.backend == backend]
+        assert {config.max_active_clusters for config in configs} == {
+            None, 1, 2, 4, 8, 16, 24, 32, 36, 48,
+        }
+        assignments = [component.TUNING.encode_config(config) for config in configs]
+        assert len({configuration.space.compile_assignment(a) for a in assignments}) == 1
+        with pytest.raises(ValueError, match="resident SM count"):
+            component.TUNING.configure(
+                query, device=device, override=replace(configs[0], max_active_clusters=49)
+            )
+    assert len(candidates) == 20
+
+
 def test_a16_wide_tile_needs_more_than_one_n_tile():
     from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledQuery
 

@@ -973,6 +973,7 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
     assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
 
 
+@pytest.mark.parametrize("max_active_clusters", (None, 1, 24, 48))
 @pytest.mark.parametrize(
     ("max_tokens", "unseen_counts", "expected_implementation"),
     (
@@ -984,11 +985,13 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
     max_tokens: int,
     unseen_counts: tuple[int, ...],
     expected_implementation: str,
+    max_active_clusters: int | None,
 ) -> None:
     _skip_if_unavailable()
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x.moe import fused_moe
     from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 
     device = torch.device("cuda", torch.cuda.current_device())
     n = 192
@@ -1031,6 +1034,13 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=max_tokens, top_k=_TOPK),
         invocation={"fast_math": False},
+        override=MoeDecodeConfig(
+            backend=expected_implementation,
+            route_planner="internal",
+            max_active_clusters=max_active_clusters,
+            dynamic_tile_m=16 if expected_implementation == "dynamic" else None,
+            dynamic_route_mode="grouped" if expected_implementation == "dynamic" else None,
+        ),
     )
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
 

@@ -13,6 +13,7 @@ from benchmarks.benchmark_moe import (
     _slice_v41_tp_shard,
     build_model_spec,
     compute_model_gate_routing,
+    make_benchmark_case,
 )
 
 
@@ -36,6 +37,24 @@ def test_v41_checkpoint_shards_intermediate_at_native_width(tmp_path):
     path.write_text(json.dumps({"text_config": config}))
     with pytest.raises(ValueError, match="V4.1"):
         build_model_spec(tmp_path, profile)
+
+
+def test_shared_40_benchmark_uses_identical_oracle_and_timing_routes():
+    spec = ModelSpec(16, 128, 384, 6, 4, 0)
+    profile = MODEL_PROFILES["deepseek-v4.1-flash"]
+    oracle = make_benchmark_case(
+        profile, None, spec, 8, 50, torch.device("cpu"),
+        routing_workload="shared_40",
+    )
+    timing = make_benchmark_case(
+        profile, None, spec, 8, 50, torch.device("cpu"),
+        routing_workload="shared_40",
+    )
+    for left, right in zip(oracle[:3], timing[:3], strict=True):
+        torch.testing.assert_close(left, right)
+    assert oracle[1].unique().numel() == 29
+    assert oracle[3] is None
+    torch.testing.assert_close(oracle[2].sum(-1), torch.ones(8))
 
 def test_v41_tp_shards_keep_global_route_ids_and_unbiased_weights():
     spec = ModelSpec(2, 128, 8, 2, 4, 0)

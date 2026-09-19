@@ -1561,6 +1561,8 @@ def make_benchmark_case(
     m: int,
     seed: int,
     device: torch.device,
+    *,
+    routing_workload: str = "default",
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1570,6 +1572,18 @@ def make_benchmark_case(
     """Build a reproducible validation/timing case without retaining it."""
 
     x = make_input_activations(spec, m, seed, device)
+    if routing_workload != "default":
+        from b12x.moe.fused_moe.workloads import make_routing_ids
+
+        topk_ids = make_routing_ids(
+            m, spec.top_k, spec.num_experts,
+            workload=routing_workload, seed=seed + 1, device=device,
+        )
+        topk_weights = torch.softmax(
+            torch.arange(spec.top_k, dtype=torch.float32, device=device) * .125,
+            dim=-1,
+        ).expand(m, -1).contiguous()
+        return x, topk_ids, topk_weights, None
     if profile.default_routing == "model":
         topk_ids, topk_weights = compute_model_gate_routing(
             weights,
@@ -3099,6 +3113,10 @@ def bench_e2e() -> None:
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument(
+        "--routing-workload", choices=("default", "shared_40"), default="default",
+        help="shared_40 reuses about 40%% of token/expert assignments in the batch.",
+    )
+    parser.add_argument(
         "--routing-repeat-period",
         type=int,
         default=0,
@@ -3356,6 +3374,14 @@ def bench_e2e() -> None:
         raise ValueError("--quant-mode w4a16 currently does not support --tp-parallel")
     if args.graph_only and not args.cuda_graph:
         raise ValueError("--graph-only requires --cuda-graph")
+    if args.routing_workload != "default" and (
+        args.include_routing or args.routing_repeat_period or args.tp_parallel
+        or args.graph_mode != "single-op"
+    ):
+        raise ValueError(
+            "--routing-workload requires a pre-routed single-op, single-rank "
+            "benchmark without --routing-repeat-period"
+        )
     if args.routing_repeat_period < 0:
         raise ValueError("--routing-repeat-period must be non-negative")
     if args.routing_repeat_period and args.graph_mode != "single-op":
@@ -3433,7 +3459,12 @@ def bench_e2e() -> None:
     print(f"Layer: {layer_idx}")
     print(f"Activation: {args.activation}")
     print(f"Quant mode: {args.quant_mode}")
-    print(f"Routing source: {model_profile.default_routing}")
+    routing_source = (
+        model_profile.default_routing
+        if args.routing_workload == "default" else "synthetic"
+    )
+    print(f"Routing source: {routing_source}")
+    print(f"Routing workload: {args.routing_workload}")
     if args.routing_repeat_period:
         print(f"Routing repeat period: {args.routing_repeat_period} tokens")
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
@@ -3502,6 +3533,7 @@ def bench_e2e() -> None:
         activation_params=activation_params,
         w4a16_native=args.w4a16_native,
     )
+    precomputed_oracles: dict[int, torch.Tensor] = {}
     if args.validate == "oracle" and getattr(weight_plan, "reuses_source_storage", False):
         print(
             "  Precomputing oracle outputs before destructive weight "
@@ -3517,6 +3549,7 @@ def bench_e2e() -> None:
                 batch_size,
                 42 + batch_size,
                 device,
+                routing_workload=args.routing_workload,
             )
             oracle_ids, oracle_topk = repeat_routing_pattern(
                 oracle_ids,
@@ -3655,6 +3688,7 @@ def bench_e2e() -> None:
             batch_size,
             42 + batch_size,
             device,
+            routing_workload=args.routing_workload,
         )
         topk_ids, topk_weights = repeat_routing_pattern(
             topk_ids,
