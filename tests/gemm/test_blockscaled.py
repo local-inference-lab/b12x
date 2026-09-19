@@ -93,6 +93,35 @@ def test_capacity_lowering_preserves_explicit_hints_and_nvfp4(recipe, hint):
     assert lowering.expected_m == hint
 
 
+@pytest.mark.parametrize("capacity", [128, 2047, 2048, 6019])
+def test_mxfp8_capacity_lowering_preserves_short_prefill_program(capacity):
+    """A large prefill specialization does not replace the dynamic short tile."""
+    from b12x.gemm.blockscaled._preparation import (
+        _dense_lowering, _lower_dense_with_hint, _short_dense_lowering,
+    )
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8", num_tokens=capacity, in_features=2560,
+        padded_in_features=2560, out_features=6144, workspace_form="provided",
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        vendor="nvidia", compute_capability=(12, 0), sm_count=188,
+        product_name="RTX PRO 6000 Blackwell Max-Q",
+    ))
+    config = BlockscaledConfig(mode="quantized")
+    dynamic = _lower_dense_with_hint(query, config, device, None)
+    short = _short_dense_lowering(query, config, device)
+    if capacity < 2048:
+        assert short is None
+        assert _dense_lowering(query, config, device) == dynamic
+    else:
+        assert short == dynamic
+        assert short.mma_tiler_mn == (64, 128)
+        assert short.expected_m is None
+        assert _dense_lowering(query, config, device).mma_tiler_mn == (128, 64)
+
+
 def _quantize_mxfp4_rows(
     source: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -494,8 +494,54 @@ def test_mxfp8_prepared_functional_and_provided_forms_match():
         graph.reset()
 
 
+def test_mxfp8_prefill_capacity_owned_and_provided_match():
+    """Both scratch contracts retain short and long programs under frozen capture."""
+    require_b12x()
+    capacity, n, k = 2675, 6144, 2560
+    weight, _, _ = make_weight("mxfp8", n, k)
+    source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(mode="quantized")
+    workspace = make_workspace(source, weight, activation_mode="quantized",
+                               out=output, config=config)
+    with ExitStack() as stack:
+        _, functional = stack.enter_context(prepared_execution(
+            source, weight, activation_mode="quantized", config=config,
+            name="mxfp8-capacity-functional",
+        ))
+        _, provided = stack.enter_context(prepared_execution(
+            source, weight, activation_mode="quantized", config=config,
+            out=output, workspace=workspace, name="mxfp8-capacity-provided",
+        ))
+        assert functional.prepared.state.short_dense is not None
+        assert provided.prepared.state.short_dense is not None
+        owned_bytes = functional.prepared.state.owned_nbytes
+        assert provided.prepared.state.owned_nbytes == 0
+        with kernel_resolution_guard("packed MXFP8 capacity scratch contracts"):
+            for rows in (4, 2047, 2048, capacity):
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph):
+                        actual = blockscaled.mm(source[:rows], weight, plan=functional)
+                        blockscaled.mm(source[:rows], weight, out=output[:rows],
+                                       workspace=workspace, plan=provided)
+                    source.normal_()
+                    workspace.fill_(255)
+                    output.fill_(float("nan"))
+                    actual.fill_(float("nan"))
+                    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                    torch.testing.assert_close(actual, output[:rows], atol=0, rtol=0)
+                    assert torch.isnan(output[rows:]).all()
+                    assert functional.prepared.state.owned_nbytes == owned_bytes
+                finally:
+                    graph.reset()
+
+
 @pytest.mark.parametrize("n,k", [(2560, 2560), (2560, 6144), (6144, 2560)])
-def test_mxfp8_prefill_capacity_reuses_graph_program_for_shorter_rows(n, k):
+def test_mxfp8_prefill_capacity_reuses_graph_program_for_shorter_rows(monkeypatch, n, k):
     """A capacity-tuned tile keeps live row masks and caller scratch intact."""
     from b12x.gemm._shared.wo_mxfp8 import (
         dequantize_mxfp8_rows_torch, quantize_mxfp8_rows_torch,
@@ -515,14 +561,27 @@ def test_mxfp8_prefill_capacity_reuses_graph_program_for_shorter_rows(n, k):
         workspace=workspace, config=config,
     ) as (query, plan):
         assert query.expected_m is None
+        state = plan.prepared.state
+        assert state.short_dense is not None
+        launched = []
+        core_type = type(state.dense)
+        original_run = core_type.run
+
+        def record_core(core, *args, **kwargs):
+            launched.append(core)
+            return original_run(core, *args, **kwargs)
+
+        monkeypatch.setattr(core_type, "run", record_core)
         with kernel_resolution_guard("capacity-tuned MXFP8 prefill"):
-            for rows in (1, 4, 127, 128, 129, 2675, capacity):
+            for rows in (1, 4, 127, 128, 129, 2047, 2048, 2675, capacity):
                 live_source, live_output = source[:rows], output[:rows]
                 graph = torch.cuda.CUDAGraph()
                 try:
                     with torch.cuda.graph(graph):
                         blockscaled.mm(live_source, weight, out=live_output,
                                        workspace=workspace, plan=plan)
+                    expected = state.short_dense if rows < 2048 else state.dense
+                    assert launched[-1] is expected
                     source.normal_()
                     quantized = quantize_mxfp8_rows_torch(live_source)
                     reference = dequantize_mxfp8_rows_torch(

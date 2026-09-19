@@ -17,6 +17,8 @@ from ._tuning import (
     functional_mxfp8_quantization,
 )
 
+_MXFP8_PREFILL_MIN_ROWS = 2048
+
 
 def _decode_query(payload):
     values = dict(payload)
@@ -24,15 +26,10 @@ def _decode_query(payload):
     return BlockscaledQuery(**values)
 
 
-def _dense_lowering(query, config, device):
+def _lower_dense_with_hint(query, config, device, expected_m):
     from b12x.gemm._preparation import _default_lowering
     from b12x.gemm._tuning import DenseGemmQuery
     functional = functional_mxfp8_quantization(query, config)
-    expected_m = query.expected_m
-    if query.recipe == "mxfp8" and expected_m is None:
-        # Native tile selection uses the declared capacity, not a live batch.
-        # Keep the outer query dynamic so shorter prefills reuse this program.
-        expected_m = query.num_tokens
     inner = DenseGemmQuery(
         recipe=query.recipe, entry_point="gemm.blockscaled.mm", weight_storage="native",
         output_dtype="bfloat16", batch=1, max_rows=query.num_tokens,
@@ -44,7 +41,28 @@ def _dense_lowering(query, config, device):
     return _default_lowering(inner, device.identity)
 
 
-def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_count, capability):
+def _has_mxfp8_prefill_regime(query):
+    return (
+        query.recipe == "mxfp8" and query.expected_m is None
+        and query.num_tokens >= _MXFP8_PREFILL_MIN_ROWS
+    )
+
+
+def _dense_lowering(query, config, device):
+    # Both programs are compiled for the declared capacity. The large-row hint
+    # must not force underfilled short prefills onto a large M tile.
+    expected_m = query.num_tokens if _has_mxfp8_prefill_regime(query) else query.expected_m
+    return _lower_dense_with_hint(query, config, device, expected_m)
+
+
+def _short_dense_lowering(query, config, device):
+    if not _has_mxfp8_prefill_regime(query):
+        return None
+    return _lower_dense_with_hint(query, config, device, None)
+
+
+def compile_packed(query_payload, config_payload, dense_payload, short_dense_payload,
+                   ordinal, sm_count, capability):
     import cutlass
     from b12x._lib import dense_gemm as dense
     from . import _quantize, _reduce
@@ -71,6 +89,11 @@ def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_cou
                 programs["reduce"] = _reduce.compile_reduce(query.out_features, slices, ordinal)
             return programs
         programs = dense._compile_dense_lowering(dense_payload, ordinal)
+        if short_dense_payload is not None:
+            programs.update({
+                "short_" + name: program
+                for name, program in dense._compile_dense_lowering(short_dense_payload, ordinal).items()
+            })
         if functional_mxfp8_quantization(query, config):
             from b12x._lib.quant import mxfp8_rows
             rows = query.num_tokens if query.expected_m is None else query.expected_m
@@ -134,6 +157,7 @@ class _PackedExecutionState:
     required_workspace: int
     workspace: torch.Tensor | None = None
     mxfp8_bases: tuple | None = None
+    short_dense: object | None = None
 
     @property
     def owned_nbytes(self) -> int:
@@ -196,13 +220,18 @@ class _PackedExecutionState:
             raise ValueError("MXFP8 has no weight global scale")
         if m == 0:
             return _validate_output(source, out, q.out_features)
+        core = (
+            self.short_dense
+            if self.short_dense is not None and m < _MXFP8_PREFILL_MIN_ROWS
+            else self.dense
+        )
         with torch.cuda.device(self.device), _stream_context(stream, self.device):
             if functional_mxfp8_quantization(q, config):
                 contiguous = _pad_k(_source_2d(source), q.padded_in_features)
                 _check_tensor("quantizer source", contiguous, self.device, torch.bfloat16)
                 packed = self._mxfp8_rows(m)
                 self.programs["quantize"](contiguous, packed.values, packed.scale_rows, packed.scale_mma)
-                result = self.dense.run(
+                result = core.run(
                     (packed.values.view(m, stored_k, 1), packed.scale_mma),
                     (values.view(q.out_features, stored_k, 1), scales.view(torch.float8_e8m0fnu)),
                     stream=stream,
@@ -255,7 +284,7 @@ class _PackedExecutionState:
             )
             from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
             scale_view = (as_grouped_scale_view if fp4 else as_grouped_scale_view_mx)(packed_scales.view(1, -1), m, q.padded_in_features)
-            self.dense.run(
+            core.run(
                 (packed_values.view(m, stored_k, 1), scale_view),
                 (values.view(q.out_features, stored_k, 1), scales),
                 out=out.view(m, q.out_features, 1), alpha=alpha, stream=stream, split_k_workspace=partials,
@@ -274,14 +303,18 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def inner(config, device):
         key = (config, device.identity)
         if key not in lowerings:
-            lowerings[key] = None if config.mode == "a16" else _dense_lowering(query, config, device)
+            lowerings[key] = (None, None) if config.mode == "a16" else (
+                _dense_lowering(query, config, device),
+                _short_dense_lowering(query, config, device),
+            )
         return lowerings[key]
 
     def compile_jobs(config, device):
-        p = inner(config, device)
+        p, short = inner(config, device)
         return (CompileJob.create(
             "b12x.gemm.blockscaled._preparation:compile_packed",
             TUNING.encode_query(query), config.to_dict(), None if p is None else p.to_dict(),
+            None if short is None else short.to_dict(),
             device.ordinal, device.identity.sm_count, device.identity.compute_capability,
         ),)
 
@@ -305,10 +338,18 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         from b12x._lib import dense_gemm as dense
         from ._a16 import _layout
         config = selection.config
-        p = inner(config, device)
-        programs = compile_packed(TUNING.encode_query(query), config.to_dict(), None if p is None else p.to_dict(), device.ordinal, device.identity.sm_count, device.identity.compute_capability)
+        p, short = inner(config, device)
+        programs = compile_packed(TUNING.encode_query(query), config.to_dict(),
+                                  None if p is None else p.to_dict(),
+                                  None if short is None else short.to_dict(),
+                                  device.ordinal, device.identity.sm_count,
+                                  device.identity.compute_capability)
         resolved_device = torch.device("cuda", device.ordinal)
         core = None if p is None else dense._DenseExecutionState(p, resolved_device, programs["gemm"], programs.get("reduce"), dense._cached_alpha_one(resolved_device) if p.alpha_is_one else None)
+        short_core = None if short is None else dense._DenseExecutionState(
+            short, resolved_device, programs["short_gemm"], programs.get("short_reduce"),
+            dense._cached_alpha_one(resolved_device) if short.alpha_is_one else None,
+        )
         offsets = None if config.mode == "a16" or functional_mxfp8_quantization(query, config) else _layout(query.num_tokens, query.out_features, query.padded_in_features, query.recipe == "nvfp4", (64, 64, 1))
         needed = _workspace_bytes(query, config)
         workspace = bases = None
@@ -334,7 +375,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         return _PackedExecutionState(
             query, config, resolved_device, programs, core,
             dense._cached_alpha_one(resolved_device) if query.recipe == "mxfp8" and config.mode == "a16" else None,
-            offsets, needed, workspace, bases,
+            offsets, needed, workspace, bases, short_core,
         )
 
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, shared=True,
