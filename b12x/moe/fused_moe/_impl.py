@@ -11222,7 +11222,7 @@ def _launch_dynamic_flat(
         and _w4a8_dynamic_decode_candidate(
             quant_mode=quant_mode,
             activation=activation,
-            routed_rows=routed_rows,
+            routed_rows=planned_num_tokens * num_topk,
             num_experts=E,
             n=n,
             deterministic_output=deterministic_output,
