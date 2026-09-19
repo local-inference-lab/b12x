@@ -18,7 +18,7 @@ Max-Q Workstation GPUs, VRAM +6000, automatic graphics clocks, 325 W limits.
 Each cell contains five warmed 30-second decode windows or five uncached
 32K prefill windows. C8 output is aggregate throughput.
 
-| Median | Prepared attention-output storage repair | Plus repacked grid/capacity changes |
+| Median | Storage repair (`baseline`) | Plus repacked grid/capacity changes (`candidate`) |
 | --- | ---: | ---: |
 | Uncached 32K prefill, tokens/s | 11,362 | 11,395 |
 | C1 output, tokens/s | 204.789 | 191.045 |
@@ -63,7 +63,20 @@ mathematical tolerance.
 
 CPU predicate tests cover 48-SM and 188-SM devices, domain exclusions,
 resident bounds, explicit overrides and one compilation identity across
-runtime grid choices. The broader CPU preparation suite reports 535 passes,
+runtime grid choices. A host-only launch test also checks that the override
+namespace follows the prepared capacity: a 16-token/top-6 plan remains generic
+dynamic at live counts 1, 8 and 16, while an 8-token plan retains decode
+overrides. Two short-tail cases fail before the capacity-based namespace fix;
+all five pass afterward. The variant-selection and predicate files together
+pass 155 tests. This namespace correction does not change the measured,
+override-free grids above; it is not an additional GPU speedup claim.
+
+```bash
+uv run python -m pytest tests/moe/test_fused_moe_variant_selection.py \
+  tests/preparation/test_tuning_predicates.py -q
+```
+
+The broader CPU preparation suite reports 535 passes,
 59 CUDA skips and one failure reproduced on unmodified master: the
 device-reclaim test expects a cached selection with autotuning disabled,
 whereas the implementation returns the default. This is not an all-green

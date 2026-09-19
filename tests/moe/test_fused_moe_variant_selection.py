@@ -1,6 +1,7 @@
 """Host-only selection rules for prepared fused-MoE variants and W4A16 launches."""
 
 from dataclasses import replace
+from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -65,6 +66,42 @@ def test_capacity_state_binds_the_planned_variant_with_the_live_activations():
         state.bind(a=torch.empty(11))
     with pytest.raises(ValueError, match="exceeds prepared MoE capacity 128"):
         state.bind(a=torch.empty(129, 16))
+
+
+@pytest.mark.parametrize(
+    "capacity,live_rows,expected_namespace",
+    ((8, 1, "dynamic_w4a8_decode"), (8, 8, "dynamic_w4a8_decode"),
+     (16, 1, "dynamic"), (16, 8, "dynamic"), (16, 16, "dynamic")),
+)
+def test_repacked_grid_override_namespace_uses_prepared_capacity(
+    monkeypatch, capacity, live_rows, expected_namespace,
+):
+    """A prefill-capacity plan must not adopt decode overrides for short tails."""
+    from b12x.moe.fused_moe import _impl
+
+    class NamespaceResolved(Exception):
+        pass
+
+    def resolve_grid(namespace, **_kwargs):
+        assert namespace == expected_namespace
+        raise NamespaceResolved
+
+    monkeypatch.setattr(_impl, "_get_impl_mac", resolve_grid)
+    monkeypatch.setattr(_impl, "_dynamic_work_source", lambda: "materialized_queue")
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    # Stop at grid resolution, before any payload storage is accessed or any
+    # CUDA operation runs. Unused kernel operands intentionally remain absent.
+    arguments = dict.fromkeys(signature(_impl._launch_dynamic_flat).parameters)
+    arguments.update(
+        quant_mode="w4a8_mx", activation="silu", E=256, k=4096, n=1024,
+        m=live_rows, num_topk=6, routed_rows=live_rows * 6,
+        planned_num_tokens=capacity, planned_tile_m=16,
+        w4a8_repacked=True, w4a8_n64_repacked=False,
+        w13_sfb_rp=torch.empty(0, dtype=torch.uint8),
+        deterministic_output=False, planned_direct_routing=False,
+    )
+    with pytest.raises(NamespaceResolved):
+        _impl._launch_dynamic_flat(**arguments)
 
 
 def _launches(*, direct, route_pack, route_mode="auto"):
