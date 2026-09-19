@@ -494,6 +494,54 @@ def test_mxfp8_prepared_functional_and_provided_forms_match():
         graph.reset()
 
 
+@pytest.mark.parametrize("n,k", [(2560, 2560), (6144, 2560)])
+def test_mxfp8_prefill_capacity_reuses_graph_program_for_shorter_rows(n, k):
+    """A capacity-tuned tile keeps live row masks and caller scratch intact."""
+    from b12x.gemm._shared.wo_mxfp8 import (
+        dequantize_mxfp8_rows_torch, quantize_mxfp8_rows_torch,
+    )
+
+    require_b12x()
+    capacity = 6019
+    weight, decoded, _ = make_weight("mxfp8", n, k)
+    source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(mode="quantized")
+    workspace = make_workspace(
+        source, weight, activation_mode="quantized", out=output, config=config,
+    )
+    with prepared_execution(
+        source, weight, activation_mode="quantized", out=output,
+        workspace=workspace, config=config,
+    ) as (query, plan):
+        assert query.expected_m is None
+        with kernel_resolution_guard("capacity-tuned MXFP8 prefill"):
+            for rows in (1, 4, 127, 128, 129, 2675, capacity):
+                live_source, live_output = source[:rows], output[:rows]
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph):
+                        blockscaled.mm(live_source, weight, out=live_output,
+                                       workspace=workspace, plan=plan)
+                    source.normal_()
+                    quantized = quantize_mxfp8_rows_torch(live_source)
+                    reference = dequantize_mxfp8_rows_torch(
+                        quantized.values, quantized.scale_rows,
+                    ).float() @ decoded.T
+                    workspace.fill_(255)
+                    output.fill_(float("nan"))
+                    pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
+                    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                    assert pointers == (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
+                    assert_close(live_output, reference)
+                    assert torch.isnan(output[rows:]).all()
+                finally:
+                    graph.reset()
+
+
 
 
 @pytest.mark.parametrize("fp4", [True, False])

@@ -28,13 +28,18 @@ def _dense_lowering(query, config, device):
     from b12x.gemm._preparation import _default_lowering
     from b12x.gemm._tuning import DenseGemmQuery
     functional = functional_mxfp8_quantization(query, config)
+    expected_m = query.expected_m
+    if query.recipe == "mxfp8" and expected_m is None:
+        # Native tile selection uses the declared capacity, not a live batch.
+        # Keep the outer query dynamic so shorter prefills reuse this program.
+        expected_m = query.num_tokens
     inner = DenseGemmQuery(
         recipe=query.recipe, entry_point="gemm.blockscaled.mm", weight_storage="native",
         output_dtype="bfloat16", batch=1, max_rows=query.num_tokens,
         in_features=query.padded_in_features, out_features=query.out_features,
         output_mode="functional" if functional else "provided",
         alpha_mode="unit" if functional else "tensor",
-        expected_m=query.expected_m,
+        expected_m=expected_m,
     )
     return _default_lowering(inner, device.identity)
 

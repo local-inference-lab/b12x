@@ -7,6 +7,8 @@ replay. Exhaustive tile/support-matrix sweeps stay in the b12x repo.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -18,6 +20,7 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import blockscaled
+from b12x.preparation import DeviceIdentity
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
@@ -45,6 +48,30 @@ def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
         "max_rows": 128,
         "exact_m": (1, 2, 4, 8),
     }
+
+
+@pytest.mark.parametrize("workspace_form", ["provided", "owned"])
+@pytest.mark.parametrize("n,k", [(2560, 2560), (2560, 6144), (6144, 2560)])
+def test_mxfp8_capacity_lowering_keeps_prefill_tile_hint(workspace_form, n, k):
+    """The prepared capacity, not a live row count, selects the native tile."""
+    from b12x.gemm.blockscaled._preparation import _dense_lowering
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8", num_tokens=6019, in_features=k,
+        padded_in_features=k, out_features=n, workspace_form=workspace_form,
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        vendor="nvidia", compute_capability=(12, 0), sm_count=188,
+        product_name="RTX PRO 6000 Blackwell Max-Q",
+    ))
+    lowering = _dense_lowering(query, BlockscaledConfig(mode="quantized"), device)
+
+    assert query.expected_m is None  # The public plan still accepts shorter rows.
+    assert lowering.m == 6019
+    assert lowering.expected_m == 6019
+    assert lowering.mma_tiler_mn == (128, 64)
+    assert not lowering.policy.large_m_unroll
 
 
 def _quantize_mxfp4_rows(
