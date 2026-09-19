@@ -414,6 +414,17 @@ def test_packed_decode_layout_matches_generic_projection(rows, seed):
                         rtol=0, atol=0,
                     )
                 torch.testing.assert_close(bindings["packed"].tmp, bindings["generic"].tmp, rtol=0, atol=0)
+                left = dequantize_mxfp8_rows_torch(
+                    bindings["packed"].x_q.values, bindings["packed"].x_q.scale_rows,
+                )
+                right = dequantize_mxfp8_rows_torch(weights.wo_a.values, weights.wo_a.scale_rows)
+                previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+                torch.backends.cuda.matmul.allow_tf32 = False
+                try:
+                    first_reference = torch.einsum("mkg,nkg->mng", left, right).bfloat16()
+                    torch.testing.assert_close(bindings["packed"].tmp, first_reference, rtol=0.01, atol=0.002)
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = previous_tf32
                 if packed.policy.split_k_slices <= 2:
                     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
                 for name, output in (("packed", actual), ("generic", expected)):
