@@ -28,6 +28,12 @@ staging in the shared W4A16 kernel and compares host allocation modes. SM103
 residency preparation retains its existing memory policy and physical gates;
 the SM120 measurements are not attributed to Grace.
 
+The [routing-locality and canonical-fill experiment](expert-cache-evolution.md)
+adds held-out real-route analysis and a recoverable SM120 fill prototype at
+benchmark scope. It leaves shared policy and static SM103 preparation unchanged.
+Cheaper PCIe fills do not establish profitable adaptation or Grace-backed TMA
+legality; physical B300 qualification remains required.
+
 | State | Evidence and limits |
 | --- | --- |
 | Implemented and compiled through preparation | The full corpus at `94639562` covers 85 declarations and 241 distinct SM103 programs with CUDA uninitialized. The shared-residency source rechecks its three composing declarations and 14 programs. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |

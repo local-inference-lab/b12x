@@ -148,3 +148,12 @@ No generic allocator, N-tier routing, staged misses, canonical duplicate backing
 spare-slot retirement or concurrent replacement protocol is implemented. Those
 require additional contracts and admission tests. Reusing the host policy does
 not qualify another hardware backend or make Grace-backed SM103 TMA legal.
+
+## Canonical backing research
+
+The [locality and canonical-fill experiment](expert-cache-evolution.md) evaluates
+real checkpoint routes and a separate SM120 fill mechanism. The shared policy
+remains unchanged. Its exclusive dense-row validation does not admit canonical
+backup copies for resident experts; adding that capability requires an explicit
+backing/row-capacity contract. The benchmark does not weaken validation or mutate
+serving profiles to accommodate its experimental storage.

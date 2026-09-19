@@ -1202,3 +1202,94 @@ Rejected or deferred changes:
 - No cache admission constants are tuned from the synthetic break-even curves.
   Profiler/control overhead remains material on already-hot tiny-M traffic.
 - PCIe results do not choose a Grace allocation policy or qualify SM103 TMA.
+
+## Routing locality and canonical-fill evidence
+
+Status: **research-only; no production policy, kernel or SM103 storage change**.
+The [experiment report](expert-cache-evolution.md) describes offline real-routing
+analysis and a separate recoverable canonical-fill benchmark. The branch parent
+is `7768529ac34d4cad46a4ca54052734d06f1052a7`; fetched master remains
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`, already included in the branch.
+No master commit or speculative rebase is performed.
+
+Raw records reside at
+`/home/jasonc/b12x-cache-evolution-evidence-20260918/` and
+`ripper:/home/jasonc/b12x-cache-evolution-results-20260918/`.
+The final physical source is `source-03.tar.gz`, SHA256
+`fb2c4b6e40165702633f7ddfe98f0d6a2e7dc0627160d6215326a80af9b0b060`.
+It contains the seeded runners and equal per-boundary validation work. The
+all-layer analyzer used `source-02.tar.gz`, SHA256
+`434f19ceb38d92d6824e09a5267b53b9695d2be528269f7fed8a86b5f431b636`;
+its sidecar records the exact source hashes before the CLI gained automatic
+source-hash emission. The replay module and production controller are unchanged
+between those exports. The physical receipts retain all 546 file hashes. The physical implementation
+and production policy still match those hashes. A subsequent offline-only LFU
+fix treats an unseen frequency as zero (rather than LRU's -1 sentinel) when an
+explicit one-observation admission threshold is used; 864 repeated recorded LFU
+fixtures verify unchanged results with the measured two-observation threshold.
+
+| Receipt | Result and scope |
+| --- | --- |
+| `routing-capture/` | Eighteen authored C1 nonspeculative requests across six workload labels, 48 layers, native vLLM exported IDs. Six training requests and twelve held-out requests supply 1,650,240 total selections. Responses, prompts, checkpoint/source identity, script backups, restoration and health checks are retained. |
+| `capture-checkpoint-fields.json` | Capture host and SM120 host agree on the native layer-zero field hash; its authoritative full digest is recorded below. |
+| `replay-first/`, `replay-equivalence.json` | The initial analysis is interrupted after redundant future-use computation proves slow. All 841 completed records are exactly equal to the corresponding amortized-analysis records. No policy semantics change. |
+| `replay-second/`, `summary.json` | 48 locality records and 3,744 offline policy fixtures complete. Budgets 128/256/384; learned/positional starts; windows 4/16/128. |
+| `workload-{agent,chat,code,math,multilingual,prose}/` | 216 additional offline comparisons on layers 0/12/24/47, with workload-specific training, held-out evaluation and retained per-window/miss details. |
+| `fills-qualified/` | Twenty alternating uninstrumented transactions per arm, plus two instrumented transactions, on GPU `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`. Complete median wall times: exchange 1.244 ms, pinned fill 0.538 ms, pageable fill 0.601 ms, staged fill 0.784 ms. Native numerical and same-graph checks pass after every transaction. |
+| `fills-peer/` | Twenty transactions per arm plus two instrumented samples on GPU `GPU-47363510-b87a-13a5-4824-2542e97df76c`, source-02. Medians 1.268/0.626/0.673/0.846 ms. Unseeded supplementary run; no cross-card performance ratio asserted. |
+| `trace-native-qualified/` | 2,292 held-out layer-zero invocations, 256 resident experts, window 16, 142 promotions. Static cold selections 7,040 versus adaptive 7,323. Operator-event plus transaction-wall totals: static 1,127.54 ms, exchange 1,320.30 ms, canonical fill 1,205.76 ms. Ratios adaptive/static: 1.171 and 1.069; both lose. Synthetic activations and excluded engine/control/input-copy cost preclude serving claims. |
+| `fills-01/`, `fills-02/`, `trace-native-01/` | Preliminary complete-transaction runs remain preserved. The preliminary route replay used unseeded activations and unequal validation frequency; its timing is not the headline comparison. The seeded, equally validated run confirms the unfavorable adaptive outcome. |
+| `host-first.log`, `host-second.log`, `host-final.log`, `host-reviewed.log` | Respectively 33/66/107/108 passed, with 2/3/3/3 CUDA skips. Reviewed suite: 3.42 s. Final suite covers shared policy/exchange regressions, locality, censoring, train/test separation, import integrity and canonical recovery faults. |
+| `gpu-first.log`, `gpu-second.log`, `gpu-qualified.log` | Respectively 23/32/32 passed. Final run: 31.39 seconds, including 11 GPU cases and 21 host cases. Tests include int32/int64 routes, changed live counts, changed inputs, generation/map checks, stable pointers, no Torch replay allocator events, retained programs and recovery after submitted writes. |
+| `memcheck-small.log`, `synccheck-small.log`, `.exit` files | One bounded native graph/fill test passes under each tool: 39.73/18.61 seconds, exit zero, zero reported errors. The transaction/test files match final source. Earlier full-suite timeouts remain separate incomplete gates. |
+| `recovery/`, `bench-recovery.py` | Twenty-four submitted-write fault cases restore the victim, map, generation and native graph output. Four samples per transport/point. Pinned/pageable/staged median failed-transaction-plus-recovery wall times: 0.887/0.844/1.023 ms after first payload write; 0.854/0.898/0.996 ms after publication. Benign injected exceptions do not establish recoverability or latency of real CUDA device faults. |
+| `lfu-reviewed-{0,1,2,3}/`, `lfu-equivalence.json` | All 864 LFU comparisons repeat exactly after correcting the non-default unseen-frequency score margin. Locality records also match. |
+| `host-topology.txt`, `hardware-after.txt`, runner manifests | PCIe Gen4 ×16, one NUMA node, CPU affinity 0–63, dynamic clocks and 145 W power limits. Both GPUs return idle; no ripper service is stopped. No multi-NUMA comparison, SM103 run or overlap measurement is available. |
+
+The authoritative checkpoint field SHA256 in `capture-checkpoint-fields.json`
+and every physical manifest is
+`05384d5b0bbe71843464786f15391673847f5eaa9fa08e2a2e8309ab80c6c90e`.
+This identifies the 4,608 native layer-zero source fields, not the complete
+checkpoint or a quality evaluation. The environment/container matches the
+preceding SM120 cost report. GPU runs are serialized across physical cards.
+
+Decisions and rejected extensions:
+
+- Real-routing locality is sufficiently nonuniform to retain per-layer analysis.
+  At half residency, learned static initialization reduces held-out cold
+  selections from 48.84% positional to 22.16%. The mixed-workload blend is an
+  explicit experiment, not an automatic production profile merge.
+- Earned promotion hits do not establish net benefit. Layer zero earns 1,706
+  later hits but loses another 1,989 resident selections through eviction.
+  Thirty-five of 86 completed promotion lifetimes have zero hits. Static wins
+  even with the cheaper fill; the policy is not retuned against these prompts.
+- Canonical fill remains a benchmark primitive. It has a complete recovery
+  protocol but consumes canonical backing for hot experts; the shared exclusive
+  map contract and a pageable/mmap miss service still need explicit design.
+- Pinned canonical copies are faster here, but the experiment does not justify
+  pinning entire checkpoints. The bounded staged transport is measured while a
+  separate mapped canonical layer continues to serve misses. In allocation
+  manifests, `extra_pageable_source_bytes` records bytes referenced by the fill
+  source; all arms share the loader's one pageable source dictionary, so those
+  entries must not be summed as additional allocations.
+- No spare slot, asynchronous overwrite, hot-first kernel, fused profiler,
+  production LRU/LFU implementation or fused-MoE rewrite is added. The traces
+  lack GPU scheduling timestamps and cannot establish overlap opportunity.
+- Accepted-token exports cannot recover rejected speculative work or concurrent
+  invocation grouping. The importer requires the explicit C1/no-speculation
+  contract instead of fabricating these dimensions.
+- The corpus cannot resolve a 512-invocation within-request horizon. Censored
+  observations remain unavailable rather than being labeled non-reuse.
+- Historical 141/181-fixture spectra and failed sanitizer runs remain unchanged.
+  There is no new SM103 compiler census or physical B300 performance claim.
+
+The reviewed offline-source archive is `source-04-reviewed.tar.gz`, SHA256
+`ee207cfc3721acce3f87572dea9053c96a614b877b6c005cdb27b3816ac1b622`.
+The 864 LFU fixtures and 48 repeated locality records match exactly after the
+non-default score correction. The physical source-03 receipts remain tied to
+their original hashes; their transaction, kernel, production-policy and native
+replay implementations are unchanged by the offline comparison correction.
+
+The immutable evidence bundle is `evidence.tar.gz`, SHA256
+`e36af6f16eb618ee763baf6542571570dcf529834d4dce6cfe5c4c92c751ceb9`.
+All 166 member files in its receipt manifest were hash-verified after packaging.

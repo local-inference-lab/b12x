@@ -203,6 +203,8 @@ class Experiment:
         cache_dir=None,
         backing_write_combined=True,
         journal_write_combined=True,
+        canonical_backing=False,
+        initial_hot=None,
     ):
         self.tiers, self.graphs, self.journal_owner, self.session = [], [], None, None
         try:
@@ -215,6 +217,8 @@ class Experiment:
                 cache_dir=cache_dir,
                 backing_write_combined=backing_write_combined,
                 journal_write_combined=journal_write_combined,
+                canonical_backing=canonical_backing,
+                initial_hot=initial_hot,
             )
         except BaseException:
             self.close()
@@ -231,6 +235,8 @@ class Experiment:
         cache_dir,
         backing_write_combined,
         journal_write_combined,
+        canonical_backing,
+        initial_hot,
     ):
         from .sm120_residency_support import compile_support, invoke
 
@@ -250,13 +256,21 @@ class Experiment:
             raise ValueError(
                 "require nonempty hot/cold tiers and positive capacity/top-k"
             )
+        initial_hot = tuple(range(hot)) if initial_hot is None else tuple(initial_hot)
+        if len(initial_hot) != hot:
+            raise ValueError("initial hot population differs from admitted capacity")
         self.placement = ExpertPlacement(
             total_experts=self.e,
-            resident_expert_ids=tuple(range(hot)),
-            backing_expert_ids=tuple(range(hot, self.e)),
+            resident_expert_ids=initial_hot,
+            backing_expert_ids=tuple(e for e in range(self.e) if e not in initial_hot),
         )
         for t, ids in enumerate(
-            (self.placement.resident_expert_ids, self.placement.backing_expert_ids)
+            (
+                self.placement.resident_expert_ids,
+                range(self.e)
+                if canonical_backing
+                else self.placement.backing_expert_ids,
+            )
         ):
             self.tiers.append(
                 make_tier(
@@ -269,7 +283,14 @@ class Experiment:
             )
         self.control_tier = make_tier(source, range(self.e), self.device, mapped=False)
         self.mapping = torch.tensor(
-            self.placement.expert_map, dtype=torch.int32, device=self.device
+            tuple(
+                (0, initial_hot.index(e)) if e in initial_hot else (1, e)
+                for e in range(self.e)
+            )
+            if canonical_backing
+            else self.placement.expert_map,
+            dtype=torch.int32,
+            device=self.device,
         )
         self.maps = torch.empty(2, self.e, dtype=torch.int32, device=self.device)
         self.identity = torch.arange(self.e, dtype=torch.int32, device=self.device)
@@ -311,6 +332,33 @@ class Experiment:
             transfer=_CudaTransfer(self.device),
             owner=self.journal_owner,
         )
+        if canonical_backing:
+            from .sm120_canonical_fill import CanonicalFills
+
+            tier = self.tiers[1]
+            cpu_fields = {
+                name: tier.owner.host_view[
+                    value.data_ptr() - tier.slab.data_ptr() : value.data_ptr()
+                    - tier.slab.data_ptr()
+                    + value.numel()
+                ].view(value.shape)
+                for name, value in tier.fields.items()
+            }
+            for name, value in cpu_fields.items():
+                if not torch.equal(value, source[name]):
+                    raise AssertionError("canonical backing differs from source bytes")
+            self.updates = CanonicalFills(
+                resident=self.tiers[0].fields,
+                canonical=cpu_fields,
+                mapping=self.mapping,
+                expert_map=tuple(
+                    (0, initial_hot.index(e)) if e in initial_hot else (1, e)
+                    for e in range(self.e)
+                ),
+                before=before,
+                after=after,
+                transfer=_CudaTransfer(self.device),
+            )
         self.row_bytes = sum(v[0].numel() for v in source.values())
         self.session = PreparationSession(
             device=self.device, autotune=False, compile_workers=0, cache_dir=cache_dir

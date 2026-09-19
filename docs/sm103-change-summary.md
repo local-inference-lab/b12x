@@ -14,6 +14,12 @@ The [SM120 cost diagnosis](expert-residency-sm120-costs.md) restricts shared
 W4A16 lookup staging to Trellis payloads and adds an explicit cacheable option
 to mapped-host allocation. Existing SM103 storage defaults remain unchanged.
 
+The [routing-locality and canonical-fill experiment](expert-cache-evolution.md)
+adds held-out real-route analysis and a recoverable SM120 fill prototype at
+benchmark scope. It leaves shared policy and static SM103 preparation unchanged.
+Cheaper PCIe fills do not establish profitable adaptation or Grace-backed TMA
+legality; physical B300 qualification remains required.
+
 ## Implemented features
 
 | Feature | Implementation |

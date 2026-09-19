@@ -12,6 +12,10 @@ The [spectrum report](expert-residency-sm120-spectrum.md) retains the measured
 baseline at `d4eb33e8`. The [engineering ledger](expert-residency-ledger.md)
 identifies raw receipts and their source exports.
 
+The separate [canonical-fill and routing-locality report](expert-cache-evolution.md)
+measures complete recoverable fills and held-out real-route replay. The transport
+lower bounds and synthetic spectrum below remain bound to their original source.
+
 ## Empty-tier work
 
 The fused W4A16 constructor previously enabled a 4 KiB SQG lookup-table copy
