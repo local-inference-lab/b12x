@@ -769,3 +769,154 @@ Next evidence, in order: native static and same-graph policy correctness on B300
 full-MoE observer overhead and actual exchange pauses/C2C traffic; then balanced
 static, observed-static and adaptive lanes on fixed and shifting traffic. Only
 those measurements can justify a cost model, spare backing or concurrent work.
+
+## Shared residency extraction evidence
+
+This extraction starts from `181e234b5320eae67f7e1096672129d01c14ff09`, with
+master base `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. A fresh fetch on
+September 18, 2026 found no missing master commits; master was not edited.
+The tested package SHA256 is
+`2400c738ec87ea2ac71e21a426b1de4f315c66e6e05a642578c1828f677e60d1`.
+The local checkout and remote exported package hashes match.
+
+### Result and boundaries
+
+The shared `b12x.moe.residency` namespace owns canonical placement, cumulative
+observation contracts, generation snapshots and recent-frequency host policy.
+Its import and an actual decision/acknowledgement succeed with Torch, CUDA,
+CUTLASS, Triton, preparation and fused-MoE imports explicitly blocked. A five-expert
+host test exercises arbitrary payload accounting without an MXFP4 geometry.
+
+The SM103 fused-MoE constructor remains a thin adapter with unchanged arguments.
+It validates native layer/counter metadata and supplies successful payload/map
+copy accounting. Shared types retain aliases at existing public paths. Two
+fixtures generated from the starting source verify unchanged schema-1/schema-2
+profile payloads and hashes; strict native recipe and integrity rejection remain.
+Preparation, private storage, counters, kernels, transactions and the static
+default are unchanged. Backend capability descriptors do not qualify hardware.
+
+The [subsystem guide](expert-residency-subsystem.md) specifies extension and
+ownership contracts. Native automatic profile derivation and HBM/Grace admission
+remain backend-specific: their formulas describe actual native storage and
+private scratch. Merely renaming these limits would not support other physical
+memory topologies or prevent shared-pool double counting.
+
+### Files changed
+
+| File | Purpose |
+| --- | --- |
+| `b12x/moe/residency/__init__.py` | Shared public host namespace |
+| `b12x/moe/residency/contracts.py` | Placement, observations, generations, exchange guarantees and copy accounting |
+| `b12x/moe/residency/policy.py` | Extracted recent-frequency policy with backend-supplied accounting |
+| `b12x/moe/__init__.py` | Lazy shared namespace without GPU-op registration |
+| `b12x/moe/fused_moe/residency_cache.py` | Compatible SM103 policy adapter |
+| `b12x/moe/fused_moe/residency.py` | Shared placement view and update-capacity alias; unchanged profile fields |
+| `b12x/moe/fused_moe/automatic.py` | Shared observation type aliases |
+| `b12x/moe/fused_moe/_residency_updates.py` | Shared snapshot/error aliases; transaction unchanged |
+| `b12x/moe/fused_moe/_routing_profile_tuning.py` | Shared phase vocabulary |
+| `b12x/moe/fused_moe/routing_profile.py` | Shared observation types |
+| `b12x/moe/fused_moe/api.py` | Explicit exports for existing update/cache entry points |
+| `tests/moe/test_shared_residency.py` | Backend independence, capability rejection, accounting and compatibility tests |
+| `tests/moe/fixtures/residency-schema1.json` | Pre-extraction layer artifact |
+| `tests/moe/fixtures/residency-schema2.json` | Pre-extraction automatic artifact with fixed timestamp |
+| `docs/expert-residency-subsystem.md` | Shared architecture, backend requirements and compatibility |
+| `docs/expert-residency-cache.md` | Shared policy/native adapter distinction |
+| `docs/expert-residency.md` | Shared contract entry point |
+| `docs/sm103-readiness-report.md` | Source-bound gates and known registry failure |
+| `docs/sm103-change-summary.md` | Extraction behavior and validation |
+| `docs/expert-residency-ledger.md` | Evidence and rejected scope |
+
+### Validation commands and receipts
+
+Raw receipts are outside the repository at
+`/home/jasonc/b12x-residency-extraction-evidence-20260918/`.
+`source-final.json`, `source-manifest.json`, `source-final.tar.gz`, compiler manifests and
+`portable-source-toolchain-final.json` identify the tested sources. The remote export
+is `/home/jasonc/b12x-residency-extraction-20260918` on ripper. Final source
+manifests include documentation edits made after the package was frozen.
+
+```bash
+TMPDIR=/home/jasonc/b12x-residency-extraction-evidence-20260918/tmp \
+  .venv/bin/python -m pytest tests/moe/test_shared_residency.py \
+  tests/moe/test_residency_cache.py tests/moe/test_residency_updates.py \
+  tests/moe/test_automatic_residency.py tests/moe/test_expert_residency.py \
+  tests/moe/test_sm103_residency.py tests/moe/test_fused_moe_variant_selection.py \
+  tests/preparation tests/architecture -q
+.venv/bin/python scripts/compile_sm103_prepared.py --output-dir RECEIPTS/prepared-final \
+  --case moe:residency --case moe:residency_updates \
+  --case moe:routing_profile --workers 2
+python -m pytest tests/moe/test_residency_cache_gpu.py \
+  tests/moe/test_residency_updates_gpu.py tests/moe/test_routing_profile_gpu.py \
+  tests/moe/test_residency_kernels.py tests/moe/test_sm103_residency.py -q
+compute-sanitizer --tool memcheck --error-exitcode 91 \
+  python -m pytest tests/moe/test_residency_cache_gpu.py -q
+compute-sanitizer --tool synccheck --error-exitcode 91 \
+  python -m pytest tests/moe/test_residency_cache_gpu.py -q
+```
+
+| Receipt | Result and scope |
+| --- | --- |
+| `host-accepted-final.log` | **1,052 passed, 66 skipped**, including 15 shared-subsystem tests; 31.99 s |
+| `prepared-final/manifest.json` | **3 declarations, 14 distinct programs and 14 native SM103 exports**, zero failures, CUDA uninitialized, source unchanged |
+| `portable-final.log` | **22 passed, 11 SM103 skips**, 13.35 s; prepared counters, partitioner, mapped-host byte probes, slot exchanges and unchanged graph replay |
+| `memcheck-final.log` | **2 passed, 2 SM103 skips, zero errors**, 123.88 s |
+| `synccheck-final.log` | **2 passed, 2 SM103 skips, zero errors**, 48.06 s |
+| `host-initial.log`, `registry-baseline.log` | Separate registry gate has **5 failures** from MXFP6 metadata/registration, reproducing at untouched starting HEAD; baseline has 4 registry passes |
+
+Local compilation uses Torch 2.14.0, CUTLASS DSL 4.6.2 and Triton 3.8.0. The
+remote image identity is
+`sha256:955e088a85b5378b00275842bc839eea8cb04ca0782ed79eaa3a967d11fd22e5`:
+Torch 2.13.0, Torch CUDA 13.3, CUTLASS DSL 4.6.2,
+Triton `3.7.1+gitf797708c.nv26.7`, cuda-bindings 13.0.3. Remote commands mount
+that isolated binding directory at `/cuda-bindings` and use
+`PYTHONPATH=/workspace:/cuda-bindings`.
+
+Both physical devices are RTX PRO 4000 Blackwell SM120 in default compute mode,
+driver 580.173.02. Portable/synccheck use
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`; memcheck uses
+`GPU-47363510-b87a-13a5-4824-2542e97df76c`. No service was stopped. Durations
+above are test wall times, not performance measurements. Existing compiler
+warnings concern the 128-iteration scale-padding loop.
+
+The full 85-declaration/241-program/235-native-export resource census remains
+historical evidence for `94639562`. No kernel, tuning query or candidate set was
+added; the extraction rechecks the three composing declarations. No resource or
+performance improvement is claimed. Physical B300, Grace-backed TMA, native
+operator parity and end-to-end serving remain deferred; exact physical commands
+remain in the cache guide and qualification runbook.
+
+### Retained failures and rejected scope
+
+- A final whitespace check removed two trailing blank lines from the shared
+  contract module. Host, focused compiler, portable and sanitizer gates were
+  repeated on the final package hash. Earlier passing receipts remain under
+  their unsuffixed filenames and bind package `ea200747…`; they are not
+  substituted for final-source evidence.
+
+- Initial fixture generation hit the host `/tmp` disk quota while writing an
+  atomic profile. The external evidence directory supplied `TMPDIR` for the
+  successful retry; `fixture-initial-failure.txt` records the failure.
+- Two early test runs used an incorrect error-message assertion for corruption.
+  A workload edit was rejected at identity validation, and a corrupted hash was
+  rejected with `integrity mismatch`. The final test changes the hash and checks
+  the existing integrity error; validation was not weakened. `shared-initial.log`
+  and `host-final.log` preserve both failed assertions.
+- The repository-wide registry tests fail at untouched `181e234b` because
+  `quantization.mxfp6` is registered without the expected public `api.py`/`META`
+  facade. Extraction does not alter that subsystem. The independent shared import
+  test passes; registry repair remains a separate integration gate.
+- A generic allocator, speculative N-tier model, staged-miss backend, concurrent
+  exchange and automatic policy selection were not introduced. The implemented
+  backend is exclusive HBM/Grace, and another physical topology needs real
+  admission and execution contracts.
+- Copy accounting remains backend-supplied; no transfer-cost model or predicted
+  throughput is inferred from recent counts. Router rows remain immutable.
+- Moving the native geometry-aware profile optimizer merely for namespace
+  symmetry was rejected. Its schema and hardware validation remain intact.
+- `github-start-status.json` and `github-start-checks.json` record zero statuses
+  and zero check runs for `181e234b`. Local receipts do not replace independent CI.
+
+The next evidence priorities remain physical SM103 correctness and Grace TMA
+legality, complete-MoE profiling/pause measurements, then engine integration and
+workload-shift experiments. No additional backend optimization is justified by
+this host-code extraction alone.

@@ -24,6 +24,7 @@ pending PR CI and physical-target qualification.
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
 | Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |
 | Static placement profiles and operator qualification | [Offline profiling](../scripts/build_expert_residency_profile.py) ranks expert selections independently per layer and emits versioned workload artifacts with expected cold fractions. The [residency benchmark](../benchmarks/moe/expert_residency.py) requires physical SM103 and records all-HBM parity, graph invariants, total latency and isolated per-stage samples. |
+| Shared expert residency contracts | [`b12x.moe.residency`](../b12x/moe/residency/__init__.py) owns canonical placement, counter/generation snapshots and host recent-frequency policy. The existing fused-MoE constructor adapts native geometry and copy accounting; fixed-address storage/execution remains preparation-owned. |
 | Reproducible validation | [Preparation compiler](../scripts/compile_sm103_prepared.py), [kernel corpus compiler](../scripts/compile_sm103.py), resource auditors and the [qualification launcher](../scripts/qualify_sm103.py) preserve source and artifact identity. |
 
 ## Fixes required by preparation and execution
@@ -78,12 +79,16 @@ is claimed.
 ## Validation and PR acceptance
 
 The [readiness report](sm103-readiness-report.md) gives the validation totals for
-the cache-policy source: 1,037 host passes, 22 portable GPU passes and three
+the shared-residency source: 1,052 host passes, 22 portable GPU passes and three
 fresh focused SM103 declarations covering 14 programs. The full 85-declaration,
 241-program receipt remains tied to `94639562`. Physical-only skips remain separate. The [engineering ledger](expert-residency-ledger.md)
 separates that evidence from the static-residency baseline at `78a8704f` and
 retains failed runs. Counter overhead measurements on SM120 describe only the
 partition/counter stage; they establish no B300 or whole-model throughput.
+
+The separate repository registry suite has five MXFP6 metadata failures that
+also reproduce at untouched `181e234b`; that gate remains unresolved. Shared
+namespace import isolation and artifact compatibility pass.
 
 Validation remains source-bound local evidence. The wheel-release workflow has
 no pull-request trigger, so PR test CI must be enabled and pass independently.
@@ -111,3 +116,8 @@ worker control-plane and routing hooks. They are implemented b12x APIs, not an
 installed vLLM serving feature. Engine configuration, phase classification,
 quiescent polling, rank coordination and restart still belong to the integration.
 The hooks do not port the older companion branch implicitly.
+
+The [shared residency guide](expert-residency-subsystem.md) defines backend and
+engine responsibilities. Existing fused-MoE imports and serialized placement
+profiles remain compatible; a reusable host policy does not imply execution
+support on another platform.

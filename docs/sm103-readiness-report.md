@@ -17,13 +17,16 @@ The [expert residency contract](expert-residency.md) and
 boundaries, memory admission, exact qualification commands and retained failures.
 The [automatic SM103 guide](expert-residency-automatic.md) documents the lifecycle,
 configuration and explicit engine hooks. The [slot exchange contract](expert-residency-slots.md)
-specifies opt-in fixed-address replacement at a scheduler pause.
+specifies opt-in fixed-address replacement at a scheduler pause. The
+[shared residency subsystem](expert-residency-subsystem.md) separates host
+contracts/policy from the SM103 execution adapter.
 
 | State | Evidence and limits |
 | --- | --- |
-| Implemented and compiled through preparation | The full corpus at `94639562` covers 85 declarations and 241 distinct SM103 programs with CUDA uninitialized. The cache-policy source rechecks its three composing declarations and 14 programs. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |
+| Implemented and compiled through preparation | The full corpus at `94639562` covers 85 declarations and 241 distinct SM103 programs with CUDA uninitialized. The shared-residency source rechecks its three composing declarations and 14 programs. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |
 | Hierarchical MXFP4 expert residency implemented | Immutable per-layer profiles and memory budgets prepare HBM and exact-size mapped Grace slabs. Native MXFP8/MXFP4 projections consume compact tier-local routes and produce unfinalized expert outputs for one original-top-k-order FP32 FMA reduction. Checkpoint weight bytes remain unchanged. |
 | Quiescent slot exchange implemented | Declared rollback journals, disjoint canonical-ID pairs, synchronized payload/map commit, stale-generation rejection and fail-closed rollback preserve captured addresses. Portable byte-replay tests pass; SM103 TMA and native-operator exchange parity remain physical gates. |
+| Shared residency subsystem implemented | Standard-library-only placement, observation and generation contracts plus host cache policy; the SM103 adapter supplies numerical admission and copy accounting. Existing imports and schema-1/schema-2 profile hashes are preserved. No additional execution backend is qualified. |
 | Experimental cache policy implemented | Recent-window canonical counts identify observed cold selections for one unchanged generation. Explicit admission, score-margin, residency-age and batch limits propose existing quiescent exchanges; static profiles/defaults remain unchanged. Portable same-graph policy loops pass; serving-engine integration and adaptive benefit remain unqualified. |
 | Automatic residency implemented | Typed off/profile/auto/monitor modes, balanced cold-start placement, joint HBM/Grace admission, conservative activation, checkpoint/workload/recipe validation, atomic profiles, windowed convergence and drift diagnostics. Serving placement stays static; activation requires an engine-controlled restart. |
 | Prepared counter profiling implemented | CuTe uint64 counters use retained programs and stable storage. Off has no counter node. External/native routing integration uses explicit worker hooks; the companion loader/control-plane wiring remains required. |
@@ -40,21 +43,22 @@ separate tests. BTX GPU preparation tests use SM103 admission metadata on SM120 
 
 ## Source-bound validation
 
-The recent-frequency policy evidence binds package SHA256
-`12217a30f50be813bbbf7c5b95253b1af12fde5d29ae41d7f101c5700d9f587a`.
-The [engineering ledger](expert-residency-ledger.md#grace-served-cache-policy-evidence)
+The shared-residency extraction evidence binds package SHA256
+`2400c738ec87ea2ac71e21a426b1de4f315c66e6e05a642578c1828f677e60d1`.
+The [engineering ledger](expert-residency-ledger.md#shared-residency-extraction-evidence)
 records commands, source manifests, toolchains and receipts. Validation used
-edits atop `94639562`; the package hash identifies the tested implementation
+edits atop `181e234b`; the package hash identifies the tested implementation
 independently of documentation and the subsequent commit.
 
 | Gate | Result and scope |
 | --- | --- |
-| Host preparation, architecture and selected MoE suites | 1,037 passed, 66 skipped, including 16 recent-frequency policy tests and exchange/automatic-residency regressions. |
+| Host preparation, architecture and selected MoE suites | 1,052 passed, 66 skipped, including 15 shared-contract/import/artifact tests, 16 recent-frequency policy tests and exchange/automatic-residency regressions. |
+| Repository-wide registry check | 4 passed, 5 failed; the same five MXFP6 metadata/registry failures reproduce on untouched `181e234b`. This separate gate is unresolved. |
 | Portable residency, counters, exchange and policy loop | 22 passed, 11 physical-SM103 skips on SM120. The policy tests run existing counters, partitioner and slot copies through changing workloads, preserving payload bytes, graph identity, addresses and allocator counters. |
 | Policy-loop sanitizers | 2 passed, 2 SM103-only skips under each of memcheck and synccheck, zero errors. Portable byte probes do not execute native SM103 expert MMA. |
-| Fresh focused SM103 compilation | Static residency, update-enabled residency and routing profiling: 3 declarations, 14 distinct programs/native CuTe exports, CUDA uninitialized. Policy adds no kernel and changes no preparation query. |
-| Historical full compiler/resource census | Package `dbc81a14…` at `94639562` retains 85 declarations/241 programs/235 native exports and 12 production-geometry residency entries. FC1/FC2 used 142/140 registers, 1,024 static plus 51,328 dynamic SMEM bytes and no stack/local memory. This full census was not repeated for host-only policy logic. |
-| Historical policy/attention validation | Package `6b1c98b0…` retains its separate host/attention and counter sanitizer receipts. These runs are not attributed to the cache-policy source. |
+| Fresh focused SM103 compilation | Static residency, update-enabled residency and routing profiling: 3 declarations, 14 distinct programs/native CuTe exports, CUDA uninitialized. Extraction adds no kernel and changes no preparation query. |
+| Historical full compiler/resource census | Package `dbc81a14…` at `94639562` retains 85 declarations/241 programs/235 native exports and 12 production-geometry residency entries. FC1/FC2 used 142/140 registers, 1,024 static plus 51,328 dynamic SMEM bytes and no stack/local memory. This full census was not repeated for the shared host contracts/policy. |
+| Historical policy/attention validation | Package `6b1c98b0…` retains its separate host/attention and counter sanitizer receipts. These runs are not attributed to the shared-residency source. |
 | Historical portable profiler diagnostic | Package `aac5c587…` measured off/on/sampled partition stages for M=1 through 128 and top-k=1/6/8. These measurements motivate explicit profiling; they are not B300/full-MoE or adaptive-cache timings. |
 
 The [cache guide](expert-residency-cache.md) separates cold observations,
@@ -74,7 +78,7 @@ all-cold compiler variants, portable arithmetic and W4A16/pooled-selection tests
 
 ## Remaining acceptance gates
 
-GitHub reports zero commit statuses and zero check runs for the reviewed starting source `94639562` as of
+GitHub reports zero commit statuses and zero check runs for the reviewed starting source `181e234b` as of
 September 18, 2026. The
 [wheel-release workflow](../.github/workflows/lil-cu134-wheel-release.yml)
 runs on selected branch/tag pushes or manual dispatch; it does not run on pull

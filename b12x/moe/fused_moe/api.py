@@ -240,6 +240,15 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "ResidencyUpdateCapacity",
+    "ResidencySlotSnapshot",
+    "ResidencyUpdateError",
+    "residency_slot_snapshot",
+    "exchange_expert_slots",
+    "ResidencyCacheConfig",
+    "ResidencyCacheController",
+    "ResidencyCacheDecision",
+    "ResidencyCacheOutcome",
     "AutomaticResidencyConfig",
     "ResidencyCalibrationConfig",
     "ResidencyMonitorConfig",

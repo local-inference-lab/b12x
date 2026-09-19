@@ -14,10 +14,11 @@ import importlib
 from typing import Any
 
 _OP_MODULES = ("fused_moe", "ep_moe")
+_PUBLIC_MODULES = (*_OP_MODULES, "residency")
 
 
 def __getattr__(name: str) -> Any:
-    if name in _OP_MODULES:
+    if name in _PUBLIC_MODULES:
         module = importlib.import_module(f".{name}", __name__)
         globals()[name] = module
         return module
@@ -25,7 +26,7 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted(_OP_MODULES)
+    return sorted(_PUBLIC_MODULES)
 
 
-__all__ = list(_OP_MODULES)
+__all__ = list(_PUBLIC_MODULES)

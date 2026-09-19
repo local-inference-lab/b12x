@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "layers": [
+    {
+      "total_experts": 4,
+      "hbm_expert_ids": [
+        0,
+        2
+      ],
+      "grace_expert_ids": [
+        1,
+        3
+      ],
+      "layer": "layer.7",
+      "model_fingerprint": "sha256:test",
+      "workload": "agent",
+      "provenance": "trace:seed7",
+      "selection_counts": [],
+      "phase": "all",
+      "version": 1,
+      "profile_hash": "d15c6cd4c72af15f22f7cae6894a51adc5679111f1cd5ecc04ff593e246896e7"
+    }
+  ]
+}

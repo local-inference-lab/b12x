@@ -1,7 +1,10 @@
 # Grace-served misses and quiescent promotion
 
 Status: **implemented experimental control-plane policy**. The policy composes
-existing prepared routing counters and journaled slot exchange. Portable tests
+existing prepared routing counters and journaled slot exchange.
+Its host contracts and decisions live in the shared
+[`b12x.moe.residency` subsystem](expert-residency-subsystem.md); the
+`fused_moe.ResidencyCacheController` entry point supplies the SM103 adapter. Portable tests
 prove observation, decision, exchange and reuse of the same captured graph.
 Native SM103 execution, Grace-backed TMA and adaptive performance remain
 **unqualified**. This is not an installed vLLM cache or a concurrent replacement
@@ -177,8 +180,9 @@ Immutable decisions/outcomes can be logged with `dataclasses.asdict`:
 - Observed HBM hits after promotion, including hits recorded before an expert is
   evicted. Hits exclude the window that motivated its promotion. They establish
   reuse, not causal gains over every possible static profile.
-- Committed payload/map copy volume. Payload bytes are four times expert size
-  per pair; maps include read and publication. These are successful API-copy
+- Committed payload/map copy volume supplied by the backend exchange contract.
+  For the SM103 adapter, payload bytes are four times expert size per pair; maps
+  include read and publication. These are successful API-copy
   bytes, not measured C2C traffic, and exclude failed attempts/rollback traffic.
 
 Copy volume describes the policy owner's local expert shard; aggregate rank-local
