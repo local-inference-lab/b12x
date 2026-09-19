@@ -344,7 +344,7 @@ selection-cache inputs; compiled kernels do not change when the tuning
 workload changes. These are coverage points, not a claim that every model
 or layer follows a uniform distribution of sharing levels.
 
-The assumption is informed by DSV4.1 TP4 serving observations on GB10: 179,600
+The 40% mean is informed by DSV4.1 TP4 serving observations on GB10: 179,600
 target-layer calls from short/medium-context reasoning and code requests showed
 36–42% reuse at observed 5/7/8-row verification sizes. The separate drafter was
 more concentrated (about 62% reuse). Raw traces are diagnostic artifacts, not
