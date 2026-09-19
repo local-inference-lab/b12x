@@ -6,6 +6,7 @@ import torch
 from b12x._lib.compile_plan import compiled_program_available, load_programs, program_keys
 from b12x._lib.compile_pool import CompileJob, compile_in_process, describe_compilation
 from b12x.comm.pcie._owner_preparation import compile_owner_surface
+from b12x.comm.pcie._dcp_preparation import compile_dcp_surface
 from b12x.comm.pcie._tuning import PcieQuery, TUNING
 from b12x.preparation import FrozenMapping
 
@@ -37,5 +38,29 @@ def test_owner_compile_factory_retains_native_program(surface, vectorized):
     compile_in_process((description,))
     assert all(compiled_program_available(key) for key in description.programs)
     launchers = compile_owner_surface(payload, ordinal)
+    assert set(program_keys(launchers)) == set(description.programs)
+    load_programs(launchers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")
+@pytest.mark.parametrize("operation", [
+    "lse_reduce_scatter", "all_gather_heads", "all_gather_pair",
+    "all_gather_pair_kimi_topk", "kimi_topk16",
+])
+def test_dcp_compile_factory_retains_eager_and_graph_programs(operation):
+    query = PcieQuery(
+        surface=f"DcpAllToAll.{operation}", world_size=16, rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping({"threads": 256, "dtype": "bf16"}),
+        setup=FrozenMapping(),
+    )
+    payload = TUNING.encode_query(query)
+    ordinal = torch.cuda.current_device()
+    description = describe_compilation(CompileJob.create(
+        "b12x.comm.pcie._dcp_preparation:compile_dcp_surface", payload, ordinal
+    ))
+    assert len(description.programs) == (1 if operation == "kimi_topk16" else 2)
+    compile_in_process((description,))
+    launchers = compile_dcp_surface(payload, ordinal)
     assert set(program_keys(launchers)) == set(description.programs)
     load_programs(launchers)
