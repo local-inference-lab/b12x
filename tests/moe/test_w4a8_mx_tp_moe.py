@@ -1050,13 +1050,22 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         session.prepare((plan.request(name="w4a8-resident-grid", prepare_call=prepare),))
         expected_grid = min(2 * sms, max_active_clusters or 2 * sms)
-        assert calls and {grid for _, grid in calls} == {expected_grid}
-        prepared_callable = calls[-1][0]
         scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
                         for spec in plan.scratch_specs())
         output = torch.empty_like(x)
         storage = (*scratch, output, x, ids, scales)
         pointers = tuple(t.data_ptr() for t in storage)
+        # Compile planning may request the same callable with a placeholder
+        # grid. Observe an actual launch after preparation, not those requests.
+        binding = fused_moe.bind(
+            plan, scratch=scratch, a=x, topk_ids=ids, topk_weights=scales,
+            output=output, input_scales_static=True,
+        )
+        calls.clear()
+        fused_moe.run(binding=binding)
+        torch.cuda.synchronize()
+        assert calls and {grid for _, grid in calls} == {expected_grid}
+        prepared_callable = calls[-1][0]
         session.freeze()
         for rows in counts:
             binding = fused_moe.bind(
