@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from unittest.mock import Mock
 
 from b12x._lib.compile_plan import compiled_program_available, load_programs, program_keys
 from b12x._lib.compile_pool import CompileJob, compile_in_process, describe_compilation
@@ -9,6 +10,24 @@ from b12x.comm.pcie._owner_preparation import compile_owner_surface
 from b12x.comm.pcie._dcp_preparation import compile_dcp_surface
 from b12x.comm.pcie._tuning import PcieQuery, TUNING
 from b12x.preparation import FrozenMapping
+
+
+def test_prepared_pair_call_executes_both_output_bindings():
+    from b12x.comm.pcie._dcp_preparation import _DcpExecutionState, prepare_call
+    runtime = Mock()
+    first, second = torch.ones(2, 32), torch.ones(2, 16)
+    out_first, out_second = torch.empty(2, 64), torch.empty(2, 32)
+    query = PcieQuery(surface="DcpAllToAll.all_gather_pair", world_size=2,
+                     rank=0, topology="pcie_ipc", call=FrozenMapping(),
+                     setup=FrozenMapping())
+    state = _DcpExecutionState(query, runtime, {})
+    call = prepare_call(state, local_first=first, local_second=second,
+                        out_first=out_first, out_second=out_second, threads=128)
+    call.run()
+    runtime._all_gather_pair_on_device.assert_called_once_with(
+        first, second, out_first, out_second, state=state, threads=128,
+    )
+    assert call.output == (out_first, out_second)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")
