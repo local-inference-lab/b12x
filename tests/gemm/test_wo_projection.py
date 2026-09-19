@@ -294,11 +294,14 @@ def test_packed_decode_layout_matches_generic_projection(rows):
     device = torch.device("cuda", torch.cuda.current_device())
     groups, width, rank, hidden = 4, 4096, 1024, 4096
     source = torch.randn(rows, groups, width, device=device, dtype=torch.bfloat16) / 8
+    # Block scales vary across N and K; uniform scales would hide a bad index.
+    scales_a = torch.exp2(torch.randint(-2, 3, (groups * rank // 128, width // 128), device=device).float())
+    scales_b = torch.exp2(torch.randint(-2, 3, (hidden // 128, groups * rank // 128), device=device).float())
     weights = wo.pack_weights(
         (torch.randn(groups * rank, width, device=device) / width**0.5).to(torch.float8_e4m3fn),
-        torch.ones(groups * rank // 128, width // 128, device=device),
+        scales_a,
         (torch.randn(hidden, groups * rank, device=device) / (groups * rank)**0.5).to(torch.float8_e4m3fn),
-        torch.ones(hidden // 128, groups * rank // 128, device=device),
+        scales_b,
         groups=groups, group_width=width, rank=rank, hidden=hidden,
     )
     assert weights.wo_b.values_tiled is not None and weights.sfb_k_replicated
