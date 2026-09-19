@@ -354,9 +354,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     core = scratch._core_workspace_plan
     if core.full_rotation or core.projection_mixed_trellis:
         raise RuntimeError("standard W4A16 compiler adapter received a Trellis plan")
-    # Scratch rounds route storage up to a capacity bucket. Native direct
-    # launches must retain the declared variant's exact planned row count.
-    tokens = int(caps.max_tokens)
+    tokens = int(scratch.launch_plan.max_tokens_per_launch)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
     if weight_layout not in {"packed", "modelopt"}:
@@ -375,6 +373,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         props = torch.cuda.get_device_properties(core.device)
         compiler_args = dict(
             size_m=tokens, hidden_size=core.k, intermediate_size=core.n,
+            direct_token_capacity=int(caps.max_tokens),
             num_experts=core.weight_E, top_k=core.num_topk,
             activation=core.activation,
             apply_router_weight_on_input=caps.apply_router_weight_on_input,

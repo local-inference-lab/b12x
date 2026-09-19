@@ -68,8 +68,9 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
 @pytest.mark.parametrize("source_format", ["modelopt_nvfp4", "fp4_e8m0_k32"])
 @pytest.mark.parametrize("fused_sum", [False, True])
 @pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize("capacity", [14, 129])
 def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
-    source_format, fused_sum, mapped, monkeypatch
+    source_format, fused_sum, mapped, capacity, monkeypatch
 ):
     """One declared capacity serves changed inputs and live lengths without JIT."""
     from b12x.moe import fused_moe
@@ -78,7 +79,7 @@ def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
 
     monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", str(int(fused_sum)))
     torch.manual_seed(81281)
-    capacity, experts, hidden, intermediate, topk = 129, 8, 256, 192, 4
+    experts, hidden, intermediate, topk = 8, 256, 192, 4
     x = (torch.randn(capacity, hidden, device="cuda") * 0.125).to(torch.bfloat16)
     ids = torch.randint(experts, (capacity, topk), device="cuda", dtype=torch.int32)
     expert_map = None
@@ -197,7 +198,7 @@ def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
         scratch = allocate(state)
         pointers = tuple(t.data_ptr() for t in scratch)
         launchers = set()
-        for rows in (capacity, 17, 1, capacity - 1):
+        for rows in (capacity, min(17, capacity), 1, capacity - 1):
             oracle = expected(rows)
             with kernel_resolution_guard():
                 binding = fused_moe.bind(
