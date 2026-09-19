@@ -337,8 +337,8 @@ class _WOProjectionState:
                 ),
                 dtype=torch.uint8,
             )
-            if m % MXFP8_SCALE_ROW_TILE:
-                scale_physical_u8.fill_(127)
+            # Immediate producers overwrite every logical scale before GEMM.
+            # Padding belongs to masked rows; binding must only create views.
             scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(
                 3,
                 4,
