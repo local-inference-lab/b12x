@@ -777,8 +777,8 @@ def plan_moe_weight_preparation(
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
-    Shared NVFP4 recipes retain native weights and scales; uniform W4A16 uses
-    the packed MMA representation. Compact E8M0 K tails stay native. An
+    Shared NVFP4 recipes retain native weights and scales; uniform W4A16 defaults
+    to the packed MMA representation. Compact E8M0 K tails stay native. An
     explicit ``w4a16_layout`` is a development/deployment override, not an
     adapter-side reimplementation of the policy.
     """
@@ -947,15 +947,8 @@ def plan_moe_weight_preparation(
                     )
                     else PreparedWeightLayout.MMA_PACKED
                 )
-            if (
-                source_format == "modelopt_nvfp4"
-                and layout is PreparedWeightLayout.SOURCE_NATIVE
-                and not source_recipe_selected
-            ):
-                raise ValueError(
-                    "uniform NVFP4 W4A16 requires mma_packed storage; "
-                    "select shared NVFP4 recipes for native A16 promotion"
-                )
+            # An explicit native A16 contract preserves fixed expert slots.
+            # Uniform NVFP4 still defaults to the packed MMA representation.
             if (
                 source_format == "compressed_tensors"
                 and layout is not PreparedWeightLayout.MMA_PACKED

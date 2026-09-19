@@ -7,6 +7,9 @@ CuTe DSL. Supporting packing and metadata kernels may use Triton.
 The working branch is based on master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. The
 [readiness report](sm103-readiness-report.md) separates source-bound validation,
 pending PR CI and physical-target qualification.
+The [SM120 cache proof of concept](expert-residency-sm120-poc.md) reuses the
+shared host policy and exchange transaction with native NVFP4 W4A16 operations.
+It adds no SM103 kernel, component registration or production serving lane.
 
 ## Implemented features
 

@@ -920,3 +920,118 @@ The next evidence priorities remain physical SM103 correctness and Grace TMA
 legality, complete-MoE profiling/pause measurements, then engine integration and
 workload-shift experiments. No additional backend optimization is justified by
 this host-code extraction alone.
+
+## SM120 mapped-host cache proof of concept
+
+Status: **research-only native operator experiment**, validated on two physical
+RTX PRO 4000 Blackwell cards on `ripper` on 2026-09-18. The implementation is
+[`benchmarks/moe/sm120_residency_poc.py`](../benchmarks/moe/sm120_residency_poc.py);
+the [SM120 guide](expert-residency-sm120-poc.md) specifies its scope and commands.
+The working source is based on `7569c94a491ec319fabebfd2a41c578ce2d8cab0`, already
+containing master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`.
+
+### Changes and contracts
+
+- Explicit source-native ModelOpt A16 preparation uses the existing native
+  W4A16 representation. The default uniform-A16 MMA packing is unchanged.
+  An existing planner rejection prevented that explicit choice and was removed;
+  the weight-plan test now checks both default and explicit behavior.
+- A benchmark composes two ordinary prepared native operators, exact-size
+  mapped PCIe host storage, six-field rollback journals, prepared counters and
+  the shared host cache controller. It asserts retained source pointers, freezes
+  resolution, exchanges slots at a serialized pause and replays captured graphs.
+- A CuTe metadata helper derives tier maps and validates int64 IDs before
+  narrowing. A CuTe finalizer sums already weighted BF16 route outputs in original
+  order in FP32. It does not add the separately rounded tier outputs.
+- No SM103 kernel, tuning candidate set, preparation registration, automatic
+  placement algorithm or serving integration was added. The historical
+  85-declaration/241-program SM103 census remains tied to its recorded source.
+
+### Final source and results
+
+Raw artifacts reside outside the repository at
+`/home/jasonc/b12x-sm120-residency-evidence-20260918/`, with remote copies at
+`ripper:/home/jasonc/b12x-sm120-residency-results-20260918/`.
+The tested `source-final.tar.gz` has SHA256
+`37edb8645b6994af775f25ae2f137fef6b25bbac17398d7fbea6e9beb796244c`.
+`source-files-final.json` hashes package, experiment and focused test sources;
+package SHA256 is
+`3d8a44435651093068ee418c2e6d7893a19be305d527c5b53f0653e18baab9b7`.
+Documentation evidence annotations were added after this export; implementation
+and tests are identical to the exported files.
+
+| Receipt | Result |
+| --- | --- |
+| `host-final.log` | **170 passed, 6 skipped**, 6.41 s: MoE preparation corpus, SM103 contracts/defaults, native weight planning, shared contracts, policy, transactions and experiment loader tests |
+| `remote/gpu-final.log` | **16 passed, 2 deselected**, 16.98 s: focused experiment and NVFP4 preparation tests; the two large AUTO decode cases were deliberately excluded |
+| `remote/gpu-final.log`, targeted memcheck | Ordered-reduction helper: **1 passed, 4 deselected, zero errors**, 6.75 s; this is not a complete native-MoE sanitizer result |
+| `remote/checkpoint-final.json` and `.log` | **30 replay cases passed** at M=1,2,4 under capacity 4, including 18 policy windows, nine exchanges and 12 route-boundary cases |
+| `lint-final.log` | New experiment/support/test modules pass Ruff; whitespace checks pass |
+
+The full checkpoint-layer run uses E=512, H=2560, I=640, top-k=10 and an
+experimental 256/256 split. Each tier slab is **707,790,848 bytes**; the rollback
+allocation is **5,538,304 bytes**. The separate all-VRAM reference and private
+operator scratch consume additional VRAM. Loaded checkpoint fields hash to
+`05384d5b0bbe71843464786f15391673847f5eaa9fa08e2a2e8309ab80c6c90e`.
+All graph-captured pointers remained stable and all 18 measured policy windows
+had zero replay allocation/free events. Canonical router identity is unchanged.
+
+Repeated-expert policy windows matched the all-VRAM native control bitwise.
+Eleven of twelve route-boundary cases also matched bitwise. The remaining mixed
+case had maximum absolute error **3.814697265625e-6**, relative L2
+**0.0005540843121707439** and cosine **0.9999998211860657**. Diagnostic probes
+localized the difference before reduction: FC1 activation relative L2
+0.0001273119 and weighted FC2 relative L2 0.0002973982. The experimental finalizer
+matched the independent original-order FP32 sum of those BF16 rows exactly.
+Route-dependent native GEMM accumulation is consistent with this evidence;
+bitwise equivalence of arbitrary split and unsplit GEMMs is not claimed.
+
+GPU tests and targeted memcheck use
+`GPU-47363510-b87a-13a5-4824-2542e97df76c`; the full checkpoint layer uses
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`. Both are SM120, default compute mode,
+driver 580.173.02. No service was stopped. The container image is
+`sha256:955e088a85b5378b00275842bc839eea8cb04ca0782ed79eaa3a967d11fd22e5`,
+with Torch 2.13.0, CUDA 13.3, CUTLASS DSL 4.6.2, Triton
+`3.7.1+gitf797708c.nv26.7` and cuda-bindings 13.0.3. Commands mount the isolated
+binding directory at `/cuda-bindings` with `PYTHONPATH=/workspace:/cuda-bindings`.
+
+Final GPU commands inside that environment:
+
+```bash
+python -m pytest tests/moe/test_sm120_residency_poc.py \
+  tests/moe/test_nvfp4_auto.py -k 'not auto_native_decode' -q
+compute-sanitizer --tool memcheck --error-exitcode 99 python -m pytest \
+  tests/moe/test_sm120_residency_poc.py -k ordered_sum -q
+python -m benchmarks.moe.sm120_residency_poc \
+  --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 \
+  --experts 512 --hot-experts 256 --live 1 2 4 \
+  --source-revision 7569c94+export-37edb864 --receipt /results/checkpoint-final.json
+```
+
+### Retained failures and deferred work
+
+- Checkpoint discovery initially assumed a safetensors index. The export has
+  none; the implemented loader enumerates shard headers and checks missing and
+  duplicate fields. Source tensors retain their original quantized bytes.
+- `checkpoint-01.log` records the explicit-native-A16 planner rejection.
+- `gpu-03.log` records a shell-quoting error in the test selector; `gpu-03b.log`
+  contains the corrected command's result.
+- `checkpoint-03.log` preserves the failed bitwise multi-expert comparison.
+  `diagnose-03.log`, `diagnose-loop-03.log` and their scripts distinguish native
+  activation/FC2 differences from exact ordered reduction. The acceptance gate
+  records numerical errors rather than describing all comparisons as exact.
+- `memcheck-03.log` preserves an incomplete full native-MoE memcheck attempt,
+  stopped at the bounded experiment time budget. It produced no completed
+  sanitizer verdict. Full native memcheck/synccheck remain deferred.
+- `lint-04.log` retains the formatting and strict-zip findings before final
+  cleanup; final source was exported and revalidated afterward.
+- Automatic full-model budgeting, calibration/store wiring, TP, vLLM integration,
+  asynchronous copies, spare slots and policy tuning are outside this proof of
+  concept. No throughput benchmark, PCIe bandwidth claim or adaptive benefit is
+  inferred from correctness tests or control-plane wall times.
+
+Physical SM103 static correctness and Grace-backed TMA remain the first backend
+qualification gates. This experiment shows that the shared policy and fixed-slot
+transaction compose with a different native recipe and memory topology. Any
+further SM120 work should first measure complete-operator PCIe miss cost and
+exchange pause cost on shifting traffic before adding serving integration.

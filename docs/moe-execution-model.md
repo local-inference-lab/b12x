@@ -120,7 +120,7 @@ The current kernel families map onto those axes as follows:
 | direct micro W4A4 / W4A8-on-NVFP4 | direct top-k | inline | direct | source-native |
 | unified dynamic W4A4/W4A8 | append-only expert rows; direct top-k at tiny M | precomputed, or experimental streaming | atomic queue, persistent grid, fixed arithmetic domain, or ready queue | MMA views; native W4A8 uses N256/K128 QMMA repack |
 | native NVFP4 W4A16 decode | direct top-k | inline | persistent grid | source-native payload and block scales |
-| W4A16 tensor-core | sorted/padded; direct at small M for MMA-packed weights | precomputed; inline at small M | persistent grid | native payload and scales for AUTO; MMA-packed payload and scales for uniform A16 |
+| W4A16 tensor-core | sorted/padded; direct at small M for MMA-packed weights | precomputed; inline at small M | persistent grid | native payload and scales for AUTO; MMA-packed by default for uniform A16, with an explicit source-native option |
 
 ## Compact W4A8 tails
 

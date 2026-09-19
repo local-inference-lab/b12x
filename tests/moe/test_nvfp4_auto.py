@@ -50,14 +50,16 @@ def test_auto_requires_nvfp4_native_storage():
         ))
 
 
-def test_uniform_nvfp4_a16_requires_only_mma_packing():
+def test_uniform_nvfp4_a16_defaults_to_mma_and_allows_explicit_native():
     activation = replace(weight_plan().activation, mode=fused_moe.ActivationMode.A16)
     plan = weight_plan(activation=activation)
     assert plan.prepared_format.available_packings == {fused_moe.WeightPacking.MMA_PACKED}
-    with pytest.raises(ValueError, match="uniform NVFP4 W4A16 requires mma_packed"):
-        weight_plan(activation=activation, constraints=fused_moe.WeightPlanConstraints(
-            required_packing=fused_moe.WeightPacking.SOURCE_NATIVE,
-        ))
+    native = weight_plan(activation=activation, constraints=fused_moe.WeightPlanConstraints(
+        required_packing=fused_moe.WeightPacking.SOURCE_NATIVE,
+    ))
+    assert native.prepared_format.available_packings == {fused_moe.WeightPacking.SOURCE_NATIVE}
+    assert native._impl.quant_modes == {"w4a16"}
+    assert not native._impl.prepares_runtime_alphas
 
 
 @pytest.mark.parametrize("name", ["w13_blockscale", "w2_blockscale"])

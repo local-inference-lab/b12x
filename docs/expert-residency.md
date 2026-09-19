@@ -3,6 +3,8 @@
 The [shared residency subsystem](expert-residency-subsystem.md) owns canonical
 placement and optional host cache policy. This guide specifies its SM103
 HBM/Grace execution adapter and preparation contracts.
+The [SM120 NVFP4 experiment](expert-residency-sm120-poc.md) separately tests the
+shared cache policy with native W4A16 and mapped PCIe host memory.
 
 
 Status: **implemented prototype**. Host contracts, portable Blackwell metadata and

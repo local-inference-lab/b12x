@@ -4,6 +4,9 @@ Status: **implemented host contracts and policy** in `b12x.moe.residency`.
 The SM103 MXFP4 HBM/Grace adapter is the implemented execution backend. Portable
 tests exercise its fixed-address exchange protocol and captured metadata path;
 physical B300 execution and adaptive performance remain **unqualified**.
+The [SM120 experiment](expert-residency-sm120-poc.md) composes native NVFP4
+W4A16 execution with mapped host slots over PCIe and this same host policy.
+It is a single-layer research harness, not another public serving backend.
 
 The shared subsystem represents canonical expert identity, physical placement,
 cumulative routing observations and recent-frequency exchange decisions. It

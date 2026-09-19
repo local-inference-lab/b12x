@@ -20,6 +20,9 @@ configuration and explicit engine hooks. The [slot exchange contract](expert-res
 specifies opt-in fixed-address replacement at a scheduler pause. The
 [shared residency subsystem](expert-residency-subsystem.md) separates host
 contracts/policy from the SM103 execution adapter.
+The [SM120 NVFP4 cache experiment](expert-residency-sm120-poc.md) composes another
+numerical recipe and PCIe storage topology at benchmark scope. Its native SM120
+results do not qualify SM103 kernels or Grace-backed TMA.
 
 | State | Evidence and limits |
 | --- | --- |
