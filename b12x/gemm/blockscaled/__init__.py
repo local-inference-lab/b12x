@@ -16,6 +16,9 @@ row-major or F8_128x4-swizzled UE8M0 scales. Pass swizzled storage flattened
 BF16 activations and inline weight dequantization; it performs no activation
 scaling. ``plan_regimes`` combines exact static-shape variants with one bounded
 dynamic-row execution while keeping runtime dispatch behind the custom-op boundary.
+It accepts a ``BlockscaledQuery`` or a ``FixedBlockscaledQuery`` whose
+``expected_m`` is unset; a fixed capacity serves serialized NVFP4/MXFP4/block-FP8
+operands and packed tensor-FP8 at any row count up to ``max_rows``.
 
 NVFP4 packed weights require ``pack_weight(..., recipe='nvfp4', global_scale=g,
 global_scale_kind='multiplier')``. ``'reciprocal'`` accepts a weight quantizer
