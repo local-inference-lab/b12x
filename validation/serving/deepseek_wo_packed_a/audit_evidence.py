@@ -73,7 +73,7 @@ def audit(benchmark: Path) -> dict:
         "benchmark_sha256": hashlib.sha256(source).hexdigest(),
         "admission_function_source": ast.get_source_segment(source.decode(), function),
         "records": records,
-        "conclusion": "All four arms execute the same C1/C8 context-zero cells; neither KV budget limits these requests. Each arm contains five completed standalone prefill windows.",
+        "conclusion": "All four arms execute the same C1/C8 context-zero cells; no audited KV budget limits these requests. Each arm contains five completed standalone prefill windows.",
     }
 
 
