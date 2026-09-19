@@ -39,15 +39,39 @@ def test_decode_lowering_retains_declared_packed_weight_contract(rows):
         "nvidia", (12, 0), 188, "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
     ))
     caps = wo.Caps(device="cuda:0", max_tokens=rows, groups=4,
-                   group_width=512, rank=1024, hidden=4096)
-    plan = wo.plan(caps, invocation={"sfb_k_replicated": True, "wo_b_tiled": True})
+                   group_width=4096, rank=1024, hidden=4096)
+    plan = wo.plan(caps, invocation={"sfb_k_replicated": True, "wo_a_tiled": True, "wo_b_tiled": True})
     config = plan.contract.default_config(plan.query, device.identity)
     plan.contract.validate_query(plan.query, device.identity)
     jobs = plan._compile_jobs(config, device)
+    ordinary_a = jobs[0].args[0]
+    assert ordinary_a["b_tile_major"] and ordinary_a["sfb_k_reuse"]
+    assert tuple(ordinary_a["mma_tiler_mn"]) == (16, 64)
     fused, = (job.args[0] for job in jobs if job.factory.endswith(":_compile_dense_fused_quant_lowering"))
     assert fused["b_tile_major"] and fused["sfb_k_replicated"]
     assert tuple(fused["mma_tiler_mn"]) in ((16, 64), (16, 128))
     assert fused["m"] == rows and fused["source_shape"] == (rows, 1024, 4)
+
+
+@pytest.mark.parametrize("rows,width,expected", [
+    (1, 4096, (16, 64)), (6, 4096, (16, 64)), (8, 4096, (16, 64)),
+    (9, 4096, (64, 64)), (15, 4096, (64, 64)), (16, 4096, (32, 64)),
+    (9, 512, (32, 64)), (15, 512, (32, 64)), (17, 512, (64, 64)),
+])
+def test_first_projection_preserves_declared_row_tile(rows, width, expected):
+    from types import SimpleNamespace
+    from b12x.preparation import DeviceIdentity
+
+    device = SimpleNamespace(ordinal=0, identity=DeviceIdentity(
+        "nvidia", (12, 0), 188, "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    ))
+    caps = wo.Caps(device="cuda:0", max_tokens=rows, groups=4,
+                   group_width=width, rank=1024, hidden=4096)
+    plan = wo.plan(caps)
+    config = plan.contract.default_config(plan.query, device.identity)
+    a = plan._compile_jobs(config, device)[0].args[0]
+    assert tuple(a["mma_tiler_mn"]) == expected
+    assert not a["b_tile_major"]
 
 
 def test_declared_weight_contract_rejects_incompatible_binding():
@@ -63,6 +87,12 @@ def test_declared_weight_contract_rejects_incompatible_binding():
     with pytest.raises(ValueError, match="tiled WO-B"):
         state._check_weights(SimpleNamespace(sfb_k_replicated=True,
                                             wo_b=SimpleNamespace(values_tiled=None)))
+    caps = wo.Caps(device="cpu", max_tokens=6, groups=4,
+                   group_width=4096, rank=1024, hidden=4096)
+    state = _PreparedWO(None, wo.plan(caps, invocation={"wo_a_tiled": True}).query,
+                        None, None, None, None)
+    with pytest.raises(ValueError, match="tiled WO-A"):
+        state._check_weights(SimpleNamespace(wo_a=SimpleNamespace(values_tiled=None)))
 
 
 def _prepared(caps, source, weights, *, invocation=None):
@@ -347,16 +377,19 @@ def test_packed_decode_layout_matches_generic_projection(rows, seed):
         scales_b,
         groups=groups, group_width=width, rank=rank, hidden=hidden,
     )
-    assert weights.wo_b.values_tiled is not None and weights.sfb_k_replicated
+    assert weights.wo_a.values_tiled is not None and weights.wo_b.values_tiled is not None
+    assert weights.sfb_k_replicated
     caps = wo.Caps(device=device, max_tokens=rows, groups=groups,
                    group_width=width, rank=rank, hidden=hidden)
     with ExitStack() as resources:
         plans, bindings = {}, {}
-        for arm, invocation in (("generic", {}), ("packed", {"sfb_k_replicated": True, "wo_b_tiled": True})):
+        for arm, invocation in (("generic", {}), ("packed", {"sfb_k_replicated": True, "wo_a_tiled": True, "wo_b_tiled": True})):
             owned, plans[arm], bindings[arm] = _prepared(caps, source, weights, invocation=invocation)
             resources.enter_context(owned)
         packed = plans["packed"].prepared.state.fused_b.lowering
         assert packed.b_tile_major and packed.sfb_k_replicated
+        first = plans["packed"].prepared.state.ordinary_a.lowering
+        assert first.mma_tiler_mn == (16, 64) and first.b_tile_major and first.sfb_k_reuse
         graph = torch.cuda.CUDAGraph()
         try:
             with no_compilation(), torch.cuda.graph(graph):

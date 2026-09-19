@@ -31,7 +31,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
     allowed = {
         "operation", "heads_per_group", "nope_dim", "rope_dim", "return_3d",
         "positions_dtype", "cos_sin_dtype", "dynamic_tokens",
-        "sfb_k_replicated", "wo_b_tiled",
+        "sfb_k_replicated", "wo_a_tiled", "wo_b_tiled",
     }
     if set(invocation) - allowed:
         raise ValueError("unknown WO invocation field")
@@ -56,6 +56,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
         positions_dtype=str(invocation.get("positions_dtype", "int64")),
         cos_sin_dtype=str(invocation.get("cos_sin_dtype", "bfloat16")),
         sfb_k_replicated=invocation.get("sfb_k_replicated", False),
+        wo_a_tiled=invocation.get("wo_a_tiled", False),
         wo_b_tiled=invocation.get("wo_b_tiled", False),
         codegen=FrozenMapping({
             "quant_chunks_per_program": _WO_QUANT_CHUNKS_PER_PROGRAM,
@@ -85,7 +86,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
     ``invocation["dynamic_tokens"]=True`` allows any positive live count up to
     ``caps.max_tokens`` using the capacity's launch configuration. The default
     requires the exact planned count and preserves decode specialization.
-    Packed loaders may declare ``sfb_k_replicated`` and ``wo_b_tiled`` in
+    Packed loaders may declare ``sfb_k_replicated``, ``wo_a_tiled`` and ``wo_b_tiled`` in
     ``invocation``; binding verifies those weight-layout contracts.
     """
     if not isinstance(caps, WOProjectionScratchCaps):
@@ -141,8 +142,12 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
     def ordinary_states(config, device):
         key = device.identity
         if key not in ordinary:
-            from b12x.gemm._preparation import _default_lowering
+            from b12x.gemm._preparation import _default_lowering, _lower_query
             from b12x.gemm._tuning import DenseGemmQuery
+            from .._shared.wo_mxfp8 import _wo_a_mma_tiler
+            a_tile = None if query.dynamic_tokens else _wo_a_mma_tiler(
+                caps.max_tokens, rank=caps.rank, group_width=caps.group_width, groups=caps.groups,
+            )
             a_query = DenseGemmQuery(
                 recipe="mxfp8", entry_point="gemm.mm", weight_storage="native",
                 output_dtype="bfloat16", batch=caps.groups, max_rows=caps.max_tokens,
@@ -157,7 +162,13 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 output_mode="provided", alpha_mode="unit", expected_m=caps.max_tokens,
                 sfb_k_replicated=query.sfb_k_replicated,
             )
-            ordinary[key] = (_default_lowering(a_query, device.identity), _default_lowering(b_query, device.identity))
+            a_options = {"mma_tiler_mn": a_tile}
+            if query.wo_a_tiled and a_tile in ((16, 64), (32, 64), (64, 64)):
+                a_options["rhs_values_tiled"] = torch.empty(
+                    (4, 16, 32, 64, 128), dtype=torch.float8_e4m3fn, device="meta",
+                )
+            ordinary[key] = (_lower_query(a_query, device.identity, a_options),
+                             _default_lowering(b_query, device.identity))
         return ordinary[key]
 
     def memory(config, device):
@@ -244,6 +255,8 @@ class _PreparedWO:
     def _check_weights(self, weights):
         if self.query.sfb_k_replicated and not weights.sfb_k_replicated:
             raise ValueError("WO weights do not guarantee replicated block scales")
+        if self.query.wo_a_tiled and weights.wo_a.values_tiled is None:
+            raise ValueError("WO weights do not provide the declared tiled WO-A layout")
         if self.query.wo_b_tiled and weights.wo_b.values_tiled is None:
             raise ValueError("WO weights do not provide the declared tiled WO-B layout")
 
@@ -306,6 +319,8 @@ class _PreparedWO:
              binding.x_q.scale_mma),
             (a_values, binding.weights.wo_a.scale_mma),
             out=binding.tmp, alpha=None, stream=stream,
+            rhs_values_tiled=(binding.weights.wo_a.values_tiled
+                              if self.ordinary_a.lowering.b_tile_major else None),
         )
         if self.fused_b is not None:
             source = binding.tmp
@@ -342,6 +357,8 @@ class _PreparedWO:
              binding.x_q.scale_mma),
             (a_values, binding.weights.wo_a.scale_mma),
             out=binding.tmp, alpha=None, stream=stream,
+            rhs_values_tiled=(binding.weights.wo_a.values_tiled
+                              if self.ordinary_a.lowering.b_tile_major else None),
         )
         if self.fused_b is not None:
             source = binding.tmp if binding.weights.groups != 1 else binding.tmp.as_strided(
