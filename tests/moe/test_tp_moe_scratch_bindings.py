@@ -64,6 +64,56 @@ def _clear_moe_force_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+def test_w4a16_prefill_reduction_freezes_caller_scratch_contract(monkeypatch):
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    weight_plan = _weight_plan(
+        "w4a16",
+        source_format="fp4_e8m0_k32",
+        experts=896,
+        k=7168,
+        n=192,
+        activation="situ",
+    )
+    kwargs = dict(
+        max_tokens=4096,
+        core_token_counts=(4096,),
+        num_topk=16,
+        route_num_experts=896,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+        decode_config=MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            w4a16_route_mode="packed",
+        ),
+    )
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "0")
+    materialized_caps = TPMoEScratchCaps(**kwargs)
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    fused_caps = TPMoEScratchCaps(**kwargs)
+    calibrated_caps = TPMoEScratchCaps(**kwargs, collect_activation_amax=True)
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "0")
+    materialized, fused, calibrated = [
+        plan_tp_moe_scratch(caps, prewarm_launches=False)
+        for caps in (materialized_caps, fused_caps, calibrated_caps)
+    ]
+    specs = {spec.name: spec for spec in fused._core_workspace_plan.tensor_specs}
+    assert specs["intermediate_cache13"].shape == (max(4096 * 16 * 384, 4096 * 7168),)
+    assert specs["prefill_sum_accum"].shape == (4096 * 7168,)
+    assert specs["prefill_sum_accum"].dtype == torch.float32
+    assert fused._core_workspace_plan.prefill_fused_sum_fp32
+    assert not materialized._core_workspace_plan.prefill_fused_sum_fp32
+    assert not calibrated._core_workspace_plan.prefill_fused_sum_fp32
+    assert (
+        fused.layout.core_workspace_nbytes < materialized.layout.core_workspace_nbytes
+    )
+    assert calibrated.layout.core_workspace_nbytes == materialized.layout.core_workspace_nbytes
+
+
 def test_dynamic_deterministic_output_is_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

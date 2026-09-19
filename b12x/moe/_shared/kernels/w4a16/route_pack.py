@@ -10,6 +10,7 @@ import triton.language as tl
 import torch
 
 from b12x._lib.compile_plan import launch_triton
+from b12x._lib.env import env_flag
 
 from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
 
@@ -22,6 +23,9 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 
 
 _FAST_COUNT_BLOCK_T = 1024
+_STABLE_SORT_MIN_ROUTES = 4096
+_STABLE_SORT_BLOCK_T = 4096
+_STABLE_SORT_EXPERTS_PER_PROGRAM = 1
 
 
 @triton.jit
@@ -296,6 +300,73 @@ def _pack_topk_routes_sort_kernel(
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
 
 
+@triton.jit
+def _pack_topk_routes_stable_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    expert_offsets,
+    live_numel,
+    NUMEL_CAPACITY: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    EXPERTS_PER_PROGRAM: tl.constexpr,
+):
+    """Pack each expert's routes in ascending token-major route order."""
+    expert_ids = (
+        tl.program_id(0) * EXPERTS_PER_PROGRAM
+        + tl.arange(0, EXPERTS_PER_PROGRAM)
+    )
+    expert_mask = expert_ids < NUM_EXPERTS
+    output_starts = tl.load(
+        expert_offsets + expert_ids,
+        mask=expert_mask,
+        other=0,
+    )
+    output_counts = tl.zeros((EXPERTS_PER_PROGRAM,), dtype=tl.int32)
+    lanes = tl.arange(0, BLOCK_T)
+
+    for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
+        offsets = start + lanes
+        raw_ids = tl.load(
+            topk_ids + offsets,
+            mask=offsets < live_numel,
+            other=-1,
+        ).to(tl.int32)
+        valid = (
+            (offsets < live_numel)
+            & (raw_ids >= 0)
+            & (raw_ids < NUM_EXPERTS)
+        )
+        ids = raw_ids
+        if HAS_EXPERT_MAP:
+            safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+            ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(
+                tl.int32
+            )
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+
+        matches = (
+            expert_mask[:, None]
+            & valid[None, :]
+            & (expert_ids[:, None] == ids[None, :])
+        )
+        match_i32 = matches.to(tl.int32)
+        local_ranks = tl.cumsum(match_i32, axis=1) - 1
+        output_indices = (
+            output_starts[:, None]
+            + output_counts[:, None]
+            + local_ranks
+        )
+        tl.store(
+            packed_route_indices + output_indices,
+            offsets[None, :],
+            mask=matches,
+        )
+        output_counts += tl.sum(match_i32, axis=1)
+
+
 @dataclass(frozen=True)
 class W4A16RoutePackLaunches:
     """Exact prepared Triton objects for one W4A16 packed-route geometry."""
@@ -306,6 +377,7 @@ class W4A16RoutePackLaunches:
     max_packed_routes: int
     max_route_blocks: int
     use_small_prefix: bool
+    stable_order: bool
     programs: MappingProxyType
 
     def program(self, name: str, topk_ids: torch.Tensor, has_expert_map: bool):
@@ -328,6 +400,7 @@ def compile_w4a16_route_pack_launches(
     block_size: int,
     num_experts: int,
     ordinal: int,
+    stable_order: bool | None = None,
 ) -> W4A16RoutePackLaunches:
     """Compile every legal route-pack helper for one planned W4A16 capacity."""
     numel_capacity, max_packed_routes, max_route_blocks = route_pack_capacity(
@@ -342,6 +415,9 @@ def compile_w4a16_route_pack_launches(
         block_route_init <= _SMALL_PREFIX_MAX_PACKED_ROUTES
         and block_m <= _SMALL_PREFIX_MAX_ROUTE_BLOCKS
     )
+    if stable_order is None:
+        stable_order = env_flag("W4A16_STABLE_ROUTE_PACK")
+    stable_order = bool(stable_order and numel_capacity >= _STABLE_SORT_MIN_ROUTES)
     programs = {}
     # Avoid Triton's divisibility and value-one specialization of the live bound.
     live_numel = 3
@@ -369,12 +445,22 @@ def compile_w4a16_route_pack_launches(
                         BLOCK_T=_FAST_COUNT_BLOCK_T, num_warps=4,
                         grid=(triton.cdiv(int(tokens) * int(topk), _FAST_COUNT_BLOCK_T), 1, 1),
                     )
-                programs[("sort", *key)] = _pack_topk_routes_sort_kernel.warmup(
-                    ids_dtype, expert_map_dtype, torch.int32, torch.int32, live_numel,
-                    NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=has_expert_map,
-                    BLOCK_T=_SORT_BLOCK_T, num_warps=4,
-                    grid=(triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T), 1, 1),
-                )
+                if stable_order:
+                    programs[("sort", *key)] = _pack_topk_routes_stable_kernel.warmup(
+                        ids_dtype, expert_map_dtype, torch.int32, torch.int32, live_numel,
+                        NUMEL_CAPACITY=int(numel_capacity), NUM_EXPERTS=int(num_experts),
+                        HAS_EXPERT_MAP=has_expert_map, BLOCK_T=_STABLE_SORT_BLOCK_T,
+                        EXPERTS_PER_PROGRAM=_STABLE_SORT_EXPERTS_PER_PROGRAM,
+                        num_warps=8,
+                        grid=(triton.cdiv(num_experts, _STABLE_SORT_EXPERTS_PER_PROGRAM), 1, 1),
+                    )
+                else:
+                    programs[("sort", *key)] = _pack_topk_routes_sort_kernel.warmup(
+                        ids_dtype, expert_map_dtype, torch.int32, torch.int32, live_numel,
+                        NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=has_expert_map,
+                        BLOCK_T=_SORT_BLOCK_T, num_warps=4,
+                        grid=(triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T), 1, 1),
+                    )
         if not use_small_prefix:
             programs[("prefix", torch.int32, False)] = _w4a16_route_prefix_from_counts_kernel.warmup(
                 torch.int32, torch.int32, torch.int32, BLOCK_SIZE=int(block_size),
@@ -400,6 +486,7 @@ def compile_w4a16_route_pack_launches(
         numel_capacity=int(numel_capacity), block_size=int(block_size),
         num_experts=int(num_experts), max_packed_routes=max_packed_routes,
         max_route_blocks=max_route_blocks, use_small_prefix=use_small_prefix,
+        stable_order=stable_order,
         programs=MappingProxyType(programs),
     )
 
@@ -676,7 +763,27 @@ def pack_topk_routes_by_expert(
                 int(block_size), int(num_experts), max_packed_routes,
                 max_route_blocks, _POST_PREFIX_BLOCK_T, block_e.bit_length(),
             )
-    if launches is None:
+    stable_order = (
+        launches.stable_order if launches is not None else
+        env_flag("W4A16_STABLE_ROUTE_PACK") and numel >= _STABLE_SORT_MIN_ROUTES
+    )
+    if stable_order:
+        stable_grid = (triton.cdiv(num_experts, _STABLE_SORT_EXPERTS_PER_PROGRAM),)
+        if launches is None:
+            launch_triton(_pack_topk_routes_stable_kernel, stable_grid,
+                topk_ids, expert_map_tensor, packed_route_indices, expert_offsets, numel,
+                NUMEL_CAPACITY=numel_capacity, NUM_EXPERTS=int(num_experts),
+                HAS_EXPERT_MAP=expert_map is not None, BLOCK_T=_STABLE_SORT_BLOCK_T,
+                EXPERTS_PER_PROGRAM=_STABLE_SORT_EXPERTS_PER_PROGRAM, num_warps=8,
+            )
+        else:
+            _launch_prepared(
+                launches.program("sort", topk_ids, expert_map is not None), stable_grid,
+                topk_ids, expert_map_tensor, packed_route_indices, expert_offsets, numel,
+                numel_capacity, int(num_experts), expert_map is not None,
+                _STABLE_SORT_BLOCK_T, _STABLE_SORT_EXPERTS_PER_PROGRAM,
+            )
+    elif launches is None:
         launch_triton(_pack_topk_routes_sort_kernel, sort_grid,
             topk_ids, expert_map_tensor, packed_route_indices, expert_offsets, numel,
             NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=expert_map is not None,

@@ -549,7 +549,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=9,
+    query_schema_version=10,
     config_schema_version=7,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
