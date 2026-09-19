@@ -13,7 +13,8 @@ serving conditions below. Native microbenchmark speedups are not qualified.
 
 The model is `local-inference-lab/Qwen3.8-Flash-Next-NVFP4`, revision
 `b797d2e1160b9596b2570e56c1d3590faa09d4ed`. One RTX PRO 6000 Blackwell Max-Q
-Workstation GPU runs tensor parallelism one, three MTP drafts, CPU-backed PLE,
+Workstation GPU runs tensor parallelism one, multi-token prediction (MTP) with
+three draft tokens, CPU-backed per-layer embeddings (PLE),
 6,019-token batches, sixteen request slots, 8 GiB physical KV allocation and
 262,144-token maximum context. Memory offset is +6000 (16,365 MHz when busy),
 graphics clocks are automatic and the power limit is 325 W. Sampling uses
@@ -40,8 +41,14 @@ All functional checks and timed cells pass. Acceptance changes between runs;
 the exact-row A16 plans also undergo independent startup tuning. Therefore the
 decode changes cannot all be attributed to the large-prefill program.
 
-A separate compatibility run composes the complete canonical source heads
-with both fixes and the existing beta serving changes. Five windows per cell
+A separate compatibility run merges canonical vLLM
+`af9e4dca109e0348323c0182e98a3aaf7282bfc3` into the beta integration at
+`67bb922f6f401b304abb8a6d9da450445c962662`, and canonical B12X
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68` into its beta integration at
+`eea3ced11fc14625b683d3c575cf2d702ad3706a`. It adds the immutable-expert-scale
+declaration from vLLM #810 and the MXFP8 capacity policy described here.
+The resulting source identities are in the `complete_source_composition`
+entry of [results.json](results.json). Five windows per cell
 pass: prefill 12,118 tokens/s; C1 177.731 tokens/s / 84.059 steps/s; C8
 705.608 tokens/s / 340.997 steps/s. This is not an isolated-PR speedup claim.
 
@@ -61,6 +68,14 @@ arguments and runtime environment. It includes physical GPU UUID, timing
 intervals, busy-clock summaries and hashes of the originating result files.
 Output text is not copied. The `commands` arrays retain exact invocations;
 `serving_argv` is the actual process command after launcher expansion.
+Its `terms` object defines abbreviations used by the unchanged benchmark
+metadata and runtime arguments. In particular, decode context parallelism
+(DCP) is one, so attention context is not split across additional ranks.
+
+The candidate-contract version invalidates cached tuning candidates after the
+lowering changes; previously selected activation-precision and tile choices
+must be measured again. This is the cache behavior described as "cached
+precision races" in the first implementation commit.
 
 The recorded model source worktrees were committed; the diagnostic builders
 reject tracked modifications, archive Git source and verify installed runtime

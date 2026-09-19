@@ -1,5 +1,14 @@
 {
   "purpose": "Qwen3.8 packed MXFP8 capacity policy: isolated and integration serving checks",
+  "terms": {
+    "TP": "Tensor parallelism; TP1 runs each tensor-parallel model on one GPU.",
+    "MTP": "Multi-token prediction; MTP3 proposes three draft tokens per speculative step.",
+    "PLE": "Per-layer embeddings; their tables use host memory in these serving arms.",
+    "DCP": "Decode context parallelism; DCP1 does not shard attention context across additional ranks.",
+    "C1_C8": "One or eight concurrent clients; C8 output is aggregate throughput.",
+    "KV": "Attention key/value cache.",
+    "NCCL": "NVIDIA Collective Communications Library."
+  },
   "benchmark": {
     "path": "/root/vllm/qwen38next/results/karmic-qmax-ab-20260919/llm_decode_bench.py",
     "sha256": "053989edff8c9c93e2b96e61342b2ffbd9851e03deba17e6d3fc96fcd6694c1e",
