@@ -494,7 +494,7 @@ def test_mxfp8_prepared_functional_and_provided_forms_match():
         graph.reset()
 
 
-@pytest.mark.parametrize("n,k", [(2560, 2560), (6144, 2560)])
+@pytest.mark.parametrize("n,k", [(2560, 2560), (2560, 6144), (6144, 2560)])
 def test_mxfp8_prefill_capacity_reuses_graph_program_for_shorter_rows(n, k):
     """A capacity-tuned tile keeps live row masks and caller scratch intact."""
     from b12x.gemm._shared.wo_mxfp8 import (

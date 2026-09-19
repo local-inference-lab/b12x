@@ -74,6 +74,25 @@ def test_mxfp8_capacity_lowering_keeps_prefill_tile_hint(workspace_form, n, k):
     assert not lowering.policy.large_m_unroll
 
 
+@pytest.mark.parametrize("recipe,hint", [("mxfp8", 4), ("nvfp4", None), ("nvfp4", 4)])
+def test_capacity_lowering_preserves_explicit_hints_and_nvfp4(recipe, hint):
+    from b12x.gemm.blockscaled._preparation import _dense_lowering
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    query = blockscaled.BlockscaledQuery(
+        recipe=recipe, num_tokens=6019, in_features=2560,
+        padded_in_features=2560, out_features=2560, expected_m=hint,
+        activation_scale_available=recipe == "nvfp4",
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        vendor="nvidia", compute_capability=(12, 0), sm_count=188,
+        product_name="RTX PRO 6000 Blackwell Max-Q",
+    ))
+    lowering = _dense_lowering(query, BlockscaledConfig(mode="quantized"), device)
+    assert query.expected_m == hint
+    assert lowering.expected_m == hint
+
+
 def _quantize_mxfp4_rows(
     source: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
