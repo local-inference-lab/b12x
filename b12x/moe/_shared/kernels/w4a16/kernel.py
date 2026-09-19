@@ -1192,9 +1192,10 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles
             and not self.direct_topk_routes
             and not self.weight_layout_trellis256
+            and weight_layout != "modelopt"
         ):
             raise ValueError(
-                "schedule_whole_tiles requires direct_topk_routes or trellis_t256"
+                "whole-tile scheduling requires direct routes, ModelOpt or Trellis"
             )
         if self.fused_topk_sum and not self.direct_topk_routes:
             raise ValueError("fused_topk_sum requires direct_topk_routes")
@@ -5820,6 +5821,8 @@ class W4A16FusedMoeKernel:
         # decode-heavy small-M phases. It is incompatible with whole-tile
         # scheduling and grouped FC2 route subtiles.
         self.small_m_splitk = _w4a16_small_m_splitk_enabled()
+        if self.small_m_splitk and schedule_whole_tiles:
+            raise ValueError("whole-tile arithmetic is incompatible with stripe split-K")
         if self.small_m_splitk:
             schedule_whole_tiles = False
             fc2_schedule_route_block_factor = 1
@@ -9135,6 +9138,7 @@ def compile_w4a16_fused_moe(
     use_expert_map: bool = False,
     tc_decode_fused_sum: bool = False,
     collect_activation_amax: bool = False,
+    schedule_whole_tiles: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
@@ -9519,6 +9523,7 @@ def compile_w4a16_fused_moe(
         use_expert_map=use_expert_map,
         tc_decode_fused_sum=tc_decode_fused_sum,
         collect_activation_amax=collect_activation_amax,
+        schedule_whole_tiles=schedule_whole_tiles,
         intermediate_rotation=intermediate_rotation,
         full_rotation=full_rotation,
         coupled_hadamard=coupled_hadamard,

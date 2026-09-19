@@ -1,18 +1,20 @@
 # SM103 serving integration and workspace ownership
 
-Status: **control-plane adapter implemented; companion serving integration unsupported**. The
+Status: **SM120 companion serving prototype implemented; SM103 serving unsupported**. The
 b12x [automatic residency API](expert-residency-automatic.md) is implemented and
 portable-counter tested. This document identifies engine changes still required
-to serve a checkpoint larger than HBM. It does not qualify SM103 execution or
-install a serving option.
+to serve a checkpoint larger than HBM. SM103 execution and its HBM/Grace loader path remain unqualified. The separate
+[SM120 serving guide](expert-cache-serving.md) specifies the implemented CPU-source
+NVFP4 loader, canonical backing backend and single-rank vLLM configuration.
 
 The [model-wide epoch adapter](expert-residency-epochs.md) uses supported vLLM
 worker extensions and public AsyncLLM pause/RPC methods. It coordinates all
 participating layers and replicated TP ranks, admits a bounded movement batch,
-and requires coordinated reload after partial failure. The maintained loader
-does not register prepared residency runtimes. Backend registration and
-CPU-source loading remain prerequisites; the adapter alone is not a cache
-serving option.
+and requires coordinated reload after partial failure. The opt-in companion
+`codex/b12x-expert-cache` registers prepared SM120 runtimes
+after model-wide admission and weight preparation. The worker extension alone
+does not select that loader. Native SM103 CPU-source loading and component
+admission still require their own integration and physical qualification.
 
 ## Companion source boundaries
 
@@ -54,10 +56,11 @@ peak and duplicate ownership.
 
 The clean integration base is the maintained preparation branch. Port the
 required SM103 component changes onto it; do not resurrect removed b12x APIs in
-order to retain the older companion's warmup architecture. No companion source
-was changed by this policy review.
+order to retain the older companion's warmup architecture. The SM120 companion
+uses this maintained base and adds an explicit ModelOpt NVFP4 CPU parameter
+loader; it does not port or enable native SM103 components.
 
-## Reviewable integration sequence
+## Remaining native SM103 integration sequence
 
 1. **Checkpoint source ownership.** Add an explicit native-MXFP4 loader contract
    that keeps expert payloads/scales as CPU or mapped-file views while loading

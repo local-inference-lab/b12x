@@ -1,0 +1,16 @@
+{"workload": "stable_general", "text": "Explain how the Moon changes its visible shape during a month. Use simple examples and distinguish phases from eclipses."}
+{"workload": "stable_general", "text": "Write a short story about a retired teacher finding an unexpected message in a secondhand cookbook."}
+{"workload": "stable_general", "text": "Explain how wind and rain change a rocky coastline over a century. Make the explanation accessible to a teenager."}
+{"workload": "stable_general", "text": "Describe the first hour of a rainy market day from the viewpoint of a flower seller."}
+{"workload": "stable_general", "text": "Give a practical plan for growing herbs on a kitchen windowsill. Explain watering, light and harvesting."}
+{"workload": "stable_general", "text": "Write a scene in which siblings reunite in a familiar park after living in different countries."}
+{"workload": "stable_general", "text": "Explain how a heat pump warms a house in winter without creating all its heat from electricity."}
+{"workload": "stable_general", "text": "Compare learning to draw from books and attending a class. Give concrete advice for a beginner."}
+{"workload": "transition_code", "text": "Implement an LRU cache in Python using a dictionary and a doubly linked list. Explain the invariants and provide a short test."}
+{"workload": "transition_code", "text": "Write a Python function that merges overlapping intervals. Explain boundary cases and its time complexity."}
+{"workload": "transition_code", "text": "Implement binary search for the first value greater than or equal to a target in a sorted array. Explain the loop invariant."}
+{"workload": "transition_code", "text": "Write a Python parser for simple key=value configuration lines, handling blank lines, comments, and invalid input."}
+{"workload": "transition_code", "text": "Implement breadth-first search to find a shortest path through a grid with obstacles. Return the actual path."}
+{"workload": "transition_code", "text": "Write a Python generator that reads a large text file in bounded chunks and yields complete lines. Explain edge cases."}
+{"workload": "transition_code", "text": "Design and implement a small dependency resolver that topologically sorts task names and detects a cycle."}
+{"workload": "transition_code", "text": "Implement a thread-safe bounded queue in Python using a condition variable. Explain producer and consumer behavior."}

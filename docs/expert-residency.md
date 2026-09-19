@@ -29,9 +29,10 @@ then a selected promotion makes later executions use HBM. The engine still owns
 every pause; no policy or observer is added to static serving.
 The [model-wide epoch contract](expert-residency-epochs.md) bounds decisions
 across layers and coordinates one engine pause with rank-wide preflight and
-acknowledgement. Its vLLM control-plane adapter is implemented; CPU-source loader
-wiring and full-model adaptive serving remain unsupported. Static SM103 plans
-and physical qualification requirements are unchanged.
+acknowledgement. The [prepared SM120 serving cache](expert-cache-serving.md)
+connects a CPU-source NVFP4 loader and canonical backend to this protocol in
+vLLM. Its explicitly selected W4A16 recipe, PCIe transport and single-rank
+qualification are separate from static SM103 plans and physical qualification.
 
 ## Supported contracts
 

@@ -1,16 +1,16 @@
 # Model-wide residency epochs
 
-Status: **implemented control-plane prototype; full-model adaptive serving
-unsupported**. The shared coordinator and vLLM worker protocol support one
+Status: **implemented control-plane prototype with experimental SM120 serving
+integration**. The shared coordinator and vLLM worker protocol support one
 bounded residency epoch across multiple prepared MoE layers. Host tests cover
 replicated-rank coordination and failure. Portable GPU tests cover two layers
-sharing one captured graph across repeated exchanges. These are contract tests,
-not serving throughput measurements.
+sharing one captured graph across repeated exchanges.
 
-The maintained vLLM loader does not yet install this runtime. SM120 canonical
-fills remain research code, without a public PreparationSession backend or a
-CPU-source serving loader. No `--expert-residency auto` serving claim follows
-from this adapter. Static preparation and its defaults are unchanged.
+The [prepared SM120 serving cache](expert-cache-serving.md) supplies a CPU-source
+ModelOpt NVFP4 loader and canonical-fill backend through PreparationSession.
+Its single-GPU vLLM experiments measure the complete pause/RPC path separately
+from earlier contract and operator tests. SM103 serving and Grace-backed TMA
+remain physically unqualified. Static preparation and its defaults are unchanged.
 
 ## Ownership and lifecycle
 
@@ -109,6 +109,9 @@ layer/phase rows on the host. Invalid IDs and duplicates retain the existing
 counter semantics. The authoritative TP owner counts replicated routes once;
 other ranks return no routing snapshot. Padding and decode/prefill/verify/draft
 classification remain the engine's responsibility. M is not a phase label.
+The SM120 V2 integration uses `RoutingProfileQuery.runtime_token_limit=True`
+and a prepared device setter to exclude padding, dummy work and any batch
+containing prefill. Static serving has neither the setter nor counter nodes.
 
 Static serving must omit the observer at graph construction. Setting the
 control adapter to `enabled=False` performs no engine or worker operations;
@@ -140,8 +143,10 @@ changed pointers, partial maps and released owners.
 
 `bind_sm103_epoch_layer(plan, observations)` adapts an already prepared native
 MXFP4 HBM/Grace plan with declared exchange journals. It does not compile,
-reprepare, allocate expert storage or qualify Grace-backed TMA. SM120 does not
-yet have an equivalent serving backend adapter.
+reprepare, allocate expert storage or qualify Grace-backed TMA.
+`bind_sm120_epoch_layer(plan, observations)` supplies the equivalent boundary
+for a prepared canonical NVFP4/W4A16 cache. Its loader is single-rank; the
+replicated-TP protocol remains contract-tested rather than serving-qualified.
 
 The engine-side use after all workers are prepared is:
 
@@ -208,17 +213,14 @@ source retention, pinning and TP sharding remain additional constraints.
 
 Host envelopes must be apportioned across ranks sharing one physical host.
 Passing the entire available host pool independently to each rank is invalid.
-This prototype checks supplied rank envelopes; the missing loader must perform
-physical-pool admission and account for genuinely shared source owners.
+The coordinator checks supplied rank envelopes. The opt-in
+[SM120 serving loader](expert-cache-serving.md) admits CPU sources and canonical
+mapped backing for a single rank before cache allocation. Distributed source
+ownership and physical-pool apportionment remain unsupported by that loader.
+Its explicit W4A16 numerical recipe is distinct from an A4 model execution
+contract. Native SM103 loading remains an independent integration requirement.
 
-The maintained vLLM b12x provider receives GPU parameters and calls ordinary
-weight preparation. Retrofitting offload after that point would retain the
-forbidden full-GPU load peak. The required loader change must supply CPU/mmap
-checkpoint owners directly to a prepared cache backend. The research SM120
-backend also uses an explicit W4A16 numerical recipe; a serving integration
-must not silently substitute it for an A4 model execution contract.
-
-## Diagnostics and remaining serving experiment
+## Diagnostics and serving experiment
 
 Each control call returns a JSON-compatible receipt with all worker snapshots,
 selected/skipped pairs, copy accounting, per-layer outcomes and generations.
@@ -233,14 +235,15 @@ timeline instrumentation remain necessary for that decomposition. In the
 inspected vLLM AsyncLLM, the public pause method includes a fixed 20 ms sleep;
 using this adapter includes that delay. No shorter-pause performance is claimed.
 
-The serving experiment remains deferred until loader and backend registration
-exist. Its primary arms must share checkpoint, learned profile, resident
-capacity, graph geometry, actual route weights, prompts, concurrency and
-speculative settings. Compare learned static against learned static plus
-explicit decayed LFU. Include stable traffic and workload transitions; record
-TTFT, ITL distributions, output throughput, epoch-adjacent latency, cold counts,
-promotion reuse and complete pause cost. Do not replace this experiment with
-single-layer or portable byte-reader results.
+The [SM120 serving harness](../benchmarks/moe/expert_cache_serving.py) uses the
+CPU loader and prepared canonical backend. Its primary arms share checkpoint,
+learned profile, resident capacity, graph geometry, actual route weights,
+prompts and concurrency. It compares uninstrumented learned static placement
+against explicit decayed LFU, including stable traffic, workload transitions,
+TTFT, delivery-gap distributions, throughput and complete pause cost. The
+[serving guide](expert-cache-serving.md) documents its single-rank scope and
+source-bound results. Single-layer and portable byte-reader evidence remain
+separate from those serving measurements.
 
 Physical SM103 acceptance remains ordered: native all-HBM, all-Grace, mixed
 correctness and Grace TMA legality; then same-graph exchange, sanitizers, miss

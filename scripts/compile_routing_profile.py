@@ -20,6 +20,8 @@ def main():
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--sample-every", type=int, nargs="+", default=[1, 128])
+    parser.add_argument("--runtime-token-limit", action="store_true",
+                        help="Include the prepared engine phase/extent setter")
     args = parser.parse_args()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output directory must be empty")
@@ -33,7 +35,8 @@ def main():
     try:
         for sample in dict.fromkeys(args.sample_every):
             query = RoutingProfileQuery(layers=(("qualification", args.experts),), max_tokens=args.capacity,
-                max_top_k=args.top_k, sample_every=sample)
+                max_top_k=args.top_k, sample_every=sample,
+                runtime_token_limit=args.runtime_token_limit)
             programs = _compile(query, target="sm_103a", offline_dir=args.output_dir/f"every-{sample}")
             manifest["queries"].append(asdict(query))
             manifest["programs"] += len(programs)

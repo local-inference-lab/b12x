@@ -54,6 +54,7 @@ class ResidencyServingMemory:
     host_safety: int
     other_device: int = 0
     other_host: int = 0
+    host_sources: int = 0
 
     def __post_init__(self):
         for name in self.__dataclass_fields__:
@@ -68,7 +69,8 @@ class ResidencyServingMemory:
 
     @property
     def host_bytes(self):
-        return self.backing_experts + self.host_staging + self.host_safety + self.other_host
+        return (self.backing_experts + self.host_staging + self.host_sources
+                + self.host_safety + self.other_host)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -232,6 +234,55 @@ class ResidencyEpochWorkerExtension:
 
     def b12x_residency_acknowledge(self, token):
         return self._b12x_epoch_runtime().acknowledge(token)
+
+    def b12x_expert_cache_status(self):
+        """Inspect ownership without adding observation work to static serving."""
+        model = getattr(self.model_runner, "b12x_expert_cache", None)
+        if model is None:
+            raise RuntimeError("model has no prepared canonical expert cache")
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        graphs = getattr(manager, "graphs", {})
+        return {"mode": model.config.mode, "checkpoint": model.checkpoint_id,
+            "profile": model.profile_id, "memory": asdict(model.memory),
+            "load_device_peak_bytes": model.load_device_peak_bytes,
+            "graphs": {str(descriptor): id(graph) for descriptor, graph in graphs.items()},
+            "layers": {name: {"resident": plan.query.resident, "experts": plan.query.experts,
+                "max_pairs": plan.query.max_pairs,
+                "pointers": plan.prepared.state.pointers(),
+                "generation": plan.prepared.state.updates.snapshot().generation if plan.prepared.state.updates else 0}
+                for name,plan in model.plans.items()}}
+
+    def b12x_expert_cache_save_profile(self, *, quiescent=False):
+        """Caller must first complete the engine pause/drain protocol."""
+        model = getattr(self.model_runner, "b12x_expert_cache", None)
+        if model is None:
+            raise RuntimeError("model has no prepared canonical expert cache")
+        return model.save_profile(quiescent=quiescent)
+
+
+def bind_sm120_epoch_layer(plan, observations):
+    """Bind the prepared canonical cache; this installs no graph instrumentation."""
+    from b12x.preparation import require_prepared
+    state = require_prepared(plan, "moe.expert_cache")
+    if state.updates is None:
+        raise ValueError("model epochs require fill capacity declared before preparation")
+    if (observations.experts != plan.query.experts
+            or observations.max_top_k != plan.query.top_k):
+        raise ValueError("epoch observation geometry differs from the prepared cache")
+
+    def validate():
+        if require_prepared(plan, "moe.expert_cache") is not state:
+            raise RuntimeError("cache was replaced; rebuild the model epoch runtime")
+        state.validate()
+
+    payload = sum(v[0].numel() for v in state.canonical.values())
+    return ResidencyLayerBinding(observations=observations,
+        exchange=ResidencyExchangeSpec(backend="sm120_w4a16_canonical",
+            direct_backing_execution=True, fixed_address_quiescent_exchange=True,
+            payload_copy_bytes_per_pair=payload, map_copy_bytes_per_transaction=2*plan.query.experts*8,
+            backing_mode="canonical"), max_pairs=plan.query.max_pairs,
+        snapshot=state.updates.snapshot, apply=state.updates.apply,
+        pointers=state.pointers, validate=validate)
 
 
 def bind_sm103_epoch_layer(plan, observations):

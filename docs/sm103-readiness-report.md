@@ -41,30 +41,35 @@ or preparation contract and does not qualify Grace-backed execution.
 
 The [model-wide epoch prototype](expert-residency-epochs.md) adds bounded
 cross-layer decisions, experimental decayed LFU and a fail-closed vLLM
-pause/worker-RPC adapter. Counter snapshots transfer one model-wide slab.
-It adds no GPU declaration or kernel specialization. Full-model serving remains
-unsupported until CPU-source loading and a prepared cache backend are wired
-into the engine. Prior operator timings are not serving evidence for this code.
-Its focused receipts record 199 host passes, 20 portable GPU passes, two
-native-SM103 skips, four counter cross-compilations and zero reported errors in
-bounded memcheck/synccheck. A full epoch memcheck attempt timed out at 180 s and
-remains an open gate. The [ledger](expert-residency-ledger.md) binds these totals
-to their frozen source archives separately from historical corpus totals.
+pause/worker-RPC adapter. The [prepared SM120 serving cache](expert-cache-serving.md)
+adds an opt-in CPU-source NVFP4 loader, canonical host backing, fixed VRAM slots
+and real single-rank vLLM graph execution. Static and adaptive experiments start
+from the same learned profile. Their serving receipts include scheduler pauses;
+prior operator timings remain tied to their original source.
+
+The SM103 preparation corpus at package SHA256
+`2b90cf1b36809849be8449c579d42f3b614a3950489f598094134428d3daa94c`
+contains **86 declarations and 244 distinct programs**, including 238 native CuTe
+exports and six supporting Triton programs. The additional declaration exercises
+an optional prepared counter extent/phase setter; it does not add an SM103 cache
+transport. The [ledger](expert-residency-ledger.md) retains source archives,
+compiler manifests, test results and failed attempts. This is compilation
+evidence, not physical B300 evidence.
 
 | State | Evidence and limits |
 | --- | --- |
-| Implemented and compiled through preparation | The full corpus at `94639562` covers 85 declarations and 241 distinct SM103 programs with CUDA uninitialized. The shared-residency source rechecks its three composing declarations and 14 programs. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |
+| Implemented and compiled through preparation | The serving-cache source corpus covers 86 declarations and 244 distinct SM103 programs with CUDA uninitialized; 238 native CuTe exports are retained. The historical `94639562` corpus remains 85 declarations/241 programs at its own source. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |
 | Hierarchical MXFP4 expert residency implemented | Immutable per-layer profiles and memory budgets prepare HBM and exact-size mapped Grace slabs. Native MXFP8/MXFP4 projections consume compact tier-local routes and produce unfinalized expert outputs for one original-top-k-order FP32 FMA reduction. Checkpoint weight bytes remain unchanged. |
 | Quiescent slot exchange implemented | Declared rollback journals, disjoint canonical-ID pairs, synchronized payload/map commit, stale-generation rejection and fail-closed rollback preserve captured addresses. Portable byte-replay tests pass; SM103 TMA and native-operator exchange parity remain physical gates. |
-| Shared residency subsystem implemented | Standard-library-only placement, observation and generation contracts plus host cache policy; the SM103 adapter supplies numerical admission and copy accounting. Existing imports and schema-1/schema-2 profile hashes are preserved. No additional execution backend is qualified. |
+| Shared residency subsystem implemented | Standard-library-only placement, observation and generation contracts plus host cache policy; the SM103 adapter supplies numerical admission and copy accounting. Existing imports and schema-1/schema-2 profile hashes are preserved. An opt-in canonical-host W4A16 backend has separate SM120 serving evidence; it does not qualify native SM103 execution. |
 | Experimental cache policy implemented | Recent-frequency remains the default; explicit decayed LFU retains window history. Canonical counts identify cold selections for one unchanged generation. Model-wide pair/byte budgets select subsets across layers. Static profiles/defaults remain unchanged; adaptive serving benefit remains unqualified. |
 | Automatic residency implemented | Typed off/profile/auto/monitor modes, balanced cold-start placement, joint HBM/Grace admission, conservative activation, checkpoint/workload/recipe validation, atomic profiles, windowed convergence and drift diagnostics. Serving placement stays static; activation requires an engine-controlled restart. |
-| Prepared counter profiling implemented | CuTe uint64 counters use retained programs and stable storage. Off has no counter node. External/native routing integration uses explicit worker hooks; the companion loader/control-plane wiring remains required. |
+| Prepared counter profiling implemented | CuTe uint64 counters use retained programs and stable storage. Off has no counter node. The SM120 V2 companion supplies explicit decode phase and valid rows through a retained device setter; native SM103 serving wiring remains required. |
 | Implemented and tested on SM120 | Residency component tests cover quantization, route compaction, ordered-FMA adversaries, invalid int64 IDs, mapped-host reads, live-count reuse and allocation-free CUDA graph replay. Prepared counter tests add sampling, TP ownership, overflow and lifecycle coverage. These tests do not execute SM103 tcgen05 kernels or establish Grace-backed TMA legality. |
 | Implemented, awaiting physical SM103 qualification | Native tcgen05/TMEM dense and expert kernels, HBM/Grace complete-operator parity, Grace-backed TMA operands, architecture launch/resource behavior, complete model execution, chunk-parallel GDN prefill and experimental Station TP2 communication. |
 | Independent PR CI pending | Source-bound local receipts are separate from CI acceptance. The repository's wheel-release workflow has no pull-request trigger. |
-| Companion integration requires loader/backend wiring | The retained SM103 companion targets the preceding b12x interface. The maintained companion already uses PreparationSession. The implemented control adapter uses public pause/RPC hooks but is not registered by its loader. The [integration audit](expert-residency-integration.md) identifies source ownership, phase and budget requirements. |
-| Unsupported or research-only | Separate tiny-M and pipelined-TMEM MoE strategies, concurrent residency adaptation, cache-policy serving integration, measured HBM/Grace overlap, direct HBM RDMA and frozen QSRT coupled high-rate conversion. |
+| Companion integration | The maintained PreparationSession base has an opt-in SM120 CPU-source loader and prepared canonical cache in `codex/b12x-expert-cache`. Native SM103 loading/serving remains deferred. The [serving guide](expert-cache-serving.md) separates supported scope, configuration and measured evidence. |
+| Unsupported or research-only | Separate tiny-M and pipelined-TMEM MoE strategies, concurrent residency adaptation, distributed cache-loader serving, measured HBM/Grace overlap, direct HBM RDMA and frozen QSRT coupled high-rate conversion. |
 
 Trellis offline declarations exercise production compiler factories using
 canonical weight metadata. They do not perform checkpoint preparation on the

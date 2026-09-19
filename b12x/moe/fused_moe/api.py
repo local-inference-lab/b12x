@@ -64,6 +64,8 @@ from .routing_profile import (
     bind_routing_profile, routing_profile_state,
 )
 from ._residency_tuning import ResidencyConfig, ResidencyQuery
+from .cache_source import ExpertWeightSource
+from ._cache_tuning import ExpertCacheConfig, ExpertCacheQuery
 from .weights import (
     BtxWeights,
     PackedWeights,
@@ -103,7 +105,7 @@ def prepare_weights(
 
 def plan_execution(
     *,
-    experts: PreparedExperts | WeightPlan,
+    experts: PreparedExperts | WeightPlan | ExpertWeightSource,
     capacity: ExecutionCapacity,
     weights: PackedWeights | None = None,
     placement: ExpertResidencyPlan | None = None,
@@ -111,10 +113,16 @@ def plan_execution(
     updates: ResidencyUpdateCapacity | None = None,
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
-    override: MoeDecodeConfig | ResidencyConfig | None = None,
+    override: MoeDecodeConfig | ResidencyConfig | ExpertCacheConfig | None = None,
 ):
     """Declare capacity variants; preparation publishes executable states."""
     if placement is not None:
+        if isinstance(experts, ExpertWeightSource):
+            from ._cache_preparation import plan as cache_plan
+            if weights is not None or invocation or routing not in (None, RoutingSpec()):
+                raise ValueError("canonical cache consumes source-owned weights and unchanged preselected routes")
+            return cache_plan(source=experts, capacity=capacity, placement=placement,
+                memory_budget=memory_budget, updates=updates, override=override)
         from ._residency_preparation import plan as residency_plan
         return residency_plan(weight_plan=experts, weights=weights, capacity=capacity,
             placement=placement, memory_budget=memory_budget, routing=routing,
@@ -152,6 +160,10 @@ def plan_fc2(
 
 def bind(plan: Plan, **kwargs: Any) -> Binding:
     """Bind live tensors within a session-prepared token capacity."""
+    if plan.component_id == "moe.expert_cache":
+        if plan.prepared is None:
+            raise RuntimeError("expert cache requires PreparationSession before binding")
+        return replace(require_prepared(plan, "moe.expert_cache").bind(**kwargs), plan=plan)
     if plan.component_id == "moe.expert_residency" and plan.prepared is None:
         raise RuntimeError("expert residency plan is not prepared; use PreparationSession before binding")
     component = "moe.expert_residency" if plan.component_id == "moe.expert_residency" else "moe.decode"
@@ -162,6 +174,12 @@ def bind(plan: Plan, **kwargs: Any) -> Binding:
 def run(*, binding: Binding):
     """Run only a binding created from a prepared plan."""
     plan = binding.plan
+    if plan.component_id == "moe.expert_cache":
+        from ._cache_preparation import ExpertCacheBinding
+        state = require_prepared(plan, "moe.expert_cache", binding.a.device)
+        if not isinstance(binding, ExpertCacheBinding) or binding.state is not state:
+            raise ValueError("cache binding belongs to another preparation")
+        return binding.run()
     if plan.component_id == "moe.expert_residency":
         from ._residency_preparation import ResidencyBinding
         if plan.prepared is None:
@@ -240,6 +258,9 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "ExpertWeightSource",
+    "ExpertCacheQuery",
+    "ExpertCacheConfig",
     "ResidencyUpdateCapacity",
     "ResidencySlotSnapshot",
     "ResidencyUpdateError",

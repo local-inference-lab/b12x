@@ -1473,3 +1473,210 @@ The immutable `evidence.tar.gz` bundle has SHA256
 `8a940b27a23fcf47cc334209ac41c339c5c1a8e51494c47940673d01c52d8e79`.
 Its 164 receipt files are verified both inside the archive and against the
 administration copy. No raw benchmark evidence is added to the repository.
+
+
+## Prepared SM120 serving cache, September 19, 2026
+
+Status: **implemented and experimentally qualified for single-rank serving**.
+The [serving contract](expert-cache-serving.md) describes CPU checkpoint loading,
+model-wide admission, the registered `moe.expert_cache` preparation backend,
+canonical fills and the opt-in vLLM V2 integration. SM103 retains its distinct
+MXFP8/MXFP4 HBM/Grace transport and physical gates.
+
+Source and environment:
+
+- b12x base: `52a12b46b890915fc15d95250bdeb3976691ae68`, on
+  `work/sm103-bringup`. Master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`
+  remains an ancestor; the branch is 80 commits ahead and zero behind before
+  these changes. No rebase or master write is necessary.
+- Companion: `codex/b12x-expert-cache`, based on maintained PreparationSession
+  branch `ef1aeaf080879865febd27a92c5644233d157987`. Inspected vLLM main is
+  `47ccf6c57d92f03630ebcbad3809450545825488`; the older SM103 companion is not
+  used. The companion adds a CPU ModelOpt loader, preparation registration,
+  explicit phase handoff and three loader tests. Final companion commit is
+  `1d1f870bd6`; `companion-source-11.json` and its archive bind its files.
+- Measured source archive: `source-09.tar.gz`; b12x package SHA256
+  `5bf175baabcb3b4d0678ce819a5e854e782fb554b016c8b11d71d3220a852da2`.
+  `companion-source-09.json`, its patch and `companion-files-09.tar.gz` bind all
+  five companion files, including added files absent from a tracked-only patch.
+- Final code archive: `source-11.tar.gz`; package SHA256
+  `2b90cf1b36809849be8449c579d42f3b614a3950489f598094134428d3daa94c`.
+  It adds three public names to `api.__all__` and rejects non-CPU optional
+  source metadata/retained tensor owners. b12x kernels, execution preparation,
+  policy and benchmark implementations are byte-identical to measured source.
+  `source-difference-09-11.json` records the comparison. Final host/GPU tests
+  and the compiler census are rerun on source-11. The nine-run serving matrix
+  and sanitizer receipts remain bound to source-09. Companion source-11 adds
+  non-dictionary configuration opt-out guards and uses the maintained Torch
+  accelerator aliases for device selection and preparation cleanup.
+- Physical serving GPU: `GPU-47363510-b87a-13a5-4824-2542e97df76c`, RTX PRO 4000
+  Blackwell, 24 GB, driver 580.173.02, PCIe Gen4 x16, dynamic clocks, 145 W cap.
+  GPU `GPU-cc109c01-9756-d0db-21ea-f1825d3f963f` runs correctness/sanitizers.
+  The host has one NUMA node and CPU affinity 0–63. Some separate-GPU sanitizer
+  work overlaps serving; both GPUs share host CPU/memory resources.
+- Runtime image: `jovian-judgement-qwen38-sm120-amd64-4c1f7b2-a45d3f7-c3:latest`,
+  Torch 2.13.0, CUDA 13.3, CUTLASS DSL 4.6.2, Triton 3.7.1 and CUDA bindings
+  13.0.3 overlay. Maintained Python source uses the image's compiled vLLM
+  extensions, not a matching complete rebuild. Full-decode CUDA graphs with
+  mode 0 and FlashInfer attention work; Inductor is not qualified.
+- Checkpoint: `nvidia/Qwen3-30B-A3B-NVFP4`, revision
+  `2538ded2a4edb247b4d2b4a8ba24e44bd4c017c3`, 16.85 GiB on disk. Complete
+  local content fingerprint:
+  `bdde460712efe6ea50175eac186c27aa983348baf9faf2ab28a917ed93182609`.
+  All 6,144 gate/up global-scale pairs match without reconciliation. Routed
+  activations explicitly use W4A16; this is not A4 equivalence or model quality
+  qualification. Dense weights follow ordinary engine preparation.
+
+Evidence roots are `/home/jasonc/b12x-serving-evidence-20260919/` and
+`ripper:/home/jasonc/b12x-serving-results-20260919/`. The administration copy's
+`physical/` directory retains the complete remote receipts, including failures.
+`protocol-09.json`, `protocol-amendment-09.json`, `run-serving.sh`, raw JSONL,
+per-run telemetry and `serving-summary-09.json` specify the experiment. No raw
+checkpoint, compiler or serving receipts are committed to the repository.
+
+The learned profile has 58 resident experts in every one of 48 layers. Its hash
+is `20006a3fa40680307aa6d1f72816ded8fe91c4d7297c44410e585031a28fc4fa`.
+Eight authored general requests provide calibration; sixteen separate evaluation
+requests contain eight stable general prompts followed by eight code prompts.
+Every request generates 128 greedy tokens with actual runtime gate weights.
+The model-wide cache envelope is 8 GiB, including private scratch/maps/counters.
+KV is explicitly BF16 with 2 GiB reserved. Context is 2,048; prepared capacity
+is 64 tokens. Both arms use the same profile and graph geometry.
+
+| Concurrency / arm | Output tok/s | TTFT median ms | Delivery gap median / p99 ms | Promotions |
+| --- | ---: | ---: | ---: | ---: |
+| C1 learned static | 52.91 | 147.22 | 14.35 / 45.63 | 0 |
+| C1 adaptive, 32-token trigger | 52.31 | 130.20 | 11.40 / 149.28 | 928 |
+| C4 learned static | 79.43 | 270.67 | 50.60 / 96.35 | 0 |
+| C4 adaptive, 32-token trigger | 72.72 | 284.15 | 40.00 / 202.83 | 736 |
+| C8 learned static | 102.85 | 500.21 | 61.22 / 140.85 | 0 |
+| C8 adaptive, 32-token trigger | 90.15 | 503.09 | 76.76 / 254.92 | 576 |
+| C1 adaptive, 128-token trigger | 54.08 | 142.82 | 13.46 / 45.60 | 240 |
+| C4 adaptive, 128-token trigger | 78.33 | 281.91 | 47.00 / 176.85 | 224 |
+| C1 observation/control, zero movement | 44.23 | 149.20 | 15.11 / 137.02 | 0 |
+
+Each cell is one complete serving run, not a statistically established winner.
+Triggers count delivered output tokens across requests, not scheduler iterations.
+The 128-token runs are explicitly exploratory follow-ups to the frequent-epoch
+results. Ratios must compare matching concurrency: frequent adaptive/static
+throughput is 0.9887, 0.9155 and 0.8766 at C1/C4/C8. Longer epochs yield 1.0222
+and 0.9862 at C1/C4. The small C1 difference is inconclusive under dynamic clocks.
+No production default changes.
+
+| Adaptive trigger / concurrency | Epochs | Median / p95 pause ms | Total pause s | Copy bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 32 / C1 | 58 | 153.94 / 254.55 | 10.060 | 2,464,746,752 |
+| 32 / C4 | 46 | 208.08 / 307.31 | 10.170 | 1,954,823,936 |
+| 32 / C8 | 36 | 252.13 / 356.81 | 9.541 | 1,529,864,704 |
+| 128 / C1 | 15 | 148.46 / 186.02 | 2.284 | 637,439,872 |
+| 128 / C4 | 14 | 205.88 / 277.71 | 3.030 | 594,937,600 |
+
+Copy-byte accounting includes payload and required map traffic. Raw receipts
+retain layer transaction durations and all control stages. At frequent C1,
+median pause/drain is 46.63 ms, begin/snapshot RPC 21.51 ms, policy 9.07 ms,
+preflight RPC 9.31 ms, apply RPC 24.06 ms, acknowledge RPC 4.01 ms and resume
+1.22 ms. Stage medians do not sum to the median complete pause. The supported
+AsyncLLM pause includes a 20 ms output-settling delay. JSON receipt generation,
+request scheduling and the final pending epoch remain in serving wall time.
+GPU iteration latency and isolated D2H/publication DMA are not measured here.
+
+The no-movement C1 control observes 24.11% cold selections, versus 15.77% for
+frequent adaptation and 20.92% for longer epochs. It preserves the static
+placement and outputs but pays observation/control overhead; its throughput is
+not used as the uninstrumented static baseline. Observations cover completed
+pure-decode windows and exclude the final partial window. Window samples wholly
+inside the general interval give 7.16% static versus 7.45% frequent adaptive cold
+selections; wholly inside the code interval, 41.24% versus 23.84%. Crossing
+windows are excluded from those phase-specific figures.
+
+Stable general traffic loses throughput under adaptation. At C1 the interval
+rates are 91.95 static, 66.83 frequent and 83.30 longer-epoch adaptive tok/s.
+The code interval rates are 37.14, 42.99 and 40.06. The frequent C1 run does not
+recover its initial stable-interval deficit before completion. No future
+break-even point or universal workload benefit is inferred.
+
+All nine completed source-09 evaluation runs generate 18,432 tokens. Every
+adaptive and instrumented control matches its same-concurrency static output
+IDs exactly. All 2,704 serving promotions preserve the captured graph objects
+and slab/map/workspace pointers. The component tests independently check zero
+Torch allocator events during replay; complete-engine allocation tracing is
+not claimed. Repeated fresh worker startups/cleanup pass the serving protocol,
+with the image's forced-shutdown warnings retained.
+
+Final integration validation uses source-11 and companion `1d1f870bd6` on GPU
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`, with the same profile and evaluation
+requests. `final-static-c1-11.jsonl` records 53.07 tok/s; the 128-token adaptive
+arm records 54.42 tok/s. Median TTFT is 145.09 versus 140.78 ms, and p99 delivery
+gap is 45.64 versus 45.38 ms. Fifteen epochs perform 240 promotions with a
+149.29 ms median pause and 2.292 s total pause. All 4,096 tokens match exactly
+between arms and also match source-09 C1 outputs. All 48 layers retain graph
+objects and cache pointers. The second GPU confirms the final integration, but
+one additional dynamic-clock pair does not establish a general performance win.
+`serving-summary-11.json` and `serving-audit-11.json` retain the separate results.
+Across both source-bound sets, 22,528 tokens and 2,944 promotions pass.
+
+| Validation receipt | Result |
+| --- | --- |
+| `host-11.log` | 281 passed, 5 physical-GPU skips, 8.88 s. Admission, identity/profile validation, calibration, shared policy, epoch faults and source ownership. |
+| `physical/prepared-cache-11.log` | 24 passed, 2 DSL warnings, 43.92 s. Native cache graphs, production H=2048/I=768 at capacity 64, int32/int64 invalid/duplicate routes, changed inputs/live M, fills, exact reference outputs, stable pointers, frozen resolution, zero replay allocations, bounded counters and model-wide epochs. |
+| `physical/vllm-loader-11.log` | 3 passed, 14 existing Torch warnings, 8.88 s. CPU allocation under an ambient meta device, retained byte ownership, rejection of unequal gate/up global scales and non-dictionary configuration opt-out. |
+| `physical/prepared-cache-memcheck-09.log` | Two production-geometry graph cases passed in 327.17 s, zero sanitizer errors; 11 unrelated cases deselected. |
+| `physical/prepared-cache-synccheck-09.log` | Same two cases passed in 147.03 s, zero sanitizer errors. |
+| `sm103-full-11/manifest.json` | 86 declarations, 244 distinct programs: 238 native CuTe exports and 6 supporting Triton programs; source unchanged, CUDA uninitialized. Compiler environment Torch 2.14.0, CUTLASS 4.6.2, Triton 3.8.0. Offline evidence only. |
+| `sm120-native-09/` | Six exact cache objects from the measured/tested source retain manifest-verified object SHA256s and extracted CUDA ELF hashes. Whole-K native kernels use 144 allocated registers, 1,024 B static SMEM, 54,272 B dynamic launch SMEM, zero stack and zero local memory. Achieved occupancy is not measured. |
+| `preparation-09.log` | 130 passed, 33 skipped, two pre-existing stale internal-API tests fail because they omit required `decode_config`. Both failures reproduce on pristine `52a12b46` in `baseline-execution-52a.log`. |
+| `preparation-06.log`, `baseline-registry-52a.log` | Five MXFP6 registry/META failures reproduce on pristine `52a12b46`. They are not concealed by the focused suite. |
+
+The checkpoint-backed graph test hashes layer-12 source fields as
+`4821ecbebad0a22b8aedc642a6efe9441f23b83673243af9eb1505d9085cd26b`.
+It uses all 128 experts and live M=1/2/4/64, comparing cache output with a native
+all-resident whole-K control exactly before and after repeated fills.
+
+Failures and decisions retained:
+
+- Source-07 serving diverges after promotions. Production-sized randomized
+  tests expose one-BF16-ULP differences that H=I=128 misses. Split-K grouping
+  depends on route packing. Whole-K scheduling fixes exact same-input parity
+  without changing expert bytes or BF16 boundaries. It is an explicit numerical
+  recipe; the native split-K result is not claimed bitwise equivalent. Decode
+  query schema becomes 9. Source-07 timings and failed probes remain diagnostic.
+- The initial native oracle omitted its identity map, allowing invalid routes
+  to read stale native scratch. The oracle is corrected; raw failed runs and
+  debug variants remain retained.
+- Initial loader attempts lack `use_global_sf` and then miss vLLM's existing
+  ModelOpt class-name dispatch. The dedicated subclass supplies both contracts.
+  It does not patch loader functions or rename logical expert IDs.
+- The mixed engine build's Inductor run fails on a missing unrelated DeepSeek
+  extension overload. A BF16 attention attempt selects unsupported-PTX FA
+  fallback. Full-decode graphs with mode 0 and explicit FlashInfer attention
+  are the measured configuration. Neither failure is called a passing gate.
+- A sanitizer selector initially matches no tests. Two later collection
+  commands use nonexistent filenames. Their logs remain; explicit corrected
+  invocations supply the accepted test totals. No sanitizer timeout occurs in
+  the bounded source-09 runs; historical full-suite timeouts remain unchanged.
+- Companion precommit initially rejects formatting, unguarded dictionary access
+  on vLLM's alternate configuration type and forbidden Torch CUDA API names.
+  Explicit opt-out guards and maintained accelerator aliases fix those cases.
+  All required companion hooks, including mypy and import/API checks, pass on
+  commit `1d1f870bd6`; failed hook logs remain in the evidence root.
+- Direct cuobjdump on CUTLASS host objects reports no device code. The existing
+  migration evidence extractor obtains the exact embedded CUDA ELF after
+  object-hash verification; both failed attempts and successful resource dumps
+  are retained.
+- Full mapped canonical backing plus retained CPU sources costs about 30.38 GiB
+  of host payload for this model. This is admitted on the test host, not a
+  recommendation to pin arbitrary full checkpoints. Bounded pageable/mmap
+  staging requires a separate miss-service design. TP/DP/PP>1, EP, speculation,
+  LoRA and modified numerical recipes fail closed in the serving loader.
+- No faster unsafe pause, concurrent replacement, production decayed-LFU
+  default, spare-slot requirement or fused-MoE rewrite is added. The measured
+  priority is reducing epoch coordination/serialization cost and avoiding
+  unproductive stable-workload epochs. Physical B300 correctness/TMA gates
+  precede any transfer of this serving experiment to SM103.
+- GitHub exposes zero status contexts and zero check runs for the inspected
+  base source. Local evidence does not replace a matching engine build or PR CI.
+
+Both physical GPUs return idle with 2 MiB allocated after the experiments.
+The pre-existing homeassistant container remains running; no household service
+is stopped. Historical 141-fixture and 181-fixture spectra and the held-out
+single-layer receipts are unchanged and are not relabeled as serving evidence.

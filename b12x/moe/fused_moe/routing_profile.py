@@ -22,12 +22,24 @@ def _compile(query, *, target, offline_dir=None):
     programs = {}
     if query.rank != query.owner_rank:
         return programs
+    if query.runtime_token_limit:
+        from b12x.moe._shared.kernels.routing_profile import SetTokenLimit
+        args = (pointer(cutlass.Int32), cutlass.Int32(1), cuda.CUstream(0))
+        if offline_dir is not None:
+            path = Path(offline_dir)/"set_token_limit"
+            path.mkdir(parents=True, exist_ok=True)
+            programs["set_token_limit"] = cute.compile(SetTokenLimit(), *args,
+                options=f"--gpu-arch={target} --keep-ptx --keep-cubin --dump-dir={path}", no_jit_engine=True)
+        else:
+            programs["set_token_limit"] = compile_kernel(SetTokenLimit(), *args,
+                options=f"--gpu-arch={target}", compile_spec=KernelCompileSpec.from_facts(
+                    "moe.routing_profile.set_token_limit", 1, ("target", target)))
     for experts in sorted({e for _, e in query.layers}):
         for dtype, suffix in ((cutlass.Int32, "i32"), (cutlass.Int64, "i64")):
             key = f"count_{experts}_{suffix}"
             args = [pointer(dtype), pointer(cutlass.Uint64), pointer(cutlass.Int32),
                     cutlass.Int32(1), cutlass.Int32(1), cuda.CUstream(0)]
-            kernel = CountRoutes(experts, query.sample_every)
+            kernel = CountRoutes(experts, query.sample_every, query.runtime_token_limit)
             options = f"--gpu-arch={target}"
             if offline_dir is not None:
                 path = Path(offline_dir)/key
@@ -37,6 +49,7 @@ def _compile(query, *, target, offline_dir=None):
             else:
                 spec = KernelCompileSpec.from_facts("moe.routing_profile", 1, ("experts", experts),
                     ("sample_every", query.sample_every), ("ids_dtype", suffix),
+                    ("runtime_token_limit", query.runtime_token_limit),
                     ("max_tokens", query.max_tokens), ("max_top_k", query.max_top_k), ("target", target))
                 program = compile_kernel(kernel, *args, options=options, compile_spec=spec)
             programs[key] = program
@@ -82,6 +95,7 @@ class _CounterState:
                     self.rows[layer, phase] = self.storage[offset:offset+size].view(torch.uint64)
                     offset += size
             self.enabled[0] = 1
+            self.enabled[1] = query.max_tokens
 
     def bind(self, *, layer, phase, topk_ids):
         import cutlass
@@ -112,6 +126,21 @@ class _CounterState:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("counter controls cannot execute during graph capture")
             torch.cuda.synchronize(self.device)
+
+    def set_token_limit(self, tokens):
+        """Publish an engine-labelled unpadded prefix on the producer stream.
+
+        Zero excludes warmup, prefill, mixed batches or verification. There is
+        no host wait or copy. Concurrent lanes need independent counter plans.
+        """
+        if not self.query.runtime_token_limit or type(tokens) is not int or not 0 <= tokens <= self.query.max_tokens:
+            raise ValueError("runtime observation extent is outside its prepared contract")
+        if self.storage is not None:
+            import cutlass
+            import cuda.bindings.driver as cuda
+            from b12x.moe._shared.kernels.sm103.launch import pointer
+            self.programs["set_token_limit"](pointer(cutlass.Int32, self.enabled),
+                cutlass.Int32(tokens), cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
 
     def reset(self, *, quiescent=False):
         self._quiesce(quiescent)

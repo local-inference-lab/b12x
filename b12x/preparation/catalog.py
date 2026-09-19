@@ -26,6 +26,7 @@ class KernelTuningRegistration:
 TUNING_COMPONENTS = (
     KernelTuningRegistration(op_qualname="moe.fused_moe", contract_ref="b12x.moe.fused_moe._routing_profile_tuning:TUNING", variant="routing_profile"),
     KernelTuningRegistration(op_qualname="moe.fused_moe", contract_ref="b12x.moe.fused_moe._residency_tuning:TUNING", variant="residency"),
+    KernelTuningRegistration(op_qualname="moe.fused_moe", contract_ref="b12x.moe.fused_moe._cache_tuning:TUNING", variant="cache"),
     KernelTuningRegistration(op_qualname="sequence.embedding", contract_ref="b12x.sequence.embedding._tuning:TUNING"),
     KernelTuningRegistration(op_qualname="attention.compressed_sparse_mla", contract_ref="b12x.attention.compressed_sparse_mla.cast:TUNING", variant="cast"),
     KernelTuningRegistration(op_qualname='attention.compressed_sparse_mla', contract_ref='b12x.attention.compressed_sparse_mla._tuning:TUNING', variant='default'),

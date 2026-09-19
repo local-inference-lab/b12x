@@ -32,8 +32,9 @@ class CountRoutes:
     snapshots reject that epoch. Atomic updates permit concurrent producer
     streams; snapshot/control operations require quiescent producers.
     """
-    def __init__(self, experts, sample_every):
+    def __init__(self, experts, sample_every, runtime_token_limit=False):
         self.experts, self.sample_every = experts, sample_every
+        self.runtime_token_limit = runtime_token_limit
 
     @cute.jit
     def __call__(self, ids: cute.Pointer, counts: cute.Pointer, enabled: cute.Pointer,
@@ -45,11 +46,13 @@ class CountRoutes:
     def kernel(self, ids: cute.Pointer, counts: cute.Pointer, enabled: cute.Pointer,
                tokens: Int32, top_k: Int32):
         tid, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.runtime_token_limit):
+            tokens = cutlass.max(Int32(0), cutlass.min(tokens, enabled[1]))
         sampled = SmemAllocator().allocate_tensor(Int32, 1, byte_alignment=4)
         overflow = counts + self.experts + 4
         if tid == 0:
             sampled[0] = 0
-            if enabled[0] != 0:
+            if enabled[0] != 0 and tokens > 0:
                 call = increment(counts + self.experts, overflow, Int64(1))
                 increment(counts + self.experts + 2, overflow, Int64(tokens))
                 if call % Uint64(self.sample_every) == Uint64(0):
@@ -62,3 +65,14 @@ class CountRoutes:
                 expert = Int64(ids[Int64(offset)])
                 if (expert >= 0) & (expert < self.experts):
                     increment(counts + expert, overflow, Int64(1))
+
+
+class SetTokenLimit:
+    """Publish an engine-labelled observation extent on the producer stream."""
+    @cute.jit
+    def __call__(self, enabled: cute.Pointer, tokens: Int32, stream: cuda.CUstream):
+        self.kernel(enabled, tokens).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, enabled: cute.Pointer, tokens: Int32):
+        enabled[1] = tokens

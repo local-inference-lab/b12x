@@ -19,12 +19,47 @@ def prepare(query):
         calls = [state.bind(layer=layer, phase=phase, topk_ids=ids)
                  for layer, _ in query.layers for phase in query.phases]
         def run():
+            if query.runtime_token_limit:
+                state.set_token_limit(query.max_tokens)
             for binding in calls: binding.run()
         return PreparedCall(run=run, output=state.storage, owners=(state, *calls))
     session = PreparationSession(device="cuda:0", autotune=False, compile_workers=0)
     result = session.prepare((plan.request(name="counter", prepare_call=prime),))
     session.freeze()
     return plan, session, result
+
+
+def test_engine_phase_limit_changes_under_same_graph_without_host_reads():
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    query = RoutingProfileQuery(layers=(("layer", 4),), max_tokens=4,
+        max_top_k=2, runtime_token_limit=True)
+    plan, session, result = prepare(query)
+    graph = None
+    try:
+        state = routing_profile_state(plan)
+        ids = torch.tensor([[0,0], [1,2], [3,3], [3,3]], device="cuda", dtype=torch.int64)
+        observer = bind_routing_profile(plan, layer="layer", phase="decode", topk_ids=ids)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            observer.run()
+        state.reset(quiescent=True)
+        pointer = state.storage.data_ptr()
+        for live in (0, 1, 2, 0):
+            before = torch.cuda.memory_stats()
+            with kernel_resolution_guard("runtime profile extent"):
+                state.set_token_limit(live)
+                graph.replay()
+            torch.cuda.synchronize()
+            assert before["allocation.all.allocated"] == torch.cuda.memory_stats()["allocation.all.allocated"]
+        row = state.snapshot(quiescent=True).layers[0]
+        assert row.counts == (4, 1, 1, 0)
+        assert row.calls == 2 and row.tokens == 3
+        assert state.storage.data_ptr() == pointer
+    finally:
+        if graph is not None:
+            graph.reset()
+        result.close()
+        session.close()
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

@@ -25,6 +25,14 @@ offline replacement policies and native SM120 replay beyond layer zero. It adds
 benchmark selection and validation only; public residency contracts, serving
 defaults and SM103 program counts remain unchanged.
 
+The [prepared SM120 serving cache](expert-cache-serving.md) adds CPU checkpoint
+source ownership, a registered canonical-host NVFP4/W4A16 preparation backend,
+and an opt-in maintained-vLLM loader. All MoE layers share one bounded engine
+epoch; static serving has no observer. SM103 storage, numerical contracts and
+physical gates remain distinct. The complete source-bound SM103 compiler corpus
+contains 86 declarations and 244 programs, including 238 native CuTe exports.
+The [ledger](expert-residency-ledger.md) binds those counts to the tested source.
+
 ## Implemented features
 
 | Feature | Implementation |
@@ -42,7 +50,7 @@ defaults and SM103 program counts remain unchanged.
 | Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |
 | Static placement profiles and operator qualification | [Offline profiling](../scripts/build_expert_residency_profile.py) ranks expert selections independently per layer and emits versioned workload artifacts with expected cold fractions. The [residency benchmark](../benchmarks/moe/expert_residency.py) requires physical SM103 and records all-HBM parity, graph invariants, total latency and isolated per-stage samples. |
 | Shared expert residency contracts | [`b12x.moe.residency`](../b12x/moe/residency/__init__.py) owns canonical placement, counter/generation snapshots and host recent-frequency policy. The existing fused-MoE constructor adapts native geometry and copy accounting; fixed-address storage/execution remains preparation-owned. |
-| Model-wide residency epochs | [Bounded coordination](expert-residency-epochs.md) retains layer-scoped policies, admits global pair/copy-byte limits, supports explicit decayed LFU and checks complete generation acknowledgement. A vLLM worker-extension adapter performs one pause and all-rank preflight; CPU-source loader/backend registration and serving qualification remain required. |
+| Model-wide residency epochs | [Bounded coordination](expert-residency-epochs.md) retains layer-scoped policies, admits global pair/copy-byte limits, supports explicit decayed LFU and checks complete generation acknowledgement. A vLLM worker-extension adapter performs one pause and all-rank preflight; the SM120 canonical backend and CPU loader register this boundary. Distributed loading and native SM103 serving qualification remain required. |
 | Reproducible validation | [Preparation compiler](../scripts/compile_sm103_prepared.py), [kernel corpus compiler](../scripts/compile_sm103.py), resource auditors and the [qualification launcher](../scripts/qualify_sm103.py) preserve source and artifact identity. |
 
 ## Fixes required by preparation and execution
@@ -126,17 +134,19 @@ The companion vLLM branch at `f6c6ac72c3` targets the preceding b12x API. Its GL
 pooling and loader fixes remain recorded in
 [historical evidence](sm103-glm-sparse-validation.json); that receipt does not
 qualify this preparation port or establish companion API compatibility.
-The maintained companion preparation branch at `ef1aeaf080` already uses
-`PreparationSession`. Its CPU expert-loading, model-wide admission, phase and
-control-plane boundaries still require residency integration. The
+The maintained companion preparation base at `ef1aeaf080` uses
+`PreparationSession`. The `codex/b12x-expert-cache` integration adds CPU expert
+loading, model-wide admission, explicit decode phase and epoch registration for
+single-rank SM120. Native SM103 loading remains deferred. The
 [integration and workspace audit](expert-residency-integration.md) distinguishes
-that work from the older companion's API port.
+these transports and the older companion's API port.
 
 The [SM103 automatic residency guide](expert-residency-automatic.md) specifies the
-worker control-plane and routing hooks. They are implemented b12x APIs, not an
-installed vLLM serving feature. Engine configuration, phase classification,
-quiescent polling, rank coordination and restart still belong to the integration.
-The hooks do not port the older companion branch implicitly.
+worker control-plane and routing hooks. Automatic SM103 calibration/activation
+still requires engine integration. The opt-in SM120 companion uses explicit
+calibration and pinned learned profiles instead of silently installing that
+automatic lifecycle. Engine configuration, phase classification, quiescent
+polling, rank coordination and restart remain integration responsibilities.
 
 The [shared residency guide](expert-residency-subsystem.md) defines backend and
 engine responsibilities. Existing fused-MoE imports and serialized placement

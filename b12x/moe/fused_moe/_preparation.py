@@ -125,20 +125,27 @@ def _query(
     controls: FrozenMapping,
     invocation: FrozenMapping,
 ) -> MoeDecodeQuery:
-    plan = experts.plan._impl
+    return _query_for_weight_plan(experts.plan, capacity, tokens, routing, controls, invocation,
+        shared_input_scales=experts._impl.can_share_input(input_scales_static=True))
+
+
+def _query_for_weight_plan(weight_plan, capacity, tokens, routing, controls, invocation,
+                           *, shared_input_scales=False):
+    """Describe execution before checkpoint storage has a device address."""
+    plan = weight_plan._impl
     return MoeDecodeQuery(
         quant_mode=(
             "nvfp4_auto"
-            if experts.plan.activation.mode is ActivationMode.AUTO
+            if weight_plan.activation.mode is ActivationMode.AUTO
             else (next(iter(plan.quant_modes)) if len(plan.quant_modes) == 1 else "multi")
         ),
         quant_modes=tuple(sorted(plan.quant_modes)),
         source_format=plan.source_format,
         activation=plan.activation,
         io_dtype=plan.io_dtype,
-        num_experts=experts.num_experts,
-        hidden_size=experts.hidden_size,
-        intermediate_size=experts.intermediate_size,
+        num_experts=plan.num_experts,
+        hidden_size=plan.hidden_size,
+        intermediate_size=plan.intermediate_size,
         top_k=capacity.top_k,
         num_tokens=tokens,
         routed_rows=tokens * capacity.top_k,
@@ -147,9 +154,9 @@ def _query(
         apply_router_weight_on_input=bool(routing.apply_router_weight_on_input),
         collect_activation_amax=bool(routing.collect_activation_amax),
         deterministic_output=routing.deterministic_output,
-        swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
-        swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
-        swiglu_beta=_codec_scalar(experts.plan.activation.swiglu_beta),
+        swiglu_limit=_codec_scalar(weight_plan.activation.swiglu_limit),
+        swiglu_alpha=_codec_scalar(weight_plan.activation.swiglu_alpha),
+        swiglu_beta=_codec_scalar(weight_plan.activation.swiglu_beta),
         w13_layout=plan.w13_layout,
         weight_layouts=tuple(sorted(layout.value for layout in plan.weight_layouts)),
         w4a16_weight_layout=plan.w4a16_weight_layout,
@@ -158,13 +165,17 @@ def _query(
         fast_math=bool(invocation.get("fast_math", True)),
         numerical_recipe=invocation.get("numerical_recipe"),
         controls=controls,
-        shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
+        shared_input_scales=shared_input_scales,
     )
 
 
 def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
     """Serialize native planner inputs using its public layout enum values."""
-    plan = experts.plan._impl
+    return _weight_plan_payload(experts.plan)
+
+
+def _weight_plan_payload(weight_plan):
+    plan = weight_plan._impl
     w4a16_layout = (
         plan.required_weight_layout("w4a16")
         if "w4a16" in plan.quant_modes
@@ -276,6 +287,7 @@ class _W4A16PrimaryLaunches:
             )
         native_direct = (
             int(tokens) == self.tokens
+            and not getattr(self.packed, "schedule_whole_tiles", False)
             and self.route_mode != "packed"
             and not has_route_map
             and activation_amax is None
@@ -379,6 +391,9 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             swiglu_limit=core.swiglu_limit, swiglu_alpha=core.swiglu_alpha,
             swiglu_beta=core.swiglu_beta, weight_layout=weight_layout,
             scale_format=scale_format, w13_layout=w13_layout,
+            schedule_whole_tiles=bool(
+                caps.deterministic_output and weight_layout == "modelopt"
+            ),
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,

@@ -16,6 +16,7 @@ class RoutingProfileQuery:
     owner_rank: int = 0
     tp_size: int = 1
     expert_parallel: bool = False
+    runtime_token_limit: bool = False
 
     def __post_init__(self):
         from ..residency.contracts import PHASES
@@ -41,6 +42,8 @@ class RoutingProfileQuery:
             raise ValueError("routing capacity or sampling interval exceeds the counter ABI")
         if self.expert_parallel is not False:
             raise ValueError("expert-parallel profiling requires global-ID semantics and is unsupported")
+        if type(self.runtime_token_limit) is not bool:
+            raise TypeError("runtime_token_limit must be boolean")
 
     @property
     def storage_bytes(self):
@@ -66,7 +69,7 @@ def _validate(query, config, device):
         raise ValueError("unsupported routing counter configuration")
 
 
-TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=1,
+TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=2,
     config_schema_version=1, query_fields=frozenset(RoutingProfileQuery.__dataclass_fields__),
     config_fields=frozenset(RoutingProfileConfig.__dataclass_fields__), encode_query=asdict,
     encode_config=asdict, decode_config=lambda p: RoutingProfileConfig(**dict(p)),
