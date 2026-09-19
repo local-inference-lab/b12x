@@ -29,10 +29,45 @@ def test_caller_scratch_views_do_not_initialize_scale_padding(tokens):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def _prepared(caps, source, weights):
+@pytest.mark.parametrize("rows", [1, 6, 8])
+def test_decode_lowering_retains_declared_packed_weight_contract(rows):
+    from types import SimpleNamespace
+    from b12x.preparation import DeviceIdentity
+
+    device = SimpleNamespace(ordinal=0, identity=DeviceIdentity(
+        "nvidia", (12, 0), 188, "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    ))
+    caps = wo.Caps(device="cuda:0", max_tokens=rows, groups=4,
+                   group_width=512, rank=1024, hidden=4096)
+    plan = wo.plan(caps, invocation={"sfb_k_replicated": True, "wo_b_tiled": True})
+    config = plan.contract.default_config(plan.query, device.identity)
+    plan.contract.validate_query(plan.query, device.identity)
+    jobs = plan._compile_jobs(config, device)
+    fused, = (job.args[0] for job in jobs if job.factory.endswith(":_compile_dense_fused_quant_lowering"))
+    assert fused["b_tile_major"] and fused["sfb_k_replicated"]
+    assert tuple(fused["mma_tiler_mn"]) in ((16, 64), (16, 128))
+    assert fused["m"] == rows and fused["source_shape"] == (rows, 1024, 4)
+
+
+def test_declared_weight_contract_rejects_incompatible_binding():
+    from types import SimpleNamespace
+    from b12x.gemm.wo_projection._preparation import _PreparedWO
+
+    caps = wo.Caps(device="cpu", max_tokens=6, groups=4,
+                   group_width=512, rank=1024, hidden=4096)
+    query = wo.plan(caps, invocation={"sfb_k_replicated": True, "wo_b_tiled": True}).query
+    state = _PreparedWO(None, query, None, None, None, None)
+    with pytest.raises(ValueError, match="replicated block scales"):
+        state._check_weights(SimpleNamespace(sfb_k_replicated=False))
+    with pytest.raises(ValueError, match="tiled WO-B"):
+        state._check_weights(SimpleNamespace(sfb_k_replicated=True,
+                                            wo_b=SimpleNamespace(values_tiled=None)))
+
+
+def _prepared(caps, source, weights, *, invocation=None):
     resources = ExitStack()
     specs = ()
-    declaration = wo.plan(caps)
+    declaration = wo.plan(caps, invocation=invocation or {})
 
     def prepare(state):
         nonlocal specs
@@ -247,3 +282,51 @@ def test_decode_projection_replays_with_poisoned_caller_scratch(groups, width, r
                 torch.testing.assert_close(replayed, expected, rtol=0.01, atol=0.002)
             finally:
                 graph.reset()
+
+
+@pytest.mark.parametrize("rows", [1, 6, 8])
+@torch.no_grad()
+def test_packed_decode_layout_matches_generic_projection(rows):
+    """Packed checkpoint metadata must change storage access, not quantization."""
+    require_b12x()
+    from b12x.preparation._measurement import no_compilation
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    groups, width, rank, hidden = 4, 512, 1024, 4096
+    source = torch.randn(rows, groups, width, device=device, dtype=torch.bfloat16) / 8
+    weights = wo.pack_weights(
+        (torch.randn(groups * rank, width, device=device) / width**0.5).to(torch.float8_e4m3fn),
+        torch.ones(groups * rank // 128, width // 128, device=device),
+        (torch.randn(hidden, groups * rank, device=device) / (groups * rank)**0.5).to(torch.float8_e4m3fn),
+        torch.ones(hidden // 128, groups * rank // 128, device=device),
+        groups=groups, group_width=width, rank=rank, hidden=hidden,
+    )
+    assert weights.wo_b.values_tiled is not None and weights.sfb_k_replicated
+    caps = wo.Caps(device=device, max_tokens=rows, groups=groups,
+                   group_width=width, rank=rank, hidden=hidden)
+    with ExitStack() as resources:
+        plans, bindings = {}, {}
+        for arm, invocation in (("generic", {}), ("packed", {"sfb_k_replicated": True, "wo_b_tiled": True})):
+            owned, plans[arm], bindings[arm] = _prepared(caps, source, weights, invocation=invocation)
+            resources.enter_context(owned)
+        packed = plans["packed"].prepared.state.fused_b.lowering
+        assert packed.b_tile_major and packed.sfb_k_replicated
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with no_compilation(), torch.cuda.graph(graph):
+                actual = wo.run(binding=bindings["packed"], plan=plans["packed"])
+            for sign in (1, -1):
+                source.mul_(sign)
+                actual.fill_(float("nan"))
+                bindings["packed"].x_q.scale_mma.view(torch.uint8).fill_(255)
+                pointer, allocated = actual.data_ptr(), torch.cuda.memory_allocated(device)
+                with no_compilation():
+                    graph.replay()
+                    expected = wo.run(binding=bindings["generic"], plan=plans["generic"])
+                torch.cuda.synchronize(device)
+                assert torch.cuda.memory_allocated(device) == allocated and actual.data_ptr() == pointer
+                assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+                torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+                assert torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0) > 0.99999
+        finally:
+            graph.reset()

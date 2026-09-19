@@ -31,6 +31,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
     allowed = {
         "operation", "heads_per_group", "nope_dim", "rope_dim", "return_3d",
         "positions_dtype", "cos_sin_dtype", "dynamic_tokens",
+        "sfb_k_replicated", "wo_b_tiled",
     }
     if set(invocation) - allowed:
         raise ValueError("unknown WO invocation field")
@@ -54,6 +55,8 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
         return_3d=bool(invocation.get("return_3d", False)),
         positions_dtype=str(invocation.get("positions_dtype", "int64")),
         cos_sin_dtype=str(invocation.get("cos_sin_dtype", "bfloat16")),
+        sfb_k_replicated=invocation.get("sfb_k_replicated", False),
+        wo_b_tiled=invocation.get("wo_b_tiled", False),
         codegen=FrozenMapping({
             "quant_chunks_per_program": _WO_QUANT_CHUNKS_PER_PROGRAM,
             "wo_b_fused_tile": _fused_tile_override(),
@@ -61,10 +64,18 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
     )
 
 
-def _fused_b_tile(query: WoProjectionQuery, config):
+def _fused_b_tile(query: WoProjectionQuery, config, device):
     override = query.codegen["wo_b_fused_tile"]
     if override:
         return tuple(map(int, override.split("x")))
+    if query.wo_b_tiled:
+        from b12x._lib.dense_gemm import _select_default_dense_gemm_plan
+        selected = _select_default_dense_gemm_plan(
+            query.max_tokens, query.hidden, query.rank * query.groups,
+            device.identity.sm_count, is_mxfp8=True, expected_m=query.max_tokens,
+        )
+        tile = selected.mma_tiler_mn
+        return tile if tile in ((16, 64), (16, 128)) else (16, 128)
     return (16, config.decode_tile_n) if config.decode_tile_n else None
 
 
@@ -74,6 +85,8 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
     ``invocation["dynamic_tokens"]=True`` allows any positive live count up to
     ``caps.max_tokens`` using the capacity's launch configuration. The default
     requires the exact planned count and preserves decode specialization.
+    Packed loaders may declare ``sfb_k_replicated`` and ``wo_b_tiled`` in
+    ``invocation``; binding verifies those weight-layout contracts.
     """
     if not isinstance(caps, WOProjectionScratchCaps):
         raise TypeError("caps must be WOProjectionScratchCaps")
@@ -115,9 +128,11 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 span = caps.rank
             fused[key] = _lower_dense_gemm_fused_quant_a(
                 source, rhs[0], rhs[1], sm_count=device.identity.sm_count, out=output,
-                expected_m=caps.max_tokens, sfb_k_replicated=False,
-                rhs_values_tiled=None, a_inner_span=span,
-                mma_tiler_mn=_fused_b_tile(query, config),
+                expected_m=caps.max_tokens, sfb_k_replicated=query.sfb_k_replicated,
+                rhs_values_tiled=(torch.empty((1, 32, 32, 128, 128),
+                                             dtype=torch.float8_e4m3fn, device="meta")
+                                  if query.wo_b_tiled else None),
+                a_inner_span=span, mma_tiler_mn=_fused_b_tile(query, config, device),
             )
         return fused[key]
 
@@ -133,12 +148,14 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 output_dtype="bfloat16", batch=caps.groups, max_rows=caps.max_tokens,
                 in_features=caps.group_width, out_features=caps.rank,
                 output_mode="provided", alpha_mode="unit", expected_m=caps.max_tokens,
+                sfb_k_replicated=query.sfb_k_replicated,
             )
             b_query = DenseGemmQuery(
                 recipe="mxfp8", entry_point="gemm.mm", weight_storage="native",
                 output_dtype="bfloat16", batch=1, max_rows=caps.max_tokens,
                 in_features=caps.rank * caps.groups, out_features=caps.hidden,
                 output_mode="provided", alpha_mode="unit", expected_m=caps.max_tokens,
+                sfb_k_replicated=query.sfb_k_replicated,
             )
             ordinary[key] = (_default_lowering(a_query, device.identity), _default_lowering(b_query, device.identity))
         return ordinary[key]
@@ -203,6 +220,7 @@ class _PreparedWO:
         if str(source.dtype).removeprefix("torch.") != self.query.dtype:
             raise ValueError("WO source dtype differs from declaration")
         self._check_tokens(source.shape[0])
+        self._check_weights(kwargs["weights"])
         return self._scratch_state.bind(**kwargs)
 
     def bind_inv_rope(self, **kwargs):
@@ -220,7 +238,14 @@ class _PreparedWO:
         ):
             raise ValueError("inverse-RoPE WO tensor dtypes differ from declaration")
         self._check_tokens(o.shape[0])
+        self._check_weights(kwargs["weights"])
         return self._scratch_state.bind_inv_rope(**kwargs)
+
+    def _check_weights(self, weights):
+        if self.query.sfb_k_replicated and not weights.sfb_k_replicated:
+            raise ValueError("WO weights do not guarantee replicated block scales")
+        if self.query.wo_b_tiled and weights.wo_b.values_tiled is None:
+            raise ValueError("WO weights do not provide the declared tiled WO-B layout")
 
     def _check_tokens(self, tokens):
         if not 1 <= int(tokens) <= self.query.max_tokens:
@@ -292,6 +317,7 @@ class _PreparedWO:
             self.fused_b.run(
                 source, binding.weights.wo_b.values.reshape(binding.weights.hidden, -1, 1),
                 binding.weights.wo_b.scale_mma, out=binding.output, stream=stream,
+                rhs_values_tiled=(binding.weights.wo_b.values_tiled if self.query.wo_b_tiled else None),
             )
         else:
             self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
@@ -324,6 +350,7 @@ class _PreparedWO:
             self.fused_b.run(
                 source, binding.weights.wo_b.values.reshape(binding.weights.hidden, -1, 1),
                 binding.weights.wo_b.scale_mma, out=binding.output, stream=stream,
+                rhs_values_tiled=(binding.weights.wo_b.values_tiled if self.query.wo_b_tiled else None),
             )
         else:
             self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
