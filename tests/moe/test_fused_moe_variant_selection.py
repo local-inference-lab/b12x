@@ -139,6 +139,20 @@ def test_repacked_grid_override_namespace_uses_prepared_capacity(
         _impl._launch_dynamic_flat(**arguments)
 
 
+@pytest.mark.parametrize("tokens, expected", [(4, 4), (11, 128)])
+def test_public_route_dispatch_selects_retained_capacity(monkeypatch, tokens, expected):
+    from b12x.moe.fused_moe import api
+
+    plan = object()
+    binding = SimpleNamespace(plan=plan, hidden_states=torch.empty(tokens, 16))
+    variants = {
+        count: SimpleNamespace(route=lambda bound, count=count: (count, bound))
+        for count in (4, 128)
+    }
+    monkeypatch.setattr(api, "require_prepared", lambda *_args: SimpleNamespace(variants=variants))
+    assert api.route(plan, binding=binding) == (expected, binding)
+
+
 def _launches(*, direct, route_pack, route_mode="auto"):
     return _W4A16PrimaryLaunches(
         tokens=8, route_mode=route_mode, packed="packed", packed_mapped="packed_mapped",

@@ -359,6 +359,7 @@ def _serial_tier(
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
     block_size_m: int = 8,
+    activation: str = "silu",
 ) -> torch.Tensor:
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
     buffers = make_w4a16_packed_buffers(
@@ -378,7 +379,7 @@ def _serial_tier(
         prepared,
         topk_weights,
         topk_ids,
-        activation="silu",
+        activation=activation,
         intermediate_cache13=buffers.intermediate_cache13,
         intermediate_cache2=buffers.intermediate_cache2,
         output=buffers.output,

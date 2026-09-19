@@ -61,6 +61,8 @@ META = OpMeta(
     group="moe",
     api_style="planned",
     entry_points=(
+        "BtxSource",
+        "BtxWeights",
         "ActivationMode",
         "ActivationSpec",
         "Binding",
@@ -125,6 +127,8 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        BtxSource,
+        BtxWeights,
         ActivationMode,
         ActivationSpec,
         Binding,

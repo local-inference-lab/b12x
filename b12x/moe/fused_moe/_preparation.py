@@ -571,6 +571,8 @@ def _program_carriers(
     launches = [item[-1] for item in scratch._prewarmed_fused_launches]
     launches.extend(item[-1] for item in scratch._prewarmed_topk_sum_launches)
     launches.extend(item[-1] for item in scratch._mixed_trellis_launches)
+    if scratch._prewarmed_route_pack_launches is not None:
+        launches.extend(scratch._prewarmed_route_pack_launches.carriers())
     plan = scratch.launch_plan
     if plan.implementation == "w4a16" and not scratch.full_rotation:
         launches.extend(

@@ -401,10 +401,12 @@ def compile_w4a16_route_pack_launches(
     num_experts: int,
     ordinal: int,
     stable_order: bool | None = None,
+    bucket_tokens: bool = True,
 ) -> W4A16RoutePackLaunches:
     """Compile every legal route-pack helper for one planned W4A16 capacity."""
     numel_capacity, max_packed_routes, max_route_blocks = route_pack_capacity(
-        int(tokens) * int(topk), int(block_size), int(num_experts), topk=int(topk)
+        int(tokens) * int(topk), int(block_size), int(num_experts), topk=int(topk),
+        bucket_tokens=bucket_tokens,
     )
     max_packed_routes = max(int(max_packed_routes), 1)
     max_route_blocks = max(int(max_route_blocks), 1)
