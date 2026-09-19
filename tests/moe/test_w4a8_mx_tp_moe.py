@@ -973,6 +973,109 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
     assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
 
 
+@pytest.mark.parametrize("tile_m", (16, 32))
+@pytest.mark.parametrize("max_active_clusters", (None, 1, 64, 128))
+def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
+    monkeypatch, tile_m: int, max_active_clusters: int | None,
+) -> None:
+    _skip_if_unavailable()
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.moe import fused_moe
+    from b12x.moe.fused_moe import _impl
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if max_active_clusters is not None and max_active_clusters > 2 * sms:
+        pytest.skip("Requested test grid exceeds this GPU's resident bound")
+    for name in (
+        "B12X_DYNAMIC_W4A8_DECODE_MAX_ACTIVE_CLUSTERS",
+        "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS", "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _impl.clear_tp_moe_caches()
+    capacity = 8
+    counts = (1, 2, 6, capacity)
+    weights = _weights(seed=281)
+    x, ids, scales = _routed_inputs(capacity, 282)
+    references = {
+        rows: moe_reference_w4a8_mx(
+            x[:rows].float(), weights["w13_fp4"], weights["w13_mx"], None,
+            weights["alphas"], weights["w2_fp4"], weights["w2_mx"], None,
+            weights["alphas"], ids[:rows], scales[:rows], _E, _K, _N,
+            activation="silu",
+        ) for rows in counts
+    }
+    experts = _prepare(weights)
+    plan = fused_moe.plan_execution(
+        experts=experts,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=_TOPK),
+        invocation={"fast_math": False},
+        override=MoeDecodeConfig(
+            backend="dynamic", route_planner="internal",
+            max_active_clusters=max_active_clusters, dynamic_tile_m=tile_m,
+            dynamic_route_mode="grouped",
+        ),
+    )
+    calls = []
+    original = _impl._get_dynamic_kernel
+
+    def record_grid(*args, **kwargs):
+        compiled, grid = original(*args, **kwargs)
+        calls.append((compiled, grid))
+        return compiled, grid
+
+    monkeypatch.setattr(_impl, "_get_dynamic_kernel", record_grid)
+
+    def prepare(state):
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                        for spec in state.scratch.scratch_specs())
+        output = torch.empty_like(x)
+        binding = state.bind(scratch=scratch, a=x, topk_ids=ids,
+                             topk_weights=scales, output=output, input_scales_static=True)
+        return PreparedCall(run=lambda: state.run(binding), output=output,
+                            owners=(scratch, binding))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare((plan.request(name="w4a8-resident-grid", prepare_call=prepare),))
+        expected_grid = min(2 * sms, max_active_clusters or 2 * sms)
+        assert calls and {grid for _, grid in calls} == {expected_grid}
+        prepared_callable = calls[-1][0]
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                        for spec in plan.scratch_specs())
+        output = torch.empty_like(x)
+        storage = (*scratch, output, x, ids, scales)
+        pointers = tuple(t.data_ptr() for t in storage)
+        session.freeze()
+        for rows in counts:
+            binding = fused_moe.bind(
+                plan, scratch=scratch, a=x[:rows], topk_ids=ids[:rows],
+                topk_weights=scales[:rows], output=output[:rows], input_scales_static=True,
+            )
+            calls.clear()
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                fused_moe.run(binding=binding)
+            assert calls and all(compiled is prepared_callable and grid == expected_grid
+                                 for compiled, grid in calls)
+            for _ in range(3):
+                output.fill_(float("nan"))
+                allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert tuple(t.data_ptr() for t in storage) == pointers
+                actual = output[:rows]
+                assert actual.isfinite().all() and actual.abs().sum() > 0
+                cosine = torch.nn.functional.cosine_similarity(
+                    actual.float().flatten(), references[rows].float().flatten(), dim=0,
+                ).item()
+                assert cosine > 0.998, (rows, expected_grid, cosine)
+                assert torch.isnan(output[rows:]).all()
+            graph.reset()
+
+
 @pytest.mark.parametrize("max_active_clusters", (None, 1, 24, 48))
 @pytest.mark.parametrize(
     ("max_tokens", "unseen_counts", "expected_implementation"),
