@@ -35,7 +35,7 @@ SURFACES = {
     "DcpAllToAllPool.kimi_topk16": (2, 4, 8, 16),
     "DcpTopKOwnerExchange.stage_candidates": (2, 3, 4, 6, 8),
     "VocabParallelArgmax.fused_add_argmax": (8, 12, 16),
-    "PCIeHierarchicalAllReduce.all_reduce": (12, 16),
+    "PCIeHierarchicalAllReduce.all_reduce": (9, 10, 12, 16),
     "PCIeIslandRSAllReduce.all_reduce": (16,),
     "kimi_topk16": (1,),
 }

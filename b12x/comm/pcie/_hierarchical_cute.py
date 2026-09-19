@@ -1,4 +1,4 @@
-"""CuTeDSL implementation of the bounded-degree TP12/TP16 collective."""
+"""CuTeDSL all-reduce over four-rank islands with a possibly partial tail."""
 
 from __future__ import annotations
 
@@ -157,14 +157,14 @@ class _HierarchicalLaunch:
         vectorized_bf16x2: bool = False,
     ) -> None:
         self._world_size = int(world_size)
-        self._num_islands = self._world_size // _ISLAND_SIZE
+        self._num_islands = (self._world_size + _ISLAND_SIZE - 1) // _ISLAND_SIZE
         self._rank = int(rank)
         self._threads = int(threads)
         self._wait_nanosleep_cycles = int(wait_nanosleep_cycles)
         self._double_buffered = bool(double_buffered)
         self._deferred_consumption = bool(deferred_consumption)
         self._vectorized_bf16x2 = bool(vectorized_bf16x2)
-        if self._world_size not in (12, 16):
+        if self._world_size not in (9, 10, 12, 16):
             raise ValueError(f"unsupported world size {self._world_size}")
         if not 0 <= self._rank < self._world_size:
             raise ValueError(
@@ -184,6 +184,9 @@ class _HierarchicalLaunch:
         self._island = self._rank // _ISLAND_SIZE
         self._local_rank = self._rank % _ISLAND_SIZE
         self._leader_rank = self._island * _ISLAND_SIZE
+        # Header slots retain a four-rank stride. Absent ranks in the final
+        # island must neither be dereferenced nor waited on by its leader.
+        self._local_size = min(_ISLAND_SIZE, self._world_size - self._leader_rank)
 
     @cute.jit
     def __call__(
@@ -355,7 +358,7 @@ class _HierarchicalLaunch:
                                 generation,
                                 self._wait_nanosleep_cycles,
                             )
-                for peer in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                for peer in cutlass.range_constexpr(1, self._local_size):
                     _wait_for(
                         _flag_address(
                             self_base,
@@ -545,7 +548,7 @@ class _HierarchicalLaunch:
                     )
         else:
             if tidx == Int32(0):
-                for peer in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                for peer in cutlass.range_constexpr(1, self._local_size):
                     _wait_for(
                         _flag_address(
                             self_base,
@@ -570,7 +573,7 @@ class _HierarchicalLaunch:
                 while index < pairs:
                     total_lo = Float32(0.0)
                     total_hi = Float32(0.0)
-                    for peer in cutlass.range_constexpr(_ISLAND_SIZE):
+                    for peer in cutlass.range_constexpr(self._local_size):
                         peer_rank = self._leader_rank + peer
                         peer_stage = cute.make_ptr(
                             Uint32,
@@ -591,7 +594,7 @@ class _HierarchicalLaunch:
                 ):
                     tail = elements - Int64(1)
                     total = Float32(0.0)
-                    for peer in cutlass.range_constexpr(_ISLAND_SIZE):
+                    for peer in cutlass.range_constexpr(self._local_size):
                         peer_rank = self._leader_rank + peer
                         peer_stage = cute.make_ptr(
                             cutlass.BFloat16,
@@ -605,7 +608,7 @@ class _HierarchicalLaunch:
                 index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
                 while index < elements:
                     total = Float32(0.0)
-                    for peer in cutlass.range_constexpr(_ISLAND_SIZE):
+                    for peer in cutlass.range_constexpr(self._local_size):
                         peer_rank = self._leader_rank + peer
                         peer_stage = cute.make_ptr(
                             cutlass.BFloat16,
@@ -747,7 +750,7 @@ class _HierarchicalLaunch:
                                     ),
                                     generation,
                                 )
-                for peer in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                for peer in cutlass.range_constexpr(1, self._local_size):
                     peer_rank = self._leader_rank + peer
                     _store_release_sys_u32(
                         Int64(slabs[peer_rank].toint())
@@ -773,7 +776,7 @@ class _HierarchicalLaunch:
                                     generation,
                                     self._wait_nanosleep_cycles,
                                 )
-                    for peer in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                    for peer in cutlass.range_constexpr(1, self._local_size):
                         _wait_for(
                             _flag_address(
                                 self_base,
@@ -798,10 +801,10 @@ def get_hierarchical_launcher(
     deferred_consumption: bool = False,
     vectorized_bf16x2: bool = False,
 ) -> Callable[..., None]:
-    """Return the rank-specialized TP12/TP16 launcher for this channel."""
+    """Return the rank-specialized bounded-peer launcher for this channel."""
 
     del device_index  # retained in the process-local cache key
-    if world_size not in (12, 16):
+    if world_size not in (9, 10, 12, 16):
         raise ValueError(f"unsupported world size {world_size}")
     if not 0 <= rank < world_size:
         raise ValueError(f"invalid rank {rank} for world size {world_size}")
@@ -848,7 +851,7 @@ def get_hierarchical_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.hierarchical.bf16",
-            3,
+            4,
             cache_key,
             labels=(
                 "world_size",
