@@ -354,7 +354,9 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     core = scratch._core_workspace_plan
     if core.full_rotation or core.projection_mixed_trellis:
         raise RuntimeError("standard W4A16 compiler adapter received a Trellis plan")
-    tokens = int(scratch.launch_plan.max_tokens_per_launch)
+    # Scratch rounds route storage up to a capacity bucket. Native direct
+    # launches must retain the declared variant's exact planned row count.
+    tokens = int(caps.max_tokens)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
     if weight_layout not in {"packed", "modelopt", "iq2_xs"}:
