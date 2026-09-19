@@ -74,8 +74,7 @@ metadata and runtime arguments. In particular, decode context parallelism
 
 The candidate-contract version invalidates cached tuning candidates after the
 lowering changes; previously selected activation-precision and tile choices
-must be measured again. This is the cache behavior described as "cached
-precision races" in the first implementation commit.
+must be measured again.
 
 The recorded model source worktrees were committed; the diagnostic builders
 reject tracked modifications, archive Git source and verify installed runtime
