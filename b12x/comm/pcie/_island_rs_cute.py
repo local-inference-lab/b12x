@@ -23,6 +23,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import (
     cuda_stream_from_int_or_current,
