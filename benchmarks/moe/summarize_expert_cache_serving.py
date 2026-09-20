@@ -47,8 +47,26 @@ def summarize(path):
     requests = sorted(
         (r for r in records if r["kind"] == "request"), key=lambda r: r["index"]
     )
+    # Normalize compact worker-local receipts without inventing route histories.
+    # Engine wall time is the blocked scheduling interval. Client roundtrip and
+    # nested device-drain/worker stages remain distinct diagnostics.
+    for record in records:
+        if record["kind"] != "maintenance":
+            continue
+        value, worker = record["receipt"], record["receipt"]["worker"]
+        value.update(
+            baseline=worker["baseline"],
+            status="resumed",
+            pause_to_resume_wall_ns=value["engine_wall_ns"],
+            stages_ns={
+                **{"engine_" + n: t for n, t in value["engine_stages_ns"].items()},
+                **{"worker_" + n: t for n, t in worker["stages_ns"].items()},
+            },
+        )
     epochs = [
-        r for r in records if r["kind"] == "epoch" and not r["receipt"]["baseline"]
+        r
+        for r in records
+        if r["kind"] in ("epoch", "maintenance") and not r["receipt"]["baseline"]
     ]
     pauses = [
         (r["time_ns"] - r["receipt"]["total_wall_ns"], r["time_ns"]) for r in epochs
@@ -68,27 +86,41 @@ def summarize(path):
             raise ValueError("epoch did not acknowledge and resume")
         for name, ns in value["stages_ns"].items():
             stages[name].append(ns / 1e6)
-        d = value["decision"]
+        if r["kind"] == "maintenance":
+            d = value["worker"]
+            n, misses = d["selections"], d["cold_selections"]
+            outcomes = {
+                name: {
+                    "observed_hits_after_promotion": row["hits"],
+                    "evicted_promotion_hits": row["evicted_hits"],
+                }
+                for name, row in d["layers"].items()
+            }
+        else:
+            d = value["decision"]
+            n = sum(sum(v["decision"]["counts"]) for v in d["layers"])
+            misses = sum(v["decision"]["cold_selections"] for v in d["layers"])
+            outcomes = value["outcomes"]
         promotions += d["selected_pairs"]
         copy_bytes += d["copy_bytes"]
         skipped += d["proposed_pairs"] - d["selected_pairs"]
-        n = sum(sum(v["decision"]["counts"]) for v in d["layers"])
-        misses = sum(v["decision"]["cold_selections"] for v in d["layers"])
         cold += misses
         selections += n
-        last_outcomes.update(value["outcomes"])
+        last_outcomes.update(outcomes)
         evictions.extend(
             hits
-            for layer in value["outcomes"].values()
+            for layer in outcomes.values()
             for _, hits in layer["evicted_promotion_hits"]
         )
         series.append(
             dict(
                 output_tokens=r.get("output_tokens_so_far"),
+                next_check_tokens=r.get("next_check_tokens"),
                 cold_fraction=misses / n if n else None,
                 selections=n,
                 promotions=d["selected_pairs"],
                 copy_bytes=d["copy_bytes"],
+                health=d.get("health"),
                 pause_ms=value["pause_to_resume_wall_ns"] / 1e6,
             )
         )
@@ -159,6 +191,12 @@ def summarize(path):
             completed_promotion_evictions=len(evictions),
             zero_hit_completed_evictions=sum(hits == 0 for hits in evictions),
             series=series,
+            no_op_pause_ms=distribution(
+                [v["pause_ms"] for v in series if v["promotions"] == 0]
+            ),
+            promotion_pause_ms=distribution(
+                [v["pause_ms"] for v in series if v["promotions"] > 0]
+            ),
         ),
         output_token_sha256=hashlib.sha256(
             json.dumps([r["token_ids"] for r in requests]).encode()

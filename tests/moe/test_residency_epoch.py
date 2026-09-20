@@ -60,6 +60,17 @@ def test_global_budget_selects_subset_and_accounts_one_map_per_layer(canonical):
     assert all(s.generation == 1 for s in result.values())
 
 
+def test_declining_movement_keeps_decayed_history_without_changing_slots():
+    c, slots = coordinator(scoring="decayed_lfu")
+    first = c.observe(snapshot({n: (8, 0, 4, 0) for n in slots}, 1),
+                      slots=slots, allow_movement=False)
+    assert first.proposed_pairs == first.selected_pairs == 0
+    c.finish(first, slots=slots)
+    second = c.observe(snapshot({n: (8, 0, 14, 0) for n in slots}, 2), slots=slots)
+    assert all(x.decision.scores == (4, 0, 12, 0) for x in second.layers)
+    assert all(x.pairs == ((2, 1),) for x in second.layers)
+
+
 @pytest.mark.parametrize("replicas,budget,pairs,used", [(1, 131, 0, 0), (1, 132, 1, 132),
     (2, 263, 0, 0), (2, 264, 1, 264), (2, 464, 2, 464)])
 def test_global_budget_includes_every_replica_and_transaction_map(replicas, budget, pairs, used):

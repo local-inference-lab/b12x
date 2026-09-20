@@ -89,6 +89,7 @@ class ResidencyLayerBinding:
     apply: Callable
     pointers: Callable
     validate: Callable
+    timings: Callable | None = None
 
 
 class ResidencyEpochRuntime:
@@ -117,6 +118,7 @@ class ResidencyEpochRuntime:
         self._pointers = {name: tuple(b.pointers()) for name, b in self.bindings.items()}
         self._token, self._command, self._before = None, None, None
         self._stage, self._failed = "idle", False
+        self._controller_kind = None
 
     def _validate(self):
         if self._failed:
@@ -134,6 +136,9 @@ class ResidencyEpochRuntime:
     def begin(self, token):
         """Called only after the engine's completed pause/drain boundary."""
         self._validate()
+        if self._controller_kind not in (None, "rpc"):
+            raise RuntimeError("residency controller changed; reload the lane")
+        self._controller_kind = "rpc"
         _text("epoch token", token)
         if self._stage != "idle":
             raise RuntimeError("worker already has a pending residency epoch")
@@ -223,6 +228,18 @@ class ResidencyEpochWorkerExtension:
             raise RuntimeError("model has no prepared residency runtime; CPU-source loader/backend integration is required")
         return runtime
 
+    def b12x_residency_maintenance(self, config):
+        """Only the engine's completed single-rank drain may invoke this method."""
+        from .residency_maintenance import LocalResidencyMaintenance
+        runtime = self._b12x_epoch_runtime()
+        maintenance = getattr(runtime, "_local_maintenance", None)
+        if maintenance is None:
+            maintenance = LocalResidencyMaintenance(runtime, config)
+            runtime._local_maintenance = maintenance
+        elif maintenance.config != config:
+            raise ValueError("maintenance session/config changed; reload the lane")
+        return maintenance.run()
+
     def b12x_residency_begin(self, token):
         return self._b12x_epoch_runtime().begin(token)
 
@@ -282,7 +299,8 @@ def bind_sm120_epoch_layer(plan, observations):
             payload_copy_bytes_per_pair=payload, map_copy_bytes_per_transaction=2*plan.query.experts*8,
             backing_mode="canonical"), max_pairs=plan.query.max_pairs,
         snapshot=state.updates.snapshot, apply=state.updates.apply,
-        pointers=state.pointers, validate=validate)
+        pointers=state.pointers, validate=validate,
+        timings=lambda: dict(getattr(state.updates, "last_timings_ns", {})))
 
 
 def bind_sm103_epoch_layer(plan, observations):
@@ -428,6 +446,7 @@ class VllmResidencyEpochs:
 
             try:
                 await timed("pause_and_drain", self.engine.pause_generation(mode="keep", clear_cache=False))
+                receipt["engine_pause_stages_ns"] = getattr(self.engine, "last_pause_timings_ns", {})
                 ranks = await rpc("begin", token)
                 self._validate_replicas(ranks)
                 owner = ranks[self.owner_rank]

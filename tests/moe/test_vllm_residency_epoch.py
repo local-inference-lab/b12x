@@ -180,6 +180,100 @@ def test_disabled_performs_no_engine_or_worker_operations():
     assert not e.events and e.reads == [0, 0]
 
 
+def local_maintenance(engine, threshold=0.2, pairs=2):
+    from dataclasses import asdict
+    from b12x.integration.vllm.residency_maintenance import LocalResidencyMaintenance
+    engine.paused = True
+    runtime = engine.workers[0].model_runner.b12x_residency_runtime
+    return LocalResidencyMaintenance(runtime, {
+        "session": "test", "layers": {n: asdict(config(scoring="decayed_lfu")) for n in ("a", "b")},
+        "budget": {"max_pairs": pairs, "max_copy_bytes": 528},
+        "cold_fraction_threshold": threshold,
+    })
+
+
+def test_local_health_gate_preserves_stable_generation_then_tracks_transition():
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e)
+    assert m.run()["baseline"]
+    for window in range(1, 4):
+        e.counts = snapshot({n: (20*window, 0, window, 0) for n in ("a", "b")}, window)
+        receipt = m.run()
+        assert receipt["health"] == "healthy" and receipt["selected_pairs"] == 0
+        assert all(l.slots.generation == 0 for l in e.layers[0].values())
+    e.counts = snapshot({n: (60, 0, 43, 0) for n in ("a", "b")}, 4)
+    receipt = m.run()
+    assert receipt["health"] == "pressure" and receipt["selected_pairs"] == 2
+    assert all(l.slots.expert_map[2][0] == 0 for l in e.layers[0].values())
+    assert all(l.addresses == (1000, 2000, 3000) for l in e.layers[0].values())
+    assert e.reads == [5]
+
+
+@pytest.mark.parametrize("failure", ["stale", "partial", "pointer"])
+def test_local_failure_poisoning_requires_reload(failure):
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e)
+    m.run()
+    e.counts = snapshot({n: (0, 0, 10, 0) for n in ("a", "b")}, 1)
+    if failure == "stale":
+        e.layers[0]["b"].slots = replace(e.layers[0]["b"].slots, generation=1)
+    elif failure == "partial":
+        e.layers[0]["b"].fail = True
+    else:
+        e.layers[0]["b"].addresses = (1, 2, 3)
+    with pytest.raises((ValueError, RuntimeError, r.ResidencyUpdateError)):
+        m.run()
+    with pytest.raises(RuntimeError, match="reload"):
+        m.run()
+    if failure == "partial":
+        assert e.layers[0]["a"].slots.generation == 1
+
+
+def test_local_zero_budget_and_mixed_controller_rejection():
+    e = Engine(ranks=1)
+    m = local_maintenance(e, threshold=None, pairs=0)
+    m.run()
+    e.counts = snapshot({n: (0, 0, 10, 0) for n in ("a", "b")}, 1)
+    receipt = m.run()
+    assert receipt["proposed_pairs"] == 2 and receipt["selected_pairs"] == 0
+    assert receipt["transaction_ns"] == {}
+    with pytest.raises(RuntimeError, match="controller changed"):
+        m.runtime.begin("foreign")
+
+
+def test_maintenance_driver_serializes_checks_and_poisoned_outcomes():
+    from b12x.integration.vllm.residency_maintenance import VllmResidencyMaintenance
+
+    async def run():
+        active, calls = 0, 0
+
+        async def maintain(config):
+            nonlocal active, calls
+            active += 1
+            assert active == 1
+            await asyncio.sleep(0)
+            active -= 1
+            calls += 1
+            if calls == 3:
+                raise RuntimeError("unknown worker outcome")
+            return {"worker": {"baseline": calls == 1}}
+
+        driver = VllmResidencyMaintenance(
+            SimpleNamespace(residency_maintenance=maintain),
+            configs={n: config() for n in ("a", "b")},
+            budget=r.ResidencyEpochBudget(max_pairs=2, max_copy_bytes=528),
+        )
+        results = await asyncio.gather(driver.run(), driver.run())
+        assert calls == 2 and results[1]["lock_wait_ns"] > 0
+        with pytest.raises(RuntimeError, match="unknown worker"):
+            await driver.run()
+        with pytest.raises(RuntimeError, match="reload"):
+            await driver.run()
+        assert calls == 3
+
+    asyncio.run(run())
+
+
 def test_cannot_steal_external_pause_or_merge_dp_lanes():
     e = Engine()
     e.paused = True

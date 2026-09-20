@@ -169,8 +169,10 @@ class ResidencyCacheController:
             raise ValueError("counter window has inconsistent selection/sampling totals")
         return row, counts, metadata
 
-    def observe(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot):
+    def observe(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot, propose=True):
         """Propose pairs from completed requests; never perform an exchange."""
+        if type(propose) is not bool:
+            raise TypeError("propose must be bool")
         row, counts, metadata = self.validate_observation(snapshot, slots=slots)
         calls, sampled_calls, tokens, sampled_tokens = metadata
         scores = counts
@@ -181,9 +183,9 @@ class ResidencyCacheController:
         hot = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 0)
         cold = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 1 and counts[e])
         protected = tuple(e for e in hot if window-self._entered[e] < self.config.minimum_residency_windows)
-        candidates = sorted((e for e in cold if counts[e] >= self.config.minimum_cold_selections),
+        candidates = sorted((e for e in cold if propose and counts[e] >= self.config.minimum_cold_selections),
                             key=lambda e: (-scores[e], e))
-        victims = sorted((e for e in hot if e not in protected), key=lambda e: (scores[e], e))
+        victims = sorted((e for e in hot if propose and e not in protected), key=lambda e: (scores[e], e))
         pairs, hysteresis = [], 0
         for candidate, victim in zip(candidates, victims):
             if len(pairs) == self.config.max_pairs:
@@ -201,7 +203,7 @@ class ResidencyCacheController:
             cold_selections=cold_count, unique_cold_experts=cold,
             cold_fraction=cold_count/sum(counts) if sum(counts) else None,
             counterfactual_cold_fraction=remaining/sum(counts) if sum(counts) else None,
-            below_threshold=len(cold)-len(candidates), below_hysteresis=hysteresis,
+            below_threshold=sum(counts[e] < self.config.minimum_cold_selections for e in cold), below_hysteresis=hysteresis,
             protected_hot_experts=protected, unpaired_candidates=len(candidates)-len(pairs)-hysteresis,
             observed_hits_since_promotion=tuple(sorted(hits.items())), scores=tuple(scores))
         self._baseline, self._window, self._hits = row, window, hits
@@ -214,7 +216,10 @@ class ResidencyCacheController:
         """Validate acknowledgement before a model coordinator commits any layer."""
         if self._pending is None or decision is not self._pending:
             raise ValueError("cache decision is stale or belongs to another controller")
-        _validate_slots(slots, self.observations.experts, self.exchange.backing_mode)
+        # The retained immutable generation was validated at admission/commit.
+        # Equality proves a declined/no-op decision still has that exact map.
+        if slots != self._slots:
+            _validate_slots(slots, self.observations.experts, self.exchange.backing_mode)
         selected = decision.pairs if accepted_pairs is None else tuple(accepted_pairs)
         if len(set(selected)) != len(selected) or any(pair not in decision.pairs for pair in selected):
             raise ValueError("accepted pairs must be a subset of the pending decision")

@@ -33,6 +33,15 @@ physical gates remain distinct. The complete source-bound SM103 compiler corpus
 contains 86 declarations and 244 programs, including 238 native CuTe exports.
 The [ledger](expert-residency-ledger.md) binds those counts to the tested source.
 
+The [scheduler-maintenance control](expert-cache-maintenance.md) adds an opt-in
+single-rank engine boundary, worker-local model-wide policy and explicit cold
+pressure gating. It preserves the scheduler/device barrier without the public
+administrative pause's output-settling delay. Static serving declares no
+observer or maintenance task. The same source fixes repeated expert selections
+in the native one-token packed W4A16 path; only top-1 can assume one row per
+expert block. The SM103 corpus remains 86 declarations/244 programs at package
+`667fad34f8bb0ba5ad048154e2cfd6281ebe206a19b1b8e32a69fd34e89e0d6b`.
+
 ## Implemented features
 
 | Feature | Implementation |
@@ -107,9 +116,15 @@ is claimed.
 
 ## Validation and PR acceptance
 
-The [readiness report](sm103-readiness-report.md) gives the validation totals for
-the shared-residency source: 1,052 host passes, 22 portable GPU passes and three
-fresh focused SM103 declarations covering 14 programs. The full 85-declaration,
+The scheduler-maintenance source passes 86 focused host tests with six GPU-only
+skips and the complete offline SM103 corpus of 86 declarations / 244 programs.
+The [maintenance guide](expert-cache-maintenance.md) and
+[engineering ledger](expert-residency-ledger.md#scheduler-owned-maintenance-and-serving-control-costs)
+separate its physical SM120 serving evidence and engine-build qualification.
+
+The [readiness report](sm103-readiness-report.md) also retains historical
+shared-residency extraction totals: 1,052 host passes, 22 portable GPU passes and
+three focused SM103 declarations covering 14 programs. The full 85-declaration,
 241-program receipt remains tied to `94639562`. Physical-only skips remain separate. The [engineering ledger](expert-residency-ledger.md)
 separates that evidence from the static-residency baseline at `78a8704f` and
 retains failed runs. Counter overhead measurements on SM120 describe only the

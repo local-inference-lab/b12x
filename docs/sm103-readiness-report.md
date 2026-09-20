@@ -47,8 +47,14 @@ and real single-rank vLLM graph execution. Static and adaptive experiments start
 from the same learned profile. Their serving receipts include scheduler pauses;
 prior operator timings remain tied to their original source.
 
+The [scheduler-maintenance experiment](expert-cache-maintenance.md) adds an
+explicit single-rank worker-local control boundary, routing-pressure gating and
+separate counters-only measurements. It retains scheduler/device drain and
+fail-closed reload semantics. Native SM103 execution, distributed serving and
+production adaptive defaults remain unqualified.
+
 The SM103 preparation corpus at package SHA256
-`2b90cf1b36809849be8449c579d42f3b614a3950489f598094134428d3daa94c`
+`667fad34f8bb0ba5ad048154e2cfd6281ebe206a19b1b8e32a69fd34e89e0d6b`
 contains **86 declarations and 244 distinct programs**, including 238 native CuTe
 exports and six supporting Triton programs. The additional declaration exercises
 an optional prepared counter extent/phase setter; it does not add an SM103 cache
@@ -62,7 +68,7 @@ evidence, not physical B300 evidence.
 | Hierarchical MXFP4 expert residency implemented | Immutable per-layer profiles and memory budgets prepare HBM and exact-size mapped Grace slabs. Native MXFP8/MXFP4 projections consume compact tier-local routes and produce unfinalized expert outputs for one original-top-k-order FP32 FMA reduction. Checkpoint weight bytes remain unchanged. |
 | Quiescent slot exchange implemented | Declared rollback journals, disjoint canonical-ID pairs, synchronized payload/map commit, stale-generation rejection and fail-closed rollback preserve captured addresses. Portable byte-replay tests pass; SM103 TMA and native-operator exchange parity remain physical gates. |
 | Shared residency subsystem implemented | Standard-library-only placement, observation and generation contracts plus host cache policy; the SM103 adapter supplies numerical admission and copy accounting. Existing imports and schema-1/schema-2 profile hashes are preserved. An opt-in canonical-host W4A16 backend has separate SM120 serving evidence; it does not qualify native SM103 execution. |
-| Experimental cache policy implemented | Recent-frequency remains the default; explicit decayed LFU retains window history. Canonical counts identify cold selections for one unchanged generation. Model-wide pair/byte budgets select subsets across layers. Static profiles/defaults remain unchanged; adaptive serving benefit remains unqualified. |
+| Experimental cache policy implemented | Recent-frequency remains the default; explicit decayed LFU retains window history. Canonical counts identify cold selections for one unchanged generation. Model-wide pair/byte budgets select subsets across layers. Static profiles/defaults remain unchanged. SM120 serving benefit is workload-dependent; physical SM103 benefit remains unqualified. |
 | Automatic residency implemented | Typed off/profile/auto/monitor modes, balanced cold-start placement, joint HBM/Grace admission, conservative activation, checkpoint/workload/recipe validation, atomic profiles, windowed convergence and drift diagnostics. Serving placement stays static; activation requires an engine-controlled restart. |
 | Prepared counter profiling implemented | CuTe uint64 counters use retained programs and stable storage. Off has no counter node. The SM120 V2 companion supplies explicit decode phase and valid rows through a retained device setter; native SM103 serving wiring remains required. |
 | Implemented and tested on SM120 | Residency component tests cover quantization, route compaction, ordered-FMA adversaries, invalid int64 IDs, mapped-host reads, live-count reuse and allocation-free CUDA graph replay. Prepared counter tests add sampling, TP ownership, overflow and lifecycle coverage. These tests do not execute SM103 tcgen05 kernels or establish Grace-backed TMA legality. |
@@ -77,6 +83,18 @@ CPU. Canonical GPU weight preparation and portable SM120 expert execution are
 separate tests. BTX GPU preparation tests use SM103 admission metadata on SM120 solely to exercise byte preparation and the independent oracle; they execute no native SM103 expert kernel.
 
 ## Source-bound validation
+
+Scheduler-maintenance validation binds the package hash above. The focused host
+suite passes **86 tests**, with six GPU-only skips; the complete offline SM103
+preparation corpus passes **86 declarations / 244 programs**. The
+[maintenance guide](expert-cache-maintenance.md) and
+[serving-control ledger](expert-residency-ledger.md#scheduler-owned-maintenance-and-serving-control-costs)
+record the separate physical SM120 serving, kernel and engine-build gates.
+The focused physical suite passes 25 cases and targeted memcheck/synccheck;
+the source-built companion passes ten engine/loader cases plus adaptive and
+ordinary graph-serving smoke tests. The five MXFP6 registry failures reproduce
+on untouched `b067db4` and remain a separate unresolved gate.
+The extraction results below remain historical evidence for their own source.
 
 The shared-residency extraction evidence binds package SHA256
 `2400c738ec87ea2ac71e21a426b1de4f315c66e6e05a642578c1828f677e60d1`.
@@ -113,8 +131,9 @@ all-cold compiler variants, portable arithmetic and W4A16/pooled-selection tests
 
 ## Remaining acceptance gates
 
-GitHub reports zero commit statuses and zero check runs for the reviewed starting source `181e234b` as of
-September 18, 2026. The
+GitHub reports zero commit statuses and zero check runs for the reviewed starting
+source `b067db404e8b2dd22855482eaa11bff68c631342` and companion
+`1d1f870bd617a4905637a30fcb552859b9fb2ded` as of September 19, 2026. The
 [wheel-release workflow](../.github/workflows/lil-cu134-wheel-release.yml)
 runs on selected branch/tag pushes or manual dispatch; it does not run on pull
 requests. A PR test workflow must be enabled and pass for the reviewed PR source

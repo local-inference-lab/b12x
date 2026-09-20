@@ -33,6 +33,10 @@ acknowledgement. The [prepared SM120 serving cache](expert-cache-serving.md)
 connects a CPU-source NVFP4 loader and canonical backend to this protocol in
 vLLM. Its explicitly selected W4A16 recipe, PCIe transport and single-rank
 qualification are separate from static SM103 plans and physical qualification.
+Opt-in [scheduler-owned maintenance](expert-cache-maintenance.md) reduces the
+single-rank companion's control roundtrips and can gate movement on observed
+cold-route pressure. It preserves static defaults and the engine-owned reader
+barrier; it does not qualify physical SM103 kernels or change Grace storage.
 
 ## Supported contracts
 

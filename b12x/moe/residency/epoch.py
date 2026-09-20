@@ -1,6 +1,7 @@
 """Bounded model-wide decisions; engines own quiescence and backend execution."""
 from dataclasses import dataclass
 from types import MappingProxyType
+from time import perf_counter_ns
 
 from .contracts import _integer
 from .policy import ResidencyCacheController, ResidencyCacheDecision
@@ -69,8 +70,11 @@ class ResidencyEpochCoordinator:
         if self._failed:
             raise RuntimeError("residency epoch failed; reload the lane and establish fresh baselines")
 
-    def observe(self, snapshot, *, slots):
+    def observe(self, snapshot, *, slots, allow_movement=True):
+        """Advance observation history even when an external health gate declines movement."""
         self._require_healthy()
+        if type(allow_movement) is not bool:
+            raise TypeError("allow_movement must be bool")
         if self._pending is not None:
             raise RuntimeError("finish the pending model epoch before observing another")
         if set(slots) != set(self.controllers):
@@ -78,7 +82,10 @@ class ResidencyEpochCoordinator:
         # Invalid later layers must not consume earlier layers' observations.
         for name, controller in self.controllers.items():
             controller.validate_observation(snapshot, slots=slots[name])
-        decisions = {name: c.observe(snapshot, slots=slots[name]) for name, c in self.controllers.items()}
+        started = perf_counter_ns()
+        decisions = {name: c.observe(snapshot, slots=slots[name], propose=allow_movement)
+                     for name, c in self.controllers.items()}
+        ranked = perf_counter_ns()
         opportunities = []
         for name, decision in decisions.items():
             cost = self.controllers[name].exchange.payload_copy_bytes_per_pair * self.replicas
@@ -101,6 +108,8 @@ class ResidencyEpochCoordinator:
             layers=tuple(ResidencyLayerDecision(layer=name, decision=d, pairs=tuple(selected[name]))
                          for name, d in decisions.items()),
             proposed_pairs=len(opportunities), selected_pairs=pairs, copy_bytes=used)
+        self.last_timings_ns = {"layer_policy": ranked-started,
+                               "opportunity_ranking": perf_counter_ns()-ranked}
         return self._pending
 
     def finish(self, decision, *, slots):

@@ -1,5 +1,6 @@
 """Physical Blackwell gates for prepared counters and allocator-free replay."""
 from dataclasses import replace
+import gc
 
 import pytest
 import torch
@@ -88,6 +89,9 @@ def test_counter_exact_graph_capacity_controls_and_overflow(dtype, monkeypatch):
                     state.reset(quiescent=True)
                     state.set_enabled(True, quiescent=True)
                     ids.fill_(fill)
+                    # Retire unrelated graph-owner cycles before measuring replay.
+                    gc.collect()
+                    torch.cuda.synchronize()
                     before = torch.cuda.memory_stats()
                     for _ in range(3): graph.replay()
                     torch.cuda.synchronize()

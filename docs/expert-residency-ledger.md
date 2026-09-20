@@ -1680,3 +1680,313 @@ Both physical GPUs return idle with 2 MiB allocated after the experiments.
 The pre-existing homeassistant container remains running; no household service
 is stopped. Historical 141-fixture and 181-fixture spectra and the held-out
 single-layer receipts are unchanged and are not relabeled as serving evidence.
+
+
+## Scheduler-owned maintenance and serving control costs
+
+Status: **experimental single-rank control; SM103 physical qualification unchanged**.
+The source begins at b12x `b067db404e8b2dd22855482eaa11bff68c631342` on
+`work/sm103-bringup` and companion vLLM
+`1d1f870bd617a4905637a30fcb552859b9fb2ded` on `codex/b12x-expert-cache`.
+The inspected master is `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`;
+the companion main is `47ccf6c57d92f03630ebcbad3809450545825488`.
+Raw receipts live outside the repository at
+`/home/jasonc/b12x-control-evidence-20260919`; the remote collection directory is
+`/home/jasonc/b12x-control-results-20260919` on ripper. Source archives,
+companion patches/file hashes, commands, telemetry and failed runs are retained.
+
+The implementation keeps the existing scheduler/device drain, moves the
+single-rank policy into one worker RPC and avoids the administrative frontend's
+20 ms output-settling delay. A configured cold-fraction gate declines movement
+without discarding decayed history. Immutable unchanged map generations avoid
+repeated structural validation. The shared all-rank protocol, static opt-out,
+expert-copy transaction and SM103 storage model remain intact.
+
+The frozen library package is
+`667fad34f8bb0ba5ad048154e2cfd6281ebe206a19b1b8e32a69fd34e89e0d6b`.
+`source-06.json` binds the engine files; `source-07.json` retains the same library
+and engine hashes with the additional research-only cadence harness. The
+`sm103-full-06/manifest.json` compile receipt passes 86 declarations and 244
+programs, including 238 native CuTe exports, with CUDA uninitialized and the
+source unchanged. This is compile evidence, not B300 execution evidence.
+
+The serving matrix uses the same Qwen3-30B-A3B-NVFP4 checkpoint, learned
+58/128-per-layer profile, 16 authored requests, 128 generated tokens per request,
+8 GiB expert envelope, 2 GiB BF16 KV and full-decode graph configuration as the
+prepared-cache qualification. Every arm starts a fresh worker. Static has no
+observer; counters-only has no epochs. Fixed external 32/128-token epochs,
+conditional worker-local maintenance and explicit healthy-check backoff are
+separate arms. Conditional experiments use a declared 0.15 cold-fraction gate,
+not a production default. The backoff experiment uses 32 through 256 delivered
+tokens and does not claim fixed four-iteration observation semantics.
+
+GPU 0 is RTX PRO 4000 Blackwell
+`GPU-47363510-b87a-13a5-4824-2542e97df76c`; GPU 1 is
+`GPU-cc109c01-9756-d0db-21ea-f1825d3f963f`. Driver 580.173.02, CUDA 13.3,
+Torch 2.13.0, CUTLASS DSL 4.6.2 and Triton 3.7.1 identify the physical image.
+The workstation has one NUMA node and negotiated PCIe Gen4 x16. Dynamic
+clocks/power and CPU affinity are retained in receipts. The complete engine
+build is paused during timing collection. Image binary extensions plus modified
+maintained Python sources remain an explicit experimental build identity until
+separately verified against a complete source-matched build.
+
+Failures and rejected approaches retained:
+
+- `stalled-maintenance-02.json` and its raw serving log retain an engine that
+  completed its first maintenance transaction but did not resume requests.
+  An idle callback resumed existing work, then the input loop blocked waiting
+  for another client message. Rechecking `has_work()` after callbacks fixes the
+  missing wakeup; a regression test requires progress without another message.
+- `whole-k-03`, `whole-k8-03`, `whole-debug-03` and `whole-routes-03` expose a
+  one-token packed W4A16 shortcut that reads only the first route in each
+  expert block. A repeated expert leaves its later route unwritten. The mapped
+  variant clears that row to zero; the unmapped variant can expose stale scratch.
+  Adding an identity map merely hides the stale value and is not a fix.
+  Restricting the shortcut to top-1 restores the declared duplicate-route
+  contract. A production-sized independent top-1 oracle verifies repeated routes
+  under the same captured graph. The serving capacity-64 path does not select
+  this one-token compile specialization; prior serving receipts remain intact.
+- `gpu-tests-05.log` retains an incorrect test filename. The corrected suite in
+  `gpu-tests-05b.log` passes 24 cases and rejects the first independent-oracle
+  declaration because an all-resident cache cannot reserve eviction pairs.
+  The test declares no updates for that all-resident oracle; `duplicate-test-06`
+  passes. Neither collection failure nor invalid test declaration is a GPU pass.
+- `matching-build-03.log` retains the first build launch failure: the copied host
+  `uv` executable requires a missing jemalloc library. The isolated build uses
+  the official standalone wheel instead. Build logs and artifacts remain under
+  `/models/b12x-control-build-20260919` on ripper.
+- No always-on pressure atomic, router fusion, device policy, asynchronous fill,
+  spare slot, storage rewrite or production cadence is introduced. Measurements
+  distinguish counter overhead, host maintenance, movement and deterministic
+  compute cost before choosing further work.
+
+### Complete control cost
+
+The fixed-cadence serving table in the
+[maintenance guide](expert-cache-maintenance.md#serving-evidence) is computed
+from `static`, `observe`, `external32`, `external128` and `maintenance` receipts
+ending in `-06.jsonl`. Each concurrency has one shared output-token hash across
+those arms. The additional `maintenance-repeat-c1-06` and
+`static-repeat-c1-06` receipts give 63.00 and 52.82 generated tokens/s, compared
+with 63.02 and 52.84 in the first pair. All rates include control work.
+
+Median wall-time stages for the C1 external 32-token arm:
+
+| Stage | ms |
+| --- | ---: |
+| Pause/drain roundtrip, including output settling | 45.58 |
+| Administrative output settling alone | 20.17 |
+| Begin/snapshot RPC | 21.74 |
+| Client policy | 9.08 |
+| Preflight RPC | 9.25 |
+| Apply RPC | 24.43 |
+| Acknowledge RPC | 4.25 |
+| Resume RPC | 1.23 |
+| Pause-to-resume interval | 152.27 |
+| Complete client control call | 162.37 |
+
+The broad stages do not account for all Python serialization/bookkeeping, and
+medians are not additive. Worker snapshot work is about 2 ms, substantially less
+than its RPC roundtrip. Administrative output settling is one cost, not the
+entire explanation. Worker-local control removes repeated map-bearing RPCs and
+retains only compact diagnostic replies.
+
+Conditional-maintenance checks separate no movement from completed promotions:
+
+| Concurrency / check | Count | Engine interval median ms | Drain median ms | Worker RPC median ms | Policy median ms | Fill-batch median ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 / no movement | 32 | 23.23 | 8.66 | 14.28 | 7.10 | 0.002 |
+| C1 / promotion | 28 | 42.87 | 15.39 | 27.88 | 8.91 | 7.03 |
+| C4 / no movement | 25 | 41.21 | 27.19 | 14.17 | 6.85 | 0.002 |
+| C4 / promotion | 26 | 83.09 | 54.57 | 28.52 | 8.80 | 7.03 |
+| C8 / no movement | 21 | 54.81 | 40.55 | 14.61 | 6.84 | 0.002 |
+| C8 / promotion | 21 | 115.09 | 85.86 | 28.35 | 8.98 | 6.94 |
+
+Drain includes the remaining useful execution of a submitted iteration. The
+worker's no-movement cost remains approximately 14 ms across concurrency; the
+larger engine interval is not all wasted CPU control time. C1 counter snapshot
+medians are 0.044 ms drain, 0.058 ms D2H and 1.908 ms host decoding. Pressure
+classification takes 2.179 ms; layer policy 5.958 ms and ranking 0.215 ms.
+Frontend lock waiting is 0.003 ms. These are nested host intervals, not isolated
+device-event measurements.
+
+Client latency remains visible rather than being absorbed into aggregate rates:
+
+| Arm | TTFT p50 / p95 ms | Delivery gap p50 / p95 / p99 ms |
+| --- | ---: | ---: |
+| C1 static | 147.73 / 195.04 | 14.30 / 36.04 / 46.22 |
+| C1 conditional | 132.35 / 180.17 | 11.74 / 33.59 / 43.05 |
+| C4 static | 269.79 / 512.60 | 51.19 / 82.88 / 96.83 |
+| C4 conditional | 258.59 / 509.56 | 38.35 / 79.10 / 102.81 |
+| C8 static | 502.06 / 938.89 | 61.50 / 133.63 / 140.78 |
+| C8 conditional | 505.40 / 940.95 | 66.25 / 119.95 / 142.01 |
+
+Delivery gaps are client event intervals, not GPU iteration durations; raw
+receipts retain coalesced-token counts and intervals overlapping maintenance.
+Tail latency is not uniformly better. Conditional C1/C4/C8 perform 448/416/336
+promotions, account for 1,189,871,104 / 1,104,880,896 / 892,412,544 copy bytes,
+and record 69,508 / 68,458 / 60,732 later selections of promoted experts.
+Their observed decode cold fractions are 16.05% / 16.60% / 16.51%; static
+has no observer, so no static cold fraction is inferred. Engine-interval p95
+is 60.11 / 99.25 / 122.40 ms. The final summary retains request decode rates,
+all workload splits, skipped proposals, promotion lifetimes and raw epoch series.
+
+The 382 C1 layer-fill transactions have a 0.398 ms median complete transaction.
+Median stages are 0.015 ms initial drain, 0.031/0.013 ms map-read enqueue/wait,
+0.119 ms validation/encoding, 0.162/0.016 ms payload enqueue/wait and
+0.025/0.012 ms map-publication enqueue/wait. Enqueue can include synchronous
+work; these intervals are not transport bandwidth measurements. Copy mechanics
+are unchanged. The evidence does not prioritize further DMA optimization.
+
+The 32–256-token backoff experiment retains separate `backoff-c*-07` receipts.
+C1 and C8 match static tokens and reduce stable penalties to about 2%, with
+slower transition recovery than fixed checks. C4 generates different token IDs
+for requests 4–7 before any promotion; its first movement is recorded only at
+1,309 delivered tokens. The whole stable interval retains generation zero.
+The run's 87.31 overall / 134.75 stable / 64.60 code tokens/s are retained as an
+**unqualified comparison**, not evidence of a matched-output speedup. Changed
+batch scheduling is a hypothesis; no unmeasured causal explanation is asserted.
+Backoff remains an explicit research harness option.
+
+The ungated worker-local C1 arm, `maintenance-ungated-c1-07`, matches output IDs
+and produces 63.08 tokens/s overall, 84.45 stable and 50.43 after transition.
+It performs 960 promotions versus 448 with the gate, but its whole-run rate is
+effectively the same. The narrower engine boundary explains the main measured
+gain; this corpus does not establish an additional aggregate throughput win
+from the pressure threshold. The gate reduces movement and stable-workload loss.
+
+### Deterministic scheduling cost
+
+`whole-k-08.json` binds 16 physical comparisons on GPU 1: M=1 through 128,
+top-k=2/8, checkpoint layer 12, E=128/H=2048/I=768. Each arm retains 12 balanced
+samples of 100 CUDA graph replays, with warm constant activations/routes.
+The output is finite/nonzero; the prepared cache matches native whole-K exactly
+at every shape. Timed replay records zero Torch allocator events under frozen
+kernel resolution. `whole-k-08-telemetry.csv` retains clock/power samples.
+
+Median complete operator microseconds, lower is better:
+
+| M | top-k=2 preferred | whole-K | all-resident cache | top-k=8 preferred | whole-K | all-resident cache |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 12.29 | 24.21 | 34.81 | 26.64 | 38.93 | 51.22 |
+| 2 | 16.42 | 24.57 | 34.83 | 53.66 | 64.49 | 73.69 |
+| 4 | 26.63 | 38.94 | 49.22 | 144.77 | 168.84 | 179.35 |
+| 8 | 55.00 | 65.52 | 73.70 | 285.03 | 280.07 | 297.14 |
+| 16 | 160.62 | 158.97 | 166.90 | 450.26 | 448.39 | 468.52 |
+| 32 | 264.74 | 258.32 | 276.11 | 574.81 | 571.16 | 594.70 |
+| 64 | 429.09 | 423.53 | 442.94 | 659.23 | 655.63 | 690.09 |
+| 128 | 569.86 | 565.90 | 594.59 | 1117.56 | 1103.79 | 1166.67 |
+
+The preferred path selects `moe.w4a16.small_m_direct` through M=8 at top-k=2
+and M=4 at top-k=8. Whole-K uses the packed native path. The small-M ratio
+therefore includes route preparation and execution-structure differences; it
+does not isolate split-K arithmetic alone. Preferred/whole-K cosine is at least
+0.999986, but small-M results differ in many BF16 elements. No numerical mode
+is substituted in serving. Larger shapes are close in this warm diagnostic;
+small percentage differences under dynamic clocks are not tuning winners.
+
+`sm120-native-08/identity.json` and `resources.json` bind 22 captured native
+objects to verified manifests/cubins and exact driver resource/occupancy queries.
+At top-k=8/M=1, the direct kernel uses 127 registers, 512 threads/CTA and 5,312
+static SMEM bytes. Whole-K uses 144 registers, 256 threads/CTA, 1,024 static plus
+54,272 dynamic SMEM bytes. Both permit one CTA/SM. At M=128, preferred/whole-K
+use 152/150 registers, 128 threads/CTA and 1,024 + 27,648 SMEM bytes, permitting
+three CTAs/SM. These are resource bounds, not measured achieved occupancy.
+The audited compute kernels have no local loads/stores or driver local memory.
+This targeted census covers observed CuTe programs, not every Triton metadata
+program or an Nsight tensor-utilization trace.
+
+### Focused correctness
+
+The host suite passes 86 tests with six GPU-only skips (`host-08.log`). The
+physical cache/counter/model-epoch suite passes 25 tests (`gpu-tests-09.log`).
+The duplicate-route independent oracle passes targeted memcheck and synccheck,
+one test each, zero errors (`duplicate-*-09.log`). Seven companion engine tests
+pass at the final Python source, covering deferred drain, failure, cancellation,
+opt-out, competing administrative control and idle-callback progress.
+
+`gpu-tests-08.log` retains an allocator-accounting failure: a counter replay
+window observed 1,536 bytes freed after preceding graph tests, with 24 other
+cases passing. The counter test now collects retired Python owner cycles and
+synchronizes before taking its replay baseline. It retains strict allocation
+and free-event equality during replay. Only the test boundary changes; the
+frozen library hash is unchanged in `source-09.json`.
+
+The ordinary non-cache smoke in `ordinary-smoke-mixed-02` loads the complete
+checkpoint through the ordinary GPU loader, selects FlashInfer CUTLASS, captures
+decode graphs and generates 16 tokens with empty additional configuration.
+It is an opt-out regression check, not an arithmetic comparison with the cache's
+declared W4A16 recipe. The first smoke launcher omitted Python's multiprocessing
+main guard; `ordinary-smoke-mixed.log` retains that bootstrap error. The guarded
+launcher passes without an engine source change.
+
+The serving image ID is
+`sha256:697f1be219540b9a5bdcd020fdd549dd0f0e848011b6630d654f43cb1782908a`.
+`mixed-loaded-binaries.json` records the actual imported package path/version
+and native-library hashes. The source-build attempt in `matching-build-04.log`
+was deliberately interrupted after timing collection to increase compile
+parallelism; `matching-build-05.log` resumes the same source and object tree.
+No precompiled engine extension is admitted to that build.
+
+### Source-matched engine qualification
+
+The complete CUDA/C++/Rust build succeeds in `matching-build-06.log` with
+precompiled engine and Rust artifacts disabled. The source-bound wheel is
+`vllm-0.0.0.dev0+expertcache.1d1f870b.cu133-cp312-cp312-linux_x86_64.whl`,
+SHA256 `2dacf96bc6f6f046857e077c451ba24516b4f9bc4872c97a99a45709bd3a305a`,
+retained under `/models/b12x-control-build-20260919/wheels` on ripper.
+`matching-wheel-identity.json` verifies the three modified engine Python files
+against `source-08.json` and records all 11 native-library hashes. The libraries
+loaded from `/build/installed/vllm` match those hashes exactly.
+
+`matching-unit-tests-03.log` passes ten engine/loader tests. The source-matched
+adaptive smoke, `matching-cache-smoke.jsonl`, generates 2,048 tokens through
+60 checks and 448 promotions. All graph/cache addresses remain unchanged, and
+token IDs match the mixed-build static C1 reference exactly. The source-matched
+ordinary smoke generates the same 16 tokens as the ordinary mixed-build smoke,
+with no expert-cache additional configuration. These are separate correctness
+checks; they do not relabel the mixed-build C1/C4/C8 timing matrix.
+
+Build/environment failures remain visible. `matching-build-05.log` fails because
+DeepGEMM's DeepJIT dependency needs `elfutils/libdwfl.h`; installing `libdw-dev`
+and `libelf-dev` in the isolated build container resolves it. The initial wheel
+check therefore has no artifact to load. `matching-unit-tests-02.log` then
+records a runtime collection failure for missing `cbor2` in the build-only
+virtual environment. Runtime qualification uses the image's complete dependency
+environment with the source-built wheel first on the import path. It does not
+fall back to the image's engine extensions.
+
+The separate registry suite still reports four passes and five MXFP6 metadata
+failures in both `registry-final.log` and a pristine `b067db4` checkout
+(`registry-base-b067.log`). The focused maintenance gates do not clear that
+repository-wide gate. Both repositories expose zero GitHub check runs/status
+contexts for the inspected starting commits; independent PR CI remains required.
+
+### Remaining work ranked by this evidence
+
+1. Establish batching-sensitive output repeatability for C4 healthy backoff and
+   repeat the full paired matrix on the source-built wheel. The failed backoff
+   comparison prevents treating cadence adaptation as qualified across lanes.
+2. Reduce the approximately 14 ms worker cost of a healthy check, especially
+   counter decoding, repeated observation validation and host policy history.
+   A compact health observation needs an explicit consistency/overhead contract
+   before it can replace the complete quiescent snapshot.
+3. Evaluate cadence/short-history tradeoffs on longer stable and transition
+   traffic. Backoff reduces stable cost but delays reaction; a delivered-token
+   interval is not a fixed scheduler-iteration window. Device counter banks or
+   decay remain unimplemented until the loss from coarse history is measured.
+4. Investigate a placement-invariant small-M native schedule. The preferred
+   direct path is materially faster at small M, but its numerical grouping is
+   different. Ordered finalization and movement-independent arithmetic remain
+   required; no compute recipe is changed for timing.
+5. Retain bounded host staging and physical B300 qualification as separate
+   gates. Copies take hundreds of microseconds per layer transaction, while
+   healthy host control takes milliseconds. Concurrent replacement and further
+   DMA work are not the measured priority.
+
+The timed matrix contains 43,008 generated tokens and 6,384 promotions across
+21 fresh workers. One C4 backoff arm fails cross-arm token equality; the other
+20 arms account for 40,960 matched tokens and 6,080 promotions. Earlier receipts,
+the failing arm and the separate source-built smoke retain their own identities.
+No adaptive default, distributed local-maintenance path, model-quality result
+or physical SM103 performance claim follows from these tests.

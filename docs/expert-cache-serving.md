@@ -155,7 +155,9 @@ The engine's actual KV reservation must match the declared admission value.
   counter, phase setter, fill buffers or background epoch loop.
 - `adaptive` starts from the same pinned learned profile and prepares counters
   and bounded canonical fills. The application explicitly drives epochs through
-  `VllmResidencyEpochs`.
+  `VllmResidencyEpochs`, or single-rank
+  [scheduler-owned maintenance](expert-cache-maintenance.md) through
+  `VllmResidencyMaintenance`. Neither driver installs an automatic cadence.
 
 The artifact wrapper uses version 1 and SHA256 integrity. Its identity includes
 checkpoint contents, numerical recipe, workload, top-k, layer names, E/H/I and
@@ -188,6 +190,14 @@ all layers. One counter readback precedes policy decisions, global pair/copy-byt
 admission, all-rank preflight, backend fills, generation verification and
 acknowledgement. Resume occurs only after success. A failed or unknown partial
 layer/rank update leaves the lane stopped for coordinated reload.
+
+For single-rank serving, worker-local maintenance combines those stages behind
+one engine utility call. It retains the scheduler/device reader barrier while
+avoiding the administrative output-settling delay. An explicit routing-pressure
+gate can decline movement while retaining decayed history. Checks still pay
+counter readback and host control cost; they are not free. The
+[maintenance guide](expert-cache-maintenance.md) defines the boundary, opt-out,
+failure behavior and counters-only comparison arm.
 
 A canonical fill drains readers, verifies the device map, copies every selected
 candidate into its victim's fixed VRAM slot, waits for completion, then publishes

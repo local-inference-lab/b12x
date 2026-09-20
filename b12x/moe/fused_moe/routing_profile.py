@@ -1,6 +1,7 @@
 """PreparationSession-owned counters and explicit out-of-band worker controls."""
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import perf_counter_ns
 
 import torch
 
@@ -158,11 +159,14 @@ class _CounterState:
             torch.cuda.synchronize(self.device)
 
     def snapshot(self, *, quiescent=False):
+        started = perf_counter_ns()
         self._quiesce(quiescent)
+        drained = perf_counter_ns()
         rows = []
         # One slab transfer snapshots the model at a quiescent boundary. Reading
         # each layer separately would add one synchronous D2H operation per row.
         host = self.storage.cpu() if self.storage is not None else None
+        copied = perf_counter_ns()
         for (layer, phase), value in self.rows.items():
             experts = dict(self.query.layers)[layer]
             offset = value.data_ptr() - self.storage.data_ptr()
@@ -171,7 +175,10 @@ class _CounterState:
                 raise OverflowError("routing counters overflowed; discard this epoch and reset")
             rows.append(LayerRoutingCounts(layer=layer, phase=phase, counts=tuple(data[:experts]),
                 calls=data[experts], sampled_calls=data[experts+1], tokens=data[experts+2], sampled_tokens=data[experts+3]))
-        return RoutingSnapshot(epoch=self.epoch, rank=self.query.rank, layers=tuple(rows))
+        result = RoutingSnapshot(epoch=self.epoch, rank=self.query.rank, layers=tuple(rows))
+        self.last_snapshot_timings_ns = {"counter_drain": drained-started,
+            "counter_d2h": copied-drained, "counter_decode": perf_counter_ns()-copied}
+        return result
 
 
 def plan_routing_profile(query, *, override=None):

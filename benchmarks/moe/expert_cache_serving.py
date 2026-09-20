@@ -15,11 +15,19 @@ import subprocess
 import time
 
 
+def maintenance_check_interval(current, *, minimum, maximum, health):
+    """Experimental host cadence; pressure and absent observations reset it."""
+    if not 0 < minimum <= current <= maximum:
+        raise ValueError("maintenance intervals must be positive and ordered")
+    return min(maximum, current * 2) if health == "healthy" else minimum
+
+
 async def run(args):
     import torch
     from vllm import AsyncEngineArgs, SamplingParams
     from vllm.v1.engine.async_llm import AsyncLLM
     from b12x.integration.vllm.residency_epoch import VllmResidencyEpochs
+    from b12x.integration.vllm.residency_maintenance import VllmResidencyMaintenance
     from b12x.moe.residency import ResidencyCacheConfig, ResidencyEpochBudget
 
     settings = dict(
@@ -94,8 +102,18 @@ async def run(args):
                 "graph-enabled serving did not retain a captured graph"
             )
         record("prepared", status=status)
-        if args.mode == "adaptive":
-            controller = VllmResidencyEpochs(
+        if args.mode == "adaptive" and args.control != "observe":
+            controller_type = (
+                VllmResidencyMaintenance
+                if args.control == "maintenance"
+                else VllmResidencyEpochs
+            )
+            extra = (
+                {"cold_fraction_threshold": args.cold_threshold}
+                if args.control == "maintenance"
+                else {}
+            )
+            controller = controller_type(
                 engine,
                 configs={
                     name: ResidencyCacheConfig(
@@ -111,8 +129,12 @@ async def run(args):
                 budget=ResidencyEpochBudget(
                     max_pairs=args.epoch_pairs, max_copy_bytes=args.epoch_mib << 20
                 ),
+                **extra,
             )
-            record("epoch", receipt=await controller.run())
+            record(
+                "maintenance" if args.control == "maintenance" else "epoch",
+                receipt=await controller.run(),
+            )
         prompts = [
             json.loads(line)
             for line in args.prompts.read_text().splitlines()
@@ -121,18 +143,29 @@ async def run(args):
         if not prompts:
             raise ValueError("real serving benchmark requires a nonempty prompt corpus")
         tokens_completed, next_epoch = 0, args.epoch_tokens
+        check_interval = args.epoch_tokens
         finished = asyncio.Event()
 
         async def epochs():
-            nonlocal next_epoch
+            nonlocal next_epoch, check_interval
             while not finished.is_set():
                 await asyncio.sleep(0.01)
                 if tokens_completed >= next_epoch:
                     receipt = await controller.run()
+                    if args.healthy_check_max_tokens is not None:
+                        check_interval = maintenance_check_interval(
+                            check_interval,
+                            minimum=args.epoch_tokens,
+                            maximum=args.healthy_check_max_tokens,
+                            health=receipt["worker"].get("health"),
+                        )
                     record(
-                        "epoch", receipt=receipt, output_tokens_so_far=tokens_completed
+                        "maintenance" if args.control == "maintenance" else "epoch",
+                        receipt=receipt,
+                        output_tokens_so_far=tokens_completed,
+                        next_check_tokens=check_interval,
                     )
-                    next_epoch = tokens_completed + args.epoch_tokens
+                    next_epoch = tokens_completed + check_interval
 
         if controller is not None:
             epoch_task = asyncio.create_task(epochs())
@@ -269,6 +302,22 @@ def main():
     p.add_argument("--layer-pairs", type=int, default=2)
     p.add_argument("--epoch-pairs", type=int, default=16)
     p.add_argument("--epoch-mib", type=int, default=64)
+    p.add_argument(
+        "--control",
+        choices=("external", "observe", "maintenance"),
+        default="external",
+        help="Observe records routing counters without policy, epochs or promotions",
+    )
+    p.add_argument(
+        "--cold-threshold",
+        type=float,
+        help="Experimental maintenance cold-fraction gate; omission permits all proposals",
+    )
+    p.add_argument(
+        "--healthy-check-max-tokens",
+        type=int,
+        help="Experimental healthy-check backoff cap; requires conditional maintenance",
+    )
     p.add_argument("--eager", action="store_true")
     p.add_argument(
         "--inductor",
@@ -276,6 +325,15 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if args.healthy_check_max_tokens is not None and (
+        args.mode != "adaptive"
+        or args.control != "maintenance"
+        or args.cold_threshold is None
+        or not 0 < args.epoch_tokens <= args.healthy_check_max_tokens
+    ):
+        p.error(
+            "healthy backoff requires conditional maintenance and ordered positive intervals"
+        )
     if args.output.exists():
         raise FileExistsError(
             "serving receipts are append-only; choose a new output path"

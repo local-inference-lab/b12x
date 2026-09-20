@@ -17,6 +17,20 @@ from b12x.moe.fused_moe.residency import profile_from_counts
 from tests.moe.test_prepared_expert_cache import source
 
 
+def test_experimental_check_cadence_backs_off_only_on_observed_health():
+    from benchmarks.moe.expert_cache_serving import maintenance_check_interval
+
+    interval, history = 32, []
+    for health in ("healthy", "healthy", "healthy", "healthy", "pressure", None):
+        interval = maintenance_check_interval(
+            interval, minimum=32, maximum=256, health=health
+        )
+        history.append(interval)
+    assert history == [64, 128, 256, 256, 32, 32]
+    with pytest.raises(ValueError, match="ordered"):
+        maintenance_check_interval(16, minimum=32, maximum=256, health="healthy")
+
+
 def config(tmp_path, **changes):
     return ExpertCacheServingConfig(
         **(

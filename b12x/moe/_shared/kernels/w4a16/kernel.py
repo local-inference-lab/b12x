@@ -6002,7 +6002,9 @@ class W4A16FusedMoeKernel:
                 "n" if self.fc1_trellis_pair_kind is not None else None
             ),
             source_n_rotation=fc1_source_n_rotation,
-            single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
+            # One token can select the same expert more than once. Only top-1
+            # guarantees one live row in every expert-packed block.
+            single_token_route_fast_path=size_m == 1 and top_k == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             dual_a=self.dual_a,
             route_major_a=self.full_rotation,
@@ -6034,7 +6036,7 @@ class W4A16FusedMoeKernel:
             trellis_rate_axis=(
                 "k" if self.fc2_trellis_pair_kind is not None else None
             ),
-            single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
+            single_token_route_fast_path=size_m == 1 and top_k == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),

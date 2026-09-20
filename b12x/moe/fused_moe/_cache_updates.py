@@ -2,6 +2,7 @@
 
 from threading import Lock
 from uuid import uuid4
+from time import perf_counter_ns
 
 import torch
 
@@ -90,24 +91,41 @@ class CanonicalSlotUpdates:
                 raise ValueError("fill batch exceeds prepared pair capacity")
             next_map = updated_slot_map(expected, pairs, backing_mode="canonical")
             overwritten = []
+            started = mark = perf_counter_ns()
+            self.last_timings_ns = {}
+
+            def stamp(name):
+                nonlocal mark
+                now = perf_counter_ns()
+                self.last_timings_ns[name] = now - mark
+                mark = now
+
             try:
                 self.transfer.synchronize()
+                stamp("initial_drain")
                 self.transfer.copy(self.before, self.mapping)
+                stamp("map_d2h_enqueue")
                 self.transfer.synchronize()
+                stamp("map_d2h_completion")
                 if tuple(map(tuple, self.before.tolist())) != self._map:
                     self._healthy = False
                     raise RuntimeError(
                         "device map differs from authoritative generation"
                     )
                 self.after.copy_(torch.tensor(next_map, dtype=torch.int32))
+                stamp("map_validation_and_encoding")
                 for candidate, victim in pairs:
                     slot = self._map[victim][1]
                     overwritten.append((slot, victim))
                     for name, value in self._canonical[candidate].items():
                         self.transfer.copy(self._resident[slot][name], value)
+                stamp("payload_enqueue")
                 self.transfer.synchronize()
+                stamp("payload_completion")
                 self.transfer.copy(self.mapping, self.after)
+                stamp("map_publication_enqueue")
                 self.transfer.synchronize()
+                stamp("map_publication_completion")
                 self._map = next_map
                 self._generation += 1
             except BaseException as error:
@@ -132,4 +150,5 @@ class CanonicalSlotUpdates:
                     else "canonical map diverged; reload every rank",
                     resumable=self._healthy,
                 ) from error
+            self.last_timings_ns["total"] = perf_counter_ns() - started
             return self._snapshot()

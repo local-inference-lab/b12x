@@ -58,7 +58,7 @@ def declaration(s, capacity=4, top_k=4, hot_count=2):
         capacity=moe.ExecutionCapacity(max_tokens=capacity, top_k=top_k),
         placement=placement,
         memory_budget=moe.ExpertMemoryBudget(hbm_bytes=2 << 30, grace_bytes=2 << 30),
-        updates=moe.ResidencyUpdateCapacity(max_pairs=2),
+        updates=moe.ResidencyUpdateCapacity(max_pairs=2) if hot_count < e else None,
     )
 
 
@@ -365,3 +365,85 @@ def test_checkpoint_layer_same_graph_canonical_fills(tmp_path):
     )
     print("checkpoint layer SHA256:", digest.hexdigest())
     _graph_parity(tmp_path, torch.int64, s, 64, top_k, e // 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="physical SM120 required")
+def test_single_token_duplicate_routes_match_independent_top1(tmp_path):
+    """An expert-packed block may contain several routes even at one token."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("physical SM120 required")
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    s = source(2048, 768)
+    plans = (declaration(s, 1, 4, 2), declaration(s, 1, 1, 4))
+    a = torch.randn(1, 2048, device="cuda", dtype=torch.bfloat16) * 0.125
+    ids = torch.tensor([[0, 0, 2, 2]], device="cuda", dtype=torch.int64)
+    weights = torch.tensor([[0.125, 0.25, 0.375, 0.25]], device="cuda")
+    row_ids = [ids[:, rank : rank + 1].clone() for rank in range(4)]
+    outputs = [torch.empty_like(a) for _ in range(4)]
+    calls = []
+
+    def prepare(state, single):
+        bindings = (
+            tuple(
+                state.bind(
+                    a=a,
+                    topk_ids=row_ids[rank],
+                    topk_weights=weights[:, rank : rank + 1],
+                    output=outputs[rank],
+                )
+                for rank in range(4)
+            )
+            if single
+            else (state.bind(a=a, topk_ids=ids, topk_weights=weights),)
+        )
+
+        def run():
+            for binding in bindings:
+                binding.run()
+            return bindings[0].output
+
+        calls.append((run, bindings))
+        return PreparedCall(
+            run=run, output=bindings[0].output, owners=bindings, close=state.close
+        )
+
+    with PreparationSession(
+        autotune=False, compile_workers=0, cache_dir=tmp_path
+    ) as session:
+        session.prepare(
+            tuple(
+                p.request(
+                    name=str(index),
+                    prepare_call=lambda state, single=bool(index): prepare(
+                        state, single
+                    ),
+                )
+                for index, p in enumerate(plans)
+            )
+        )
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            for run, _ in calls:
+                run()
+        session.freeze()
+        state = plans[0].prepared.state
+        pointers = state.pointers()
+        for routes in ((0, 0, 2, 2), (2, 2, 2, 2), (1, 3, 1, 3)):
+            ids.copy_(torch.tensor([routes], device="cuda"))
+            for rank, row in enumerate(row_ids):
+                row.copy_(ids[:, rank : rank + 1])
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            with kernel_resolution_guard("duplicate expert graph"):
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+            expected = torch.zeros_like(a, dtype=torch.float32)
+            for output in outputs:
+                expected.add_(output.float())
+            torch.testing.assert_close(
+                calls[0][1][0].output, expected.bfloat16(), atol=0, rtol=0
+            )
+            assert state.pointers() == pointers
+        graph.reset()
