@@ -66,6 +66,21 @@ overhead to roughly 1–2%, but delays pressure detection by about five seconds
 relative to the workload transition. The cadence report retains the complete
 interval tables, 64 host / 21 GPU / 10 companion test passes and all failures.
 
+The [read-only health experiment](expert-cache-health.md) adds an optional
+prepared CuTe counter/map reduction and asynchronous single-worker utility.
+Health does not advance policy state; maintenance rebases its observations
+after map publication. The metadata inventory is **87 declarations and 245
+programs**. The dedicated health declaration cross-compiles its four programs
+for SM103 without a CUDA context, including one additional reduction. The
+historical full-corpus evidence below remains bound to its original source.
+SM120 serving uses the complete source-built companion; PCIe transport results
+are specific to `ripper`'s Gen4 x16 link and imply no Gen5 or B300 ceiling.
+Its [three-corpus matrix](expert-cache-health-results.md) passes exact paired
+outputs across 45 runs, 92,160 tokens and 8,512 promotions. Read-only probes
+reduce stable-interval full maintenance from 226 checks to twelve, with recorded
+stable throughput within -1.3% to +1.8% of static. Health control does not
+consistently outperform fixed checks; it remains explicit and experimental.
+
 The SM103 preparation corpus at package SHA256
 `667fad34f8bb0ba5ad048154e2cfd6281ebe206a19b1b8e32a69fd34e89e0d6b`
 contains **86 declarations and 244 distinct programs**, including 238 native CuTe
@@ -84,6 +99,7 @@ evidence, not physical B300 evidence.
 | Experimental cache policy implemented | Recent-frequency remains the default; explicit decayed LFU retains window history. Canonical counts identify cold selections for one unchanged generation. Model-wide pair/byte budgets select subsets across layers. Static profiles/defaults remain unchanged. SM120 serving benefit is workload-dependent; physical SM103 benefit remains unqualified. |
 | Automatic residency implemented | Typed off/profile/auto/monitor modes, balanced cold-start placement, joint HBM/Grace admission, conservative activation, checkpoint/workload/recipe validation, atomic profiles, windowed convergence and drift diagnostics. Serving placement stays static; activation requires an engine-controlled restart. |
 | Prepared counter profiling implemented | CuTe uint64 counters use retained programs and stable storage. Off has no counter node. The SM120 V2 companion supplies explicit decode phase and valid rows through a retained device setter; native SM103 serving wiring remains required. |
+| Experimental read-only health implemented | Optional prepared reduction of existing counters and maps, independent health baselines, overflow/reset/generation guards and asynchronous event-polled readback. Single-worker probes do not pause the scheduler or change policy history. Distributed health completion and physical SM103 serving remain unsupported. |
 | Implemented and tested on SM120 | Residency component tests cover quantization, route compaction, ordered-FMA adversaries, invalid int64 IDs, mapped-host reads, live-count reuse and allocation-free CUDA graph replay. Prepared counter tests add sampling, TP ownership, overflow and lifecycle coverage. These tests do not execute SM103 tcgen05 kernels or establish Grace-backed TMA legality. |
 | Implemented, awaiting physical SM103 qualification | Native tcgen05/TMEM dense and expert kernels, HBM/Grace complete-operator parity, Grace-backed TMA operands, architecture launch/resource behavior, complete model execution, chunk-parallel GDN prefill and experimental Station TP2 communication. |
 | Independent PR CI pending | Source-bound local receipts are separate from CI acceptance. The repository's wheel-release workflow has no pull-request trigger. |

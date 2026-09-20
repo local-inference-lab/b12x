@@ -1,0 +1,10 @@
+{"text": "Explain to a neighbor how a community seed library works and suggest a friendly first visit.", "workload": "stable_general"}
+{"text": "Give a thoughtful account of why people keep handwritten recipe cards even when recipes are online.", "workload": "stable_general"}
+{"text": "Describe an ordinary morning at a small coastal railway station, using clear natural prose.", "workload": "stable_general"}
+{"text": "Help two roommates agree on a fair way to share a sunny windowsill for their houseplants.", "workload": "stable_general"}
+{"text": "Explain how to welcome a new volunteer at a neighborhood book exchange without overwhelming them.", "workload": "stable_general"}
+{"text": "Suggest a relaxed way for a family to record stories told by an older relative during dinner.", "workload": "stable_general"}
+{"text": "Describe the practical differences between keeping a travel journal and making a photo album.", "workload": "stable_general"}
+{"text": "Write a conversational explanation of how listening carefully can improve a difficult everyday conversation.", "workload": "stable_general"}
+{"text": "Implement a Python iterator that merges sorted event streams with stable tie ordering and bounded memory. Include edge cases.", "workload": "transition_code"}
+{"text": "Write a Rust function that validates a binary packet header before accessing the payload. Explain length and overflow checks.", "workload": "transition_code"}

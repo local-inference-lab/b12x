@@ -35,6 +35,19 @@ def _compile(query, *, target, offline_dir=None):
             programs["set_token_limit"] = compile_kernel(SetTokenLimit(), *args,
                 options=f"--gpu-arch={target}", compile_spec=KernelCompileSpec.from_facts(
                     "moe.routing_profile.set_token_limit", 1, ("target", target)))
+    if query.health_summary:
+        from b12x.moe._shared.kernels.routing_health import RoutingHealth
+        args = (pointer(cutlass.Int64), pointer(cutlass.Uint64), cutlass.Int32(1),
+                cutlass.Int32(0), cuda.CUstream(0))
+        if offline_dir is not None:
+            path = Path(offline_dir)/"health"
+            path.mkdir(parents=True, exist_ok=True)
+            programs["health"] = cute.compile(RoutingHealth(), *args,
+                options=f"--gpu-arch={target} --keep-ptx --keep-cubin --dump-dir={path}", no_jit_engine=True)
+        else:
+            programs["health"] = compile_kernel(RoutingHealth(), *args,
+                options=f"--gpu-arch={target}", compile_spec=KernelCompileSpec.from_facts(
+                    "moe.routing_health", 1, ("target", target)))
     for experts in sorted({e for _, e in query.layers}):
         for dtype, suffix in ((cutlass.Int32, "i32"), (cutlass.Int64, "i64")):
             key = f"count_{experts}_{suffix}"
@@ -97,6 +110,10 @@ class _CounterState:
                     offset += size
             self.enabled[0] = 1
             self.enabled[1] = query.max_tokens
+        self.health = None
+        if query.health_summary:
+            from ._routing_health import RoutingHealthState
+            self.health = RoutingHealthState(self)
 
     def bind(self, *, layer, phase, topk_ids):
         import cutlass
@@ -192,7 +209,7 @@ def plan_routing_profile(query, *, override=None):
         _compile_jobs=lambda c, d: (CompileJob.create(
             "b12x.moe.fused_moe.routing_profile:compile_programs", FrozenMapping(asdict(query)), d.ordinal),),
         _memory_requirements=lambda c, d: MemoryRequirements(persistent=(
-            PersistentMemory(key=("routing_profile", current_plan()), required_nbytes=query.storage_bytes),)) if query.storage_bytes else MemoryRequirements(),
+            PersistentMemory(key=("routing_profile", current_plan()), required_nbytes=query.storage_bytes+query.health_device_bytes),)) if query.storage_bytes else MemoryRequirements(),
         _materialize=materialize)
 
 

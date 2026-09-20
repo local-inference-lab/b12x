@@ -1,0 +1,24 @@
+{"text": "Explain to a neighbor how a community seed library works and suggest a friendly first visit.", "workload": "stable_general"}
+{"text": "Give a thoughtful account of why people keep handwritten recipe cards even when recipes are online.", "workload": "stable_general"}
+{"text": "Describe an ordinary morning at a small coastal railway station, using clear natural prose.", "workload": "stable_general"}
+{"text": "Help two roommates agree on a fair way to share a sunny windowsill for their houseplants.", "workload": "stable_general"}
+{"text": "Explain how to welcome a new volunteer at a neighborhood book exchange without overwhelming them.", "workload": "stable_general"}
+{"text": "Suggest a relaxed way for a family to record stories told by an older relative during dinner.", "workload": "stable_general"}
+{"text": "Describe the practical differences between keeping a travel journal and making a photo album.", "workload": "stable_general"}
+{"text": "Write a conversational explanation of how listening carefully can improve a difficult everyday conversation.", "workload": "stable_general"}
+{"text": "Implement a Python iterator that merges sorted event streams with stable tie ordering and bounded memory. Include edge cases.", "workload": "transition_code"}
+{"text": "Write a Rust function that validates a binary packet header before accessing the payload. Explain length and overflow checks.", "workload": "transition_code"}
+{"text": "Design a SQL migration that adds a unique normalized username while safely handling existing duplicates. Show the transaction.", "workload": "transition_code"}
+{"text": "Implement a TypeScript request coalescer that shares concurrent fetches for the same key and removes rejected promises.", "workload": "transition_code"}
+{"text": "Write Python tests for a monotonic clock deadline helper, including cancellation, expiry, and a deadline already in the past.", "workload": "transition_code"}
+{"text": "Implement a Go worker pool that shuts down after processing queued jobs without sending on closed channels.", "workload": "transition_code"}
+{"text": "Write a C++ bounded ring buffer interface and explain the invariants for wraparound and full versus empty states.", "workload": "transition_code"}
+{"text": "Build a small Python parser for quoted comma-separated fields with escaped quotes and useful malformed-input errors.", "workload": "transition_code"}
+{"text": "Implement a Java method that groups timestamped readings into half-open intervals, including readings exactly at each boundary.", "workload": "transition_code"}
+{"text": "Write a Python context manager that creates a temporary output file and atomically replaces the destination only on success.", "workload": "transition_code"}
+{"text": "Design a PostgreSQL query that finds gaps in a sequence per customer without assuming IDs start at one. Explain the window functions.", "workload": "transition_code"}
+{"text": "Implement a TypeScript discriminated union for a retryable job state machine and show exhaustive transition validation.", "workload": "transition_code"}
+{"text": "Write a Rust iterator adapter that emits a final partial chunk without copying items unnecessarily. Explain ownership.", "workload": "transition_code"}
+{"text": "Implement a Go HTTP handler that caps request-body size and returns structured validation errors without leaking internal details.", "workload": "transition_code"}
+{"text": "Write a C function that parses a decimal unsigned integer and detects overflow before multiplying by ten.", "workload": "transition_code"}
+{"text": "Implement a Python dependency scheduler that detects cycles and returns a stable topological ordering of tasks.", "workload": "transition_code"}

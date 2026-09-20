@@ -1,0 +1,16 @@
+{"text": "Write a calm description of an old observatory being opened to the public for the first time in years.", "workload": "stable_general"}
+{"text": "Tell a short realistic story about a courier returning a misplaced parcel to its owner.", "workload": "stable_general"}
+{"text": "Describe how a neighborhood cafe changes between the morning rush and the quiet afternoon.", "workload": "stable_general"}
+{"text": "Explain in everyday language why a familiar walking route can feel different in each season.", "workload": "stable_general"}
+{"text": "Write a reflective passage about learning a craft slowly from someone with decades of experience.", "workload": "stable_general"}
+{"text": "Describe a small museum through the observations of a visitor who notices the labels and lighting.", "workload": "stable_general"}
+{"text": "Tell a warm story about two strangers discovering that they once lived on the same street.", "workload": "stable_general"}
+{"text": "Write an accessible explanation of why local oral histories can preserve details that official records omit.", "workload": "stable_general"}
+{"text": "A bag contains four red and six blue tokens. Draw three without replacement. Derive the probability of exactly two red tokens.", "workload": "transition_math"}
+{"text": "Prove that the sum of the first n odd positive integers equals n squared, using induction and a geometric argument.", "workload": "transition_math"}
+{"text": "Find the stationary points of f(x,y)=x squared plus xy plus y squared minus 6x. Classify them with the Hessian.", "workload": "transition_math"}
+{"text": "A recurrence satisfies a(n)=3a(n-1)-2a(n-2), with a(0)=2 and a(1)=5. Derive and verify its closed form.", "workload": "transition_math"}
+{"text": "Explain why a connected undirected graph with n vertices and n-1 edges is a tree. State the role of connectedness.", "workload": "transition_math"}
+{"text": "Compute the expected number of fair coin tosses needed to observe two consecutive heads, using conditional equations.", "workload": "transition_math"}
+{"text": "Derive the least-squares slope for points (1,2), (2,2), (3,5), (4,7), showing the centered sums.", "workload": "transition_math"}
+{"text": "For positive a and b with a+b=10, find the maximum of a times b and prove the result in two different ways.", "workload": "transition_math"}

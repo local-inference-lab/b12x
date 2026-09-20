@@ -42,6 +42,7 @@ async def run(args):
         device_safety_bytes=1 << 30,
         host_safety_bytes=1 << 30,
         max_pairs_per_layer=args.layer_pairs,
+        health_probes=args.control == "health",
     )
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -123,12 +124,16 @@ async def run(args):
         if args.mode == "adaptive" and args.control != "observe":
             controller_type = (
                 VllmResidencyMaintenance
-                if args.control == "maintenance"
+                if args.control in ("maintenance", "health")
                 else VllmResidencyEpochs
             )
             extra = (
-                {"cold_fraction_threshold": args.cold_threshold}
-                if args.control == "maintenance"
+                {
+                    "cold_fraction_threshold": None
+                    if args.control == "health"
+                    else args.cold_threshold
+                }
+                if args.control in ("maintenance", "health")
                 else {}
             )
             controller = controller_type(
@@ -150,7 +155,7 @@ async def run(args):
                 **extra,
             )
             record(
-                "maintenance" if args.control == "maintenance" else "epoch",
+                "maintenance" if args.control in ("maintenance", "health") else "epoch",
                 receipt=await controller.run(),
             )
         prompts = [
@@ -172,18 +177,52 @@ async def run(args):
                     },
                 ),
             )
+        health_probe = thresholds = None
+        last_maintenance_tokens = 0
+        if args.control == "health":
+            from b12x.integration.vllm.residency_health import VllmResidencyHealth
+            from b12x.moe.residency.health import RoutingHealthThresholds
+
+            health_probe = VllmResidencyHealth(engine)
+            thresholds = RoutingHealthThresholds(
+                cold_fraction=args.cold_threshold,
+                minimum_layer_fraction=args.health_layer_breadth,
+                layer_cold_fraction=args.health_layer_threshold,
+            )
         tokens_completed, next_epoch = 0, args.epoch_tokens
         check_interval = args.epoch_tokens
         finished = asyncio.Event()
         control_lock = asyncio.Lock()
 
         async def epochs():
-            nonlocal next_epoch, check_interval
+            nonlocal next_epoch, check_interval, last_maintenance_tokens
             while not finished.is_set():
                 await asyncio.sleep(0.01)
                 if tokens_completed >= next_epoch:
                     async with control_lock:
+                        reason = None
+                        if health_probe is not None:
+                            probe = await health_probe.probe()
+                            assessment = thresholds.assess(probe["summary"])
+                            record(
+                                "health_probe",
+                                receipt=probe,
+                                assessment=assessment,
+                                output_tokens_so_far=tokens_completed,
+                            )
+                            reason = (
+                                "pressure"
+                                if assessment["health"] == "pressure"
+                                else "maximum_interval"
+                                if tokens_completed - last_maintenance_tokens
+                                >= args.health_max_tokens
+                                else None
+                            )
+                            if reason is None:
+                                next_epoch = tokens_completed + args.epoch_tokens
+                                continue
                         receipt = await controller.run()
+                        last_maintenance_tokens = tokens_completed
                     if args.healthy_check_max_tokens is not None:
                         check_interval = maintenance_check_interval(
                             check_interval,
@@ -192,10 +231,13 @@ async def run(args):
                             health=receipt["worker"].get("health"),
                         )
                     record(
-                        "maintenance" if args.control == "maintenance" else "epoch",
+                        "maintenance"
+                        if args.control in ("maintenance", "health")
+                        else "epoch",
                         receipt=receipt,
                         output_tokens_so_far=tokens_completed,
                         next_check_tokens=check_interval,
+                        trigger=reason,
                     )
                     next_epoch = tokens_completed + check_interval
 
@@ -413,7 +455,7 @@ def main():
     p.add_argument("--epoch-mib", type=int, default=64)
     p.add_argument(
         "--control",
-        choices=("external", "observe", "maintenance"),
+        choices=("external", "observe", "maintenance", "health"),
         default="external",
         help="Observe records routing counters without policy, epochs or promotions",
     )
@@ -427,6 +469,14 @@ def main():
         type=int,
         help="Experimental healthy-check backoff cap; requires conditional maintenance",
     )
+    p.add_argument(
+        "--health-max-tokens",
+        type=int,
+        default=1024,
+        help="Experimental maximum delivered-token interval for a full snapshot",
+    )
+    p.add_argument("--health-layer-breadth", type=float, default=0.0)
+    p.add_argument("--health-layer-threshold", type=float, default=0.15)
     p.add_argument("--eager", action="store_true")
     p.add_argument(
         "--execution-trace",
@@ -463,6 +513,16 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if args.control == "health" and (
+        args.mode != "adaptive"
+        or args.cold_threshold is None
+        or args.health_max_tokens < args.epoch_tokens
+        or args.epoch_tokens <= 0
+        or args.healthy_check_max_tokens is not None
+    ):
+        p.error(
+            "health control requires adaptive mode, an explicit threshold and positive ordered intervals"
+        )
     if args.measure_control_floor and not (
         args.execution_trace
         and args.mode == "adaptive"

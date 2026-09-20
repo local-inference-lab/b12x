@@ -232,13 +232,57 @@ class ResidencyEpochWorkerExtension:
         """Only the engine's completed single-rank drain may invoke this method."""
         from .residency_maintenance import LocalResidencyMaintenance
         runtime = self._b12x_epoch_runtime()
+        cache = getattr(self.model_runner, "b12x_expert_cache", None)
+        health = getattr(getattr(cache, "_counters", None), "health", None)
+        if health is not None and health.pending:
+            raise RuntimeError("consume pending health result before maintenance")
         maintenance = getattr(runtime, "_local_maintenance", None)
         if maintenance is None:
             maintenance = LocalResidencyMaintenance(runtime, config)
             runtime._local_maintenance = maintenance
         elif maintenance.config != config:
             raise ValueError("maintenance session/config changed; reload the lane")
-        return maintenance.run()
+        result = maintenance.run()
+        cache = getattr(self.model_runner, "b12x_expert_cache", None)
+        health = getattr(getattr(cache, "_counters", None), "health", None)
+        if health is not None:
+            # Mutation completes at the existing maintenance boundary. Rebase
+            # before another graph can count selections against the new map.
+            health.rebase(self._b12x_health_generation())
+        return result
+
+    def _b12x_health_generation(self):
+        runtime = self._b12x_epoch_runtime()
+        runtime._validate()
+        if runtime._stage != "idle":
+            raise RuntimeError("residency transaction is pending")
+        return tuple((n, b.snapshot().preparation_id, b.snapshot().generation)
+                     for n, b in sorted(runtime.bindings.items()))
+
+    def b12x_residency_health(self, operation):
+        """Serialized single-worker utility; event polling never drains the device.
+
+        The maintained executor submits this on the same actor as model calls.
+        Only its producer stream may write the prepared routing counters. A
+        pending read must be consumed before the client requests maintenance.
+        """
+        import torch
+        cache = getattr(self.model_runner, "b12x_expert_cache", None)
+        health = getattr(getattr(cache, "_counters", None), "health", None)
+        if health is None:
+            raise RuntimeError("cache health probes were not prepared")
+        started = perf_counter_ns()
+        generation = self._b12x_health_generation()
+        with torch.cuda.stream(self.model_runner.main_stream):
+            if operation == "start":
+                health.start(generation)
+                return {"submitted": True, "worker_wall_ns": perf_counter_ns()-started}
+            if operation == "poll":
+                result = health.poll(generation)
+                if result is not None:
+                    result["worker_poll_ns"] = perf_counter_ns()-started
+                return result
+            raise ValueError("unknown residency health operation")
 
     def b12x_residency_begin(self, token):
         return self._b12x_epoch_runtime().begin(token)

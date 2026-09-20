@@ -22,8 +22,13 @@ def prepare(query):
         def run():
             if query.runtime_token_limit:
                 state.set_token_limit(query.max_tokens)
-            for binding in calls: binding.run()
+            for binding in calls:
+                binding.run()
+            if state.health is not None:
+                state.health.rebase(("prime",))
+
         return PreparedCall(run=run, output=state.storage, owners=(state, *calls))
+
     session = PreparationSession(device="cuda:0", autotune=False, compile_workers=0)
     result = session.prepare((plan.request(name="counter", prepare_call=prime),))
     session.freeze()
@@ -246,4 +251,137 @@ def test_operator_timing_graph_batches_device_repetitions():
         assert len(timing["raw_us"]) == 3 and timing["median_us"] > 0
     finally:
         if graph is not None: graph.reset()
+        session.close()
+
+
+@pytest.mark.parametrize("experts", [7, 128, 385])
+def test_health_reduction_exact_read_only_reset_generation_and_graph(experts):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    query = RoutingProfileQuery(
+        layers=(("a", 4), ("b", experts)),
+        max_tokens=8,
+        max_top_k=4,
+        health_summary=True,
+    )
+    plan, session, result = prepare(query)
+    try:
+        state = routing_profile_state(plan)
+        state.reset(quiescent=True)
+        health = state.health
+        maps = {
+            n: torch.tensor(
+                [[e % 2, e] for e in range(count)], device="cuda", dtype=torch.int32
+            )
+            for n, count in query.layers
+        }
+        health.bind_maps(maps)
+        health.rebase((0, 0))
+        pointers = (
+            state.storage.data_ptr(),
+            health.previous.data_ptr(),
+            health.output.data_ptr(),
+            health.host.data_ptr(),
+        )
+        ids = torch.tensor(
+            [[1, 1, -1, 2**40], [0, 3, 2, 1]], device="cuda", dtype=torch.int64
+        )
+        bindings = [
+            bind_routing_profile(plan, layer=n, phase="decode", topk_ids=ids)
+            for n, _ in query.layers
+        ]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for binding in bindings:
+                binding.run()
+
+        def read(generation=(0, 0)):
+            with kernel_resolution_guard("prepared health"):
+                health.start(generation)
+            health.done.synchronize()
+            return health.poll(generation)
+
+        assert read()["selections"] == 0
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        for _ in range(3):
+            graph.replay()
+        summary = read()
+        assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
+        assert summary["selections"] == 36 and summary["cold_selections"] == 24
+        assert all(
+            r
+            == dict(
+                selections=18,
+                cold_selections=12,
+                cold_experts_once=0,
+                cold_experts_repeated=2,
+                repeated_cold_selections=10,
+            )
+            for r in summary["layers"].values()
+        )
+        snapshot = state.snapshot(quiescent=True)
+        assert read()["selections"] == 0
+        assert state.snapshot(quiescent=True) == snapshot
+        health.start((0, 0))
+        health.done.synchronize()
+        with pytest.raises(RuntimeError, match="stale health"):
+            health.poll((1, 0))
+        health.poll((0, 0))
+        maps["a"][:, 0].zero_()
+        with pytest.raises(RuntimeError, match="stale health"):
+            read((1, 0))
+        health.rebase((1, 0))
+        graph.replay()
+        assert read((1, 0))["cold_selections"] == 4
+        state.reset(quiescent=True)
+        with pytest.raises(RuntimeError, match="stale health"):
+            read((1, 0))
+        health.rebase((1, 0))
+        graph.replay()
+        read((1, 0))
+        state.rows["a", "decode"].zero_()  # Unannounced reset must also fail closed.
+        with pytest.raises(ValueError, match="invalid health"):
+            read((1, 0))
+        assert pointers == (
+            state.storage.data_ptr(),
+            health.previous.data_ptr(),
+            health.output.data_ptr(),
+            health.host.data_ptr(),
+        )
+        graph.reset()
+    finally:
+        result.close()
+        session.close()
+
+
+def test_health_unsigned_totals_and_sticky_overflow_fail_closed():
+    q = RoutingProfileQuery(
+        layers=(("a", 4),), max_tokens=1, max_top_k=1, health_summary=True
+    )
+    plan, session, result = prepare(q)
+    try:
+        s = routing_profile_state(plan)
+        s.reset(quiescent=True)
+        h = s.health
+        h.rebase((0,))
+        s.rows["a", "decode"].view(torch.int64)[:3].fill_(2**62)
+        h.start((0,))
+        h.done.synchronize()
+        assert h.poll((0,))["selections"] == 3 * 2**62
+        s.reset(quiescent=True)
+        h.rebase((0,))
+        s.rows["a", "decode"].view(torch.int64)[:4].fill_(2**62)
+        h.start((0,))
+        h.done.synchronize()
+        with pytest.raises(ValueError, match="invalid health"):
+            h.poll((0,))
+        s.reset(quiescent=True)
+        h.rebase((0,))
+        s.rows["a", "decode"].view(torch.int64)[8] = 1
+        h.start((0,))
+        h.done.synchronize()
+        with pytest.raises(ValueError, match="invalid health"):
+            h.poll((0,))
+    finally:
+        result.close()
         session.close()

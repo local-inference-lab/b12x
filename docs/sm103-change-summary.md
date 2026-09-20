@@ -16,6 +16,17 @@ at its retained compiler source; physical B300 gates remain open.
 Its controlled serving matrix retains exact output equality at C1/C4/C8 with
 the complete source-built engine. Healthy backoff trades fewer stable checks
 for delayed transition response; it remains experimental.
+The [read-only health experiment](expert-cache-health.md) separates counter
+observation, compact health probes and full maintenance. Its prepared reduction
+and host-only pressure rule preserve the numerical recipe and static opt-out.
+The metadata corpus contains 87 declarations/245 programs; the added health case
+has separate SM103 cross-compilation evidence. Historical full-corpus counts
+below remain attached to their original package source.
+The [health serving matrix](expert-cache-health-results.md) qualifies 45 runs
+across three held-out transitions at C1/C4/C8. Stable full maintenance falls
+from 226 checks to twelve, while exact output equality and fixed graph/cache
+addresses are retained. This is Gen4 SM120 control evidence, not B300 execution
+or a universal win over fixed maintenance.
 The [SM120 cache proof of concept](expert-residency-sm120-poc.md) reuses the
 shared host policy and exchange transaction with native NVFP4 W4A16 operations.
 It adds no SM103 kernel, component registration or production serving lane.
@@ -63,6 +74,7 @@ expert block. The SM103 corpus remains 86 declarations/244 programs at package
 | Automatic residency orchestration | [Typed controller and profile store](../b12x/moe/fused_moe/automatic.py) validate workload/checkpoint identity, budget the model once, derive per-layer hot membership with joint HBM/Grace admission, balance bootstrap coverage, detect convergence/drift and separate saved experiments from accepted restart candidates. Source geometry and numerical contracts remain authoritative. |
 | Grace-served cache policy | The [host controller](../b12x/moe/fused_moe/residency_cache.py) classifies counter deltas against one placement generation, proposes frequency-ranked pairs with explicit safeguards and acknowledges committed/restored snapshots. Existing Grace execution serves observed misses; exchange changes later accesses. The [policy guide](expert-residency-cache.md) defines integration and measurement limits. |
 | Prepared routing counters | [CuTe counters](../b12x/moe/_shared/kernels/routing_profile.py) use preparation-owned uint64 storage, sampling and overflow detection. The disabled serving path has no observer. [Worker hooks](../b12x/integration/vllm/expert_residency.py) expose lifecycle operations without patching vLLM. |
+| Read-only routing health | [Prepared reduction](../b12x/moe/_shared/kernels/routing_health.py) reads existing counters and canonical maps. [Health thresholds](../b12x/moe/residency/health.py) are independent of replacement policy. The [single-worker adapter](../b12x/integration/vllm/residency_health.py) polls prepared readback storage without scheduler pause; complete maintenance alone advances policy and publishes placement. |
 | Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
 | Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |

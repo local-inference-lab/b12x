@@ -2118,3 +2118,93 @@ validation archive 07 is distinct from timing archive 05; final CLI/doc cleanup
 does not overwrite either source identity. No core kernel, preparation contract,
 engine default or production cadence changes. The additional evidence supports
 configurable experimental cadence, not a universal adaptive default.
+
+## Read-only routing health experiment (2026-09-20 UTC)
+
+The starting sources are b12x `173d0746f80d317ee8b2ac9d4d463716fe065849`,
+containing master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`, and companion
+`3e45b530e58186046383e7294e611c2f6bf5cfb8` with main
+`47ccf6c57d92f03630ebcbad3809450545825488`. No companion engine, expert transport,
+BF16 router or W4A16 whole-K compute change is needed. Evidence is retained in
+`/home/jasonc/b12x-health-evidence-20260920` and on `ripper` under
+`/home/jasonc/b12x-health-results-20260920`.
+The only companion-main commit absent from its maintained branch removes
+inherited GitHub Actions workflows. It changes no serving code and is left
+separate from this experiment; the source-built companion remains unchanged.
+
+The implemented experiment prepares a CuTe reduction over existing canonical
+counters and current device maps, plus an independent per-expert health
+baseline. A two-part worker utility submits a 2,304-byte asynchronous readback
+for the qualification geometry and polls its completion event. It never pauses
+the scheduler or advances policy history. Full maintenance remains the only
+mutation protocol and rebases health after map publication. Static opt-out
+allocates neither the reduction state nor its pinned result slot.
+
+Source archive 04, SHA256
+`604368dc0ad51a713ecd84cf8454a97a015d2191b9b98e216a1d4260a4389b81`, binds the
+serving matrix. The complete source-built wheel remains
+`2dacf96bc6f6f046857e077c451ba24516b4f9bc4872c97a99a45709bd3a305a`.
+New held-out fixtures contain 48 independently authored prompts across
+chat-to-code, prose-to-math and English-to-multilingual traffic. Their text does
+not overlap the retained training or evaluation fixtures. Arms use controlled
+admission and retain exact output equality as the numerical gate.
+
+The original-fixture C4 health smoke matches every static output ID. It reports
+approximately 4.10 microseconds for reduction and 6.62 microseconds for the
+compact copy. Median client probe response is about 73.4 milliseconds while
+serving continues; that is not a scheduler pause. Worker submission/poll costs
+are recorded separately in the matrix. The first held-out C1 health arm uses
+29 probes and two full maintenance operations during general traffic, detects
+code pressure at 1.22 seconds, and reaches 68.08 tok/s versus fixed 67.61 and
+backoff 63.74. This individual result does not select a universal cadence.
+
+Initial failures are preserved. CuTe unsigned arithmetic required explicit
+casts at control-flow joins, and shared allocation required a CuTe layout rather
+than a shape tuple. The first SM103 compile also failed its module admission
+check; the portable metadata kernel now has an explicit architecture admission
+and corpus declaration. The admitted health case cross-compiles four declared
+programs without initializing CUDA. A metadata census reports 87 declarations
+and 245 distinct programs; this does not relabel the historical full compile
+receipt as covering the modified source.
+
+Targeted SM120 memcheck and synccheck for the initial exact-count/graph health
+case both report zero errors. The expanded cache/counter suite reports 21 passes
+and one skipped checkpoint case because that invocation omitted the checkpoint
+mount/environment. The separate serving runs use the real checkpoint. The
+ignored interpreter-shutdown `AsyncLLM.__del__` exception remains visible in
+completed run logs; this experiment does not change engine teardown.
+
+### Completed health matrix and duration experiments
+
+The [health results](expert-cache-health-results.md) retain all five arms at
+C1/C4/C8 for three independent corpora. All 45 matrix runs pass exact paired
+outputs across 92,160 tokens and 8,512 promotions. Health reduces stable full
+checks from 226 to twelve; stable throughput ranges from -1.3% to +1.8% of
+static. Pressure response is 0.63–2.11 seconds. Health does not consistently
+beat fixed checks, and prose-to-math C8 favors backoff. No losing arm is removed.
+
+The duration and probe-interval additions bring the serving total to 56 runs,
+115,712 tokens and 10,912 promotions. The short code regime exposes a backoff
+loss: detection arrives near the end and complete-run cost is about 265 ms
+worse than static. Health repays the preceding stable cost near four seconds
+across the tested code prefixes; this is not a universal dwell threshold.
+Sixteen-token probes outperform longer intervals in the one additional C4
+fixture, partly with an early maximum-interval snapshot. No default changes.
+
+Final validation passes 132 focused host tests, 99 preparation/admission tests,
+25 prepared-cache/counter tests including the checkpoint, four health cases
+under each of memcheck and synccheck with zero errors, and ten source-built
+companion tests. The ordinary non-cache V2 smoke generates 512 tokens through
+two captured graphs without cache configuration or worker extension. Its two
+failed diagnostic drivers remain: missing multiprocessing entry guard, then a
+callable RPC rejected by default serialization. The successful driver inspects
+loaded libraries externally and changes no engine security setting. Existing
+lint diagnostics are retained; new health code and tests add none.
+
+The final SM103 health compile binds package
+`a895d1e279365bbb72d6e72b84930879f9940422a5828a9ad4156b2bb47f5c97` and exports
+four objects. The health reduction reports 32 registers, no stack/local memory,
+1 KiB static shared memory and 6 KiB dynamic shared allocation. Source archives
+04 and 06 remain the serving and GPU-validation identities, respectively;
+final test formatting preserves the tested AST. No physical SM103 execution,
+Gen5 transport result or independent GitHub CI acceptance is claimed.

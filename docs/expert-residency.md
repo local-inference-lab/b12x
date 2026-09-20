@@ -40,6 +40,11 @@ barrier; it does not qualify physical SM103 kernels or change Grace storage.
 The [cadence qualification](expert-cache-cadence.md) separates cache identity and
 graph safety from engine batch-shape numerics. Its SM120 router, control-cost
 and serving measurements retain their own source and hardware receipts.
+Optional [read-only health probes](expert-cache-health.md) reduce existing
+counters against the current expert map without advancing LFU history or
+pausing the scheduler. Prepared storage, generation-bound baselines and event
+completion keep the health cadence separate from bounded maintenance. The
+single-worker SM120 experiment does not change static SM103 behavior.
 
 ## Supported contracts
 

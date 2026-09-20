@@ -47,6 +47,7 @@ class ExpertCacheServingConfig:
     device_safety_bytes: int
     host_safety_bytes: int
     max_pairs_per_layer: int = 2
+    health_probes: bool = False
 
     def __post_init__(self):
         if (
@@ -72,6 +73,8 @@ class ExpertCacheServingConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
+        if type(self.health_probes) is not bool or (self.health_probes and self.mode != "adaptive"):
+            raise ValueError("health probes require explicitly adaptive serving")
         if self.mode == "adaptive" and not self.max_pairs_per_layer:
             raise ValueError("adaptive cache requires positive prepared fill capacity")
 
@@ -290,9 +293,12 @@ class ExpertCacheModel:
                     max_tokens=capacity.max_tokens,
                     max_top_k=capacity.top_k,
                     runtime_token_limit=True,
+                    health_summary=c.health_probes,
                 )
             )
-        counter_bytes = 0 if self.counter is None else self.counter.query.storage_bytes
+        counter_bytes = 0 if self.counter is None else (
+            self.counter.query.storage_bytes + self.counter.query.health_device_bytes)
+        health_host_bytes = 0 if self.counter is None else self.counter.query.health_host_bytes
         device_cache = sum(m.hbm_total_bytes for m in memories.values()) + counter_bytes
         if device_cache > c.expert_device_bytes:
             raise ValueError(
@@ -301,7 +307,7 @@ class ExpertCacheModel:
         free, total = torch.cuda.mem_get_info(self.device)
         allocated = torch.cuda.memory_allocated(self.device)
         host_free = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        host_new = sum(m.backing_bytes + m.update_host_bytes for m in memories.values())
+        host_new = sum(m.backing_bytes + m.update_host_bytes for m in memories.values()) + health_host_bytes
         if host_new + c.host_safety_bytes > host_free:
             raise ValueError(
                 "canonical mapped backing exceeds available physical host memory"
@@ -316,7 +322,7 @@ class ExpertCacheModel:
             graphs=c.graph_reserved_bytes,
             workspace=sum(m.workspace_bytes for m in memories.values()),
             metadata=sum(m.metadata_bytes for m in memories.values()) + counter_bytes,
-            host_staging=sum(m.update_host_bytes for m in memories.values()),
+            host_staging=sum(m.update_host_bytes for m in memories.values()) + health_host_bytes,
             host_sources=sum(m.source_bytes for m in memories.values()),
             device_safety=c.device_safety_bytes,
             host_safety=c.host_safety_bytes,
@@ -372,6 +378,8 @@ class ExpertCacheModel:
                     state.set_token_limit(self.capacity.max_tokens)
                     for binding in bindings:
                         binding.run()
+                    if state.health is not None:
+                        state.health.rebase(("preparation",))
 
                 return PreparedCall(run=run, owners=(state, ids, *bindings))
 
@@ -390,6 +398,9 @@ class ExpertCacheModel:
         self._counters = counters
         counters.reset(quiescent=True)
         counters.set_token_limit(0)
+        if counters.health is not None:
+            counters.health.bind_maps({n: self.plans[n].prepared.state.mapping
+                                      for n in self.observed_layers})
         if self.config.mode == "adaptive":
             bindings = {
                 name: bind_sm120_epoch_layer(

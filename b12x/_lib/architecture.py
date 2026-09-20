@@ -73,6 +73,7 @@ def require_kernel_architecture(
         return
     if module in {
         "b12x.moe._shared.kernels.routing_profile",
+        "b12x.moe._shared.kernels.routing_health",
         "b12x.comm.roce._oneshot_cute", "b12x.comm.roce._allgather_cute",
         "b12x.sequence.gdn_decode._cute_kernels",
         "b12x.sequence.mtp_feedback._concat",

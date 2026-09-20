@@ -17,6 +17,7 @@ from .epoch import (
     ResidencyEpochBudget, ResidencyEpochCoordinator, ResidencyEpochDecision,
     ResidencyLayerDecision,
 )
+from .health import RoutingHealthThresholds
 
 __all__ = [
     "ExpertPlacement", "LayerRoutingCounts", "ResidencyExchangeSpec",
@@ -24,5 +25,5 @@ __all__ = [
     "RoutingObservationSpec", "RoutingSnapshot", "ResidencyCacheConfig",
     "ResidencyCacheController", "ResidencyCacheDecision", "ResidencyCacheOutcome",
     "updated_slot_map", "ResidencyEpochBudget", "ResidencyEpochCoordinator",
-    "ResidencyEpochDecision", "ResidencyLayerDecision",
+    "ResidencyEpochDecision", "ResidencyLayerDecision", "RoutingHealthThresholds",
 ]
