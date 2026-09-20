@@ -123,6 +123,22 @@ class ExpertCacheModel:
             )
         self.source_reserved_bytes += nbytes
 
+    def close(self):
+        """Release cache references after readers and PreparationSession retire."""
+        if any(p.prepared is not None for p in self.plans.values()) or (
+            self.counter is not None and self.counter.prepared is not None
+        ):
+            raise RuntimeError("close the preparation session after graphs before cache owners")
+        # The engine has drained every stream, including pending health copies.
+        # Break counter/health cycles while their CUDA owners are still live.
+        if self._counters is not None:
+            self._counters.health = self._counters.history = None
+        self.runtime = self._counters = self.counter = None
+        self.sources.clear()
+        self.plans.clear()
+        self.placements.clear()
+        self.source_reserved_bytes = 0
+
     def add_source(self, source):
         name = source.weights.layer_name
         if (

@@ -1,5 +1,38 @@
 """Worker/RPC contract tests; these do not measure a serving engine."""
 import asyncio
+
+
+def test_close_serving_awaits_cancelled_control_before_engine_release():
+    from b12x.integration.vllm.lifecycle import close_serving
+
+    async def scenario():
+        submitted, release = asyncio.Event(), asyncio.Event()
+        order = []
+
+        async def control():
+            submitted.set()
+            try:
+                await asyncio.Future()
+            finally:
+                await release.wait()
+                order.append("result slot retired")
+
+        class Engine:
+            async def shutdown_async(self, **kwargs):
+                order.append("worker released")
+
+        producer = asyncio.create_task(control())
+        await submitted.wait()
+        closing = asyncio.create_task(close_serving(Engine(), (producer,)))
+        await asyncio.sleep(0)
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert order == []
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert order == ["result slot retired", "worker released"]
+    asyncio.run(scenario())
 from dataclasses import replace
 from types import SimpleNamespace
 

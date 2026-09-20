@@ -57,7 +57,12 @@ class VllmResidencyHealth:
                 # The engine owns the submitted GPU read and pinned result slot.
                 # Consume it before another operation can reuse that storage.
                 try:
-                    await task
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            pass
+                    task.result()
                 finally:
                     self.failed = True
                 raise

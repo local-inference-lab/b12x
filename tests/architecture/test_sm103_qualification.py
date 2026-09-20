@@ -182,3 +182,15 @@ def test_skipped_tests_remain_visible_in_qualification_counts(tmp_path):
     assert qualification.junit_counts(path) == dict(
         tests=3, failures=0, errors=0, skipped=1
     )
+
+
+def test_residency_launches_native_tiers_before_updates(tmp_path):
+    output = tmp_path / 'residency'
+    qualification.main(['--output-dir', str(output), '--component', 'residency'])
+    receipt = json.loads((output / 'qualification.json').read_text())
+    assert receipt['components'] == [
+        'residency_hbm', 'residency_grace', 'residency_mixed',
+        'residency_updates', 'residency_control',
+    ]
+    assert not receipt['runtime_qualified']
+    assert all('portable_bytes' not in ' '.join(r['command']) for r in receipt['results'])

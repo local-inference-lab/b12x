@@ -65,7 +65,7 @@ def prepare(session, plan, a, ids, weights, name):
 
 
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("hot", [(0, 1, 2, 3), (0, 2), ()])
+@pytest.mark.parametrize("hot", [(0, 1, 2, 3), (0, 2), ()], ids=["hbm", "mixed", "grace"])
 def test_public_preparation_split_parity_and_graph_replay(id_dtype, hot, tmp_path):
     device = require_device(grace=len(hot) < 4)
     profile = placement(hot=hot, cold=tuple(e for e in range(4) if e not in hot))
@@ -119,7 +119,7 @@ def test_public_preparation_split_parity_and_graph_replay(id_dtype, hot, tmp_pat
                     graph.reset()
 
 
-@pytest.mark.parametrize("hot", [(0, 1, 2, 3), (0, 2), ()])
+@pytest.mark.parametrize("hot", [(0, 1, 2, 3), (0, 2), ()], ids=["hbm", "mixed", "grace"])
 def test_quiescent_slot_exchange_replays_native_graph(hot, tmp_path):
     """Physical TMA/MMA gate against freshly prepared equivalent placement."""
     device = require_device(grace=len(hot) < 4)

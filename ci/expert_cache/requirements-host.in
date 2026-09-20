@@ -1,0 +1,2 @@
+# CPU Torch omits Triton, but native declarations import its metadata APIs.
+triton==3.7.0

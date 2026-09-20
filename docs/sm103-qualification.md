@@ -140,3 +140,42 @@ Experimental Grace TP2 transport requires actual memory registration, NIC and
 peer visibility, epoch/reset behavior, failure handling and ordering tests.
 Direct HBM RDMA remains unsupported. Operator compilation does not qualify
 Station communication or a complete serving deployment.
+
+## Native hierarchical residency execution
+
+The existing launcher groups reduced-geometry native gates in dependency order:
+all HBM, all coherent Grace, mixed parity, same-graph slot updates, and native
+cache-control replay. Every required skip fails acceptance. Preparation emits
+commands without importing CUDA; execution requires an explicit physical UUID
+and observed compute capability 10.3. Grace operand tests additionally require
+verified coherent host memory.
+
+```bash
+python scripts/qualify_sm103.py --component residency --output-dir "$PREPARED"
+python scripts/qualify_sm103.py --component residency --execute \
+  --device-uuid "$B300_UUID" --output-dir "$NATIVE_RECEIPTS"
+python scripts/qualify_sm103.py --component residency --execute \
+  --device-uuid "$B300_UUID" --sanitizer "$COMPUTE_SANITIZER" \
+  --sanitizer-tool memcheck --output-dir "$MEMCHECK_RECEIPTS"
+python scripts/qualify_sm103.py --component residency --execute \
+  --device-uuid "$B300_UUID" --sanitizer "$COMPUTE_SANITIZER" \
+  --sanitizer-tool synccheck --output-dir "$SYNCCHECK_RECEIPTS"
+```
+
+Run these on the Station with a native aarch64 CUDA/Torch/CUTLASS environment,
+sufficient admitted HBM/Grace memory, exclusive access to the selected GPU, and
+an approved exact source revision. Compilation or SM120 execution cannot satisfy
+them. If a native gate fails, preserve its receipt and resolve that failure before
+production geometry or performance. Native failure/recovery coverage remains a
+separate required check; portable transaction fault injection proves host state
+semantics only.
+
+After correctness and sanitizer gates, use the existing
+[production-geometry and per-stage benchmark](expert-residency.md#qualification-commands)
+with matched weights, routes, activation and reduction semantics. Keep three
+claims separate: native all-HBM execution versus an applicable established
+operator; hierarchical versus all-HBM b12x tier cost; and learned-static versus
+adaptive full-engine cost. The benchmark supplies the second comparison, not a
+complete established-backend baseline or full-model loader. Whole-model SM103
+serving remains deferred until its native source/preparation adapter is qualified;
+the SM120 ModelOpt canonical cache adapter explicitly rejects SM103.

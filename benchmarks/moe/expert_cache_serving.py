@@ -30,6 +30,9 @@ async def run(args):
     from b12x.integration.vllm.residency_maintenance import VllmResidencyMaintenance
     from b12x.moe.residency import ResidencyCacheConfig, ResidencyEpochBudget
 
+    if args.resources:
+        os.environ["B12X_LIFECYCLE_OUTPUT"] = str(args.resources.resolve())
+
     settings = dict(
         mode=args.mode,
         activation="w4a16",
@@ -118,6 +121,7 @@ async def run(args):
         minimum_layer_fraction=args.anchor_breadth,
     ) if args.anchor_advantage is not None else None)
     controller, epoch_task, traffic_task = None, None, None
+    completed = False
     try:
         engine = AsyncLLM.from_engine_args(engine_args)
         status = (
@@ -130,6 +134,9 @@ async def run(args):
                 "graph-enabled serving did not retain a captured graph"
             )
         record("prepared", status=status)
+        if args.resources:
+            record("resources", result=await engine.collective_rpc(
+                "b12x_lifecycle_resources", args=("graphs_ready",)))
         if args.mode == "adaptive" and args.control != "observe":
             controller_type = (
                 VllmResidencyMaintenance
@@ -450,7 +457,33 @@ async def run(args):
         for name, before in status["layers"].items() if status else ():
             if before["pointers"] != after["layers"][name]["pointers"]:
                 raise AssertionError("serving cache changed a captured pointer")
-        record("complete", status=after)
+        if args.resources:
+            record("resources", result=await engine.collective_rpc(
+                "b12x_lifecycle_resources", args=("serving_finished",)))
+        if args.shutdown_case == "health-pending":
+            record("shutdown_case", case=args.shutdown_case,
+                   result=await engine.collective_rpc("b12x_residency_health", args=("start",)))
+        elif args.shutdown_case == "health-completed":
+            record("shutdown_case", case=args.shutdown_case, result=await health_probe.probe())
+        elif args.shutdown_case in ("health-cancelled", "maintenance-cancelled"):
+            operation = asyncio.create_task(
+                health_probe.probe() if args.shutdown_case == "health-cancelled" else controller.run())
+            await asyncio.sleep(0.001)
+            operation.cancel()
+            try:
+                result = await operation
+                record("shutdown_case", case=args.shutdown_case, completed_before_cancel=True,
+                       result=result)
+            except asyncio.CancelledError:
+                record("shutdown_case", case=args.shutdown_case, cancellation_observed=True)
+            after = (await engine.collective_rpc("b12x_expert_cache_status"))[0]
+            if status["graphs"] != after["graphs"] or any(
+                before["pointers"] != after["layers"][name]["pointers"]
+                for name, before in status["layers"].items()
+            ):
+                raise AssertionError("shutdown diagnostic changed captured storage")
+        record("serving_complete", status=after)
+        completed = True
     except BaseException as error:
         record(
             "failure",
@@ -459,16 +492,27 @@ async def run(args):
         )
         raise
     finally:
-        if epoch_task is not None and not epoch_task.done():
-            epoch_task.cancel()
-        if traffic_task is not None and not traffic_task.done():
-            traffic_task.cancel()
         if engine is not None:
-            engine.shutdown()
+            from b12x.integration.vllm.lifecycle import close_serving
+
+            started = time.perf_counter_ns()
+            try:
+                await close_serving(engine, (epoch_task, traffic_task))
+            except BaseException as error:
+                record("shutdown_failure", error=repr(error))
+                raise
+            record("shutdown", wall_ns=time.perf_counter_ns() - started)
+    if completed:
+        record("complete", status=after)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--resources", type=Path, help="Explicit worker lifecycle observations; outside timed traffic")
+    p.add_argument("--repeat-lifecycle", type=int, default=1,
+                   help="Reconstruct engines in this client process; output becomes a directory")
+    p.add_argument("--shutdown-case", default="normal", choices=("normal", "health-pending",
+                   "health-completed", "health-cancelled", "maintenance-cancelled"))
     p.add_argument("--model", required=True)
     p.add_argument(
         "--mode", choices=("profile", "static", "adaptive", "native"), required=True
@@ -570,6 +614,10 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if args.repeat_lifecycle < 1:
+        p.error("repeat lifecycle must be positive")
+    if args.shutdown_case != "normal" and (args.mode != "adaptive" or args.control != "health"):
+        p.error("shutdown diagnostics require adaptive health control")
     if (min(args.recenter_protect, args.recenter_protect_windows) < 0
             or bool(args.recenter_protect) != bool(args.recenter_protect_windows)
             or (args.recenter_protect and args.anchor_advantage is None)):
@@ -622,7 +670,23 @@ def main():
         raise FileExistsError(
             "serving receipts are append-only; choose a new output path"
         )
-    asyncio.run(run(args))
+    if args.repeat_lifecycle == 1:
+        asyncio.run(run(args))
+    else:
+        import copy
+        import gc
+        from b12x.testing.lifecycle import process_resources
+
+        args.output.mkdir(parents=True)
+        async def repeat():
+            for cycle in range(args.repeat_lifecycle):
+                arm = copy.copy(args)
+                arm.output = args.output / f"cycle-{cycle}.jsonl"
+                await run(arm)
+                gc.collect()
+                with (args.output / "client-resources.jsonl").open("a") as stream:
+                    stream.write(json.dumps(dict(cycle=cycle, **process_resources())) + "\n")
+        asyncio.run(repeat())
 
 
 if __name__ == "__main__":

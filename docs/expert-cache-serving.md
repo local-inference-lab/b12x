@@ -12,6 +12,9 @@ The [SM103 HBM/Grace backend](expert-residency.md) has a different numerical and
 storage contract. Neither these PCIe serving tests nor the shared controller
 qualify SM103 tcgen05 execution or Grace-backed TMA.
 
+For reproducible commands, supported scope, artifact verification and explicit
+shutdown, use the [experimental reference guide](expert-cache-reference.md).
+
 ## Checkpoint ownership and numerical contract
 
 `fused_moe.ExpertWeightSource` combines an immutable weight declaration,

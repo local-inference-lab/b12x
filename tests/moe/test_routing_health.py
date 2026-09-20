@@ -152,6 +152,8 @@ def test_probe_does_not_invoke_policy_and_cancellation_consumes_pending_slot(
         await e.started.wait()
         task.cancel()
         await asyncio.sleep(0.005)
+        task.cancel()
+        await asyncio.sleep(0.005)
         assert not task.done()
         e.release.set()
         with pytest.raises(asyncio.CancelledError):

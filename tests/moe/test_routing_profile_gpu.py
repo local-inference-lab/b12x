@@ -537,3 +537,32 @@ def test_anchor_health_same_graph_canonical_counts_and_immutable_reference(exper
             graph.reset()
         result.close()
         session.close()
+
+
+def test_pending_health_close_reconstructs_without_retained_allocations():
+    """Reader drain precedes owner release; allocator pools may remain cached."""
+    import weakref
+
+    samples = []
+    for _ in range(4):
+        query = RoutingProfileQuery(layers=(("a", 4),), max_tokens=2,
+                                    max_top_k=2, health_summary=True)
+        plan, session, result = prepare(query)
+        state = plan.prepared.state
+        mapping = torch.tensor([[0, 0], [0, 1], [1, 2], [1, 3]], device='cuda', dtype=torch.int32)
+        health = state.health
+        health.bind_maps({'a': mapping})
+        health.rebase((0,))
+        health.start((0,))
+        assert health.pending
+        host = weakref.ref(health.host)
+        # This is the engine shutdown order, not a hot-path synchronization.
+        torch.cuda.synchronize()
+        result.close()
+        session.close()
+        state.health = None
+        del result, session, plan, state, health, mapping, query
+        gc.collect()
+        assert host() is None
+        samples.append(torch.cuda.memory_allocated())
+    assert max(samples[1:]) == min(samples[1:])

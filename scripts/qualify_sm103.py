@@ -3,7 +3,8 @@
 
 Preparation requires no CUDA context. Execution requires an explicitly selected
 physical SM103 GPU and records every subprocess result. This suite does not
-qualify complete models, performance, Grace memory, or Station RDMA.
+qualify complete models, performance, or Station RDMA. The residency component
+requires physical coherent Grace operand access, beyond compilation.
 """
 
 from __future__ import annotations
@@ -25,6 +26,11 @@ from scripts._sm103_source import package_source_sha256 as _package_source_sha25
 from scripts._sm103_source import source_identity
 
 SUITES = {
+    "residency_hbm": ["tests/moe/test_sm103_residency.py", "-k", "split_parity and hbm"],
+    "residency_grace": ["tests/moe/test_sm103_residency.py", "-k", "split_parity and grace"],
+    "residency_mixed": ["tests/moe/test_sm103_residency.py", "-k", "split_parity and mixed"],
+    "residency_updates": ["tests/moe/test_sm103_residency.py", "-k", "quiescent"],
+    "residency_control": ["tests/moe/test_residency_cache_gpu.py", "-k", "native_sm103"],
     "moe": ["tests/moe/test_sm103_pointwise.py", "tests/moe/test_sm103_nvfp4.py"],
     "trellis_reconstruction": ["tests/moe/test_sm103_trellis.py"],
     "trellis_projection": ["tests/moe/test_sm103_trellis_gemm.py", "tests/moe/test_sm103_trellis_staging.py"],
@@ -108,7 +114,7 @@ def verify_compile_artifacts(manifest_path, compiled):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--component", choices=(*SUITES, "all"), default="all")
+    parser.add_argument("--component", choices=(*SUITES, "residency", "all"), default="all")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
         "--device-uuid", help="physical GPU UUID; mandatory for execution"
@@ -148,7 +154,9 @@ def main(argv=None):
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
     out.mkdir(parents=True, exist_ok=True)
-    components = list(SUITES) if args.component == "all" else [args.component]
+    components = (list(SUITES) if args.component == "all" else
+                  [n for n in SUITES if n.startswith("residency_")] if args.component == "residency"
+                  else [args.component])
     receipt = {
         "status": "prepared",
         "runtime_qualified": False,
@@ -167,7 +175,7 @@ def main(argv=None):
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
             "frozen QSRT coupled high-rate conversion",
-            "Grace memory",
+            "Grace production-geometry performance and full-model loading",
             "Station RDMA",
             "FlashInfer/vLLM plugin installation",
             "performance qualification",

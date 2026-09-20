@@ -337,6 +337,16 @@ class ResidencyEpochWorkerExtension:
     def b12x_residency_acknowledge(self, token):
         return self._b12x_epoch_runtime().acknowledge(token)
 
+    def b12x_lifecycle_resources(self, stage):
+        """Explicit diagnostic; no allocation or observation node enters replay."""
+        import os
+        from b12x.testing.lifecycle import record_worker_resources
+
+        path = os.environ.get("B12X_LIFECYCLE_OUTPUT")
+        if not path:
+            raise RuntimeError("lifecycle recording requires an explicit output path")
+        return record_worker_resources(self, stage, path)
+
     def b12x_expert_cache_status(self):
         """Inspect ownership without adding observation work to static serving."""
         model = getattr(self.model_runner, "b12x_expert_cache", None)

@@ -1,0 +1,31 @@
+name: Expert cache host contracts
+on:
+  pull_request:
+  push:
+    branches: [work/sm103-bringup]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: 0.12.3
+          enable-cache: false
+      - name: Install hash-locked CPU test dependencies
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip sync --python .venv/bin/python --torch-backend cpu --require-hashes ci/expert_cache/requirements-host.lock
+      - name: Run host acceptance
+        run: .venv/bin/python scripts/qualify_expert_cache.py --tier host --output acceptance-host
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: host-acceptance-${{ github.sha }}
+          path: acceptance-host
