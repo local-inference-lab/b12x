@@ -548,3 +548,35 @@ def test_declined_anchor_recheck_never_falls_through_to_normal_adaptation():
     receipt = m.run(movement_mode='recenter')
     assert receipt['movement_mode'] == 'recenter' and receipt['selected_pairs'] == 0
     assert all(layer.slots.generation == 0 for layer in e.layers[0].values())
+
+
+@pytest.mark.parametrize("pairs,limit,selected", [(0, 528, 0), (4, 0, 0),
+                                                 (1, 528, 1), (4, 528, 2)])
+def test_independent_recovery_budget_preserves_later_normal_adaptation(pairs, limit, selected):
+    from dataclasses import asdict
+    from b12x.integration.vllm.residency_maintenance import LocalResidencyMaintenance
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e, threshold=None, pairs=2)
+    anchor = r.ResidencyAnchor(profile_id='a'*64, checkpoint='checkpoint-sha',
+        recipe='recipe', workload='general', placements=tuple((n, r.ExpertPlacement(
+            total_experts=4, resident_expert_ids=(0, 1), backing_expert_ids=(2, 3))) for n in ('a', 'b')))
+    m.runtime.anchor = anchor
+    m = LocalResidencyMaintenance(m.runtime, {**m.config,
+        'recenter_budget': dict(max_pairs=pairs, max_copy_bytes=limit),
+        'anchor_thresholds': asdict(r.RoutingAnchorThresholds(
+            advantage_fraction=.02, minimum_layer_fraction=.75))})
+    m.run()
+    e.counts = snapshot({n: (0, 0, 12, 0) for n in ('a', 'b')}, 1)
+    assert m.run()['selected_pairs'] == 2
+    before = {n: b.snapshot() for n, b in m.runtime.bindings.items()}
+    e.counts = snapshot({n: (24, 0, 12, 0) for n in ('a', 'b')}, 2)
+    recovered = m.run(movement_mode='recenter')
+    assert recovered['selected_pairs'] == selected
+    assert recovered['proposal_backlog']['budget'] == dict(max_pairs=pairs, max_copy_bytes=limit)
+    if not selected:
+        assert before == {n: b.snapshot() for n, b in m.runtime.bindings.items()}
+    e.counts = snapshot({n: (24, 0, 12, 60) for n in ('a', 'b')}, 3)
+    again = m.run()
+    assert again['selected_pairs'] == 2
+    assert again['proposal_backlog']['budget']['max_pairs'] == 2
+    assert m.runtime.anchor is anchor

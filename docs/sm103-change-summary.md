@@ -13,10 +13,14 @@ resident mask, observational current-versus-anchor cold counts and explicit
 bounded re-centering through existing policy and backend transactions. Query
 schema 5 admits the added device/pinned bytes. The metadata corpus contains
 88 declarations/246 programs at runtime package
-`e812e2e6aa06fd250e40375172022ff412874213fa73eb277fac12f69eb4b3f2`;
+`d93c1f772cea923edca01de349ff7a8b3b9f1749e76a9341043e61036d7144ca`;
 the anchor specialization has a separate SM103 compilation receipt. The
 [movement and recovery results](expert-cache-anchor-results.md) retain source-built
 SM120 evidence without changing physical SM103 gates or serving defaults.
+The [long-return study](expert-cache-recovery.md) separates normal and recovery
+movement envelopes through the existing coordinator. Its diagnostic analyzer
+distinguishes eligibility, per-layer capacity, global budget and anchor-gate
+limits without changing replacement scores or numerical arithmetic.
 The [cadence qualification](expert-cache-cadence.md) adds bounded execution
 tracing, controlled-admission comparisons, an isolated router replay and
 checkpoint-byte whole-K shape checks. It explains the C4 generation-zero

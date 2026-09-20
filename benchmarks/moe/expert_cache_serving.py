@@ -141,6 +141,11 @@ async def run(args):
                     else args.cold_threshold,
                     "policy_diagnostics": args.policy_diagnostics,
                     "anchor_thresholds": anchor_gate,
+                    "recenter_budget": (
+                        ResidencyEpochBudget(max_pairs=args.recenter_pairs,
+                                             max_copy_bytes=args.recenter_mib << 20)
+                        if args.recenter_pairs is not None else None
+                    ),
                 }
                 if args.control in ("maintenance", "health")
                 else {}
@@ -468,6 +473,8 @@ def main():
     p.add_argument("--layer-pairs", type=int, default=2)
     p.add_argument("--epoch-pairs", type=int, default=16)
     p.add_argument("--epoch-mib", type=int, default=64)
+    p.add_argument("--recenter-pairs", type=int, help="Explicit recovery pair cap; omission uses the normal epoch budget")
+    p.add_argument("--recenter-mib", type=int, help="Explicit recovery copy-byte cap in MiB")
     p.add_argument(
         "--control",
         choices=("external", "observe", "maintenance", "health"),
@@ -542,6 +549,11 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if (args.recenter_pairs is None) != (args.recenter_mib is None):
+        p.error("recovery requires both pair and byte limits")
+    if args.recenter_pairs is not None:
+        if args.anchor_advantage is None or min(args.recenter_pairs, args.recenter_mib) < 0:
+            p.error("recovery budgets require anchor control and nonnegative limits")
     if (args.anchor_health or args.anchor_advantage is not None) and args.control != "health":
         p.error("anchor observation/recovery requires explicit adaptive health control")
     if args.anchor_advantage is not None:

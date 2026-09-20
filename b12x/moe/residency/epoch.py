@@ -75,9 +75,12 @@ class ResidencyEpochCoordinator:
         if self._failed:
             raise RuntimeError("residency epoch failed; reload the lane and establish fresh baselines")
 
-    def observe(self, snapshot, *, slots, allow_movement=True, recenter=None):
+    def observe(self, snapshot, *, slots, allow_movement=True, recenter=None, budget=None):
         """Advance observation history even when an external health gate declines movement."""
         self._require_healthy()
+        budget = self.budget if budget is None else budget
+        if not isinstance(budget, ResidencyEpochBudget):
+            raise TypeError("epoch requires a typed promotion budget")
         if type(allow_movement) is not bool:
             raise TypeError("allow_movement must be bool")
         if self._pending is not None:
@@ -117,11 +120,11 @@ class ResidencyEpochCoordinator:
             spec = self.controllers[name].exchange
             cost = self.replicas * (spec.payload_copy_bytes_per_pair
                                    + (0 if selected[name] else spec.map_copy_bytes_per_transaction))
-            if pairs == self.budget.max_pairs:
+            if pairs == budget.max_pairs:
                 pair_skips += 1
                 skipped_bytes += cost
                 continue
-            if used + cost > self.budget.max_copy_bytes:
+            if used + cost > budget.max_copy_bytes:
                 byte_skips += 1
                 skipped_bytes += cost
                 continue

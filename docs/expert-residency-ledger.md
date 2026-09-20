@@ -2369,3 +2369,61 @@ three tests under each sanitizer with zero errors, ten companion tests, and the
 88-declaration/246-program metadata census. Both health cases cross-compile.
 A separate ordinary non-cache graph smoke generates 512 tokens and verifies its
 loaded native libraries against the source-built wheel. The source-03 matrix is not relabeled as source-04 performance evidence.
+
+
+## Longer returns and independent recovery budgets, September 20, 2026
+
+Inspection finds b12x `9bbc1eec48badb3c792f7e6a967a4f7c140af609`, master
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`, companion
+`3e45b530e58186046383e7294e611c2f6bf5cfb8` and companion main
+`47ccf6c57d92f03630ebcbad3809450545825488`. A final fetch confirms these refs
+remain unchanged. The source-built wheel and eleven native libraries are
+reverified; the companion needs no edit.
+
+The [recovery study](expert-cache-recovery.md) adds an optional recovery envelope
+to the existing epoch coordinator and a retrospective constraint analyzer. It
+preserves normal adaptation budgets, per-layer capacity, scores, guards, health
+thresholds, history depth zero and numerical arithmetic. Zero recovery budgets
+and subsequent normal adaptation have focused contract coverage. Static and
+ordinary non-cache execution acquire no new device state or replay work.
+
+Twenty C4 serving runs cover fresh long code/math returns, an independently ended
+short prefix, a longer partial return and a second specialist shift. They generate
+119,808 tokens and 17,478 promotions with exact paired outputs, stable graph/cache
+addresses and independently checked per-layer generation accounting. Eight runs
+use the immutable inspected HEAD; twelve use frozen source archive 01, runtime
+package digest `d93c1f772cea923edca01de349ff7a8b3b9f1749e76a9341043e61036d7144ca`.
+Two full-policy diagnostic runs remain separate from headline timings.
+
+With adaptation fixed at 32 pairs, code return reaches 134.57 tok/s without
+recovery and 152.53/156.53/163.24 at recovery budgets 16/32/64; static is 171.17.
+Math reaches 131.14 without recovery and 142.45/150.70/154.35 with recovery;
+static is 170.98. The 64-pair controls are admitted only after all useful 32-pair
+recovery epochs hit their pair cap. Byte caps do not bind. The stronger early
+recovery reduces repeated scheduler control, but none catches the cumulative
+static return-phase lead within 4,096 tokens.
+
+Later placement is not persistently as bad as the phase average: weighted anchor
+coverage reaches roughly 98.6–99.1% at only 91–92% set overlap, and late block
+rates approach static. Anchor advantage shrinks below the trigger. Removing
+score margin offline changes no transactions in either corpus; recent-count and
+direct bounded-restore alternatives increase recorded cold selections. Hard
+restoration remains an offline reference. No guard relaxation or sticky recovery
+mode is added.
+
+The long partial return triggers no re-centering and reproduces normal-adaptive
+transactions exactly. A second specialist shift resumes ordinary adaptation in
+about 0.9 seconds. Recovery improves that complete sequence, but the second
+specialist phase is 6.6% slower than retaining specialist state and incurs more
+re-promotions. Those losses, completed zero-hit lifetimes and right-censored
+lifetimes remain visible.
+
+Source 01 passes 342 host/compiler tests with two CUDA-only skips, 33 physical
+GPU tests, three targeted cases under each sanitizer with zero errors, ten
+companion tests and a 512-token ordinary non-cache graph smoke. Metadata remains
+88 declarations/246 programs; both health cases cross-compile for SM103. Raw
+source archives, command scripts, build hashes, token IDs, telemetry, analysis
+and the failure ledger remain in `/home/jasonc/b12x-recovery-evidence-20260920`
+and `ripper:/home/jasonc/b12x-recovery-results-20260920`. All accepted serving
+samples retain P1, Gen4 x16 and no reported throttle reasons. The results do not
+qualify Gen5 transport or native B300 execution, and no adaptive default changes.

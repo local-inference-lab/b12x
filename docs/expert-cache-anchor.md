@@ -46,8 +46,10 @@ retains the existing experimental decayed-LFU scoring. Re-centering uses that
 same arithmetic, candidate threshold, score margin and residency guards, but
 restricts candidates to missing anchor experts and victims to resident experts
 outside the anchor. It does not force every anchor expert back into residency.
-The model coordinator applies the same score-gain-per-copy-byte ranking and
-global pair/byte budgets to either intent.
+The model coordinator applies the same score-gain-per-copy-byte ranking to either
+intent. Normal adaptation and re-centering share one global pair/byte envelope
+unless the owner explicitly supplies a separate recovery envelope. Neither
+envelope changes the prepared per-layer transaction capacity.
 
 The engine owner requests re-centering only after an anchor probe triggers. At
 the existing scheduler-owned maintenance boundary, the worker checks the anchor
@@ -83,6 +85,16 @@ adapter accepts `await maintenance.run(movement_mode="recenter")`. Normal calls
 retain `movement_mode="adapt"`. Distributed anchor-triggered serving is not
 qualified; the existing fail-closed mutation and reload contracts remain intact.
 
+`VllmResidencyMaintenance(..., recenter_budget=ResidencyEpochBudget(...))` selects
+that envelope only for explicit re-centering requests. Omission retains the
+normal budget. `ResidencyEpochCoordinator.observe(..., budget=...)` applies a
+typed budget to one observation without replacing its default or resetting
+policy history. A zero pair or byte allowance still consumes the observation
+but admits no movement. A later normal request uses its original budget.
+
+The [long-return experiment](expert-cache-recovery.md) distinguishes temporary
+budget saturation from a later disappearance of sufficient anchor advantage.
+
 ## Configuration and allocation
 
 The opt-in serving configuration is `anchor_health=True`, which requires adaptive
@@ -113,6 +125,8 @@ The research harness exposes three separate controls:
   experiment, requiring two percentage points of advantage across at least 75%
   of layers.
 - `--epoch-pairs 16 --epoch-mib 64`: bound movement independently of the trigger.
+- `--recenter-pairs 32 --recenter-mib 128`: optionally bound recovery separately;
+  both flags are required together with explicit anchor control.
 
 For example, within the source-built environment documented in the results:
 
@@ -165,6 +179,24 @@ python -m benchmarks.moe.summarize_expert_anchor adaptive.jsonl \
 Probe intervals ending at a workload boundary can contain preceding traffic;
 the report retains their timestamps and labels this limitation. Unfinished
 promotion lifetimes remain right-censored rather than counted as zero-hit moves.
+
+`benchmarks.moe.analyze_anchor_recovery` reconstructs missing-anchor demand,
+traffic-weighted coverage and primary restoration constraints from full policy
+diagnostics with history disabled. It verifies actual re-centering proposals
+against the recorded scores and guards. Eligibility beyond the per-layer cap is
+explicitly counterfactual. Ordinary adaptation windows report hypothetical
+anchor eligibility, not actual re-centering rejections.
+
+```bash
+python -m benchmarks.moe.analyze_anchor_recovery serving-diagnostic.jsonl \
+  --profile placement.json --output recovery-constraints.json
+```
+
+Diagnostic receipts retain the policy configuration at their initial baseline.
+For earlier receipts without that field, the analyzer's explicit fallback
+parameters must match the recording: `--minimum-count`, `--margin` and
+`--layer-pairs`. Recorded proposals must still reproduce exactly. These options
+affect analysis only and cannot change serving policy.
 
 ## Scope
 

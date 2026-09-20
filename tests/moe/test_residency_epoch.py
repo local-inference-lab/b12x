@@ -216,3 +216,22 @@ def test_proposal_backlog_distinguishes_pair_and_byte_caps():
     c, slots = coordinator(max_pairs=4, max_bytes=132)
     d = c.observe(observation, slots=slots)
     assert d.byte_cap_skips == 3 and d.pair_cap_skips == 0
+
+
+@pytest.mark.parametrize("pairs,bytes_limit,selected", [(0, 1000, 0), (4, 0, 0),
+                                                      (4, 264, 2), (4, 1000, 4)])
+def test_epoch_budget_override_does_not_replace_default_or_advance_invalid_input(pairs, bytes_limit, selected):
+    c, slots = coordinator(max_pairs=1, max_bytes=1000)
+    observation = snapshot({n: (0, 0, 20, 10) for n in slots}, 1)
+    with pytest.raises(TypeError, match="typed"):
+        c.observe(observation, slots=slots, budget={"max_pairs": pairs})
+    decision = c.observe(observation, slots=slots, budget=r.ResidencyEpochBudget(
+        max_pairs=pairs, max_copy_bytes=bytes_limit))
+    assert decision.selected_pairs == selected
+    slots = complete(c, decision, slots)
+    c.finish(decision, slots=slots)
+    counts = {n: tuple(old + (100 if tier == 1 else 0)
+                       for old, (tier, _) in zip((0, 0, 20, 10), value.expert_map, strict=True))
+              for n, value in slots.items()}
+    later = c.observe(snapshot(counts, 2), slots=slots)
+    assert later.selected_pairs == 1 and c.budget.max_pairs == 1

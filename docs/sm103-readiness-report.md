@@ -13,11 +13,14 @@ The optional [learned-anchor recovery contract](expert-cache-anchor.md) compares
 recent canonical route counts with an immutable learned resident mask. Its
 explicit re-centering intent uses the existing score arithmetic, bounded model
 epoch and quiescent transaction. The metadata census at runtime package
-`e812e2e6aa06fd250e40375172022ff412874213fa73eb277fac12f69eb4b3f2`
+`d93c1f772cea923edca01de349ff7a8b3b9f1749e76a9341043e61036d7144ca`
 contains **88 declarations and 246 programs**. Both health specializations have
 source-bound SM103 compilation evidence. The [SM120 measurements](expert-cache-anchor-results.md)
 remain separate from physical B300 acceptance; earlier counts below describe
 their retained source.
+The [long-return experiment](expert-cache-recovery.md) adds an optional,
+independent recovery budget and diagnoses restoration constraints. It adds no
+GPU program or storage and preserves the physical SM103 acceptance sequence.
 
 The [feature and fix map](sm103-change-summary.md) identifies the implementation
 and compatibility changes. The [qualification runbook](sm103-qualification.md)

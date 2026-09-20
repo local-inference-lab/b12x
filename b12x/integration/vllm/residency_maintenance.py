@@ -40,6 +40,10 @@ class LocalResidencyMaintenance:
             n: ResidencyCacheConfig(**v) for n, v in config["layers"].items()
         }
         self.budget = ResidencyEpochBudget(**config["budget"])
+        self.recenter_budget = (
+            ResidencyEpochBudget(**config["recenter_budget"])
+            if config.get("recenter_budget") is not None else self.budget
+        )
         self.threshold = config["cold_fraction_threshold"]
         self.anchor_thresholds = (RoutingAnchorThresholds(**config["anchor_thresholds"])
                                   if config.get("anchor_thresholds") is not None else None)
@@ -99,6 +103,8 @@ class LocalResidencyMaintenance:
                     "stages_ns": stages,
                     "snapshot_stages_ns": snapshot_stages,
                     "worker_wall_ns": perf_counter_ns() - start,
+                    **({"policy_configs": {n: asdict(c) for n, c in self.configs.items()}}
+                       if self.diagnostics else {}),
                 }
 
             measured = perf_counter_ns()
@@ -160,8 +166,10 @@ class LocalResidencyMaintenance:
                 history_receipt["replayed_windows"] = max(0, len(cuts) - 1)
                 stages["history"] = perf_counter_ns() - measured
                 measured = perf_counter_ns()
+            epoch_budget = self.recenter_budget if movement_mode == "recenter" else self.budget
             decision = self.coordinator.observe(
-                snapshot, slots=slots, allow_movement=allow, recenter=recenter
+                snapshot, slots=slots, allow_movement=allow, recenter=recenter,
+                budget=epoch_budget,
             )
             stages["policy"] = perf_counter_ns() - measured
             measured = perf_counter_ns()
@@ -232,7 +240,7 @@ class LocalResidencyMaintenance:
                     "byte_cap_skips": decision.byte_cap_skips,
                     "skipped_incremental_copy_bytes": decision.skipped_incremental_copy_bytes,
                     "proposing_layers": decision.proposing_layers,
-                    "budget": asdict(self.budget),
+                    "budget": asdict(epoch_budget),
                 },
                 "selected_pairs": decision.selected_pairs,
                 "copy_bytes": decision.copy_bytes,
@@ -285,6 +293,7 @@ class VllmResidencyMaintenance:
         cold_fraction_threshold=None,
         policy_diagnostics=False,
         anchor_thresholds=None,
+        recenter_budget=None,
     ):
         self.engine = engine
         self.config = {
@@ -294,6 +303,7 @@ class VllmResidencyMaintenance:
             "cold_fraction_threshold": cold_fraction_threshold,
             "policy_diagnostics": policy_diagnostics,
             "anchor_thresholds": None if anchor_thresholds is None else asdict(anchor_thresholds),
+            "recenter_budget": None if recenter_budget is None else asdict(recenter_budget),
         }
         self._lock = asyncio.Lock()
         self.failed = False

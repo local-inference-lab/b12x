@@ -1,0 +1,48 @@
+{"text": "Explain how to welcome a new neighbor who has just moved from a busy city to a small town.", "workload": "stable_general"}
+{"text": "Describe a relaxing afternoon spent reorganizing a bookshelf and rediscovering forgotten books.", "workload": "stable_general"}
+{"text": "Suggest a simple plan for sharing household chores fairly between three roommates.", "workload": "stable_general"}
+{"text": "Write a friendly introduction to a community newsletter about a weekend walking group.", "workload": "stable_general"}
+{"text": "Explain how someone can make a small rented balcony pleasant without permanent alterations.", "workload": "stable_general"}
+{"text": "Describe the experience of learning a familiar family recipe from an older relative.", "workload": "stable_general"}
+{"text": "Offer practical ideas for staying in touch with friends after everyone moves to different cities.", "workload": "stable_general"}
+{"text": "Write a short guide to choosing a thoughtful gift when you know someone's interests but not their tastes.", "workload": "stable_general"}
+{"text": "Write Python that merges overlapping half-open time intervals while preserving empty-input behavior. Include tests.", "workload": "specialist"}
+{"text": "Implement a Rust iterator adapter that yields each item alongside its zero-based position, without allocating.", "workload": "specialist"}
+{"text": "Write a TypeScript function that validates a nested configuration object and returns descriptive field errors.", "workload": "specialist"}
+{"text": "Design a SQL query that finds the most recent successful payment for each customer, with deterministic tie handling.", "workload": "specialist"}
+{"text": "Implement a Go worker pool with bounded concurrency and cancellation. Explain who closes each channel.", "workload": "specialist"}
+{"text": "Write a C++ function that rotates a vector left by an arbitrary signed offset. Handle empty input safely.", "workload": "specialist"}
+{"text": "Implement a Python parser for escaped key=value records without using regular expressions. Include malformed-input cases.", "workload": "specialist"}
+{"text": "Write a JavaScript cache with a fixed entry limit and least-recently-used eviction. Demonstrate a hit and eviction.", "workload": "specialist"}
+{"text": "Explain what makes a small local library a useful gathering place beyond lending books.", "workload": "return_partial"}
+{"text": "Suggest gentle ways to establish a morning routine when your work schedule changes each week.", "workload": "return_partial"}
+{"text": "Implement a Rust iterator adapter that yields each item alongside its zero-based position, without allocating.", "workload": "return_partial"}
+{"text": "Implement a Rust iterator adapter that yields each item alongside its zero-based position, without allocating.", "workload": "return_partial"}
+{"text": "Give a beginner practical advice for keeping a travel journal without making it feel like homework.", "workload": "return_partial"}
+{"text": "Explain how to plan a picnic that still feels enjoyable if light rain arrives.", "workload": "return_partial"}
+{"text": "Design a SQL query that finds the most recent successful payment for each customer, with deterministic tie handling.", "workload": "return_partial"}
+{"text": "Design a SQL query that finds the most recent successful payment for each customer, with deterministic tie handling.", "workload": "return_partial"}
+{"text": "Explain how a neighborhood repair cafe can help people exchange skills and meet one another.", "workload": "return_partial"}
+{"text": "Write a cheerful description of the first warm evening after a long winter.", "workload": "return_partial"}
+{"text": "Write a C++ function that rotates a vector left by an arbitrary signed offset. Handle empty input safely.", "workload": "return_partial"}
+{"text": "Write a C++ function that rotates a vector left by an arbitrary signed offset. Handle empty input safely.", "workload": "return_partial"}
+{"text": "Describe a memorable ordinary day from the perspective of a person returning to their hometown.", "workload": "return_partial"}
+{"text": "Offer practical advice for arranging a small reading corner in a crowded living room.", "workload": "return_partial"}
+{"text": "Write a JavaScript cache with a fixed entry limit and least-recently-used eviction. Demonstrate a hit and eviction.", "workload": "return_partial"}
+{"text": "Write a JavaScript cache with a fixed entry limit and least-recently-used eviction. Demonstrate a hit and eviction.", "workload": "return_partial"}
+{"text": "Suggest a low-pressure way to start a neighborhood walking club with people of varied abilities.", "workload": "return_partial"}
+{"text": "Describe the calm of tidying a kitchen after a lively dinner with friends.", "workload": "return_partial"}
+{"text": "Implement a Rust function to split a byte slice on a multi-byte delimiter without losing empty fields.", "workload": "return_partial"}
+{"text": "Implement a Rust function to split a byte slice on a multi-byte delimiter without losing empty fields.", "workload": "return_partial"}
+{"text": "Write a warm farewell message for a colleague moving to a different team.", "workload": "return_partial"}
+{"text": "Describe how a small garden can change the rhythm of someone's week.", "workload": "return_partial"}
+{"text": "Create a SQL query reporting missing calendar dates between each account's first and last transaction.", "workload": "return_partial"}
+{"text": "Create a SQL query reporting missing calendar dates between each account's first and last transaction.", "workload": "return_partial"}
+{"text": "Suggest ways to make regular video calls with distant family feel less repetitive.", "workload": "return_partial"}
+{"text": "Describe the experience of revisiting a museum you enjoyed as a child.", "workload": "return_partial"}
+{"text": "Write a C++ routine to merge two sorted ranges into a preallocated output span, checking its capacity first.", "workload": "return_partial"}
+{"text": "Write a C++ routine to merge two sorted ranges into a preallocated output span, checking its capacity first.", "workload": "return_partial"}
+{"text": "Offer ideas for enjoying a quiet weekend at home after a busy month of travel.", "workload": "return_partial"}
+{"text": "Describe how a community noticeboard can reflect the character of a neighborhood.", "workload": "return_partial"}
+{"text": "Implement JavaScript event subscription with unsubscribe behavior that remains correct while callbacks remove themselves.", "workload": "return_partial"}
+{"text": "Implement JavaScript event subscription with unsubscribe behavior that remains correct while callbacks remove themselves.", "workload": "return_partial"}

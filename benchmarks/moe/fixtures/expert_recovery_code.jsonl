@@ -1,0 +1,48 @@
+{"text": "Explain how to welcome a new neighbor who has just moved from a busy city to a small town.", "workload": "stable_general"}
+{"text": "Describe a relaxing afternoon spent reorganizing a bookshelf and rediscovering forgotten books.", "workload": "stable_general"}
+{"text": "Suggest a simple plan for sharing household chores fairly between three roommates.", "workload": "stable_general"}
+{"text": "Write a friendly introduction to a community newsletter about a weekend walking group.", "workload": "stable_general"}
+{"text": "Explain how someone can make a small rented balcony pleasant without permanent alterations.", "workload": "stable_general"}
+{"text": "Describe the experience of learning a familiar family recipe from an older relative.", "workload": "stable_general"}
+{"text": "Offer practical ideas for staying in touch with friends after everyone moves to different cities.", "workload": "stable_general"}
+{"text": "Write a short guide to choosing a thoughtful gift when you know someone's interests but not their tastes.", "workload": "stable_general"}
+{"text": "Write Python that merges overlapping half-open time intervals while preserving empty-input behavior. Include tests.", "workload": "specialist"}
+{"text": "Implement a Rust iterator adapter that yields each item alongside its zero-based position, without allocating.", "workload": "specialist"}
+{"text": "Write a TypeScript function that validates a nested configuration object and returns descriptive field errors.", "workload": "specialist"}
+{"text": "Design a SQL query that finds the most recent successful payment for each customer, with deterministic tie handling.", "workload": "specialist"}
+{"text": "Implement a Go worker pool with bounded concurrency and cancellation. Explain who closes each channel.", "workload": "specialist"}
+{"text": "Write a C++ function that rotates a vector left by an arbitrary signed offset. Handle empty input safely.", "workload": "specialist"}
+{"text": "Implement a Python parser for escaped key=value records without using regular expressions. Include malformed-input cases.", "workload": "specialist"}
+{"text": "Write a JavaScript cache with a fixed entry limit and least-recently-used eviction. Demonstrate a hit and eviction.", "workload": "specialist"}
+{"text": "Explain what makes a small local library a useful gathering place beyond lending books.", "workload": "return_general"}
+{"text": "Suggest gentle ways to establish a morning routine when your work schedule changes each week.", "workload": "return_general"}
+{"text": "Describe how the atmosphere of a town changes when its weekly street market opens.", "workload": "return_general"}
+{"text": "Write a considerate message declining a social invitation while keeping the friendship warm.", "workload": "return_general"}
+{"text": "Give a beginner practical advice for keeping a travel journal without making it feel like homework.", "workload": "return_general"}
+{"text": "Explain how to plan a picnic that still feels enjoyable if light rain arrives.", "workload": "return_general"}
+{"text": "Describe the pleasures and challenges of sharing an apartment with a close friend.", "workload": "return_general"}
+{"text": "Offer ideas for making a family gathering welcoming to both quiet and outgoing guests.", "workload": "return_general"}
+{"text": "Explain how a neighborhood repair cafe can help people exchange skills and meet one another.", "workload": "return_general"}
+{"text": "Write a cheerful description of the first warm evening after a long winter.", "workload": "return_general"}
+{"text": "Suggest ways to make a long train ride comfortable and interesting without relying on a screen.", "workload": "return_general"}
+{"text": "Explain how to discuss different expectations before planning a holiday with friends.", "workload": "return_general"}
+{"text": "Describe a memorable ordinary day from the perspective of a person returning to their hometown.", "workload": "return_general"}
+{"text": "Offer practical advice for arranging a small reading corner in a crowded living room.", "workload": "return_general"}
+{"text": "Write a welcoming note for visitors staying in a friend's spare bedroom for the weekend.", "workload": "return_general"}
+{"text": "Explain why familiar smells can evoke memories, using everyday examples and simple language.", "workload": "return_general"}
+{"text": "Suggest a low-pressure way to start a neighborhood walking club with people of varied abilities.", "workload": "return_general"}
+{"text": "Describe the calm of tidying a kitchen after a lively dinner with friends.", "workload": "return_general"}
+{"text": "Offer ways to keep a shared office comfortable when people prefer different noise levels.", "workload": "return_general"}
+{"text": "Explain how to choose a hobby based on curiosity rather than pressure to become excellent at it.", "workload": "return_general"}
+{"text": "Write a warm farewell message for a colleague moving to a different team.", "workload": "return_general"}
+{"text": "Describe how a small garden can change the rhythm of someone's week.", "workload": "return_general"}
+{"text": "Give advice for planning a relaxed birthday celebration on a limited budget.", "workload": "return_general"}
+{"text": "Explain how to ask a friend for help with moving house without assuming they are available.", "workload": "return_general"}
+{"text": "Suggest ways to make regular video calls with distant family feel less repetitive.", "workload": "return_general"}
+{"text": "Describe the experience of revisiting a museum you enjoyed as a child.", "workload": "return_general"}
+{"text": "Write a short guide to being a considerate guest during an extended family visit.", "workload": "return_general"}
+{"text": "Explain how to keep a shared cupboard organized when several people use it every day.", "workload": "return_general"}
+{"text": "Offer ideas for enjoying a quiet weekend at home after a busy month of travel.", "workload": "return_general"}
+{"text": "Describe how a community noticeboard can reflect the character of a neighborhood.", "workload": "return_general"}
+{"text": "Suggest thoughtful questions to ask an older relative about everyday life when they were young.", "workload": "return_general"}
+{"text": "Write an encouraging note to someone preparing for their first solo trip to a nearby city.", "workload": "return_general"}
