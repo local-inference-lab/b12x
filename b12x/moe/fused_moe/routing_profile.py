@@ -114,6 +114,10 @@ class _CounterState:
         if query.health_summary:
             from ._routing_health import RoutingHealthState
             self.health = RoutingHealthState(self)
+        self.history = None
+        if query.history_depth:
+            from ._routing_history import RoutingHistoryState
+            self.history = RoutingHistoryState(self)
 
     def bind(self, *, layer, phase, topk_ids):
         import cutlass
@@ -179,11 +183,18 @@ class _CounterState:
         started = perf_counter_ns()
         self._quiesce(quiescent)
         drained = perf_counter_ns()
-        rows = []
         # One slab transfer snapshots the model at a quiescent boundary. Reading
         # each layer separately would add one synchronous D2H operation per row.
         host = self.storage.cpu() if self.storage is not None else None
         copied = perf_counter_ns()
+        result = self.decode_snapshot(host)
+        self.last_snapshot_timings_ns = {"counter_drain": drained-started,
+            "counter_d2h": copied-drained, "counter_decode": perf_counter_ns()-copied}
+        return result
+
+    def decode_snapshot(self, host):
+        """Decode a completed, owner-retained slab with the declared row layout."""
+        rows = []
         for (layer, phase), value in self.rows.items():
             experts = dict(self.query.layers)[layer]
             offset = value.data_ptr() - self.storage.data_ptr()
@@ -192,10 +203,7 @@ class _CounterState:
                 raise OverflowError("routing counters overflowed; discard this epoch and reset")
             rows.append(LayerRoutingCounts(layer=layer, phase=phase, counts=tuple(data[:experts]),
                 calls=data[experts], sampled_calls=data[experts+1], tokens=data[experts+2], sampled_tokens=data[experts+3]))
-        result = RoutingSnapshot(epoch=self.epoch, rank=self.query.rank, layers=tuple(rows))
-        self.last_snapshot_timings_ns = {"counter_drain": drained-started,
-            "counter_d2h": copied-drained, "counter_decode": perf_counter_ns()-copied}
-        return result
+        return RoutingSnapshot(epoch=self.epoch, rank=self.query.rank, layers=tuple(rows))
 
 
 def plan_routing_profile(query, *, override=None):
@@ -209,7 +217,7 @@ def plan_routing_profile(query, *, override=None):
         _compile_jobs=lambda c, d: (CompileJob.create(
             "b12x.moe.fused_moe.routing_profile:compile_programs", FrozenMapping(asdict(query)), d.ordinal),),
         _memory_requirements=lambda c, d: MemoryRequirements(persistent=(
-            PersistentMemory(key=("routing_profile", current_plan()), required_nbytes=query.storage_bytes+query.health_device_bytes),)) if query.storage_bytes else MemoryRequirements(),
+            PersistentMemory(key=("routing_profile", current_plan()), required_nbytes=query.storage_bytes+query.health_device_bytes+query.history_bytes),)) if query.storage_bytes else MemoryRequirements(),
         _materialize=materialize)
 
 

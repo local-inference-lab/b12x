@@ -34,6 +34,7 @@ def declare(case):
         return op.plan_routing_profile(op.RoutingProfileQuery(layers=(("compile", 384),),
             max_tokens=128, max_top_k=8, phases=("decode",) if case.endswith("_health") else ("decode", "verify"),
             health_summary=case.endswith("_health"),
+            history_depth=4 if case.endswith("_health") else 0,
             runtime_token_limit=case.endswith(("_extent", "_health"))))
     if case in ("moe:residency", "moe:residency_updates"):
         from b12x.moe import fused_moe as op

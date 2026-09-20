@@ -199,6 +199,14 @@ counter readback and host control cost; they are not free. The
 [maintenance guide](expert-cache-maintenance.md) defines the boundary, opt-out,
 failure behavior and counters-only comparison arm.
 
+Optional [read-only health probes](expert-cache-health.md) can inspect routing
+pressure without that maintenance barrier. Explicit
+`ExpertCacheServingConfig(history_depth=D)` also admits a bounded device/pinned
+counter ring for adaptive serving. The [routing-history contract](expert-cache-history.md)
+separates checkpoint recording from deferred host policy replay and documents
+wrap, generation and memory rules. Static mode rejects nonzero history depth;
+health without history allocates no ring.
+
 A canonical fill drains readers, verifies the device map, copies every selected
 candidate into its victim's fixed VRAM slot, waits for completion, then publishes
 one complete map generation. Every overwritten victim remains reconstructible

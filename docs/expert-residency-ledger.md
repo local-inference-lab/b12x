@@ -2208,3 +2208,93 @@ four objects. The health reduction reports 32 registers, no stack/local memory,
 04 and 06 remain the serving and GPU-validation identities, respectively;
 final test formatting preserves the tested AST. No physical SM103 execution,
 Gen5 transport result or independent GitHub CI acceptance is claimed.
+
+## Deferred routing-history experiment (2026-09-20 UTC)
+
+The inspected and rechecked sources are b12x
+`f6daf48fb8484f68e62dee9d40212a3546a8cf4b`, containing master
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`, and companion
+`3e45b530e58186046383e7294e611c2f6bf5cfb8`. Companion main remains
+`47ccf6c57d92f03630ebcbad3809450545825488`; its absent CI-removal commit is
+unrelated to serving. The companion source and complete source-built wheel are
+unchanged. The [history contract](expert-cache-history.md) specifies the optional
+counter ring; the [history results](expert-cache-history-results.md) retain the
+measurements, source identities and interpretation.
+
+Before implementation, nine immutable-source 16-token health repeats cover
+three transitions at C1/C4/C8. All pass exact paired outputs and fixed-address
+checks. Overall rates exceed their retained health-32 references, with stable
+changes ranging from -1.65% to +3.17% of historical static. More probes also cause
+24 stable maintenance operations versus twelve in the earlier health matrix.
+No universal cadence is selected from these single runs.
+
+The retained prose-to-math C8 comparison has two distinct differences: health
+uses a much larger first observation window, and executes sixteen promotion
+epochs versus fixed control's 21. Both repeatedly exhaust the 16-pair budget.
+The implementation therefore changes history alone. It uses prepared D2D copies
+and the existing coordinator's `allow_movement=False` path; movement budgets,
+BF16 router arithmetic, W4A16 whole-K execution and transport remain fixed.
+Wrap coalesces omitted boundaries explicitly while retaining every selection.
+
+The depth sweep at 0/2/4/8/16 remains within a 0.5% overall range. Retained history
+changes eleven of the first sixteen selected pairs in a same-endpoint replay,
+and those choices have more subsequent candidate-minus-victim demand. However,
+only the first maintenance can replay multiple cuts: sustained pressure already
+triggers maintenance at every subsequent probe. Additional historical detail
+does not recreate missed movement opportunities. A device replacement policy,
+larger ring default, new completion-output engine hook and transport changes
+are not justified by that result.
+
+Failures remain in `/home/jasonc/b12x-history-evidence-20260920` and the matching
+`b12x-history-results-20260920` directory on `ripper`. Source archive 02 computed
+full-interval pressure/accounting after advancing deferred policy baselines,
+which incorrectly limited those totals to the final window. Its no-history and
+depth-4 receipts are retained separately. Archive 03 computes pressure before
+replay; a regression checks all 196 selections in a multi-cut example. The
+recorded health arms use an external pressure gate, but the earlier accounting
+receipts are not qualification evidence for the corrected contract.
+
+The first build verifier used a missing container mount path; the corrected
+verifier checks the wheel and eleven installed native libraries. An offline
+diagnostic initially overwrote its receipt-path variable while iterating
+placements; both the initial output and corrected analysis remain available.
+The existing ignored `AsyncLLM.__del__` shutdown exception and optional-extension
+warnings remain visible in completed serving logs.
+
+The frozen runtime digest is
+`8244104e55c8f8e3df8ee983d990c979b4e87fbe4a6f49ec9ebc8d29f4ba6f16`.
+Focused validation passes 275 host tests, including full-interval pressure
+gating before replay when the final subwindow is entirely cold. Thirty SM120
+prepared-counter/cache tests pass, including checkpoint execution. Each of
+memcheck and synccheck passes
+five history depths with zero errors. The SM103 health/history preparation case
+cross-compiles four required native programs from that exact package. History
+adds no kernel: the metadata inventory remains 87 declarations/245 programs.
+These checks do not qualify Grace TMA, physical B300 execution or Gen5 transport.
+
+The completed serving qualification contains sixty runs, 130,560 generated
+tokens and 18,400 promotions, with exact paired outputs and unchanged graph/cache
+addresses. The two source-02 accounting-bug receipts remain excluded. Ten
+source-built companion tests pass, and ordinary non-cache graph serving produces
+512 tokens without the cache extension. All sampled request intervals retain
+PCIe Gen4 x16, P1 and throttle mask `0x0`; dynamic clocks still limit small
+single-run comparisons.
+
+The fixed-budget history matrix shows no consistent throughput gain. Measured
+complete observation windows expand from 48 decode tokens under fixed control
+to 64 under health-32 in the targeted math-C8 case. Sixteen-token probes restore
+more movement opportunities. A separate history-disabled control increases only
+the global allowance from 16 pairs/64 MiB to 32 pairs/128 MiB: math throughput
+rises from 60.01 to 64.57 tok/s, with the same sixteen maintenance operations and
+twice the promotions. This supports movement capacity as a stronger limitation
+than history depth in that case; it does not change the default budget.
+
+Mixed traffic improves overall throughput but exposes a return-to-general loss:
+static reaches 185.42 tok/s, health 143.70 and history 143.00. Most return checks
+remain below the unchanged routing-pressure threshold. History cannot correct a
+movement decision that the health gate declines. Short math regimes also show
+late, small payback margins, and history delays measured payback in the retained
+duration controls. The result report preserves these losses, completed and
+right-censored promotion lifetimes, raw timing distributions and fixture hashes.
+Larger history defaults, a completion-output engine hook, asynchronous fills and
+arithmetic changes remain deferred.

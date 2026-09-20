@@ -41,6 +41,9 @@ class LocalResidencyMaintenance:
         }
         self.budget = ResidencyEpochBudget(**config["budget"])
         self.threshold = config["cold_fraction_threshold"]
+        self.diagnostics = config.get("policy_diagnostics", False)
+        if type(self.diagnostics) is not bool:
+            raise TypeError("policy_diagnostics must be boolean")
         if self.threshold is not None and (
             type(self.threshold) not in (float, int)
             or not math.isfinite(self.threshold)
@@ -108,6 +111,34 @@ class LocalResidencyMaintenance:
             )
             stages["pressure"] = perf_counter_ns() - measured
             measured = perf_counter_ns()
+            history = getattr(state, "history", None)
+            history_receipt, policy_observations = None, []
+            if history is not None:
+                generation = tuple(
+                    (n, s.preparation_id, s.generation)
+                    for n, s in sorted(slots.items())
+                )
+                cuts, history_receipt = history.read(generation, quiescent=True)
+                from b12x.moe.residency.contracts import validate_routing_progress
+
+                validate_routing_progress((*cuts, snapshot))
+                if cuts:
+                    for name, controller in self.coordinator.controllers.items():
+                        controller.validate_observation(cuts[0], slots=slots[name])
+                # The final checkpoint and the maintenance tail form one window.
+                # Deferred cuts age history/guards but never propose movement.
+                for cut in cuts[:-1]:
+                    deferred = self.coordinator.observe(
+                        cut, slots=slots, allow_movement=False
+                    )
+                    self.coordinator.finish(deferred, slots=slots)
+                    if self.diagnostics:
+                        policy_observations.append(
+                            policy_observation(deferred, deferred=True)
+                        )
+                history_receipt["replayed_windows"] = max(0, len(cuts) - 1)
+                stages["history"] = perf_counter_ns() - measured
+                measured = perf_counter_ns()
             decision = self.coordinator.observe(
                 snapshot, slots=slots, allow_movement=allow
             )
@@ -194,6 +225,15 @@ class LocalResidencyMaintenance:
                     }
                     for n, o in outcomes.items()
                 },
+                **({"history": history_receipt} if history_receipt is not None else {}),
+                **(
+                    {
+                        "policy_observations": policy_observations
+                        + [policy_observation(decision)]
+                    }
+                    if self.diagnostics
+                    else {}
+                ),
                 "worker_wall_ns": perf_counter_ns() - start,
             }
         except BaseException:
@@ -206,13 +246,22 @@ class LocalResidencyMaintenance:
 class VllmResidencyMaintenance:
     """Explicit engine control; no task or cadence is installed automatically."""
 
-    def __init__(self, engine, *, configs, budget, cold_fraction_threshold=None):
+    def __init__(
+        self,
+        engine,
+        *,
+        configs,
+        budget,
+        cold_fraction_threshold=None,
+        policy_diagnostics=False,
+    ):
         self.engine = engine
         self.config = {
             "session": uuid4().hex,
             "layers": {n: asdict(c) for n, c in configs.items()},
             "budget": asdict(budget),
             "cold_fraction_threshold": cold_fraction_threshold,
+            "policy_diagnostics": policy_diagnostics,
         }
         self._lock = asyncio.Lock()
         self.failed = False
@@ -235,3 +284,24 @@ class VllmResidencyMaintenance:
             )
             self.last_receipt = result
             return result
+
+
+def policy_observation(decision, *, deferred=False):
+    """Opt-in control-plane evidence; never recorded by graph execution."""
+    return {
+        "deferred": deferred,
+        "layers": {
+            layer.layer: {
+                "window": layer.decision.window,
+                "counts": layer.decision.counts,
+                "scores": layer.decision.scores,
+                "calls": layer.decision.calls,
+                "cold_selections": layer.decision.cold_selections,
+                "candidates": layer.decision.pairs,
+                "selected": layer.pairs,
+                "protected": layer.decision.protected_hot_experts,
+                "hits": layer.decision.observed_hits_since_promotion,
+            }
+            for layer in decision.layers
+        },
+    }

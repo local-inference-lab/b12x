@@ -249,6 +249,11 @@ class ResidencyEpochWorkerExtension:
             # Mutation completes at the existing maintenance boundary. Rebase
             # before another graph can count selections against the new map.
             health.rebase(self._b12x_health_generation())
+        history = getattr(getattr(cache, "_counters", None), "history", None)
+        if history is not None:
+            import torch
+            with torch.cuda.stream(self.model_runner.main_stream):
+                history.rebase(self._b12x_health_generation())
         return result
 
     def _b12x_health_generation(self):
@@ -259,13 +264,15 @@ class ResidencyEpochWorkerExtension:
         return tuple((n, b.snapshot().preparation_id, b.snapshot().generation)
                      for n, b in sorted(runtime.bindings.items()))
 
-    def b12x_residency_health(self, operation):
+    def b12x_residency_health(self, operation, record_history=False):
         """Serialized single-worker utility; event polling never drains the device.
 
         The maintained executor submits this on the same actor as model calls.
         Only its producer stream may write the prepared routing counters. A
         pending read must be consumed before the client requests maintenance.
         """
+        if type(record_history) is not bool or (record_history and operation != "start"):
+            raise ValueError("history recording is a boolean start-only option")
         import torch
         cache = getattr(self.model_runner, "b12x_expert_cache", None)
         health = getattr(getattr(cache, "_counters", None), "health", None)
@@ -275,14 +282,33 @@ class ResidencyEpochWorkerExtension:
         generation = self._b12x_health_generation()
         with torch.cuda.stream(self.model_runner.main_stream):
             if operation == "start":
+                checkpoint = None
+                if record_history:
+                    history = getattr(cache._counters, "history", None)
+                    if history is None:
+                        raise RuntimeError("routing history was not prepared")
+                    health._validate(generation)
+                    checkpoint = history.checkpoint(generation)
                 health.start(generation)
-                return {"submitted": True, "worker_wall_ns": perf_counter_ns()-started}
+                return {"submitted": True, "history": checkpoint,
+                        "worker_wall_ns": perf_counter_ns()-started}
             if operation == "poll":
                 result = health.poll(generation)
                 if result is not None:
                     result["worker_poll_ns"] = perf_counter_ns()-started
                 return result
             raise ValueError("unknown residency health operation")
+
+    def b12x_residency_checkpoint(self):
+        """Optional observation cut, independent of health or policy cadence."""
+        import torch
+        cache = getattr(self.model_runner, "b12x_expert_cache", None)
+        history = getattr(getattr(cache, "_counters", None), "history", None)
+        if history is None:
+            raise RuntimeError("routing history was not prepared")
+        generation = self._b12x_health_generation()
+        with torch.cuda.stream(self.model_runner.main_stream):
+            return history.checkpoint(generation)
 
     def b12x_residency_begin(self, token):
         return self._b12x_epoch_runtime().begin(token)

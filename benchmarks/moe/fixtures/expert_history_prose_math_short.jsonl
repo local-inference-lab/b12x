@@ -1,0 +1,10 @@
+{"text": "Write a calm description of an old observatory being opened to the public for the first time in years.", "workload": "stable_general"}
+{"text": "Tell a short realistic story about a courier returning a misplaced parcel to its owner.", "workload": "stable_general"}
+{"text": "Describe how a neighborhood cafe changes between the morning rush and the quiet afternoon.", "workload": "stable_general"}
+{"text": "Explain in everyday language why a familiar walking route can feel different in each season.", "workload": "stable_general"}
+{"text": "Write a reflective passage about learning a craft slowly from someone with decades of experience.", "workload": "stable_general"}
+{"text": "Describe a small museum through the observations of a visitor who notices the labels and lighting.", "workload": "stable_general"}
+{"text": "Tell a warm story about two strangers discovering that they once lived on the same street.", "workload": "stable_general"}
+{"text": "Write an accessible explanation of why local oral histories can preserve details that official records omit.", "workload": "stable_general"}
+{"text": "A bag contains four red and six blue tokens. Draw three without replacement. Derive the probability of exactly two red tokens.", "workload": "transition_math"}
+{"text": "Prove that the sum of the first n odd positive integers equals n squared, using induction and a geometric argument.", "workload": "transition_math"}

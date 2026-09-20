@@ -1,0 +1,32 @@
+{"text": "Explain to a neighbor how a community seed library works and suggest a friendly first visit.", "workload": "stable_general"}
+{"text": "Give a thoughtful account of why people keep handwritten recipe cards even when recipes are online.", "workload": "stable_general"}
+{"text": "Describe an ordinary morning at a small coastal railway station, using clear natural prose.", "workload": "stable_general"}
+{"text": "Help two roommates agree on a fair way to share a sunny windowsill for their houseplants.", "workload": "stable_general"}
+{"text": "Explain how to welcome a new volunteer at a neighborhood book exchange without overwhelming them.", "workload": "stable_general"}
+{"text": "Suggest a relaxed way for a family to record stories told by an older relative during dinner.", "workload": "stable_general"}
+{"text": "Describe the practical differences between keeping a travel journal and making a photo album.", "workload": "stable_general"}
+{"text": "Write a conversational explanation of how listening carefully can improve a difficult everyday conversation.", "workload": "stable_general"}
+{"text": "Suggest a practical way for roommates with different schedules to keep a shared kitchen pleasant.", "workload": "mixed"}
+{"text": "Write a Python function that merges overlapping half-open time intervals and explain how empty intervals are handled.", "workload": "mixed"}
+{"text": "Explain why the sum of the first n odd positive integers equals n squared, using a geometric argument.", "workload": "mixed"}
+{"text": "Responde en español: propone un itinerario tranquilo para pasar una tarde lluviosa en una ciudad desconocida.", "workload": "mixed"}
+{"text": "Plan a sequence of tool calls to compare three refundable train bookings, including how to handle conflicting fare information.", "workload": "mixed"}
+{"text": "Write TypeScript code for a bounded task queue that rejects new work after graceful shutdown begins.", "workload": "mixed"}
+{"text": "Describe the sound and atmosphere of a small harbor just before the fishing boats leave at dawn.", "workload": "mixed"}
+{"text": "Solve this probability problem: draw two cards without replacement from five red and three blue cards. Find the chance they have different colors.", "workload": "mixed"}
+{"text": "日本語で、初めて地域の図書館を利用する人に貸出と返却の流れをわかりやすく説明してください。", "workload": "mixed"}
+{"text": "Design a SQL query that finds customers whose most recent order was cancelled while preserving customers with no orders.", "workload": "mixed"}
+{"text": "A recipe uses flour and water in a ratio of 5 to 3. Explain how much of each is needed for 640 grams of dough.", "workload": "mixed"}
+{"text": "Give an agent a careful plan for reconciling two travel calendars without deleting events or sending invitations prematurely.", "workload": "mixed"}
+{"text": "Décris en français comment organiser un échange de graines entre voisins, avec des règles simples et accueillantes.", "workload": "mixed"}
+{"text": "Explain how to test a Go HTTP handler that validates a JSON body and returns distinct errors for malformed and missing fields.", "workload": "mixed"}
+{"text": "Write a gentle scene about two old friends repairing a garden bench while recalling how they first met.", "workload": "mixed"}
+{"text": "Prove that if an integer leaves remainder 2 when divided by 5, its square leaves remainder 4 when divided by 5.", "workload": "mixed"}
+{"text": "Describe a friendly neighborhood market opening on a cool autumn morning.", "workload": "return_general"}
+{"text": "Explain how a family could plan shared meals when everyone has different weekly commitments.", "workload": "return_general"}
+{"text": "Write a short passage about someone rediscovering a hobby after many years away.", "workload": "return_general"}
+{"text": "Suggest ways a small public garden can welcome visitors who want either quiet or conversation.", "workload": "return_general"}
+{"text": "Describe a train journey through familiar countryside from the perspective of a returning traveler.", "workload": "return_general"}
+{"text": "Explain how a volunteer group could make its first meeting useful and welcoming.", "workload": "return_general"}
+{"text": "Write a calm account of preparing a guest room for a relative arriving after a long trip.", "workload": "return_general"}
+{"text": "Describe how a community workshop might organize shared tools so newcomers can find them easily.", "workload": "return_general"}

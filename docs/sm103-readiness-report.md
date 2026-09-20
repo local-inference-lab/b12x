@@ -81,6 +81,15 @@ reduce stable-interval full maintenance from 226 checks to twelve, with recorded
 stable throughput within -1.3% to +1.8% of static. Health control does not
 consistently outperform fixed checks; it remains explicit and experimental.
 
+Optional [deferred routing history](expert-cache-history.md) retains recent
+counter cuts without another kernel, route atomic or scheduler drain. Full
+maintenance consumes those cuts before its final policy decision. Device and
+pinned-host ring bytes enter model-wide admission; schema 4 distinguishes the
+preparation contract. The metadata inventory remains 87 declarations/245
+programs. The [history results](expert-cache-history-results.md) bind serving and
+depth measurements to their source archives. This storage/control capability
+adds no physical SM103 qualification.
+
 The SM103 preparation corpus at package SHA256
 `667fad34f8bb0ba5ad048154e2cfd6281ebe206a19b1b8e32a69fd34e89e0d6b`
 contains **86 declarations and 244 distinct programs**, including 238 native CuTe

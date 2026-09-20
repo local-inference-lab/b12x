@@ -45,6 +45,11 @@ counters against the current expert map without advancing LFU history or
 pausing the scheduler. Prepared storage, generation-bound baselines and event
 completion keep the health cadence separate from bounded maintenance. The
 single-worker SM120 experiment does not change static SM103 behavior.
+Optional [routing history](expert-cache-history.md) retains short cumulative
+counter windows without running host policy or draining serving. Full
+maintenance replays compatible windows through the shared controller before
+bounded movement. Its SM120 measurements and SM103 cross-compilation remain
+separate from physical Grace execution qualification.
 
 ## Supported contracts
 

@@ -241,6 +241,117 @@ def test_local_zero_budget_and_mixed_controller_rejection():
         m.runtime.begin("foreign")
 
 
+def test_policy_diagnostics_retain_scores_without_changing_decisions():
+    engines = [Engine(ranks=1, canonical=True) for _ in range(2)]
+    controls = [local_maintenance(e, threshold=None) for e in engines]
+    controls[1].diagnostics = True
+    for m in controls:
+        m.run()
+    for e in engines:
+        e.counts = snapshot({n: (0, 0, 12, 0) for n in ("a", "b")}, 1)
+    plain, recorded = [m.run() for m in controls]
+    assert "policy_observations" not in plain
+    assert plain["layers"] == recorded["layers"]
+    assert plain["selected_pairs"] == recorded["selected_pairs"]
+    observation, = recorded["policy_observations"]
+    assert observation["deferred"] is False
+    for row in observation["layers"].values():
+        assert row["counts"] == row["scores"] == (0, 0, 12, 0)
+        assert row["window"] == 1
+        assert row["selected"] and row["candidates"]
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_maintenance_replays_deferred_cuts_then_publishes_once(monkeypatch, corrupt):
+    from contextlib import nullcontext
+    import torch
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e, threshold=None)
+    m.diagnostics = True
+
+    class History:
+        generation = None
+        reads = 0
+
+        def rebase(self, generation):
+            self.generation = generation
+
+        def read(self, generation, *, quiescent):
+            assert quiescent and self.generation == generation
+            self.reads += 1
+            frames = [snapshot({n: counts for n in ("a", "b")}, calls)
+                      for counts, calls in (((0, 0, 80, 0), 1),
+                                           ((0, 0, 80, 8), 2),
+                                           ((0, 0, 80, 16), 3))]
+            return tuple(frames), {"checkpoints": 3, "coalesced_checkpoints": 0}
+
+    class Counters:
+        history = History()
+        health = None
+
+        def snapshot(self, *, quiescent):
+            assert quiescent and e.paused
+            return e.counts
+
+    counters = Counters()
+    worker = e.workers[0]
+    worker.model_runner.main_stream = None
+    worker.model_runner.b12x_expert_cache = SimpleNamespace(_counters=counters)
+    m.runtime.snapshot_counters = counters.snapshot
+    m.runtime._local_maintenance = m
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    assert worker.b12x_residency_maintenance(m.config)["baseline"]
+    e.counts = snapshot({n: (0, 0, 80, 10 if corrupt else 18) for n in ("a", "b")}, 4)
+    if corrupt:
+        with pytest.raises(ValueError, match="decreased"):
+            worker.b12x_residency_maintenance(m.config)
+        assert m.runtime._failed
+        assert all(layer.slots.generation == 0 for layer in e.layers[0].values())
+        return
+    receipt = worker.b12x_residency_maintenance(m.config)
+    assert receipt["history"]["replayed_windows"] == 2
+    assert receipt["selections"] == receipt["cold_selections"] == 196
+    assert counters.history.reads == 1
+    assert [x["deferred"] for x in receipt["policy_observations"]] == [True, True, False]
+    assert all(c._window == 3 and c._scores == (0, 0, 20, 14)
+               for c in m.coordinator.controllers.values())
+    assert all(layer.slots.generation == 1 and layer.slots.expert_map[3][0] == 0
+               for layer in e.layers[0].values())
+    assert counters.history.generation == worker._b12x_health_generation()
+
+
+def test_history_does_not_redefine_the_full_interval_pressure_gate():
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e, threshold=0.15)
+    names = ("a", "b")
+
+    class History:
+        def read(self, generation, *, quiescent):
+            assert quiescent
+            return tuple(snapshot({n: counts for n in names}, calls)
+                         for calls, counts in enumerate(((100, 0, 0, 0),
+                                                         (100, 0, 1, 0),
+                                                         (100, 0, 1, 1)), 1)), {}
+
+    class Counters:
+        history = History()
+
+        def snapshot(self, *, quiescent):
+            assert quiescent and e.paused
+            return e.counts
+
+    m.runtime.snapshot_counters = Counters().snapshot
+    assert m.run()["baseline"]
+    e.counts = snapshot({n: (100, 0, 1, 9) for n in names}, 4)
+    receipt = m.run()
+    # The final window is entirely cold, but the complete interval is healthy.
+    assert receipt["selections"] == 220 and receipt["cold_selections"] == 20
+    assert receipt["health"] == "healthy" and receipt["selected_pairs"] == 0
+    assert all(c._window == 3 and c._scores[3] == 9
+               for c in m.coordinator.controllers.values())
+    assert all(layer.slots.generation == 0 for layer in e.layers[0].values())
+
+
 def test_maintenance_driver_serializes_checks_and_poisoned_outcomes():
     from b12x.integration.vllm.residency_maintenance import VllmResidencyMaintenance
 

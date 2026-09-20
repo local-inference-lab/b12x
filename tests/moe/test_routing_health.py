@@ -53,7 +53,77 @@ def test_health_declaration_is_explicit_and_memory_is_model_wide(tmp_path):
         replace(config(tmp_path), mode="static", health_probes=True)
 
 
-def test_probe_does_not_invoke_policy_and_cancellation_consumes_pending_slot():
+def test_history_capacity_is_independent_and_fully_admitted(tmp_path):
+    q = RoutingProfileQuery(layers=(("a", 4), ("b", 7)), max_tokens=128, max_top_k=8)
+    assert q.history_bytes == 0
+    for depth in (1, 2, 4, 8, 16):
+        h = replace(q, history_depth=depth)
+        assert h.history_bytes == depth * q.storage_bytes
+        assert h.health_device_bytes == h.health_host_bytes == 0
+        assert plan_routing_profile(h).prepared is None
+    for depth in (-1, True, 1.5):
+        with pytest.raises(ValueError):
+            replace(q, history_depth=depth)
+    with pytest.raises(ValueError):
+        replace(q, history_depth=4, phases=("verify",))
+    with pytest.raises(ValueError):
+        replace(q, history_depth=4, rank=1, tp_size=2)
+    with pytest.raises(ValueError):
+        replace(config(tmp_path), mode="static", history_depth=4)
+
+
+def test_history_rejects_decreasing_unused_tail_and_reset_epoch():
+    from b12x.moe.residency.contracts import validate_routing_progress
+    from tests.moe.test_residency_epoch import snapshot
+
+    a = snapshot({"a": (0, 0, 8, 0), "b": (0, 0, 0, 9)}, 1)
+    b = snapshot({"a": (0, 0, 12, 0), "b": (0, 0, 0, 10)}, 2)
+    c = snapshot({"a": (0, 0, 10, 0), "b": (0, 0, 0, 11)}, 3)
+    validate_routing_progress((a, a, b))
+    with pytest.raises(ValueError, match="decreased"):
+        validate_routing_progress((a, b, c))
+    with pytest.raises(ValueError, match="epoch"):
+        validate_routing_progress((a, replace(b, epoch=2)))
+    with pytest.raises(ValueError, match="layer"):
+        validate_routing_progress((a, replace(b, layers=b.layers[:1])))
+
+
+def test_history_churn_distinguishes_completed_and_censored_lifetimes():
+    from benchmarks.moe.summarize_expert_history import churn
+
+    rows = []
+    for token, pair, hits in (
+        (32, (2, 0), ()),
+        (64, (3, 2), ((2, 0),)),
+        (96, (2, 3), ((3, 5),)),
+    ):
+        rows.append(
+            dict(
+                kind="maintenance",
+                output_tokens_so_far=token,
+                receipt=dict(
+                    worker=dict(
+                        baseline=False,
+                        copy_bytes=100,
+                        layers={"a": dict(pairs=(pair,), evicted_hits=hits)},
+                    )
+                ),
+            )
+        )
+    result = churn(rows, tokens=128, initial_hot={"a": (0, 1)})
+    assert result["promotions"] == 3 and result["re_promotions"] == 1
+    assert result["zero_hit_completed_lifetimes"] == 1
+    assert result["completed_promoted_lifetimes"] == 2
+    assert result["active_right_censored"] == 1
+    assert result["final_membership_change"] == {"a": 0.5}
+    assert result["copy_bytes"] == 300
+    assert not result["demand_observation_available"]
+
+
+@pytest.mark.parametrize("record_history", [False, True])
+def test_probe_does_not_invoke_policy_and_cancellation_consumes_pending_slot(
+    record_history,
+):
     class Engine:
         def __init__(self):
             self.started = asyncio.Event()
@@ -62,7 +132,12 @@ def test_probe_does_not_invoke_policy_and_cancellation_consumes_pending_slot():
 
         async def collective_rpc(self, method, *, args):
             assert method == "b12x_residency_health"
-            (operation,) = args
+            operation = args[0]
+            assert args == (
+                ("start", True)
+                if record_history and operation == "start"
+                else (operation,)
+            )
             self.operations.append(operation)
             if operation == "start":
                 self.started.set()
@@ -72,7 +147,7 @@ def test_probe_does_not_invoke_policy_and_cancellation_consumes_pending_slot():
 
     async def run():
         e = Engine()
-        p = VllmResidencyHealth(e)
+        p = VllmResidencyHealth(e, record_history=record_history)
         task = asyncio.create_task(p.probe())
         await e.started.wait()
         task.cancel()
@@ -86,7 +161,7 @@ def test_probe_does_not_invoke_policy_and_cancellation_consumes_pending_slot():
             await p.probe()
         e = Engine()
         e.release.set()
-        result = await VllmResidencyHealth(e).probe()
+        result = await VllmResidencyHealth(e, record_history=record_history).probe()
         assert result["summary"]["cold_selections"] == 2
         assert e.operations == ["start", "poll"]
 
@@ -130,6 +205,9 @@ def test_worker_health_reads_leave_policy_and_generation_untouched(monkeypatch):
         def rebase(self, g):
             self.generation = g
 
+        def _validate(self, g):
+            assert g == self.generation
+
         def start(self, g):
             assert g == self.generation
             self.pending = True
@@ -159,10 +237,35 @@ def test_worker_health_reads_leave_policy_and_generation_untouched(monkeypatch):
         (c._scores, c._window, c._baseline, c._slots)
         for c in m.coordinator.controllers.values()
     ]
+    with pytest.raises(RuntimeError, match="history was not prepared"):
+        worker.b12x_residency_health("start", True)
+
+    class History:
+        recorded = []
+
+        def rebase(self, g):
+            self.generation = g
+
+        def checkpoint(self, g):
+            assert g == self.generation
+            self.recorded.append(g)
+            return {"checkpoint": len(self.recorded)}
+
+    history = History()
+    history.rebase(worker._b12x_health_generation())
+    worker.model_runner.b12x_expert_cache._counters.history = history
+    assert worker.b12x_residency_checkpoint()["checkpoint"] == 1
+    assert worker.b12x_residency_health("start", True)["history"]["checkpoint"] == 2
+    worker.b12x_residency_health("poll")
+    assert before == [
+        (c._scores, c._window, c._baseline, c._slots)
+        for c in m.coordinator.controllers.values()
+    ]
     assert e.reads == [1]
     e.counts = snapshot({n: (0, 0, 20, 0) for n in ("a", "b")}, 1)
     assert worker.b12x_residency_maintenance(m.config)["selected_pairs"] == 2
     assert health.generation == worker._b12x_health_generation()
+    assert history.generation == health.generation
     assert all(c._window == 1 for c in m.coordinator.controllers.values())
     worker.model_runner.b12x_expert_cache = None
     with pytest.raises(RuntimeError, match="not prepared"):

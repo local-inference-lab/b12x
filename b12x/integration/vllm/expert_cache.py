@@ -48,6 +48,7 @@ class ExpertCacheServingConfig:
     host_safety_bytes: int
     max_pairs_per_layer: int = 2
     health_probes: bool = False
+    history_depth: int = 0
 
     def __post_init__(self):
         if (
@@ -69,12 +70,15 @@ class ExpertCacheServingConfig:
             "device_safety_bytes",
             "host_safety_bytes",
             "max_pairs_per_layer",
+            "history_depth",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if type(self.health_probes) is not bool or (self.health_probes and self.mode != "adaptive"):
             raise ValueError("health probes require explicitly adaptive serving")
+        if self.history_depth and self.mode != "adaptive":
+            raise ValueError("routing history requires explicitly adaptive serving")
         if self.mode == "adaptive" and not self.max_pairs_per_layer:
             raise ValueError("adaptive cache requires positive prepared fill capacity")
 
@@ -294,11 +298,14 @@ class ExpertCacheModel:
                     max_top_k=capacity.top_k,
                     runtime_token_limit=True,
                     health_summary=c.health_probes,
+                    history_depth=c.history_depth,
                 )
             )
         counter_bytes = 0 if self.counter is None else (
-            self.counter.query.storage_bytes + self.counter.query.health_device_bytes)
-        health_host_bytes = 0 if self.counter is None else self.counter.query.health_host_bytes
+            self.counter.query.storage_bytes + self.counter.query.health_device_bytes
+            + self.counter.query.history_bytes)
+        health_host_bytes = 0 if self.counter is None else (
+            self.counter.query.health_host_bytes + self.counter.query.history_bytes)
         device_cache = sum(m.hbm_total_bytes for m in memories.values()) + counter_bytes
         if device_cache > c.expert_device_bytes:
             raise ValueError(
@@ -380,6 +387,10 @@ class ExpertCacheModel:
                         binding.run()
                     if state.health is not None:
                         state.health.rebase(("preparation",))
+                    if state.history is not None:
+                        state.history.rebase(("preparation",))
+                        for _ in range(state.history.depth):
+                            state.history.checkpoint(("preparation",))
 
                 return PreparedCall(run=run, owners=(state, ids, *bindings))
 
@@ -398,6 +409,9 @@ class ExpertCacheModel:
         self._counters = counters
         counters.reset(quiescent=True)
         counters.set_token_limit(0)
+        if counters.history is not None:
+            # Preparation's copy/event priming precedes producer ownership.
+            counters.history.epoch = counters.history.stream = None
         if counters.health is not None:
             counters.health.bind_maps({n: self.plans[n].prepared.state.mapping
                                       for n in self.observed_layers})

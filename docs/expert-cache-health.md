@@ -23,7 +23,7 @@ where health control is slower than fixed maintenance.
 
 `RoutingProfileQuery(health_summary=True)` declares the reduction, device
 baseline, descriptors, result storage and pinned result buffer. This option
-requires owner-rank, decode-only counters. Its query schema is version 3;
+requires owner-rank, decode-only counters. Its query schema is version 4;
 health-disabled queries retain the original counting programs and storage.
 The registered `moe.routing_profile` preparation contract owns both programs.
 No kernel is resolved, compiled or allocated during graph replay.
@@ -38,6 +38,11 @@ For 48 layers with 128 experts each, this is 102,144 device bytes and 2,304
 pinned bytes. Allocator pool rounding still requires reserved headroom. Host
 metadata and CUDA event objects also remain owned by the prepared state; they
 are not model-scale storage.
+
+Optional [deferred routing history](expert-cache-history.md) retains short counter
+windows without advancing policy at probe time. Full maintenance can replay those
+windows before its final movement decision. Health without history allocates no
+history storage.
 
 ## Summary and baseline semantics
 

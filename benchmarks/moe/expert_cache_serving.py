@@ -43,6 +43,7 @@ async def run(args):
         host_safety_bytes=1 << 30,
         max_pairs_per_layer=args.layer_pairs,
         health_probes=args.control == "health",
+        history_depth=args.history_depth,
     )
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -131,7 +132,8 @@ async def run(args):
                 {
                     "cold_fraction_threshold": None
                     if args.control == "health"
-                    else args.cold_threshold
+                    else args.cold_threshold,
+                    "policy_diagnostics": args.policy_diagnostics,
                 }
                 if args.control in ("maintenance", "health")
                 else {}
@@ -183,7 +185,9 @@ async def run(args):
             from b12x.integration.vllm.residency_health import VllmResidencyHealth
             from b12x.moe.residency.health import RoutingHealthThresholds
 
-            health_probe = VllmResidencyHealth(engine)
+            health_probe = VllmResidencyHealth(
+                engine, record_history=bool(args.history_depth)
+            )
             thresholds = RoutingHealthThresholds(
                 cold_fraction=args.cold_threshold,
                 minimum_layer_fraction=args.health_layer_breadth,
@@ -477,6 +481,17 @@ def main():
     )
     p.add_argument("--health-layer-breadth", type=float, default=0.0)
     p.add_argument("--health-layer-threshold", type=float, default=0.15)
+    p.add_argument(
+        "--policy-diagnostics",
+        action="store_true",
+        help="Retain full policy scores/counts at maintenance only",
+    )
+    p.add_argument(
+        "--history-depth",
+        type=int,
+        default=0,
+        help="Opt-in retained counter cuts; zero allocates no history",
+    )
     p.add_argument("--eager", action="store_true")
     p.add_argument(
         "--execution-trace",
@@ -513,6 +528,8 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if args.history_depth < 0 or (args.history_depth and args.control != "health"):
+        p.error("history requires health control and a nonnegative depth")
     if args.control == "health" and (
         args.mode != "adaptive"
         or args.cold_threshold is None

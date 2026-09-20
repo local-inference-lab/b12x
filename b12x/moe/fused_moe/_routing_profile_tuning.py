@@ -18,6 +18,7 @@ class RoutingProfileQuery:
     expert_parallel: bool = False
     runtime_token_limit: bool = False
     health_summary: bool = False
+    history_depth: int = 0
 
     def __post_init__(self):
         from ..residency.contracts import PHASES
@@ -50,6 +51,14 @@ class RoutingProfileQuery:
             raise TypeError("health_summary must be boolean")
         if self.health_summary and (self.phases != ("decode",) or self.rank != self.owner_rank):
             raise ValueError("health summary requires owner-rank decode counters")
+        _integer("history_depth", self.history_depth)
+        if self.history_depth and (self.phases != ("decode",) or self.rank != self.owner_rank):
+            raise ValueError("routing history requires owner-rank decode counters")
+
+    @property
+    def history_bytes(self):
+        """Each device and pinned-host ring owns this many payload bytes."""
+        return self.history_depth * self.storage_bytes
 
     @property
     def health_device_bytes(self):
@@ -84,7 +93,7 @@ def _validate(query, config, device):
         raise ValueError("unsupported routing counter configuration")
 
 
-TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=3,
+TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=4,
     config_schema_version=1, query_fields=frozenset(RoutingProfileQuery.__dataclass_fields__),
     config_fields=frozenset(RoutingProfileConfig.__dataclass_fields__), encode_query=asdict,
     encode_config=asdict, decode_config=lambda p: RoutingProfileConfig(**dict(p)),

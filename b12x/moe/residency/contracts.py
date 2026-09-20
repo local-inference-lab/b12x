@@ -10,6 +10,32 @@ from dataclasses import dataclass
 PHASES = ("decode", "prefill", "verify", "draft")
 
 
+def validate_routing_progress(snapshots):
+    """Validate cumulative cuts before interpreting a retained history chain.
+
+    This checks every adjacent cut, including an unused final checkpoint before
+    a maintenance tail. It neither changes policy state nor infers lost windows.
+    """
+    previous = None
+    for snapshot in snapshots:
+        if not isinstance(snapshot, RoutingSnapshot):
+            raise TypeError("routing history requires RoutingSnapshot cuts")
+        rows = {(r.layer, r.phase): r for r in snapshot.layers}
+        if previous is not None:
+            before, old = previous
+            if (snapshot.epoch != before.epoch or snapshot.rank != before.rank
+                    or rows.keys() != old.keys()):
+                raise ValueError("routing history owner, epoch or layer set changed")
+            for key, row in rows.items():
+                prior = old[key]
+                fields = ("calls", "sampled_calls", "tokens", "sampled_tokens")
+                if (len(row.counts) != len(prior.counts)
+                        or any(b < a for a, b in zip(prior.counts, row.counts))
+                        or any(getattr(row, n) < getattr(prior, n) for n in fields)):
+                    raise ValueError("cumulative routing history decreased")
+        previous = snapshot, rows
+
+
 def _integer(name, value, minimum=0):
     if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")

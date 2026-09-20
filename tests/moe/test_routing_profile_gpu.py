@@ -26,6 +26,10 @@ def prepare(query):
                 binding.run()
             if state.health is not None:
                 state.health.rebase(("prime",))
+            if state.history is not None:
+                state.history.rebase(("prime",))
+                for _ in range(state.history.depth):
+                    state.history.checkpoint(("prime",))
 
         return PreparedCall(run=run, output=state.storage, owners=(state, *calls))
 
@@ -383,5 +387,79 @@ def test_health_unsigned_totals_and_sticky_overflow_fail_closed():
         with pytest.raises(ValueError, match="invalid health"):
             h.poll((0,))
     finally:
+        result.close()
+        session.close()
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4, 8, 16])
+def test_history_wrap_preserves_canonical_counts_without_replay_allocations(depth):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    query = RoutingProfileQuery(layers=(("a", 4), ("b", 7)), max_tokens=128,
+                                max_top_k=4, history_depth=depth)
+    plan, session, result = prepare(query)
+    graph = None
+    try:
+        state = routing_profile_state(plan)
+        history = state.history
+        state.reset(quiescent=True)
+        generation = (("a", "prepared-a", 0), ("b", "prepared-b", 0))
+        history.rebase(generation)
+        assert history.read(generation, quiescent=True)[0] == ()
+        ids = torch.tensor([[0, 0, -1, 2**40], [3, 6, 3, -1]],
+                           device="cuda", dtype=torch.int64)
+        bindings = [bind_routing_profile(plan, layer=n, phase="decode", topk_ids=ids)
+                    for n in ("a", "b")]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for binding in bindings:
+                binding.run()
+        state.reset(quiescent=True)
+        history.rebase(generation)
+        pointers = (state.storage.data_ptr(), history.storage.data_ptr(), history.host.data_ptr())
+        gc.collect()
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()
+        with kernel_resolution_guard("routing history checkpoints"):
+            for _ in range(depth+3):
+                graph.replay()
+                history.checkpoint(generation)
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_stats()
+        for key in ("allocation.all.allocated", "allocation.all.freed", "allocated_bytes.all.current"):
+            assert before[key] == after[key]
+        snapshots, receipt = history.read(generation, quiescent=True)
+        assert receipt["coalesced_checkpoints"] == 3
+        assert receipt["retained"] == depth
+        assert receipt["readback_bytes"] == depth*query.storage_bytes
+        for count, snap in zip(range(4, depth+4), snapshots, strict=True):
+            assert snap.layers[0].counts == (2*count, 0, 0, 2*count)
+            assert snap.layers[1].counts == (2*count, 0, 0, 2*count, 0, 0, count)
+            assert snap.layers[0].calls == count
+        with pytest.raises(RuntimeError, match="quiescence"):
+            history.read(generation)
+        with pytest.raises(RuntimeError, match="stale"):
+            history.checkpoint((("a", "foreign", 0), ("b", "prepared-b", 0)))
+        newer = (("a", "prepared-a", 1), ("b", "prepared-b", 0))
+        history.rebase(newer)
+        assert history.read(newer, quiescent=True)[0] == ()
+        ids.fill_(-1)
+        graph.replay()
+        history.checkpoint(newer)
+        torch.cuda.synchronize()
+        current, _ = history.read(newer, quiescent=True)
+        assert current[0].layers[0].counts == snapshots[-1].layers[0].counts
+        assert pointers == (state.storage.data_ptr(), history.storage.data_ptr(), history.host.data_ptr())
+        state.reset(quiescent=True)
+        with pytest.raises(RuntimeError, match="stale"):
+            history.checkpoint(newer)
+        history.rebase(newer)
+        state.rows["a", "decode"][8] = 1  # Sticky counter-overflow flag.
+        history.checkpoint(newer)
+        torch.cuda.synchronize()
+        with pytest.raises(OverflowError):
+            history.read(newer, quiescent=True)
+    finally:
+        if graph is not None:
+            graph.reset()
         result.close()
         session.close()

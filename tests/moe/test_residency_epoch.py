@@ -71,6 +71,35 @@ def test_declining_movement_keeps_decayed_history_without_changing_slots():
     assert all(x.pairs == ((2, 1),) for x in second.layers)
 
 
+def test_deferred_observations_keep_recency_without_inventing_earlier_promotions():
+    retained, slots = coordinator(scoring="decayed_lfu", max_pairs=1)
+    coarse, coarse_slots = coordinator(scoring="decayed_lfu", max_pairs=1)
+    windows = [snapshot({n: counts for n in slots}, calls) for counts, calls in (
+        ((0, 0, 80, 0), 1), ((0, 0, 80, 8), 2), ((0, 0, 80, 16), 3))]
+    for window in windows[:-1]:
+        decision = retained.observe(window, slots=slots, allow_movement=False)
+        outcomes = retained.finish(decision, slots=slots)
+        assert decision.proposed_pairs == decision.selected_pairs == 0
+        assert all(o.promotions == o.observed_hits_after_promotion == 0
+                   and o.generation == 0 for o in outcomes.values())
+    recent = retained.observe(windows[-1], slots=slots)
+    aggregate = coarse.observe(windows[-1], slots=coarse_slots)
+    assert recent.layers[0].decision.scores == (0, 0, 20, 12)
+    assert recent.layers[0].pairs == ((3, 0),)
+    assert aggregate.layers[0].pairs == ((2, 0),)
+    assert recent.layers[0].decision.window == 3
+    assert aggregate.layers[0].decision.window == 1
+    after = complete(retained, recent, slots)
+    outcomes = retained.finish(recent, slots=after)
+    assert outcomes["a"].promotions == 1
+    assert outcomes["a"].observed_hits_after_promotion == 0
+    # An unchanged cumulative cut does not age guards or decay scores again.
+    repeated = retained.observe(windows[-1], slots=after, allow_movement=False)
+    assert repeated.layers[0].decision.window == 3
+    assert repeated.layers[0].decision.scores == (0, 0, 20, 12)
+    retained.finish(repeated, slots=after)
+
+
 @pytest.mark.parametrize("replicas,budget,pairs,used", [(1, 131, 0, 0), (1, 132, 1, 132),
     (2, 263, 0, 0), (2, 264, 1, 264), (2, 464, 2, 464)])
 def test_global_budget_includes_every_replica_and_transaction_map(replicas, budget, pairs, used):
