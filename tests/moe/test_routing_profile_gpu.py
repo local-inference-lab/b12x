@@ -553,8 +553,13 @@ def test_pending_health_close_reconstructs_without_retained_allocations():
         health = state.health
         health.bind_maps({'a': mapping})
         health.rebase((0,))
+        torch.cuda.synchronize()
+        # Keep the producer busy so the host result is actually in flight,
+        # rather than merely unconsumed when the teardown starts.
+        torch.cuda._sleep(100_000_000)
         health.start((0,))
         assert health.pending
+        assert not health.done.query()
         host = weakref.ref(health.host)
         # This is the engine shutdown order, not a hot-path synchronization.
         torch.cuda.synchronize()
