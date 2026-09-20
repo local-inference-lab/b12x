@@ -542,6 +542,7 @@ def test_anchor_health_same_graph_canonical_counts_and_immutable_reference(exper
 def test_pending_health_close_reconstructs_without_retained_allocations():
     """Reader drain precedes owner release; allocator pools may remain cached."""
     import weakref
+    from b12x.preparation._measurement import _StreamGate
 
     samples = []
     for _ in range(4):
@@ -553,13 +554,17 @@ def test_pending_health_close_reconstructs_without_retained_allocations():
         health = state.health
         health.bind_maps({'a': mapping})
         health.rebase((0,))
-        torch.cuda.synchronize()
-        # Keep the producer busy so the host result is actually in flight,
-        # rather than merely unconsumed when the teardown starts.
-        torch.cuda._sleep(100_000_000)
+        # Prime lazy event/copy setup before holding the producer stream.
         health.start((0,))
-        assert health.pending
-        assert not health.done.query()
+        health.done.synchronize()
+        health.poll((0,))
+        gate = _StreamGate()
+        try:
+            with gate.hold(torch.cuda.current_stream()):
+                health.start((0,))
+                assert health.pending and not health.done.query()
+        finally:
+            gate.close()
         host = weakref.ref(health.host)
         # This is the engine shutdown order, not a hot-path synchronization.
         torch.cuda.synchronize()
