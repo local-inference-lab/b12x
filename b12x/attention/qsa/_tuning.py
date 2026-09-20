@@ -45,6 +45,9 @@ class QsaQuery:
     mrope_sections: tuple[int, int, int] | None
     rms_norm_eps: float
     abi: FrozenMapping
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    cp_kv_cache_interleave_size: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "abi", FrozenMapping(self.abi))
@@ -75,6 +78,9 @@ class QsaQuery:
             "compressed_page_size": self.compressed_page_size,
             "mrope_sections": self.mrope_sections,
             "rms_norm_eps": self.rms_norm_eps,
+            "dcp_size": self.dcp_size,
+            "dcp_rank": self.dcp_rank,
+            "cp_kv_cache_interleave_size": self.cp_kv_cache_interleave_size,
             "abi": self.abi,
         }
 
@@ -164,6 +170,14 @@ def _validate_query(
         raise ValueError("QSA max_q_rows must cover max_batch")
     if query.max_speculative_tokens < 0:
         raise ValueError("QSA speculative-token capacity must be nonnegative")
+    from ._dcp import validate_geometry
+
+    validate_geometry(
+        size=query.dcp_size,
+        rank=query.dcp_rank,
+        token_interleave=query.cp_kv_cache_interleave_size,
+        compress_ratio=query.compress_ratio,
+    )
     if query.position_axes not in (1, 3):
         raise ValueError("QSA position_axes must be 1 or 3")
     if query.position_axes == 1 and query.mrope_interleaved:
@@ -251,7 +265,7 @@ def _encode_query(query: QsaQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="attention.qsa",
-    query_schema_version=6,
+    query_schema_version=7,
     config_schema_version=2,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset(QsaConfig.__dataclass_fields__),
@@ -269,7 +283,7 @@ TUNING = TuningContract(
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
 )
 
 

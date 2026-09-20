@@ -144,6 +144,8 @@ class _DcpExecutionState:
             return self.runtime._all_gather_heads_on_device(call["local_input"], call.get("out"), state=self, threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
         if surface.endswith("all_gather_pair_kimi_topk"):
             return self.runtime._all_gather_pair_kimi_topk_on_device(call["local_down"], call["local_router"], call["correction_bias"], call.get("out_down"), call.get("topk_weights"), call.get("topk_ids"), state=self)
+        if surface.endswith("all_gather_pair"):
+            return self.runtime._all_gather_pair_on_device(call["local_first"], call["local_second"], call.get("out_first"), call.get("out_second"), state=self, threads=call.get("threads", 512))
         if surface == "kimi_topk16":
             from ._dcp_a2a_cute import kimi_topk16
             logits, bias = call["router_logits"], call["correction_bias"]
