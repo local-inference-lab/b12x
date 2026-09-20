@@ -1,0 +1,216 @@
+{
+  "purpose": "Incremental measurement cost of replacing four fixed-sharing realizations with five sharing levels. Both arms already include the shared expert and routing gate. These counters are not total server startup time.",
+  "method": "Sum successive autotuning counter increments at batch_end for moe.decode counts 2 through 8. Request start/end deltas are not additive because requests interleave.",
+  "arms": {
+    "baseline": {
+      "image_id": "sha256:6cb6c66cb9d70e33e4edd7e98bcfc641e814232d6ffbc4319d8bdc78a558ed75",
+      "vllm": "6902d06cdd5d9ee0f7b3cf29b36dd30a7555603b",
+      "b12x": "96724bec6b67179d1dbf7111fa2446b8ffee14e9",
+      "traces": [
+        {
+          "trace": "results/karmic-qmax-ab-20260919/qmax-ab-ds4-text-kk-head-sync-shared-gate/tuning-audit/job-847.jsonl",
+          "sha256": "c93ced06277037fd03797bc0d10b66777ce7380a18fc19847baa9bde2697f769",
+          "phases": [
+            {
+              "rank": 0,
+              "elapsed_s": 107.57386018009856,
+              "all_measurement_s": 29.874588542152196,
+              "small_moe_measurement_s": 1.314754280494526,
+              "races": [
+                {
+                  "component": "moe.decode",
+                  "tokens": 2,
+                  "measurement_s": 0.12351093231700361
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 3,
+                  "measurement_s": 0.18206701800227165
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 4,
+                  "measurement_s": 0.20854614698328078
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 5,
+                  "measurement_s": 0.20982248801738024
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 6,
+                  "measurement_s": 0.18570715025998652
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 7,
+                  "measurement_s": 0.19185137283056974
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 8,
+                  "measurement_s": 0.2132491720840335
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "trace": "results/karmic-qmax-ab-20260919/qmax-ab-ds4-text-kk-head-sync-shared-gate/tuning-audit/job-853.jsonl",
+          "sha256": "aa98735e33613c1dd0b7113ae22bf92fb8335cfa0f120ab46a48dc9e292d4d45",
+          "phases": [
+            {
+              "rank": 1,
+              "elapsed_s": 107.74649961991236,
+              "all_measurement_s": 34.51871810783632,
+              "small_moe_measurement_s": 1.446701330365613,
+              "races": [
+                {
+                  "component": "moe.decode",
+                  "tokens": 2,
+                  "measurement_s": 0.13311472977511585
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 3,
+                  "measurement_s": 0.15549395885318518
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 4,
+                  "measurement_s": 0.1797027860302478
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 5,
+                  "measurement_s": 0.24248238978907466
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 6,
+                  "measurement_s": 0.22007838007993996
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 7,
+                  "measurement_s": 0.24449968500994146
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 8,
+                  "measurement_s": 0.2713294008281082
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "candidate": {
+      "image_id": "sha256:f6ee1cb5dbb89be2b04a781f037263d369d109f08a79ddea5c2b9f8d45e7fc1b",
+      "vllm": "76ea484b2a56076d0d5435d877236a14e17e7304",
+      "b12x": "5eccd449e02c5faf7135f5d1795b465dc9fdb91b",
+      "traces": [
+        {
+          "trace": "results/karmic-qmax-ab-20260919/sharing-corpus-preparation-trace/job-847.jsonl",
+          "sha256": "74bc652060876bc4ffb0beb7a26b8614fbed8836e10478d83782eec1d59a5202",
+          "phases": [
+            {
+              "rank": 0,
+              "elapsed_s": 107.07648303708993,
+              "all_measurement_s": 30.22730943444185,
+              "small_moe_measurement_s": 1.6739204234909266,
+              "races": [
+                {
+                  "component": "moe.decode",
+                  "tokens": 2,
+                  "measurement_s": 0.16291973600164056
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 3,
+                  "measurement_s": 0.2292118149343878
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 4,
+                  "measurement_s": 0.2645865040831268
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 5,
+                  "measurement_s": 0.2613028457853943
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 6,
+                  "measurement_s": 0.22347659594379365
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 7,
+                  "measurement_s": 0.2553837688174099
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 8,
+                  "measurement_s": 0.27703915792517364
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "trace": "results/karmic-qmax-ab-20260919/sharing-corpus-preparation-trace/job-853.jsonl",
+          "sha256": "7ce6817f07db9af7c90e1760a0689737b75d9a353b920a263eca7f6a4cf01547",
+          "phases": [
+            {
+              "rank": 1,
+              "elapsed_s": 107.17654537199996,
+              "all_measurement_s": 35.72567553911358,
+              "small_moe_measurement_s": 1.7796469666063786,
+              "races": [
+                {
+                  "component": "moe.decode",
+                  "tokens": 2,
+                  "measurement_s": 0.17331847897730768
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 3,
+                  "measurement_s": 0.19424557290039957
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 4,
+                  "measurement_s": 0.22830736660398543
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 5,
+                  "measurement_s": 0.3034466539975256
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 6,
+                  "measurement_s": 0.2465942413546145
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 7,
+                  "measurement_s": 0.3069478627294302
+                },
+                {
+                  "component": "moe.decode",
+                  "tokens": 8,
+                  "measurement_s": 0.3267867900431156
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
