@@ -31,6 +31,70 @@ def test_experimental_check_cadence_backs_off_only_on_observed_health():
         maintenance_check_interval(16, minimum=32, maximum=256, health="healthy")
 
 
+def test_trace_alignment_excludes_incomplete_prefill_and_uses_logical_request():
+    from benchmarks.moe.compare_execution_traces import sample_rows
+
+    trace = {
+        "steps": [
+            {
+                "step": 0,
+                "requests": ["cache-7-deadbeef", "cache-4-1234abcd"],
+                "computed": [0, 20],
+                "scheduled": [6, 1],
+                "prefill_lengths": [18, 20],
+            }
+        ]
+    }
+    device = {"step": 0, "logits": torch.zeros(2, 8)}
+    rows = sample_rows(trace, [device])
+    assert set(rows) == {("cache-4", 1)}
+    assert rows["cache-4", 1][2] == 1
+    with pytest.raises(ValueError, match="duplicate"):
+        sample_rows(trace, [device, device])
+
+
+def test_trace_comparison_keeps_shape_and_numeric_gates_separate(tmp_path):
+    from benchmarks.moe.compare_execution_traces import compare
+
+    paths = [tmp_path / name for name in ("left.json", "right.json")]
+    for index, path in enumerate(paths):
+        trace = {
+            "overflow": False,
+            "steps": [
+                {
+                    "step": 0,
+                    "requests": ["cache-4-" + ("deadbeef" if index else "1234abcd")],
+                    "computed": [20],
+                    "scheduled": [1],
+                    "prefill_lengths": [20],
+                    "tokens": 15 if index else 57,
+                }
+            ],
+        }
+        path.write_text(json.dumps(trace))
+        torch.save(
+            [
+                {
+                    "step": 0,
+                    "hidden": torch.ones(1, 2),
+                    "logits": torch.tensor(
+                        [[2.0, 2.01 if index else 1.99, 0, 0, 0, 0]]
+                    ),
+                }
+            ],
+            str(path) + ".pt",
+        )
+    result = compare(*paths)
+    assert not result["same_execution_signature"]
+    request = result["requests"]["cache-4"]
+    assert request["first_hidden_difference"] is None
+    assert request["first_argmax_difference"]["output_index"] == 1
+    trace["overflow"] = True
+    paths[1].write_text(json.dumps(trace))
+    with pytest.raises(ValueError, match="truncated"):
+        compare(*paths)
+
+
 def config(tmp_path, **changes):
     return ExpertCacheServingConfig(
         **(

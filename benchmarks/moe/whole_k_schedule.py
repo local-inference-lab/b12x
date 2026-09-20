@@ -28,6 +28,18 @@ def main():
     p.add_argument("--samples", type=int, default=12)
     p.add_argument("--replays", type=int, default=100)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument(
+        "--check-shape-invariance",
+        action="store_true",
+        help="Require identical logical rows under changed batch packing",
+    )
+    p.add_argument(
+        "--logical-route-trace",
+        type=Path,
+        help="Use a recorded serving activation, IDs and actual gate weights as row zero",
+    )
+    p.add_argument("--trace-step", type=int, default=130)
+    p.add_argument("--trace-row", type=int, default=0)
     args = p.parse_args()
     if args.output.exists():
         raise FileExistsError("choose a fresh evidence path")
@@ -101,6 +113,16 @@ def main():
         a = torch.randn((128, h), device="cuda", dtype=torch.bfloat16) * 0.125
         ids = torch.randint(e, (128, top_k), device="cuda", dtype=torch.int32)
         weights = torch.softmax(torch.randn((128, top_k), device="cuda"), dim=1)
+        serving_output = None
+        if args.logical_route_trace:
+            trace = next(
+                r
+                for r in torch.load(args.logical_route_trace, weights_only=True)
+                if r["step"] == args.trace_step
+            )["modules"][args.layer + "/routes"]
+            for destination, key in ((a, "input"), (ids, "ids"), (weights, "weights")):
+                destination[0].copy_(trace[key][args.trace_row])
+            serving_output = trace["output"][args.trace_row].cuda()
         bindings, plans, requests = {}, {}, []
         for m in (1, 2, 4, 8, 16, 32, 64, 128):
             for name in ("preferred", "whole_k", "cache"):
@@ -168,6 +190,63 @@ def main():
                 graph.replay()
             torch.cuda.synchronize()
             session.freeze()
+            if serving_output is not None:
+                torch.testing.assert_close(
+                    bindings[1, "whole_k"].output[0], serving_output, atol=0, rtol=0
+                )
+                result["serving_route_exact"] = True
+            if args.check_shape_invariance:
+                # Keep top-k rank and weights fixed for each logical row while
+                # changing unrelated routes and expert-block occupancy.
+                originals = (a.clone(), ids.clone(), weights.clone())
+                oracle = bindings[1, "whole_k"].output[0].clone()
+                checks = []
+                for layout in ("unrelated", "duplicates", "reversed"):
+                    if layout == "duplicates":
+                        for tensor, original in zip(
+                            (a, ids, weights), originals, strict=True
+                        ):
+                            tensor.copy_(original[:1].expand_as(tensor))
+                    elif layout == "reversed":
+                        for tensor, original in zip(
+                            (a, ids, weights), originals, strict=True
+                        ):
+                            tensor.copy_(original.flip(0))
+                    for m in (1, 2, 4, 8, 16, 32, 64, 128):
+                        if layout == "reversed":
+                            for tensor, original in zip(
+                                (a, ids, weights), originals, strict=True
+                            ):
+                                tensor[:m].copy_(original[:m].flip(0))
+                        row = m - 1 if layout == "reversed" else 0
+                        for name in ("whole_k", "cache"):
+                            with kernel_resolution_guard("shape invariance"):
+                                graphs[m, name].replay()
+                            observed = bindings[m, name].output[row]
+                            check = dict(
+                                layout=layout,
+                                m=m,
+                                backend=name,
+                                exact=torch.equal(observed, oracle),
+                                max_abs=(observed.float() - oracle.float())
+                                .abs()
+                                .max()
+                                .item(),
+                            )
+                            checks.append(check)
+                result.setdefault("shape_invariance", []).append(
+                    dict(top_k=top_k, checks=checks)
+                )
+                args.output.write_text(json.dumps(result, indent=2) + "\n")
+                if not all(check["exact"] for check in checks):
+                    raise AssertionError(
+                        "whole-K logical row changes under batch packing"
+                    )
+                for tensor, original in zip((a, ids, weights), originals, strict=True):
+                    tensor.copy_(original)
+                for graph in graphs.values():
+                    graph.replay()
+                torch.cuda.synchronize()
             for m in (1, 2, 4, 8, 16, 32, 64, 128):
                 whole = bindings[m, "whole_k"].output
                 split = bindings[m, "preferred"].output

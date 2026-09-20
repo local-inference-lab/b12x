@@ -7,6 +7,15 @@ CuTe DSL. Supporting packing and metadata kernels may use Triton.
 The working branch is based on master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. The
 [readiness report](sm103-readiness-report.md) separates source-bound validation,
 pending PR CI and physical-target qualification.
+The [cadence qualification](expert-cache-cadence.md) adds bounded execution
+tracing, controlled-admission comparisons, an isolated router replay and
+checkpoint-byte whole-K shape checks. It explains the C4 generation-zero
+divergence without changing cache arithmetic, policy defaults or the companion
+engine. SM103 preparation remains the same 86-declaration/244-program inventory
+at its retained compiler source; physical B300 gates remain open.
+Its controlled serving matrix retains exact output equality at C1/C4/C8 with
+the complete source-built engine. Healthy backoff trades fewer stable checks
+for delayed transition response; it remains experimental.
 The [SM120 cache proof of concept](expert-residency-sm120-poc.md) reuses the
 shared host policy and exchange transaction with native NVFP4 W4A16 operations.
 It adds no SM103 kernel, component registration or production serving lane.

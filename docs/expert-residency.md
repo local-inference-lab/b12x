@@ -37,6 +37,9 @@ Opt-in [scheduler-owned maintenance](expert-cache-maintenance.md) reduces the
 single-rank companion's control roundtrips and can gate movement on observed
 cold-route pressure. It preserves static defaults and the engine-owned reader
 barrier; it does not qualify physical SM103 kernels or change Grace storage.
+The [cadence qualification](expert-cache-cadence.md) separates cache identity and
+graph safety from engine batch-shape numerics. Its SM120 router, control-cost
+and serving measurements retain their own source and hardware receipts.
 
 ## Supported contracts
 

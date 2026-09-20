@@ -55,14 +55,23 @@ async def run(args):
         attention_config={"backend": "FLASHINFER"},
         enforce_eager=args.eager,
         enable_chunked_prefill=True,
-        kernel_config={"enable_b12x_autotune": False, "moe_backend": "b12x"},
+        kernel_config={
+            "enable_b12x_autotune": False,
+            "moe_backend": "flashinfer_cutlass" if args.mode == "native" else "b12x",
+        },
         compilation_config={
             "cudagraph_capture_sizes": sorted({1, args.concurrency}),
             "mode": 3 if args.inductor and not args.eager else 0,
             "cudagraph_mode": "NONE" if args.eager else "FULL_DECODE_ONLY",
         },
-        additional_config={"b12x_expert_cache": settings},
-        worker_extension_cls="b12x.integration.vllm.residency_epoch.ResidencyEpochWorkerExtension",
+        additional_config={}
+        if args.mode == "native"
+        else {"b12x_expert_cache": settings},
+        worker_extension_cls=(
+            "b12x.testing.vllm_execution_trace.ExecutionTraceWorker"
+            if args.execution_trace
+            else "b12x.integration.vllm.residency_epoch.ResidencyEpochWorkerExtension"
+        ),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -79,7 +88,12 @@ async def run(args):
     record(
         "configuration",
         arguments=vars(args),
-        settings=settings,
+        settings=settings if args.mode != "native" else None,
+        numerical_recipe=(
+            "ordinary_modelopt_nvfp4_a4"
+            if args.mode == "native"
+            else "cache_w4a16_bf16_whole_k"
+        ),
         torch=torch.__version__,
         cuda=torch.version.cuda,
         host=platform.node(),
@@ -96,8 +110,12 @@ async def run(args):
     controller, epoch_task, traffic_task = None, None, None
     try:
         engine = AsyncLLM.from_engine_args(engine_args)
-        status = (await engine.collective_rpc("b12x_expert_cache_status"))[0]
-        if not args.eager and not status["graphs"]:
+        status = (
+            (await engine.collective_rpc("b12x_expert_cache_status"))[0]
+            if args.mode != "native"
+            else None
+        )
+        if status is not None and not args.eager and not status["graphs"]:
             raise AssertionError(
                 "graph-enabled serving did not retain a captured graph"
             )
@@ -142,16 +160,30 @@ async def run(args):
         ]
         if not prompts:
             raise ValueError("real serving benchmark requires a nonempty prompt corpus")
+        if args.execution_trace:
+            record(
+                "trace_begin",
+                result=await engine.collective_rpc(
+                    "begin_execution_trace",
+                    kwargs={
+                        "request_prefixes": args.trace_requests,
+                        "output_limit": args.trace_output_limit,
+                        "modules": args.trace_modules,
+                    },
+                ),
+            )
         tokens_completed, next_epoch = 0, args.epoch_tokens
         check_interval = args.epoch_tokens
         finished = asyncio.Event()
+        control_lock = asyncio.Lock()
 
         async def epochs():
             nonlocal next_epoch, check_interval
             while not finished.is_set():
                 await asyncio.sleep(0.01)
                 if tokens_completed >= next_epoch:
-                    receipt = await controller.run()
+                    async with control_lock:
+                        receipt = await controller.run()
                     if args.healthy_check_max_tokens is not None:
                         check_interval = maintenance_check_interval(
                             check_interval,
@@ -171,19 +203,41 @@ async def run(args):
             epoch_task = asyncio.create_task(epochs())
         semaphore = asyncio.Semaphore(args.concurrency)
 
-        async def request(index, prompt):
+        async def admitted_stream(index, prompt, admitted):
+            queue = await engine.add_request(
+                f"cache-{index}",
+                prompt["text"],
+                SamplingParams(temperature=0, max_tokens=args.tokens, ignore_eos=True),
+            )
+            admitted.set()
+            complete = False
+            try:
+                while not complete:
+                    result = queue.get_nowait() or await queue.get()
+                    complete = result.finished
+                    yield result
+            finally:
+                if not complete:
+                    await engine.abort(queue.request_id, internal=True)
+
+        async def request(index, prompt, admitted=None):
             nonlocal tokens_completed
             async with semaphore:
                 start = time.perf_counter_ns()
                 start_wall_ns = time.time_ns()
                 events, previous, final = [], 0, None
-                async for result in engine.generate(
-                    prompt["text"],
-                    SamplingParams(
-                        temperature=0, max_tokens=args.tokens, ignore_eos=True
-                    ),
-                    request_id=f"cache-{index}",
-                ):
+                stream = (
+                    admitted_stream(index, prompt, admitted)
+                    if admitted is not None
+                    else engine.generate(
+                        prompt["text"],
+                        SamplingParams(
+                            temperature=0, max_tokens=args.tokens, ignore_eos=True
+                        ),
+                        request_id=f"cache-{index}",
+                    )
+                )
+                async for result in stream:
                     now = time.perf_counter_ns()
                     final = result.outputs[0]
                     total = len(final.token_ids)
@@ -216,6 +270,32 @@ async def run(args):
         async def traffic():
             # Sequential corpus groups preserve explicit workload transitions.
             for offset in range(0, len(prompts), args.concurrency):
+                indices = range(offset, min(len(prompts), offset + args.concurrency))
+                if args.admission == "together":
+                    # Diagnostic control: acknowledge every add while scheduling
+                    # is paused, so asynchronous tokenization cannot split admission.
+                    tasks = []
+                    try:
+                        async with control_lock:
+                            await engine.pause_generation(
+                                mode="keep", clear_cache=False
+                            )
+                            admitted = [asyncio.Event() for _ in indices]
+                            tasks = [
+                                asyncio.create_task(request(i, prompts[i], event))
+                                for i, event in zip(indices, admitted, strict=True)
+                            ]
+                            await asyncio.wait_for(
+                                asyncio.gather(*(e.wait() for e in admitted)), 60
+                            )
+                            await engine.resume_generation()
+                        await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    continue
                 await asyncio.gather(
                     *(
                         request(i, prompts[i])
@@ -242,6 +322,29 @@ async def run(args):
         if epoch_task is not None:
             await epoch_task
         elapsed = time.perf_counter_ns() - begin
+        if args.measure_control_floor:
+            scheduler, maintenance = [], []
+            for _ in range(20):
+                started = time.perf_counter_ns()
+                await engine.is_paused()
+                scheduler.append(time.perf_counter_ns() - started)
+                maintenance.append(await controller.run())
+            started = time.perf_counter_ns()
+            readback = await engine.collective_rpc("measure_idle_readback")
+            record(
+                "idle_control_floor",
+                scheduler_rpc_ns=scheduler,
+                maintenance=maintenance,
+                readback=readback,
+                readback_rpc_ns=time.perf_counter_ns() - started,
+            )
+        if args.execution_trace:
+            record(
+                "trace_end",
+                result=await engine.collective_rpc(
+                    "end_execution_trace", args=(str(args.execution_trace),)
+                ),
+            )
         record(
             "serving",
             output_tokens=tokens_completed,
@@ -260,10 +363,14 @@ async def run(args):
                 pause_ns=time.perf_counter_ns() - start,
             )
             await engine.resume_generation()
-        after = (await engine.collective_rpc("b12x_expert_cache_status"))[0]
-        if status["graphs"] != after["graphs"]:
+        after = (
+            (await engine.collective_rpc("b12x_expert_cache_status"))[0]
+            if args.mode != "native"
+            else None
+        )
+        if status is not None and status["graphs"] != after["graphs"]:
             raise AssertionError("serving recaptured or replaced a CUDA graph")
-        for name, before in status["layers"].items():
+        for name, before in status["layers"].items() if status else ():
             if before["pointers"] != after["layers"][name]["pointers"]:
                 raise AssertionError("serving cache changed a captured pointer")
         record("complete", status=after)
@@ -286,7 +393,9 @@ async def run(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True)
-    p.add_argument("--mode", choices=("profile", "static", "adaptive"), required=True)
+    p.add_argument(
+        "--mode", choices=("profile", "static", "adaptive", "native"), required=True
+    )
     p.add_argument("--profile", type=Path, required=True)
     p.add_argument("--prompts", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
@@ -320,11 +429,49 @@ def main():
     )
     p.add_argument("--eager", action="store_true")
     p.add_argument(
+        "--execution-trace",
+        type=Path,
+        help="Opt-in CPU batch diagnostics; traced runs are not timing evidence",
+    )
+    p.add_argument(
+        "--trace-requests",
+        nargs="*",
+        default=[],
+        help="Request ID prefixes whose inputs/hidden/logits are copied for diagnostics",
+    )
+    p.add_argument("--trace-output-limit", type=int, default=40)
+    p.add_argument(
+        "--trace-modules",
+        nargs="*",
+        default=[],
+        help="Exact module names to record during selected eager prefill steps",
+    )
+    p.add_argument(
+        "--measure-control-floor",
+        action="store_true",
+        help="Measure idle readback/control after traffic; requires traced maintenance",
+    )
+    p.add_argument(
+        "--admission",
+        choices=("streamed", "together"),
+        default="streamed",
+        help="Together controls batch admission; its idle barrier cost remains in timings",
+    )
+    p.add_argument(
         "--inductor",
         action="store_true",
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if args.measure_control_floor and not (
+        args.execution_trace
+        and args.mode == "adaptive"
+        and args.control == "maintenance"
+        and args.epoch_pairs == 0
+    ):
+        p.error(
+            "control-floor diagnostic requires traced maintenance with zero movement budget"
+        )
     if args.healthy_check_max_tokens is not None and (
         args.mode != "adaptive"
         or args.control != "maintenance"

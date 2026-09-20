@@ -193,16 +193,20 @@ produces 60.19 tokens/s overall, 89.84 during stable traffic and 45.27 after the
 transition. C8 produces 106.15 overall, 187.49 stable and 74.06 after transition.
 Both retain matched token IDs. Stable penalties shrink to about 2%, but delayed
 reaction gives up some transition benefit. C4 fails the matched-output gate:
-four stable requests diverge before any promotion. Generation-zero placement
-rules out a preceding expert fill; request batching is a possible cause, not an
-established explanation. The receipt is retained and excluded from matched-output
-speedup claims. This result does not justify a default adaptive cadence.
+four stable requests diverge before any promotion. The
+[cadence investigation](expert-cache-cadence.md) reproduces those outputs with
+static placement and controlled request admission, then isolates batch-dependent
+BF16 router reduction before MoE execution. The historical receipt remains a
+failed cross-arm equality comparison. Cadence qualification therefore records
+admission shape and retains exact equality within controlled comparisons.
+This result does not justify a default adaptive cadence.
 
 A separate complete source-built vLLM wheel passes ten engine/loader tests,
 2,048 adaptive serving tokens with 448 promotions, and an ordinary non-cache
 smoke. Its loaded native-library hashes match the built wheel; adaptive token
 IDs match the static reference. This closes the focused source-build smoke gate,
-not a full source-built C1/C4/C8 performance matrix or independent PR CI.
+not independent PR CI. Source-built cadence comparisons and their separate
+admission contract are reported in the [cadence guide](expert-cache-cadence.md).
 
 Physical results and rejected runs are recorded in the
 [engineering ledger](expert-residency-ledger.md). B300 qualification still starts

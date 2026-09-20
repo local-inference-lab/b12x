@@ -53,6 +53,19 @@ separate counters-only measurements. It retains scheduler/device drain and
 fail-closed reload semantics. Native SM103 execution, distributed serving and
 production adaptive defaults remain unqualified.
 
+The [cadence investigation](expert-cache-cadence.md) isolates the generation-zero
+C4 mismatch to batch-dependent BF16 router reduction using static and ordinary
+non-cache controls. Controlled admission retains an exact output gate for
+source-built serving comparisons. This adds diagnostic tooling, not an SM103
+kernel, preparation contract or B300 qualification. The compiler inventory below
+remains tied to its recorded source; these diagnostic changes require no new
+program declaration.
+The source-built controlled-admission matrix passes exact paired outputs across
+24,576 tokens and 2,016 promotions at C1/C4/C8. Backoff reduces measured stable
+overhead to roughly 1–2%, but delays pressure detection by about five seconds
+relative to the workload transition. The cadence report retains the complete
+interval tables, 64 host / 21 GPU / 10 companion test passes and all failures.
+
 The SM103 preparation corpus at package SHA256
 `667fad34f8bb0ba5ad048154e2cfd6281ebe206a19b1b8e32a69fd34e89e0d6b`
 contains **86 declarations and 244 distinct programs**, including 238 native CuTe

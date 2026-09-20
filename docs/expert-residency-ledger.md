@@ -1990,3 +1990,131 @@ The timed matrix contains 43,008 generated tokens and 6,384 promotions across
 the failing arm and the separate source-built smoke retain their own identities.
 No adaptive default, distributed local-maintenance path, model-quality result
 or physical SM103 performance claim follows from these tests.
+
+## C4 cadence causality and controlled admission (2026-09-20 UTC)
+
+The inspected public heads are b12x `6343ecc9b479425149fbc689b9b0732eed406303`
+and vLLM `3e45b530e58186046383e7294e611c2f6bf5cfb8`. Master/main remain
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68` and
+`47ccf6c57d92f03630ebcbad3809450545825488`. The b12x branch contains master;
+this investigation requires no rebase or companion engine change.
+
+Evidence root: `/home/jasonc/b12x-c4-evidence-20260920`; remote receipts:
+`ripper:/home/jasonc/b12x-c4-results-20260920`. Frozen sources use
+`/home/jasonc/b12x-c4-source-NN` on ripper. Original September 19 receipts are
+unchanged. The [cadence guide](expert-cache-cadence.md) specifies diagnostic
+scope, the isolated cause and the comparison contract.
+
+### Causality receipts
+
+- `original-backoff-c4-r1.jsonl` reproduces the retained failure before code
+  changes: requests 4/5/6/7 first differ at token indices 36/12/5/14, and all
+  sixteen output sequences match the original failing receipt. No promotion
+  precedes the stable-interval divergence.
+- `noop-fixed-c4-r1.jsonl` and `noop-backoff-c4-r1.jsonl` use global movement
+  budget zero. Both match static. These non-reproductions are retained.
+- CPU-traced streamed-admission runs also match static. Their prefill grouping
+  varies; tracing perturbs admission timing. They are not timing evidence.
+- `matched-static-together-c4.jsonl` uses the complete source-built engine,
+  static placement, no observer and no maintenance. Group admission alone
+  reproduces the original four changed output sequences.
+- `matched-native-{streamed,together}-c4.jsonl` exercises ordinary non-cache
+  ModelOpt/FlashInfer CUTLASS serving. All sixteen requests change output under
+  the admission control. This is the ordinary A4 recipe, not an A4/A16 parity
+  assertion. It demonstrates a scheduling-sensitive numerical property outside
+  the cache path.
+- `router-probe-{streamed,together}-c4-trace.json[.pt]` retains exact model
+  inputs, positions, slot mappings, attention metadata, selected module
+  activations, actual expert IDs/weights, full logits and residency map hashes.
+  Source archive 05 adds the targeted router probes. Unchanged maps and pointers
+  are verified within each static run.
+- `router-replay-layers01.json` reproduces the recorded router outputs with
+  checkpoint weights and the ordinary Torch BF16 linear operation. Fixed-shape
+  repetitions are exact. Disabling reduced-precision BF16 reductions removes
+  the observed cross-shape difference and matches BF16-rounded FP64 dots in
+  this diagnostic. No serving numerical default is changed.
+- `shape-invariance-02.json` checks checkpoint layer 12. The separate
+  `actual-route-shapes-layer1.json` uses the actual affected serving activation,
+  IDs and route weights. Both pass 48 exact row comparisons across M=1..128,
+  duplicate routes and reversal, using native whole-K and prepared cache
+  execution. The actual row also exactly matches mixed-residency serving.
+- `matched-noop-backoff-together-c4` matches static group admission across all
+  516 CPU execution signatures, all 42 selected device records and all 2,048
+  output IDs. No promotions occur. The device comparison includes full logits,
+  not only greedy choices.
+
+The first component difference is the ordinary BF16 gate projection in a
+57-row versus 15-row mixed prefill/decode batch. Layer 0 attention and routed
+MoE output remain exact. Layer 1 has identical MoE inputs and selected IDs but
+route-weight differences up to 0.0012212172, then 988 changed MoE output elements
+(maximum absolute difference 0.00048828125). Router rounding propagates to
+later greedy choices. The original untraced receipt has no batch metadata;
+controlled reproduction establishes a sufficient causal mechanism without
+inventing missing historical observations.
+
+### Health diagnostics and rejected changes
+
+`idle-floor-and-layer-pressure-c4.jsonl` uses source archive 06 and zero movement.
+Median scheduler-only RPC is 0.684 ms; an existing 8-byte counter read is
+0.0157 ms; a full 51,472-byte snapshot is 0.812 ms (D2H 0.0164 ms, host decoding
+0.763 ms); complete idle no-op maintenance is 6.79 ms. These are lower-bound
+idle diagnostics. They do not implement a compact health signal or include a
+busy scheduler's remaining submitted iteration.
+
+The paired trace records per-layer pressure without an additional device
+snapshot. Healthy global windows at 3.3–13.8% cold already have 1–17 layers above
+15%; positive unprotected score gaps occur in 45–48 layers. A worst-layer or
+positive-gap-only trigger would cause unnecessary work on this corpus, so it
+is not adopted. After the workload transition, 47–48 layers exceed 15% and the
+no-movement global cold fraction rises to roughly 36–51%. Unique step-touch
+statistics cannot be inferred from selection counts.
+
+Natural request-group boundaries provide idle control opportunities, but this
+corpus has only four groups at C4 and two at C8. Waiting exclusively for those
+boundaries would detect drift only after a large fraction of code traffic has
+completed. The idle measurement quantifies possible control savings; it does
+not establish a generally responsive boundary-only policy. Device summaries,
+rolling counter banks and automatic trigger tuning remain deferred.
+
+The complete source-built wheel and its eleven loaded native libraries retain
+SHA256 identity `2dacf96bc6f6f046857e077c451ba24516b4f9bc4872c97a99a45709bd3a305a`
+for the wheel. `source-built-runtime-binaries.json` records the imported package
+and individual library hashes. Traced runs and source-built timing runs are
+separate. The original reproduction alone uses the retained mixed-build
+source-07 environment.
+
+Failures are retained. The first focused GPU bundle omitted `scripts/`, causing
+one helper-import failure after twenty tests passed; the source archive is
+corrected for the rerun. Some completed ordinary and cache workers print the
+existing ignored `AsyncLLM.__del__` interpreter-teardown `TypeError` after
+normal shutdown. Those logs remain visible; no shutdown fix is attributed to
+this cache investigation. The known MXFP6 registry failures and independent PR
+CI gate remain separate and unresolved.
+
+### Controlled source-built cadence matrix
+
+`qualified-{static,observe,maintenance,backoff}-c{1,4,8}.jsonl` uses archive 05,
+the complete source-built companion wheel, no trace observer, and acknowledged
+group admission in all arms. `qualified-matrix-summary.json` binds every raw
+receipt by SHA256 and retains latency distributions, reaction timestamps,
+movement, pressure and stage timings. `analyze_matrix.py` checks token equality
+within each concurrency group and unchanged graphs/pointers. The twelve runs
+complete 24,576 tokens and 2,016 promotions.
+
+Overall static/fixed/backoff tok/s is 52.37/62.01/59.44 at C1,
+79.60/91.83/87.08 at C4 and 100.18/107.06/103.15 at C8. Counters-only is
+51.99/79.48/99.97. Backoff stable overhead is approximately 2.2%/1.3%/1.9%,
+but first code-pressure detection takes 5.78/5.23/5.04 seconds versus fixed
+0.99/0.81/1.13 seconds. The stable/transition split and unfavorable latency
+tails are retained in [cadence qualification](expert-cache-cadence.md).
+Controlled group admission changes the fixture relative to historical streamed
+admission; absolute rates are not pooled across those fixtures. Dynamic clocks,
+one corpus and some concurrent diagnostic CPU activity limit small-delta claims.
+
+Final focused validation is 64 host tests passed, 21 prepared-cache/counter GPU
+tests passed in 55.12 seconds, and 10 source-built companion tests passed in
+8.92 seconds. The earlier missing-script bundle failure is not deleted. GPU
+validation archive 07 is distinct from timing archive 05; final CLI/doc cleanup
+does not overwrite either source identity. No core kernel, preparation contract,
+engine default or production cadence changes. The additional evidence supports
+configurable experimental cadence, not a universal adaptive default.
