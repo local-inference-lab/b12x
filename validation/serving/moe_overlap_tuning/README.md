@@ -6,18 +6,23 @@ Five deterministic route-sharing levels prevent the race from considering
 only one distinct-expert count. B12X chooses the launch configuration; no
 model-specific or GPU-specific grid is pinned.
 
-Status: **implemented**; the DS4 serving and CPU checks below are **qualified**.
+Status: **implemented**; the DeepSeek V4 Flash serving and CPU checks below
+are **qualified**.
 Cross-model release qualification is separate and remains pending. Loaded
 microbenchmarks outside their declared clock envelope are **research-only**
 and are not the source of the serving speedup claim.
 
 ## Conditions and result
 
-DeepSeek V4 Flash, TP2, five DSpark drafts, FP8 KV, batch budget 4096, eight
-request slots, temperature 1/top-p 1. Two RTX PRO 6000 Blackwell Max-Q
+DeepSeek V4 Flash uses two-way tensor parallelism (TP2) and DSpark speculative
+decoding with up to five draft tokens per verification step. Attention KV is
+FP8; the batch budget is 4096 tokens with eight request slots and request
+temperature 1/top-p 1. C1 and C8 mean one and eight concurrent requests.
+Hardware: two RTX PRO 6000 Blackwell Max-Q
 Workstation GPUs, VRAM +6000, automatic graphics clocks and 325 W limits.
 Each cell has five warmed, unprofiled 30-second decode windows or five cold
-32K prefill windows. Prefill is prompt tokens divided by client TTFT, with
+32K prefill windows. Prefill is prompt tokens divided by client time to first
+token (TTFT), with
 a unique prefix per request. C8 output is aggregate throughput.
 
 | Median | Isolated routed-kernel tuning | Concurrent context and varied routes | Change |
@@ -50,7 +55,8 @@ uv run python validation/serving/moe_overlap_tuning/audit_evidence.py
 
 ## Why the execution context matters
 
-A wide routed grid can delay the concurrent shared expert. The isolated
+A wide routed grid can delay the concurrent shared expert. A cooperative
+thread array (CTA) is one CUDA thread block. The isolated
 188-CTA selection has shared-down means of 52.62/48.77 microseconds on the
 two ranks, while the automatic 128-CTA selection has 8.17/8.14 microseconds.
 Each mean contains 172 target-layer calls. The 12 draft calls per rank retain
