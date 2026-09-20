@@ -7432,15 +7432,12 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     table_offset = ((bits - 2) << 16) if rate_indexed else 0
     extract_lines: list[str] = []
     load_lines: list[str] = []
-    pack_lines: list[str] = []
     for index in range(8):
         source = "$3" if index < 4 else "$2"
         shift = (3 - (index & 3)) * bits
         # Accumulate into declared scratch registers, never directly into
         # the "=r" outputs: without early-clobber the outputs may alias the
         # window inputs that later iterations still read.
-        target = "out0" if index < 4 else "out1"
-        byte_shift = 8 * (index & 3)
         if shift:
             extract_lines.append(
                 f"bfe.u32 w{index}, {source}, {shift}, 16;"
@@ -7460,19 +7457,22 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
                 ld.global.u8 w{index}, [addr{index}];
                 """
             )
-        if byte_shift:
-            pack_lines.append(
-                f"shl.b32 w{index}, w{index}, {byte_shift};"
-            )
-        pack_lines.append(f"or.b32 {target}, {target}, w{index};")
+    # Each load returns one zero-extended byte. Byte permutations pack four
+    # independent results without a serial shift/or accumulator.
+    pack_lines = [
+        "prmt.b32 w0, w0, w1, 0x4040;",
+        "prmt.b32 w2, w2, w3, 0x4040;",
+        "prmt.b32 out0, w0, w2, 0x5410;",
+        "prmt.b32 w4, w4, w5, 0x4040;",
+        "prmt.b32 w6, w6, w7, 0x4040;",
+        "prmt.b32 out1, w4, w6, 0x5410;",
+    ]
     asm = (
         """
         {
             .reg .b32 out0,out1;
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
             .reg .b64 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;
-            mov.b32 out0, 0;
-            mov.b32 out1, 0;
     """
         + "\n".join(extract_lines)
         + "\n".join(load_lines)
