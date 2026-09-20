@@ -10,7 +10,10 @@ from typing import Callable, Optional, Sequence
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
 from b12x.preparation.types import Plan, require_prepared
+
+from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _SINGLE_CHANNEL_ID,
