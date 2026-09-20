@@ -244,6 +244,12 @@ class LocalResidencyMaintenance:
                 },
                 "selected_pairs": decision.selected_pairs,
                 "copy_bytes": decision.copy_bytes,
+                **({"recenter_protection": {
+                    item.layer: {"experts": item.decision.recenter_protected_experts,
+                                 "window": item.decision.window,
+                                 "until_window": item.decision.recenter_protection_until_window}
+                    for item in decision.layers}}
+                   if any(c.recenter_protected_experts for c in self.configs.values()) else {}),
                 "stages_ns": stages,
                 "snapshot_stages_ns": snapshot_stages,
                 "policy_stages_ns": self.coordinator.last_timings_ns,
@@ -348,6 +354,8 @@ def policy_observation(decision, *, deferred=False):
                 "candidates": layer.decision.pairs,
                 "selected": layer.pairs,
                 "protected": layer.decision.protected_hot_experts,
+                "recenter_protected": layer.decision.recenter_protected_experts,
+                "recenter_protection_until_window": layer.decision.recenter_protection_until_window,
                 "hits": layer.decision.observed_hits_since_promotion,
             }
             for layer in decision.layers

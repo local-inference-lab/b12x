@@ -23,11 +23,17 @@ class ResidencyCacheConfig:
     phase: str = "decode"
     scoring: str = "recent_frequency"
     decay: float = 0.5
+    recenter_protected_experts: int = 0
+    recenter_protection_windows: int = 0
 
     def __post_init__(self):
         for name in ("max_pairs", "minimum_cold_selections", "minimum_score_gain"):
             _integer(name, getattr(self, name), 1)
         _integer("minimum_residency_windows", self.minimum_residency_windows)
+        _integer("recenter_protected_experts", self.recenter_protected_experts)
+        _integer("recenter_protection_windows", self.recenter_protection_windows)
+        if bool(self.recenter_protected_experts) != bool(self.recenter_protection_windows):
+            raise ValueError("re-centering protection requires both a count and window lifetime")
         if self.phase not in PHASES:
             raise ValueError("cache policy requires one explicit routing phase")
         if self.scoring not in ("recent_frequency", "decayed_lfu"):
@@ -56,6 +62,8 @@ class ResidencyCacheDecision:
     observed_hits_since_promotion: tuple[tuple[int, int], ...]
     scores: tuple[float, ...] = ()
     movement_mode: str = "adapt"
+    recenter_protected_experts: tuple[int, ...] = ()
+    recenter_protection_until_window: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -139,6 +147,9 @@ class ResidencyCacheController:
         self._promotions = 0
         self._total_hits = 0
         self._scores = (0.0,) * observations.experts
+        self._recenter_reference = None
+        self._recenter_retained = ()
+        self._recenter_until = None
 
     def _row(self, snapshot):
         if not isinstance(snapshot, RoutingSnapshot):
@@ -181,6 +192,9 @@ class ResidencyCacheController:
                     or any(type(e) is not int or not 0 <= e < self.observations.experts
                            for e in recenter_to)):
                 raise ValueError("re-centering reference differs from resident geometry")
+            if (self.config.recenter_protected_experts and self._recenter_reference is not None
+                    and frozenset(recenter_to) != self._recenter_reference):
+                raise ValueError("re-centering reference changed inside a policy session")
         row, counts, metadata = self.validate_observation(snapshot, slots=slots)
         calls, sampled_calls, tokens, sampled_tokens = metadata
         scores = counts
@@ -191,10 +205,24 @@ class ResidencyCacheController:
         hot = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 0)
         cold = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 1 and counts[e])
         protected = tuple(e for e in hot if window-self._entered[e] < self.config.minimum_residency_windows)
+        hits = {e: n+counts[e] for e, n in self._hits.items()}
+        retained = ()
+        if recenter_to is not None and self.config.recenter_protected_experts:
+            self._recenter_reference = frozenset(recenter_to)
+            if propose and sum(counts) and self._recenter_until is None:
+                # A recovery episode retains a bounded set of residents that
+                # have earned hits. Only committed normal movement away from
+                # the anchor can arm another episode; idle checks cannot renew it.
+                self._recenter_retained = tuple(sorted(
+                    (e for e in hot if e not in self._recenter_reference and hits.get(e, 0)),
+                    key=lambda e: (-hits[e], e))[:self.config.recenter_protected_experts])
+                self._recenter_until = window + self.config.recenter_protection_windows
+            if self._recenter_until is not None and window < self._recenter_until:
+                retained = tuple(e for e in self._recenter_retained if e in hot)
         candidates = sorted((e for e in cold if propose and counts[e] >= self.config.minimum_cold_selections
                              and (recenter_to is None or e in recenter_to)),
                             key=lambda e: (-scores[e], e))
-        victims = sorted((e for e in hot if propose and e not in protected
+        victims = sorted((e for e in hot if propose and e not in protected and e not in retained
                           and (recenter_to is None or e not in recenter_to)), key=lambda e: (scores[e], e))
         pairs, hysteresis = [], 0
         for candidate, victim in zip(candidates, victims):
@@ -207,7 +235,6 @@ class ResidencyCacheController:
             pairs.append((candidate, victim))
         cold_count = sum(counts[e] for e in cold)
         remaining = cold_count-sum(counts[c]-counts[v] for c, v in pairs)
-        hits = {e: n+counts[e] for e, n in self._hits.items()}
         decision = ResidencyCacheDecision(window=window, expected=slots, pairs=tuple(pairs), counts=counts,
             calls=calls, sampled_calls=sampled_calls, sample_every=self.observations.sample_every,
             cold_selections=cold_count, unique_cold_experts=cold,
@@ -216,7 +243,9 @@ class ResidencyCacheController:
             below_threshold=sum(counts[e] < self.config.minimum_cold_selections for e in cold), below_hysteresis=hysteresis,
             protected_hot_experts=protected, unpaired_candidates=len(candidates)-len(pairs)-hysteresis,
             observed_hits_since_promotion=tuple(sorted(hits.items())), scores=tuple(scores),
-            movement_mode="recenter" if recenter_to is not None else "adapt")
+            movement_mode="recenter" if recenter_to is not None else "adapt",
+            recenter_protected_experts=retained,
+            recenter_protection_until_window=self._recenter_until)
         self._baseline, self._window, self._hits = row, window, hits
         self._scores = tuple(scores)
         self._total_hits += sum(counts[e] for e in hits)
@@ -259,6 +288,9 @@ class ResidencyCacheController:
             self._entered[cold] = self._window
             self._hits[cold] = 0
         self._promotions += len(pairs)
+        if (decision.movement_mode == "adapt" and self._recenter_reference is not None
+                and any(cold not in self._recenter_reference for cold, _ in pairs)):
+            self._recenter_retained, self._recenter_until = (), None
         self._slots, self._pending = slots, None
         return ResidencyCacheOutcome(window=self._window, generation=slots.generation, pairs=pairs,
             hot_experts=tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 0),

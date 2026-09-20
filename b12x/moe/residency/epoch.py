@@ -99,6 +99,11 @@ class ResidencyEpochCoordinator:
                         or len(placement.resident_expert_ids)
                         != sum(t == 0 for t, _ in slots[name].expert_map)):
                     raise ValueError("anchor geometry differs from prepared slots")
+                controller = self.controllers[name]
+                if (controller.config.recenter_protected_experts
+                        and controller._recenter_reference is not None
+                        and frozenset(placement.resident_expert_ids) != controller._recenter_reference):
+                    raise ValueError("re-centering reference changed inside a policy session")
         # Invalid later layers must not consume earlier layers' observations.
         for name, controller in self.controllers.items():
             controller.validate_observation(snapshot, slots=slots[name])

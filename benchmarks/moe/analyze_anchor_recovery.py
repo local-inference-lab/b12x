@@ -96,7 +96,8 @@ def analyze(path, profile, *, minimum_count=2, margin=1, layer_pairs=2):
             config = configs.get(n, {})
             layers[n] = classify_layer(
                 counts=v["counts"], scores=v["scores"], hot=hot[n], anchor=anchor[n],
-                protected=v["protected"], minimum_count=config.get("minimum_cold_selections", minimum_count),
+                protected=(*v["protected"], *v.get("recenter_protected", ())),
+                minimum_count=config.get("minimum_cold_selections", minimum_count),
                 margin=config.get("minimum_score_gain", margin),
                 layer_pairs=config.get("max_pairs", layer_pairs),
                 proposed=v["candidates"] if actual else None,

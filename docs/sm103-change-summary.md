@@ -21,6 +21,9 @@ The [long-return study](expert-cache-recovery.md) separates normal and recovery
 movement envelopes through the existing coordinator. Its diagnostic analyzer
 distinguishes eligibility, per-layer capacity, global budget and anchor-gate
 limits without changing replacement scores or numerical arithmetic.
+The [temporary-retention study](expert-cache-retention.md) tests a small,
+expiring guard against re-centering victims with earned resident hits. Normal
+adaptation retains its eviction semantics; protection defaults to zero.
 The [cadence qualification](expert-cache-cadence.md) adds bounded execution
 tracing, controlled-admission comparisons, an isolated router replay and
 checkpoint-byte whole-K shape checks. It explains the C4 generation-zero

@@ -12,6 +12,10 @@ shrinks. Larger explicit recovery budgets improve both return fixtures. Late
 serving can approach static with only about 91–93% set overlap; demand-weighted
 coverage is substantially higher. The evidence does not support relaxing scores,
 forcing complete anchor restoration or selecting a production default.
+The [specialist-retention study](expert-cache-retention.md) separately tests
+whether a small temporary victim guard reduces rebuilding after another
+specialist shift. Its source and measurements are distinct from this budget
+comparison.
 
 ## Source and experiment contract
 

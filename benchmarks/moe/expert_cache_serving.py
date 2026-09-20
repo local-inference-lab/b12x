@@ -73,6 +73,8 @@ async def run(args):
         worker_extension_cls=(
             "b12x.testing.vllm_execution_trace.ExecutionTraceWorker"
             if args.execution_trace
+            else "b12x.testing.vllm_routing_snapshot.RoutingSnapshotWorker"
+            if args.routing_diagnostics
             else "b12x.integration.vllm.residency_epoch.ResidencyEpochWorkerExtension"
         ),
     )
@@ -159,6 +161,8 @@ async def run(args):
                         minimum_cold_selections=2,
                         minimum_score_gain=1,
                         minimum_residency_windows=1,
+                        recenter_protected_experts=args.recenter_protect,
+                        recenter_protection_windows=args.recenter_protect_windows,
                     )
                     for name, layer in status["layers"].items()
                     if layer["max_pairs"]
@@ -342,6 +346,11 @@ async def run(args):
                             await engine.pause_generation(
                                 mode="keep", clear_cache=False
                             )
+                            if args.routing_diagnostics:
+                                record("routing_boundary", next_request=offset,
+                                       receipt=await engine.collective_rpc(
+                                           "diagnostic_routing_snapshot",
+                                           kwargs={"quiescent": True}))
                             admitted = [asyncio.Event() for _ in indices]
                             tasks = [
                                 asyncio.create_task(request(i, prompts[i], event))
@@ -384,6 +393,12 @@ async def run(args):
         if epoch_task is not None:
             await epoch_task
         elapsed = time.perf_counter_ns() - begin
+        if args.routing_diagnostics:
+            await engine.pause_generation(mode="keep", clear_cache=False)
+            record("routing_boundary", next_request=len(prompts),
+                   receipt=await engine.collective_rpc(
+                       "diagnostic_routing_snapshot", kwargs={"quiescent": True}))
+            await engine.resume_generation()
         if args.measure_control_floor:
             scheduler, maintenance = [], []
             for _ in range(20):
@@ -475,6 +490,10 @@ def main():
     p.add_argument("--epoch-mib", type=int, default=64)
     p.add_argument("--recenter-pairs", type=int, help="Explicit recovery pair cap; omission uses the normal epoch budget")
     p.add_argument("--recenter-mib", type=int, help="Explicit recovery copy-byte cap in MiB")
+    p.add_argument("--recenter-protect", type=int, default=0,
+                   help="Experimental per-layer recovery victim protection by hits since promotion")
+    p.add_argument("--recenter-protect-windows", type=int, default=0,
+                   help="Protection lifetime in nonempty policy observation windows")
     p.add_argument(
         "--control",
         choices=("external", "observe", "maintenance", "health"),
@@ -507,6 +526,8 @@ def main():
         action="store_true",
         help="Retain full policy scores/counts at maintenance only",
     )
+    p.add_argument("--routing-diagnostics", action="store_true",
+                   help="Read existing counters at paused admission boundaries; excludes timing qualification")
     p.add_argument(
         "--history-depth",
         type=int,
@@ -549,6 +570,13 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if (min(args.recenter_protect, args.recenter_protect_windows) < 0
+            or bool(args.recenter_protect) != bool(args.recenter_protect_windows)
+            or (args.recenter_protect and args.anchor_advantage is None)):
+        p.error("recovery protection requires anchor control, a positive count and window lifetime")
+    if args.routing_diagnostics and (args.admission != "together" or args.mode != "adaptive"
+                                     or args.execution_trace):
+        p.error("routing diagnostics require adaptive counters, controlled admission and no execution trace")
     if (args.recenter_pairs is None) != (args.recenter_mib is None):
         p.error("recovery requires both pair and byte limits")
     if args.recenter_pairs is not None:

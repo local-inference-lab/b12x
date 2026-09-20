@@ -21,6 +21,9 @@ their retained source.
 The [long-return experiment](expert-cache-recovery.md) adds an optional,
 independent recovery budget and diagnoses restoration constraints. It adds no
 GPU program or storage and preserves the physical SM103 acceptance sequence.
+The [specialist-retention experiment](expert-cache-retention.md) adds an opt-in,
+temporary recovery-victim guard using existing promotion-hit accounting. Its
+SM120 serving evidence does not qualify native B300 execution.
 
 The [feature and fix map](sm103-change-summary.md) identifies the implementation
 and compatibility changes. The [qualification runbook](sm103-qualification.md)

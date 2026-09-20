@@ -2427,3 +2427,58 @@ and the failure ledger remain in `/home/jasonc/b12x-recovery-evidence-20260920`
 and `ripper:/home/jasonc/b12x-recovery-results-20260920`. All accepted serving
 samples retain P1, Gen4 x16 and no reported throttle reasons. The results do not
 qualify Gen5 transport or native B300 execution, and no adaptive default changes.
+
+## Recovery-victim retention, September 20, 2026
+
+Inspection and final fetch find b12x `36b6f34f367d5327b19c64cbc0bdf3eb97c81eff`,
+master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`, companion
+`3e45b530e58186046383e7294e611c2f6bf5cfb8` and companion main
+`47ccf6c57d92f03630ebcbad3809450545825488`. The companion remains unchanged.
+The [retention report](expert-cache-retention.md) binds results to source archive
+01, runtime digest `8e655890325d8b03a5a8b72338585a23793b781acdbb0e76911b25bfbe0efb43`,
+and the reverified source-built wheel/native libraries.
+
+The unchanged recover32 reconstruction reproduces the historical tokens and
+transactions. A separate recover64 diagnostic reads existing counters at paused
+request boundaries without consuming policy observations. It identifies 350
+recovery victims representing 13.89% of later code selections; 221 are re-promoted.
+Hits since promotion identify valuable victims better than promotion age in this
+retrospective sample. The victim-only oracle has a modest coverage opportunity,
+but also increases general-return cold selections.
+
+An explicit per-layer protection count and observation-window lifetime add a
+small recovery-only guard to the shared controller. Both default to zero. Normal
+adaptation can evict retained residents and re-arm a later recovery episode after
+committed movement away from the anchor. Scores, arithmetic, health thresholds,
+transaction safety, device programs and per-layer fill capacity remain unchanged.
+
+Two protected experts per layer improve second-code throughput by 0.87–1.45% in
+two opposite-order pairs, while general return loses 0.46–0.72%. Complete-sequence
+changes are +0.08% and −0.12%, so no consistent end-to-end win is established.
+One protected expert is effectively flat. Two retain 99.24% of anchor-covered
+return traffic and increase second-code precoverage from 64.23% to 65.41%.
+Recovery-eviction reloads fall from 221 to 207, but second code still needs 576
+promotions in eighteen maintenance operations. Ordinary adaptation evicts 45 of
+the initial 96 retained experts during general return, explaining much of the
+limited benefit without motivating a broader eviction-policy change.
+
+Long clean-return, expiry, partial-return and different-specialist controls pass
+exact output gates. Expiry permits formerly protected victims to move; partial
+return performs no recovery and reproduces normal-adaptive transactions exactly.
+The different-specialist complete-run improvement includes faster execution
+before protection exists and is not attributed to the guard. No math-repeat or
+C1/C8 expansion is justified by the small complete-sequence result.
+
+Fifteen source-built receipts contain 104,448 tokens and 19,434 promotions, all
+with exact paired outputs, unchanged graph/cache pointers and verified generation
+accounting. Twelve are timing runs; full-count and expiry diagnostics remain
+separate. Validation passes 141 host tests, eighteen GPU tests, two cases under
+each sanitizer with zero errors, ten companion tests and 512 ordinary non-cache
+graph-served tokens. No sanitizer timeout occurs. Existing optional-import and
+cache-harness teardown warnings remain in every raw log and are explicitly
+reported rather than treated as warning-free lifecycle qualification.
+
+Evidence is retained in `/home/jasonc/b12x-protection-evidence-20260920` and
+`ripper:/home/jasonc/b12x-protection-results-20260920`. All sampled serving remains
+P1, PCIe Gen4 x16, with no reported throttling. No Gen5 transport ceiling or native
+B300 result is inferred. The guard remains research-only and disabled by default.
