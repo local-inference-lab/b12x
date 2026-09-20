@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 def summarize(path):
+    """Attribute each counter increment once, to its completed tuning batch."""
     phases = []
     phase = None
     queries = {}
@@ -67,6 +68,7 @@ def summarize(path):
 
 
 def main():
+    """Export identified preparation counters without overwriting evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)

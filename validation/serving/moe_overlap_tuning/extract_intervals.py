@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 def summarize(path, target_layers, draft_layers):
+    """Keep every routed-layer interval and its overlapping shared kernels."""
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as stream:
         events = json.load(stream)["traceEvents"]
@@ -90,6 +91,7 @@ def summarize(path, target_layers, draft_layers):
 
 
 def main():
+    """Export rank traces with optional serving identities and compact names."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", action="append", required=True, help="label=trace.json[.gz]")
     parser.add_argument("--target-layers", type=int, required=True)

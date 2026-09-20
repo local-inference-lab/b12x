@@ -12,11 +12,13 @@ from pathlib import Path
 
 
 def require(condition, message):
+    """Reject invalid evidence even when Python assertions are disabled."""
     if not condition:
         raise ValueError(message)
 
 
 def main():
+    """Check serving/trace identities and recompute the recorded medians."""
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="?", type=Path, default=root / "results.json")
