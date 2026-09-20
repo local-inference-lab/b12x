@@ -1,7 +1,7 @@
-"""Qualify contiguous MLA normalization against FA2 and independent FP64 math.
+"""Compare multi-head latent attention (MLA) normalization with FlashAttention 2.
 
-Exact FA2 parity is checked for BF16 Q/K width 192, V width 128 and a
-128-by-64 attention tile. Other geometries retain tolerance-based coverage
+Exact FlashAttention 2 (FA2) parity is checked for BF16 Q/K width 192,
+V width 128 and a 128-by-64 attention tile. Other geometries retain tolerance-based coverage
 in tests/attention/test_varlen.py; bitwise equivalence is not a general
 attention contract.
 """
@@ -19,7 +19,7 @@ def _fa2():
     try:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
     except ImportError:
-        pytest.skip("FA2 normalization comparison requires vLLM's FA2 extension")
+        pytest.skip("Normalization comparison requires vLLM's FlashAttention 2 extension")
     return flash_attn_varlen_func
 
 

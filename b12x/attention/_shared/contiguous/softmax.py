@@ -107,7 +107,7 @@ class Softmax(ParamsBase):
         ):
             assert cute.size(sink_val) == self.num_rows
         if cutlass.const_expr(self.softmax_scale is not None):
-            # Contiguous attention uses the same quad reduction order as FA2.
+            # Match the four-lane reduction order of FlashAttention 2.
             # Reversing these additions can change BF16 output rounding and
             # the LSE weights used to merge disjoint context chunks.
             for r in range(int(self.num_rows)):
