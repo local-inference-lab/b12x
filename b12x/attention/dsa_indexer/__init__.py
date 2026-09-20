@@ -42,8 +42,6 @@ META = OpMeta(
         "Plan",
         "Binding",
         "plan",
-        "prefill_k_rows",
-        "prewarm_fp8",
         "bind",
         "run",
         "score",
