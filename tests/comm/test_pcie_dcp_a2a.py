@@ -271,6 +271,34 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         assert suffix.lstrip().startswith(f"{version},")
 
 
+def test_lse_compile_factory_retains_program_identity(monkeypatch) -> None:
+    from b12x._lib.compile_plan import ProgramKey, program_keys
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    program = ProgramKey("cute", "test", "dcp-lse")
+
+    def raw(*args, **kwargs):
+        return None
+
+    raw.__b12x_programs__ = (program,)
+    monkeypatch.setattr(kernels, "b12x_compile", lambda *args, **kwargs: raw)
+    monkeypatch.setattr(
+        kernels,
+        "raise_if_kernel_resolution_frozen",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernels, "_u32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_f32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_u8_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+
+    launcher = kernels._get_compiled_lse_reduce_scatter.__wrapped__(
+        4, 0, "bf16", 256, False
+    )
+
+    assert program_keys(launcher) == (program,)
+
+
 def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> None:
     from b12x.comm.pcie import _dcp_cute_common as common
 
