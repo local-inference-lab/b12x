@@ -19,6 +19,7 @@ class RoutingProfileQuery:
     runtime_token_limit: bool = False
     health_summary: bool = False
     history_depth: int = 0
+    anchor_summary: bool = False
 
     def __post_init__(self):
         from ..residency.contracts import PHASES
@@ -51,6 +52,8 @@ class RoutingProfileQuery:
             raise TypeError("health_summary must be boolean")
         if self.health_summary and (self.phases != ("decode",) or self.rank != self.owner_rank):
             raise ValueError("health summary requires owner-rank decode counters")
+        if type(self.anchor_summary) is not bool or (self.anchor_summary and not self.health_summary):
+            raise ValueError("anchor summary requires explicit health preparation")
         _integer("history_depth", self.history_depth)
         if self.history_depth and (self.phases != ("decode",) or self.rank != self.owner_rank):
             raise ValueError("routing history requires owner-rank decode counters")
@@ -62,12 +65,13 @@ class RoutingProfileQuery:
 
     @property
     def health_device_bytes(self):
-        return (sum(e for _, e in self.layers)*16 + len(self.layers)*80
+        return (sum(e for _, e in self.layers)*(17 if self.anchor_summary else 16)
+                + len(self.layers)*(96 if self.anchor_summary else 80)
                 if self.health_summary else 0)
 
     @property
     def health_host_bytes(self):
-        return len(self.layers)*48 if self.health_summary else 0
+        return len(self.layers)*(56 if self.anchor_summary else 48) if self.health_summary else 0
 
     @property
     def storage_bytes(self):
@@ -93,7 +97,7 @@ def _validate(query, config, device):
         raise ValueError("unsupported routing counter configuration")
 
 
-TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=4,
+TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=5,
     config_schema_version=1, query_fields=frozenset(RoutingProfileQuery.__dataclass_fields__),
     config_fields=frozenset(RoutingProfileConfig.__dataclass_fields__), encode_query=asdict,
     encode_config=asdict, decode_config=lambda p: RoutingProfileConfig(**dict(p)),

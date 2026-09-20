@@ -463,3 +463,77 @@ def test_history_wrap_preserves_canonical_counts_without_replay_allocations(dept
             graph.reset()
         result.close()
         session.close()
+
+
+@pytest.mark.parametrize('experts', [7, 128, 385])
+def test_anchor_health_same_graph_canonical_counts_and_immutable_reference(experts):
+    from b12x.moe.residency import ResidencyAnchor, ExpertPlacement
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    q = RoutingProfileQuery(layers=(('a', 4), ('b', experts)), max_tokens=8,
+                            max_top_k=4, health_summary=True, anchor_summary=True)
+    plan, session, result = prepare(q)
+    graph = None
+    try:
+        s = routing_profile_state(plan)
+        s.reset(quiescent=True)
+        h = s.health
+        maps = {n: torch.tensor([[e % 2, e] for e in range(count)],
+                                dtype=torch.int32, device='cuda') for n, count in q.layers}
+        h.bind_maps(maps)
+        anchor = ResidencyAnchor(profile_id='a'*64, checkpoint='checkpoint', recipe='recipe',
+            workload='general', placements=tuple((n, ExpertPlacement(total_experts=e,
+                resident_expert_ids=tuple(range(0, e, 2)), backing_expert_ids=tuple(range(1, e, 2))))
+                for n, e in q.layers))
+        h.bind_anchor(anchor)
+        h.rebase((0, 0))
+        ids = torch.tensor([[0, 0, 1, -1], [2, 2, 3, 2**40]], dtype=torch.int64, device='cuda')
+        bindings = [bind_routing_profile(plan, layer=n, phase='decode', topk_ids=ids) for n, _ in q.layers]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for binding in bindings:
+                binding.run()
+        def read(generation):
+            h.start(generation)
+            h.done.synchronize()
+            return h.poll(generation)
+        assert read((0, 0))['selections'] == 0
+        mask = h.anchor_mask.cpu().clone()
+        pointers = (h.anchor_mask.data_ptr(), h.output.data_ptr(), h.host.data_ptr())
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()
+        with kernel_resolution_guard('anchor health replay'):
+            graph.replay()
+            value = read((0, 0))
+        after = torch.cuda.memory_stats()
+        assert before['allocation.all.allocated'] == after['allocation.all.allocated']
+        assert value['selections'] == 12
+        assert value['cold_selections'] == value['anchor_cold_selections'] == 4
+        for mapping in maps.values():
+            mapping[0, 0] = 1
+            mapping[1, 0] = 0
+        with pytest.raises(RuntimeError, match='stale'):
+            h.start((1, 1))
+        h.rebase((1, 1))
+        graph.replay()
+        value = read((1, 1))
+        assert value['cold_selections'] == 6 and value['anchor_cold_selections'] == 4
+        ids.fill_(1)
+        graph.replay()
+        value = read((1, 1))
+        assert value['cold_selections'] == 0 and value['anchor_cold_selections'] == 16
+        assert torch.equal(mask, h.anchor_mask.cpu()) and h.anchor is anchor
+        with pytest.raises(RuntimeError, match='already bound'):
+            h.bind_anchor(anchor)
+        s.reset(quiescent=True)
+        with pytest.raises(RuntimeError, match='stale'):
+            h.start((1, 1))
+        h.rebase((1, 1))
+        h.anchor_mask[0] = 2
+        with pytest.raises(ValueError, match='invalid health'):
+            read((1, 1))
+        assert pointers == (h.anchor_mask.data_ptr(), h.output.data_ptr(), h.host.data_ptr())
+    finally:
+        if graph is not None:
+            graph.reset()
+        result.close()
+        session.close()

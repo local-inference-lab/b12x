@@ -55,6 +55,7 @@ class ResidencyCacheDecision:
     unpaired_candidates: int
     observed_hits_since_promotion: tuple[tuple[int, int], ...]
     scores: tuple[float, ...] = ()
+    movement_mode: str = "adapt"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -169,10 +170,17 @@ class ResidencyCacheController:
             raise ValueError("counter window has inconsistent selection/sampling totals")
         return row, counts, metadata
 
-    def observe(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot, propose=True):
+    def observe(self, snapshot: RoutingSnapshot, *, slots: ResidencySlotSnapshot, propose=True, recenter_to=None):
         """Propose pairs from completed requests; never perform an exchange."""
         if type(propose) is not bool:
             raise TypeError("propose must be bool")
+        if recenter_to is not None:
+            recenter_to = tuple(recenter_to)
+            if (len(set(recenter_to)) != len(recenter_to)
+                    or len(recenter_to) != sum(t == 0 for t, _ in slots.expert_map)
+                    or any(type(e) is not int or not 0 <= e < self.observations.experts
+                           for e in recenter_to)):
+                raise ValueError("re-centering reference differs from resident geometry")
         row, counts, metadata = self.validate_observation(snapshot, slots=slots)
         calls, sampled_calls, tokens, sampled_tokens = metadata
         scores = counts
@@ -183,9 +191,11 @@ class ResidencyCacheController:
         hot = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 0)
         cold = tuple(e for e, (tier, _) in enumerate(slots.expert_map) if tier == 1 and counts[e])
         protected = tuple(e for e in hot if window-self._entered[e] < self.config.minimum_residency_windows)
-        candidates = sorted((e for e in cold if propose and counts[e] >= self.config.minimum_cold_selections),
+        candidates = sorted((e for e in cold if propose and counts[e] >= self.config.minimum_cold_selections
+                             and (recenter_to is None or e in recenter_to)),
                             key=lambda e: (-scores[e], e))
-        victims = sorted((e for e in hot if propose and e not in protected), key=lambda e: (scores[e], e))
+        victims = sorted((e for e in hot if propose and e not in protected
+                          and (recenter_to is None or e not in recenter_to)), key=lambda e: (scores[e], e))
         pairs, hysteresis = [], 0
         for candidate, victim in zip(candidates, victims):
             if len(pairs) == self.config.max_pairs:
@@ -205,7 +215,8 @@ class ResidencyCacheController:
             counterfactual_cold_fraction=remaining/sum(counts) if sum(counts) else None,
             below_threshold=sum(counts[e] < self.config.minimum_cold_selections for e in cold), below_hysteresis=hysteresis,
             protected_hot_experts=protected, unpaired_candidates=len(candidates)-len(pairs)-hysteresis,
-            observed_hits_since_promotion=tuple(sorted(hits.items())), scores=tuple(scores))
+            observed_hits_since_promotion=tuple(sorted(hits.items())), scores=tuple(scores),
+            movement_mode="recenter" if recenter_to is not None else "adapt")
         self._baseline, self._window, self._hits = row, window, hits
         self._scores = tuple(scores)
         self._total_hits += sum(counts[e] for e in hits)

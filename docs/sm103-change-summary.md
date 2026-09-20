@@ -7,6 +7,16 @@ CuTe DSL. Supporting packing and metadata kernels may use Triton.
 The working branch is based on master `0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`. The
 [readiness report](sm103-readiness-report.md) separates source-bound validation,
 pending PR CI and physical-target qualification.
+
+The [learned-anchor comparison](expert-cache-anchor.md) adds an optional prepared
+resident mask, observational current-versus-anchor cold counts and explicit
+bounded re-centering through existing policy and backend transactions. Query
+schema 5 admits the added device/pinned bytes. The metadata corpus contains
+88 declarations/246 programs at runtime package
+`e812e2e6aa06fd250e40375172022ff412874213fa73eb277fac12f69eb4b3f2`;
+the anchor specialization has a separate SM103 compilation receipt. The
+[movement and recovery results](expert-cache-anchor-results.md) retain source-built
+SM120 evidence without changing physical SM103 gates or serving defaults.
 The [cadence qualification](expert-cache-cadence.md) adds bounded execution
 tracing, controlled-admission comparisons, an isolated router replay and
 checkpoint-byte whole-K shape checks. It explains the C4 generation-zero
@@ -19,7 +29,7 @@ for delayed transition response; it remains experimental.
 The [read-only health experiment](expert-cache-health.md) separates counter
 observation, compact health probes and full maintenance. Its prepared reduction
 and host-only pressure rule preserve the numerical recipe and static opt-out.
-The metadata corpus contains 87 declarations/245 programs; the added health case
+The health evidence records 87 declarations/245 programs; the added health case
 has separate SM103 cross-compilation evidence. Historical full-corpus counts
 below remain attached to their original package source.
 The [health serving matrix](expert-cache-health-results.md) qualifies 45 runs
@@ -29,7 +39,7 @@ addresses are retained. This is Gen4 SM120 control evidence, not B300 execution
 or a universal win over fixed maintenance.
 Optional [deferred routing history](expert-cache-history.md) uses prepared CUDA
 copies and the existing shared controller to separate observation windows from
-mutation cadence. It adds no kernel declaration: the inventory remains
+mutation cadence. It adds no kernel declaration: its recorded inventory is
 87 declarations/245 programs. The [history measurements](expert-cache-history-results.md)
 retain source-built SM120 results separately from physical B300 acceptance.
 The [SM120 cache proof of concept](expert-residency-sm120-poc.md) reuses the
@@ -80,7 +90,8 @@ expert block. The SM103 corpus remains 86 declarations/244 programs at package
 | Grace-served cache policy | The [host controller](../b12x/moe/fused_moe/residency_cache.py) classifies counter deltas against one placement generation, proposes frequency-ranked pairs with explicit safeguards and acknowledges committed/restored snapshots. Existing Grace execution serves observed misses; exchange changes later accesses. The [policy guide](expert-residency-cache.md) defines integration and measurement limits. |
 | Prepared routing counters | [CuTe counters](../b12x/moe/_shared/kernels/routing_profile.py) use preparation-owned uint64 storage, sampling and overflow detection. The disabled serving path has no observer. [Worker hooks](../b12x/integration/vllm/expert_residency.py) expose lifecycle operations without patching vLLM. |
 | Read-only routing health | [Prepared reduction](../b12x/moe/_shared/kernels/routing_health.py) reads existing counters and canonical maps. [Health thresholds](../b12x/moe/residency/health.py) are independent of replacement policy. The [single-worker adapter](../b12x/integration/vllm/residency_health.py) polls prepared readback storage without scheduler pause; complete maintenance alone advances policy and publishes placement. |
-| Deferred routing history | [Prepared counter checkpoints](../b12x/moe/fused_moe/_routing_history.py) retain bounded, generation-bound device snapshots. Full maintenance replays older cuts through the existing no-movement policy path, then evaluates one bounded update. Query schema 4 admits device/pinned bytes explicitly; no kernel or production default is added. The [history contract](expert-cache-history.md) defines wrap, synchronization and replay limits. |
+| Deferred routing history | [Prepared counter checkpoints](../b12x/moe/fused_moe/_routing_history.py) retain bounded, generation-bound device snapshots. Full maintenance replays older cuts through the existing no-movement policy path, then evaluates one bounded update. Counter query schema 5 admits history and optional anchor storage explicitly. The [history contract](expert-cache-history.md) defines wrap, synchronization and replay limits. |
+| Learned-anchor recovery | [Immutable anchor identity](../b12x/moe/residency/anchor.py) and a prepared resident mask compare identical route counts against current and learned placements. [Explicit re-centering](expert-cache-anchor.md) filters existing candidates and victims under unchanged scores and movement budgets. Health remains read-only; a declined full-window recovery check cannot become a normal adaptive transaction. |
 | Attention and indexing | [Sparse MLA](../b12x/attention/sparse_mla/_sm103.py), [compressed MLA](../b12x/attention/compressed_sparse_mla/_warp.py), dense MLA and DSA preserve their distinct cache layouts and fixed launch schedules. |
 | Model support | CuTe KDA/GDN, three MTP feedback contracts, mHC, HyperConnection, vocabulary projection, block-FP8 linear and DeepSeek WO retain prepared programs and planned storage. |
 | Storage and communication | [Engram storage](../b12x/sequence/engram/_storage.py) owns device or mapped-host allocations and checks Grace capability. Disk reads use the synchronous upstream transaction contract. Experimental Grace TP2 transport remains separate from model qualification. |

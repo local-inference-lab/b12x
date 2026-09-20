@@ -17,7 +17,7 @@ import torch
 from b12x.moe import fused_moe as moe
 from b12x.moe.fused_moe._cache_preparation import ExpertCacheQuery, memory_for
 from b12x.moe.fused_moe.residency import profile_from_counts
-from b12x.moe.residency import RoutingObservationSpec
+from b12x.moe.residency import RoutingObservationSpec, ResidencyAnchor
 from b12x.preparation import PreparedCall
 from .residency_epoch import (
     ResidencyEpochRuntime,
@@ -49,6 +49,7 @@ class ExpertCacheServingConfig:
     max_pairs_per_layer: int = 2
     health_probes: bool = False
     history_depth: int = 0
+    anchor_health: bool = False
 
     def __post_init__(self):
         if (
@@ -77,6 +78,8 @@ class ExpertCacheServingConfig:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if type(self.health_probes) is not bool or (self.health_probes and self.mode != "adaptive"):
             raise ValueError("health probes require explicitly adaptive serving")
+        if type(self.anchor_health) is not bool or (self.anchor_health and not self.health_probes):
+            raise ValueError("anchor health requires explicitly adaptive health probes")
         if self.history_depth and self.mode != "adaptive":
             raise ValueError("routing history requires explicitly adaptive serving")
         if self.mode == "adaptive" and not self.max_pairs_per_layer:
@@ -102,6 +105,7 @@ class ExpertCacheModel:
         )
         self.sources, self.plans, self.placements = {}, {}, {}
         self.counter = self.memory = self.runtime = None
+        self.anchor = None
         self.capacity = None
         self.source_reserved_bytes = 0
         self._counters = None
@@ -299,7 +303,15 @@ class ExpertCacheModel:
                     runtime_token_limit=True,
                     health_summary=c.health_probes,
                     history_depth=c.history_depth,
+                    anchor_summary=c.anchor_health,
                 )
+            )
+        if c.anchor_health:
+            self.anchor = ResidencyAnchor(
+                profile_id=self.profile_id, checkpoint=self.checkpoint_id,
+                recipe=self._identity()["recipe"], workload=c.workload,
+                placements=tuple((n, self.placements[n].placement)
+                                 for n in self.observed_layers),
             )
         counter_bytes = 0 if self.counter is None else (
             self.counter.query.storage_bytes + self.counter.query.health_device_bytes
@@ -415,6 +427,8 @@ class ExpertCacheModel:
         if counters.health is not None:
             counters.health.bind_maps({n: self.plans[n].prepared.state.mapping
                                       for n in self.observed_layers})
+            if self.anchor is not None:
+                counters.health.bind_anchor(self.anchor)
         if self.config.mode == "adaptive":
             bindings = {
                 name: bind_sm120_epoch_layer(
@@ -437,6 +451,7 @@ class ExpertCacheModel:
                 checkpoint_id=self.checkpoint_id,
                 initial_profile_id=self.profile_id,
                 memory=self.memory,
+                anchor=self.anchor,
             )
 
     def prepare_observation(self, decode_tokens):

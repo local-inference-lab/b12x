@@ -51,6 +51,13 @@ maintenance replays compatible windows through the shared controller before
 bounded movement. Its SM120 measurements and SM103 cross-compilation remain
 separate from physical Grace execution qualification.
 
+Optional [learned-anchor health](expert-cache-anchor.md) scores those same route
+counts against the immutable initial resident set. An explicit re-centering
+intent can propose missing anchor experts through the existing bounded epoch
+without changing score arithmetic or the slot transaction. This remains a
+single-rank SM120 serving experiment; SM103 retains its HBM/Grace storage and
+physical acceptance gates.
+
 ## Supported contracts
 
 | SM103 routed path | Status |

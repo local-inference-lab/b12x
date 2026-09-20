@@ -16,7 +16,7 @@ from b12x.moe.residency import (
     ResidencyEpochBudget,
     ResidencyEpochCoordinator,
     ResidencySlotSnapshot,
-    updated_slot_map,
+    updated_slot_map, RoutingAnchorThresholds, compare_anchor,
 )
 
 
@@ -41,6 +41,10 @@ class LocalResidencyMaintenance:
         }
         self.budget = ResidencyEpochBudget(**config["budget"])
         self.threshold = config["cold_fraction_threshold"]
+        self.anchor_thresholds = (RoutingAnchorThresholds(**config["anchor_thresholds"])
+                                  if config.get("anchor_thresholds") is not None else None)
+        if self.anchor_thresholds is not None and runtime.anchor is None:
+            raise ValueError("anchor recovery requires a prepared learned anchor")
         self.diagnostics = config.get("policy_diagnostics", False)
         if type(self.diagnostics) is not bool:
             raise TypeError("policy_diagnostics must be boolean")
@@ -57,11 +61,15 @@ class LocalResidencyMaintenance:
                 raise ValueError("maintenance exceeds prepared fill capacity")
         self.coordinator = None
 
-    def run(self):
+    def run(self, *, movement_mode="adapt"):
         r = self.runtime
         start = perf_counter_ns()
         stages = {}
         try:
+            if movement_mode not in ("adapt", "recenter"):
+                raise ValueError("unknown residency movement mode")
+            if movement_mode == "recenter" and self.anchor_thresholds is None:
+                raise ValueError("re-centering requires configured anchor thresholds")
             r._validate()
             if r._stage != "idle":
                 raise RuntimeError("another residency transaction is pending")
@@ -95,10 +103,13 @@ class LocalResidencyMaintenance:
 
             measured = perf_counter_ns()
             selections, cold = 0, 0
+            anchor_counts = {}
             for name, controller in self.coordinator.controllers.items():
                 _, counts, _ = controller.validate_observation(
                     snapshot, slots=slots[name]
                 )
+                if movement_mode == "recenter":
+                    anchor_counts[name] = counts
                 selections += sum(counts)
                 cold += sum(
                     n
@@ -109,6 +120,16 @@ class LocalResidencyMaintenance:
             allow = bool(selections) and (
                 self.threshold is None or fraction >= self.threshold
             )
+            anchor_result, recenter = None, None
+            if movement_mode == "recenter":
+                anchor_result = compare_anchor(
+                    anchor_counts,
+                    {n: tuple(e for e, (t, _) in enumerate(s.expert_map) if t == 0)
+                     for n, s in slots.items()}, r.anchor.resident_ids,
+                )
+                assessment = self.anchor_thresholds.assess(anchor_result)
+                anchor_result.update(assessment, profile=r.anchor.profile_id)
+                recenter, allow = r.anchor, assessment["anchor_better"]
             stages["pressure"] = perf_counter_ns() - measured
             measured = perf_counter_ns()
             history = getattr(state, "history", None)
@@ -140,7 +161,7 @@ class LocalResidencyMaintenance:
                 stages["history"] = perf_counter_ns() - measured
                 measured = perf_counter_ns()
             decision = self.coordinator.observe(
-                snapshot, slots=slots, allow_movement=allow
+                snapshot, slots=slots, allow_movement=allow, recenter=recenter
             )
             stages["policy"] = perf_counter_ns() - measured
             measured = perf_counter_ns()
@@ -203,7 +224,16 @@ class LocalResidencyMaintenance:
                 "selections": selections,
                 "cold_selections": cold,
                 "cold_fraction": fraction,
+                "movement_mode": "recenter" if recenter is not None else "adapt",
+                **({"anchor": anchor_result} if anchor_result is not None else {}),
                 "proposed_pairs": decision.proposed_pairs,
+                "proposal_backlog": {
+                    "pair_cap_skips": decision.pair_cap_skips,
+                    "byte_cap_skips": decision.byte_cap_skips,
+                    "skipped_incremental_copy_bytes": decision.skipped_incremental_copy_bytes,
+                    "proposing_layers": decision.proposing_layers,
+                    "budget": asdict(self.budget),
+                },
                 "selected_pairs": decision.selected_pairs,
                 "copy_bytes": decision.copy_bytes,
                 "stages_ns": stages,
@@ -254,6 +284,7 @@ class VllmResidencyMaintenance:
         budget,
         cold_fraction_threshold=None,
         policy_diagnostics=False,
+        anchor_thresholds=None,
     ):
         self.engine = engine
         self.config = {
@@ -262,19 +293,25 @@ class VllmResidencyMaintenance:
             "budget": asdict(budget),
             "cold_fraction_threshold": cold_fraction_threshold,
             "policy_diagnostics": policy_diagnostics,
+            "anchor_thresholds": None if anchor_thresholds is None else asdict(anchor_thresholds),
         }
         self._lock = asyncio.Lock()
         self.failed = False
         self.last_receipt = None
 
-    async def run(self):
+    async def run(self, *, movement_mode="adapt"):
+        if movement_mode not in ("adapt", "recenter"):
+            raise ValueError("unknown residency movement mode")
         requested = perf_counter_ns()
         async with self._lock:
             if self.failed:
                 raise RuntimeError("maintenance outcome is uncertain; reload the lane")
             acquired = perf_counter_ns()
             try:
-                result = await self.engine.residency_maintenance(self.config)
+                result = await self.engine.residency_maintenance(
+                    self.config if movement_mode == "adapt" else
+                    {**self.config, "movement_mode": movement_mode}
+                )
             except BaseException:
                 self.failed = True
                 raise
@@ -293,6 +330,7 @@ def policy_observation(decision, *, deferred=False):
         "layers": {
             layer.layer: {
                 "window": layer.decision.window,
+                "movement_mode": layer.decision.movement_mode,
                 "counts": layer.decision.counts,
                 "scores": layer.decision.scores,
                 "calls": layer.decision.calls,

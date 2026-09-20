@@ -185,3 +185,34 @@ def test_epoch_requires_matching_sampling_and_phase():
         exchange=spec(), slots=slots["b"], baseline=snapshot())
     with pytest.raises(ValueError, match="sampling"):
         r.ResidencyEpochCoordinator({"a": c.controllers["a"], "b": other}, budget=c.budget)
+
+
+def test_recenter_restricts_membership_without_changing_scores_or_sticking():
+    c, slots = coordinator(scoring='decayed_lfu', max_pairs=2, max_bytes=1000)
+    normal, _ = coordinator(scoring='decayed_lfu', max_pairs=2, max_bytes=1000)
+    anchor = r.ResidencyAnchor(profile_id='a'*64, checkpoint='checkpoint',
+        recipe='recipe', workload='general', placements=tuple((n, r.ExpertPlacement(
+            total_experts=4, resident_expert_ids=(0, 2), backing_expert_ids=(1, 3))) for n in slots))
+    observations = snapshot({n: (2, 0, 10, 20) for n in slots}, 1)
+    d = c.observe(observations, slots=slots, recenter=anchor)
+    unrestricted = normal.observe(observations, slots=slots)
+    assert all(x.pairs == ((2, 1),) and x.decision.movement_mode == 'recenter' for x in d.layers)
+    assert [x.decision.scores for x in d.layers] == [x.decision.scores for x in unrestricted.layers]
+    after = complete(c, d, slots)
+    c.finish(d, slots=after)
+    with pytest.raises(ValueError, match='stale'):
+        c.finish(d, slots=after)
+    later = c.observe(snapshot({n: (2, 0, 10, 50) for n in slots}, 2), slots=after)
+    assert all(x.pairs[0][0] == 3 and x.decision.movement_mode == 'adapt' for x in later.layers)
+    assert anchor.resident_ids == {n: (0, 2) for n in slots}
+
+
+def test_proposal_backlog_distinguishes_pair_and_byte_caps():
+    c, slots = coordinator(max_pairs=1, max_bytes=1000)
+    observation = snapshot({n: (0, 0, 20, 10) for n in slots}, 1)
+    d = c.observe(observation, slots=slots)
+    assert d.proposed_pairs == 4 and d.proposing_layers == 2
+    assert d.pair_cap_skips == 3 and d.byte_cap_skips == 0
+    c, slots = coordinator(max_pairs=4, max_bytes=132)
+    d = c.observe(observation, slots=slots)
+    assert d.byte_cap_skips == 3 and d.pair_cap_skips == 0

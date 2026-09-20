@@ -42,12 +42,12 @@ def _compile(query, *, target, offline_dir=None):
         if offline_dir is not None:
             path = Path(offline_dir)/"health"
             path.mkdir(parents=True, exist_ok=True)
-            programs["health"] = cute.compile(RoutingHealth(), *args,
+            programs["health"] = cute.compile(RoutingHealth(query.anchor_summary), *args,
                 options=f"--gpu-arch={target} --keep-ptx --keep-cubin --dump-dir={path}", no_jit_engine=True)
         else:
-            programs["health"] = compile_kernel(RoutingHealth(), *args,
+            programs["health"] = compile_kernel(RoutingHealth(query.anchor_summary), *args,
                 options=f"--gpu-arch={target}", compile_spec=KernelCompileSpec.from_facts(
-                    "moe.routing_health", 1, ("target", target)))
+                    "moe.routing_health", 2, ("anchor", query.anchor_summary), ("target", target)))
     for experts in sorted({e for _, e in query.layers}):
         for dtype, suffix in ((cutlass.Int32, "i32"), (cutlass.Int64, "i64")):
             key = f"count_{experts}_{suffix}"

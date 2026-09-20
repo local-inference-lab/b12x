@@ -481,3 +481,70 @@ def test_actual_engine_parallel_configuration_is_checked(name, value):
     with pytest.raises(ValueError, match="engine configuration"):
         driver(e)
     assert not e.events
+
+
+def test_anchor_recovery_uses_existing_transaction_and_allows_later_adaptation(monkeypatch):
+    from dataclasses import asdict
+    from b12x.integration.vllm.residency_maintenance import LocalResidencyMaintenance
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e, threshold=None)
+    anchor = r.ResidencyAnchor(profile_id='a'*64, checkpoint='checkpoint-sha',
+        recipe='recipe', workload='general', placements=tuple((n, r.ExpertPlacement(
+            total_experts=4, resident_expert_ids=(0, 1), backing_expert_ids=(2, 3))) for n in ('a', 'b')))
+    m.runtime.anchor = anchor
+    settings = {**m.config, 'anchor_thresholds': asdict(r.RoutingAnchorThresholds(
+        advantage_fraction=.02, minimum_layer_fraction=.75))}
+    m = LocalResidencyMaintenance(m.runtime, settings)
+    assert m.run()['baseline']
+    e.counts = snapshot({n: (0, 0, 12, 0) for n in ('a', 'b')}, 1)
+    with monkeypatch.context() as patch:
+        def forbidden_comparison(*args, **kwargs):
+            raise AssertionError("normal adaptation must not compute anchor regret")
+        patch.setattr("b12x.integration.vllm.residency_maintenance.compare_anchor",
+                      forbidden_comparison)
+        first = m.run()
+    assert first['movement_mode'] == 'adapt' and first['selected_pairs'] == 2
+    assert 'anchor' not in first
+    e.counts = snapshot({n: (24, 0, 12, 0) for n in ('a', 'b')}, 2)
+    returned = m.run(movement_mode="recenter")
+    assert returned['movement_mode'] == 'recenter' and returned['selected_pairs'] == 2
+    assert all(v['pairs'] == ((0, 2),) for v in returned['layers'].values())
+    e.counts = snapshot({n: (24, 0, 60, 0) for n in ('a', 'b')}, 3)
+    again = m.run()
+    assert again['movement_mode'] == 'adapt' and again['selected_pairs'] == 2
+    assert m.runtime.anchor is anchor and anchor.resident_ids == {'a': (0, 1), 'b': (0, 1)}
+
+
+def test_runtime_rejects_anchor_identity_and_initial_geometry_mismatch():
+    e = Engine(ranks=1, canonical=True)
+    old = e.workers[0].model_runner.b12x_residency_runtime
+    anchor = r.ResidencyAnchor(profile_id='a'*64, checkpoint=old.checkpoint_id,
+        recipe='recipe', workload='general', placements=tuple((n, r.ExpertPlacement(
+            total_experts=4, resident_expert_ids=(0, 1), backing_expert_ids=(2, 3))) for n in ('a', 'b')))
+    kwargs = dict(rank=0, owner_rank=0, bindings=old.bindings, snapshot_counters=old.snapshot_counters,
+                  checkpoint_id=old.checkpoint_id, initial_profile_id='a'*64, memory=old.memory)
+    assert ResidencyEpochRuntime(**kwargs, anchor=anchor).anchor is anchor
+    for bad in (replace(anchor, checkpoint='foreign'), replace(anchor, profile_id='b'*64),
+                replace(anchor, placements=tuple((n, r.ExpertPlacement(total_experts=4,
+                    resident_expert_ids=(0, 2), backing_expert_ids=(1, 3))) for n in ('a', 'b')))):
+        with pytest.raises(ValueError, match='anchor'):
+            ResidencyEpochRuntime(**kwargs, anchor=bad)
+
+
+def test_declined_anchor_recheck_never_falls_through_to_normal_adaptation():
+    from dataclasses import asdict
+    from b12x.integration.vllm.residency_maintenance import LocalResidencyMaintenance
+    e = Engine(ranks=1, canonical=True)
+    m = local_maintenance(e, threshold=None)
+    m.runtime.anchor = r.ResidencyAnchor(profile_id='a'*64, checkpoint='checkpoint-sha',
+        recipe='recipe', workload='general', placements=tuple((n, r.ExpertPlacement(
+            total_experts=4, resident_expert_ids=(0, 1), backing_expert_ids=(2, 3))) for n in ('a', 'b')))
+    m = LocalResidencyMaintenance(m.runtime, {**m.config, 'anchor_thresholds': asdict(
+        r.RoutingAnchorThresholds(advantage_fraction=.02, minimum_layer_fraction=.75))})
+    m.run()
+    e.counts = snapshot({n: (0, 0, 12, 0) for n in ('a', 'b')}, 1)
+    # A delayed client signal no longer supported by the full observation may
+    # update history, but cannot become an unrelated adaptive transaction.
+    receipt = m.run(movement_mode='recenter')
+    assert receipt['movement_mode'] == 'recenter' and receipt['selected_pairs'] == 0
+    assert all(layer.slots.generation == 0 for layer in e.layers[0].values())

@@ -95,7 +95,7 @@ class ResidencyLayerBinding:
 class ResidencyEpochRuntime:
     """Worker-side transaction participant; registration is explicit and opt-in."""
     def __init__(self, *, rank, owner_rank, bindings, snapshot_counters,
-                 checkpoint_id, initial_profile_id, memory: ResidencyServingMemory):
+                 checkpoint_id, initial_profile_id, memory: ResidencyServingMemory, anchor=None):
         _integer("rank", rank)
         _integer("owner_rank", owner_rank)
         _text("checkpoint_id", checkpoint_id)
@@ -115,6 +115,19 @@ class ResidencyEpochRuntime:
         self.rank, self.owner_rank = rank, owner_rank
         self.snapshot_counters = snapshot_counters
         self.checkpoint_id, self.initial_profile_id, self.memory = checkpoint_id, initial_profile_id, memory
+        if anchor is not None:
+            from b12x.moe.residency.anchor import ResidencyAnchor
+            if (not isinstance(anchor, ResidencyAnchor) or anchor.checkpoint != checkpoint_id
+                    or anchor.profile_id != initial_profile_id
+                    or set(anchor.resident_ids) != set(bindings)):
+                raise ValueError("anchor identity differs from prepared cache")
+            for name, placement in anchor.placements:
+                slots = bindings[name].snapshot()
+                hot = {e for e, (t, _) in enumerate(slots.expert_map) if t == 0}
+                if (placement.total_experts != len(slots.expert_map)
+                        or hot != set(placement.resident_expert_ids)):
+                    raise ValueError("initial cache differs from learned anchor")
+        self.anchor = anchor
         self._pointers = {name: tuple(b.pointers()) for name, b in self.bindings.items()}
         self._token, self._command, self._before = None, None, None
         self._stage, self._failed = "idle", False
@@ -231,6 +244,8 @@ class ResidencyEpochWorkerExtension:
     def b12x_residency_maintenance(self, config):
         """Only the engine's completed single-rank drain may invoke this method."""
         from .residency_maintenance import LocalResidencyMaintenance
+        config = dict(config)
+        movement_mode = config.pop("movement_mode", "adapt")
         runtime = self._b12x_epoch_runtime()
         cache = getattr(self.model_runner, "b12x_expert_cache", None)
         health = getattr(getattr(cache, "_counters", None), "health", None)
@@ -242,7 +257,7 @@ class ResidencyEpochWorkerExtension:
             runtime._local_maintenance = maintenance
         elif maintenance.config != config:
             raise ValueError("maintenance session/config changed; reload the lane")
-        result = maintenance.run()
+        result = maintenance.run(movement_mode=movement_mode)
         cache = getattr(self.model_runner, "b12x_expert_cache", None)
         health = getattr(getattr(cache, "_counters", None), "health", None)
         if health is not None:

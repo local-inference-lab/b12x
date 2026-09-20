@@ -1,0 +1,24 @@
+{"text": "Explain how a neighborhood can organize a shared cupboard of tools, including a friendly borrowing agreement.", "workload": "stable_general"}
+{"text": "Describe the small pleasures of taking the same walking route through different seasons.", "workload": "stable_general"}
+{"text": "Write an encouraging guide for someone hosting a potluck dinner for neighbors they do not know well.", "workload": "stable_general"}
+{"text": "Explain why a handwritten thank-you note can feel different from an online message, without dismissing either.", "workload": "stable_general"}
+{"text": "Suggest ways a family can collect stories about an old photograph whose location is uncertain.", "workload": "stable_general"}
+{"text": "Describe how a volunteer might welcome a first-time visitor to a community garden.", "workload": "stable_general"}
+{"text": "Write a balanced discussion of leaving a little unscheduled time in a busy weekend.", "workload": "stable_general"}
+{"text": "Explain how people can respectfully share a small reading room when they prefer different noise levels.", "workload": "stable_general"}
+{"text": "For independent fair dice X and Y, derive the conditional expectation of X given that their sum is at least nine.", "workload": "specialist"}
+{"text": "Prove that every finite tree with at least two vertices has at least two leaves, using two distinct arguments.", "workload": "specialist"}
+{"text": "Derive the area of the region enclosed by y=x squared and y=2x, explaining the intersection calculation.", "workload": "specialist"}
+{"text": "Find and justify the minimum of x squared plus 4 divided by x squared for positive x, without calculus first.", "workload": "specialist"}
+{"text": "Explain how to count binary strings of length n with no two consecutive ones and derive the recurrence.", "workload": "specialist"}
+{"text": "Find the eigenvalues of the matrix with rows (3,1) and (1,3), then interpret repeated multiplication geometrically.", "workload": "specialist"}
+{"text": "Calculate the probability of drawing exactly two red balls in four draws without replacement from five red and seven blue balls.", "workload": "specialist"}
+{"text": "Use induction to prove the formula for the sum of the first n odd positive integers and connect it to a diagram.", "workload": "specialist"}
+{"text": "Explain how to start a small informal book exchange at a workplace without creating extra administrative work.", "workload": "return_general"}
+{"text": "Write a warm introduction to a newsletter about a neighborhood repair cafe and the volunteers who run it.", "workload": "return_general"}
+{"text": "Describe an afternoon at a local park from the perspective of someone learning to pay closer attention.", "workload": "return_general"}
+{"text": "Suggest considerate ways to welcome a new household to an apartment building while respecting their privacy.", "workload": "return_general"}
+{"text": "Explain how a group can choose a shared walking destination when its members have different energy levels.", "workload": "return_general"}
+{"text": "Write a short reflection on why people keep postcards from places they have never personally visited.", "workload": "return_general"}
+{"text": "Describe how a public library display might connect books, local memories, and an upcoming seasonal festival.", "workload": "return_general"}
+{"text": "Give practical advice for preserving a favorite family tradition while making room for newcomers to contribute.", "workload": "return_general"}

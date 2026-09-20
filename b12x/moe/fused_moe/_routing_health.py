@@ -14,6 +14,10 @@ class RoutingHealthState:
         self.counters = counters
         q, device = counters.query, counters.device
         self.layers = tuple(n for n, _ in q.layers)
+        self.anchor = None
+        self.anchor_mask = (torch.zeros(sum(e for _, e in q.layers),
+                                       dtype=torch.uint8, device=device)
+                            if q.anchor_summary else None)
         self.previous = torch.zeros(
             sum(e for _, e in q.layers), dtype=torch.uint64, device=device
         )
@@ -21,10 +25,10 @@ class RoutingHealthState:
             (self.previous.numel(), 2), dtype=torch.int32, device=device
         )
         self.descriptors = torch.empty(
-            (len(self.layers), 4), dtype=torch.int64, device=device
+            (len(self.layers), 5 if q.anchor_summary else 4), dtype=torch.int64, device=device
         )
         self.output = torch.empty(
-            (len(self.layers), 6), dtype=torch.uint64, device=device
+            (len(self.layers), 7 if q.anchor_summary else 6), dtype=torch.uint64, device=device
         )
         self.host = torch.empty_like(self.output, device="cpu", pin_memory=True)
         self.started = torch.cuda.Event(enable_timing=True)
@@ -64,7 +68,8 @@ class RoutingHealthState:
                     mapping.data_ptr(),
                     self.previous.data_ptr() + offset * 8,
                     experts,
-                )
+                ) + ((self.anchor_mask.data_ptr() + offset,)
+                     if self.anchor_mask is not None else ())
             )
             offset += experts
         self.owners = tuple(maps[n] for n in self.layers)
@@ -73,6 +78,26 @@ class RoutingHealthState:
         )
         self.epoch = None
         self.stream = None
+
+    def bind_anchor(self, anchor):
+        """Install one validated learned profile before serving; never replace it."""
+        from b12x.moe.residency.anchor import ResidencyAnchor
+        if self.anchor_mask is None or self.pending or self.anchor is not None:
+            raise RuntimeError("anchor is unprepared, pending or already bound")
+        if not isinstance(anchor, ResidencyAnchor):
+            raise TypeError("health anchor requires a validated learned profile")
+        placements = dict(anchor.placements)
+        if set(placements) != set(self.layers) or any(
+            placements[n].total_experts != e for n, e in self.counters.query.layers
+        ):
+            raise ValueError("anchor geometry differs from routing counters")
+        mask = []
+        for name, experts in self.counters.query.layers:
+            resident = set(placements[name].resident_expert_ids)
+            mask.extend(int(e not in resident) for e in range(experts))
+        self.anchor_mask.copy_(torch.tensor(mask, dtype=torch.uint8))
+        self.anchor = anchor
+        self.epoch = None
 
     def _launch(self, baseline):
         import cutlass
@@ -103,6 +128,8 @@ class RoutingHealthState:
         if self.pending:
             raise RuntimeError("health readback already pending")
         self._validate(generation)
+        if self.anchor_mask is not None and self.anchor is None:
+            raise RuntimeError("learned anchor has not been bound")
         self.wall_started = perf_counter_ns()
         self.started.record()
         self._launch(0)
@@ -126,7 +153,7 @@ class RoutingHealthState:
             return None
         rows = self.host.tolist()
         self.pending = False
-        if any(r[5] for r in rows):
+        if any(r[-1] for r in rows):
             self.epoch = None
             raise ValueError(
                 "invalid health counters/map: reset, overflow or stale data"
@@ -138,6 +165,7 @@ class RoutingHealthState:
                 cold_experts_once=r[2],
                 cold_experts_repeated=r[3],
                 repeated_cold_selections=r[4],
+                **({"anchor_cold_selections": r[5]} if self.anchor is not None else {}),
             )
             for n, r in zip(self.layers, rows, strict=True)
         }
@@ -145,6 +173,9 @@ class RoutingHealthState:
         cold = sum(r[1] for r in rows)
         return dict(
             layers=layers,
+            **({"anchor_profile": self.anchor.profile_id,
+                "anchor_cold_selections": sum(r[5] for r in rows)}
+               if self.anchor is not None else {}),
             selections=total,
             cold_selections=cold,
             cold_fraction=cold / total if total else None,

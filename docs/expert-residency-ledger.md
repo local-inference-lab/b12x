@@ -2298,3 +2298,74 @@ duration controls. The result report preserves these losses, completed and
 right-censored promotion lifetimes, raw timing distributions and fixture hashes.
 Larger history defaults, a completion-output engine hook, asynchronous fills and
 arithmetic changes remain deferred.
+
+## Learned-anchor recovery and movement capacity, September 20, 2026
+
+Inspection finds b12x `8fb334f39c0ee64bdbe125223aa7e293bae88937`, containing master
+`0f3a8cbfd1c11d27f04e3ab37a802d522f4f1c68`, and companion
+`3e45b530e58186046383e7294e611c2f6bf5cfb8`. Companion main remains
+`47ccf6c57d92f03630ebcbad3809450545825488`; its absent CI-removal change affects
+no serving source. The complete source-built wheel and eleven native libraries
+are reverified. No companion modification is required.
+
+The [anchor contract](expert-cache-anchor.md) adds a validated immutable learned
+reference, an optional prepared byte mask and counterfactual cold counts. A
+separate re-centering intent restricts existing LFU candidate/victim sets without
+changing score arithmetic. Full-window rechecks can decline movement; global
+pair/byte budgets and the existing transaction remain authoritative. The
+[measurement report](expert-cache-anchor-results.md) separates clean-transition
+movement capacity from recovery and retains per-phase serving/churn results.
+
+Counterfactual evidence precedes implementation. The retained mixed-return
+diagnostic observes 34,889 current-map cold selections versus 20,036 under the
+learned anchor over 382,464 return selections. Advantage spans 38–48 layers even
+while most absolute cold fractions remain below 15%. Code, math and multilingual
+specialists favor adapted maps instead. Offline hard restoration is retained as
+a reference; serving implements bounded proposals only.
+
+Frozen source archive 03 has runtime digest
+`0c83a66db6c0451eda92a59f3aa37f735a1e18af65ea490e8e383d43ca60f198`.
+It passes 331 host/compiler tests with two CUDA-only skips, 33 physical GPU tests,
+three cases under each of memcheck and synccheck with zero errors, and ten
+source-built companion tests. Ordinary non-cache graph serving generates 512
+tokens, with five loaded native-library hashes matching the wheel. The metadata
+census contains 88 declarations/246 programs. Both health variants compile for
+SM103 from that exact source without a CUDA context; this is not B300 execution.
+
+The anchor extension adds 6,912 device bytes and 384 pinned bytes at 48 × 128
+experts. Counter query schema 5 admits the added storage. Static and anchor-free
+health paths allocate none of it. History remains optional and is disabled in
+the main movement/recovery arms. Whole-K W4A16 and BF16 router arithmetic remain
+unchanged.
+
+Raw evidence is retained in `/home/jasonc/b12x-anchor-evidence-20260920` and
+`ripper:/home/jasonc/b12x-anchor-results-20260920`. The first GPU qualification
+wait failed because `rg` was unavailable and overlapped one C4 timing arm; that
+receipt is excluded and replaced by an isolated run. All subsequent qualification
+and serving share a file lock. A numerically correct prototype that could fall
+back from declined recovery to normal adaptation is retained separately; source
+03 requires explicit movement intent. The failure ledger also preserves command
+setup errors, compiler-census failure and shutdown warnings. No losing result is
+removed. Physical serving uses PCIe Gen4 x16; neither Gen5 transport nor native
+Grace execution is inferred.
+
+The completed capacity sweep contains nine static/16-pair/32-pair comparisons.
+All 464 promotion epochs hit the pair cap, with copy-byte headroom. The larger
+allowance improves every specialist interval, but worsens all three clean general
+returns. Bounded anchor recovery improves mixed-return throughput from 136.87 to
+146.74 tok/s at 16 pairs and from 128.88 to 143.52 at 32; static reaches 185.65.
+The partial-return fixture triggers no recovery. These incomplete and negative
+results remain visible alongside whole-sequence gains.
+
+Across 53 accepted serving runs, 140,288 generated tokens and 30,608 promotions
+pass exact paired-output and fixed-address gates: 31 immutable-HEAD runs, twenty
+source-03 runs and two source-04 repeats. Source 04 removes a redundant full host
+anchor comparison from normal adaptation, reducing that stage from 6.25 to
+2.63 ms median in the mixed repeat while preserving both repeat transaction
+sequences. Its runtime digest is
+`e812e2e6aa06fd250e40375172022ff412874213fa73eb277fac12f69eb4b3f2`.
+It separately passes 331 host/compiler tests (two CUDA skips), 33 GPU tests,
+three tests under each sanitizer with zero errors, ten companion tests, and the
+88-declaration/246-program metadata census. Both health cases cross-compile.
+A separate ordinary non-cache graph smoke generates 512 tokens and verifies its
+loaded native libraries against the source-built wheel. The source-03 matrix is not relabeled as source-04 performance evidence.

@@ -9,6 +9,16 @@ Grace storage. Opt-in calibration adds model-wide budgeting, routing counters,
 validated workload profiles and controlled restart signaling. There is no
 measured B300 performance result or B300 tuning winner.
 
+The optional [learned-anchor recovery contract](expert-cache-anchor.md) compares
+recent canonical route counts with an immutable learned resident mask. Its
+explicit re-centering intent uses the existing score arithmetic, bounded model
+epoch and quiescent transaction. The metadata census at runtime package
+`e812e2e6aa06fd250e40375172022ff412874213fa73eb277fac12f69eb4b3f2`
+contains **88 declarations and 246 programs**. Both health specializations have
+source-bound SM103 compilation evidence. The [SM120 measurements](expert-cache-anchor-results.md)
+remain separate from physical B300 acceptance; earlier counts below describe
+their retained source.
+
 The [feature and fix map](sm103-change-summary.md) identifies the implementation
 and compatibility changes. The [qualification runbook](sm103-qualification.md)
 separates offline evidence, portable GPU checks and physical-target acceptance.
@@ -69,7 +79,7 @@ interval tables, 64 host / 21 GPU / 10 companion test passes and all failures.
 The [read-only health experiment](expert-cache-health.md) adds an optional
 prepared CuTe counter/map reduction and asynchronous single-worker utility.
 Health does not advance policy state; maintenance rebases its observations
-after map publication. The metadata inventory is **87 declarations and 245
+after map publication. Its recorded metadata inventory has **87 declarations and 245
 programs**. The dedicated health declaration cross-compiles its four programs
 for SM103 without a CUDA context, including one additional reduction. The
 historical full-corpus evidence below remains bound to its original source.
@@ -84,9 +94,9 @@ consistently outperform fixed checks; it remains explicit and experimental.
 Optional [deferred routing history](expert-cache-history.md) retains recent
 counter cuts without another kernel, route atomic or scheduler drain. Full
 maintenance consumes those cuts before its final policy decision. Device and
-pinned-host ring bytes enter model-wide admission; schema 4 distinguishes the
-preparation contract. The metadata inventory remains 87 declarations/245
-programs. The [history results](expert-cache-history-results.md) bind serving and
+pinned-host ring bytes enter model-wide admission; the schema-4 history evidence
+records 87 declarations/245 programs before the optional anchor specialization.
+The [history results](expert-cache-history-results.md) bind serving and
 depth measurements to their source archives. This storage/control capability
 adds no physical SM103 qualification.
 
@@ -101,7 +111,7 @@ evidence, not physical B300 evidence.
 
 | State | Evidence and limits |
 | --- | --- |
-| Implemented and compiled through preparation | The serving-cache source corpus covers 86 declarations and 244 distinct SM103 programs with CUDA uninitialized; 238 native CuTe exports are retained. The historical `94639562` corpus remains 85 declarations/241 programs at its own source. It covers dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |
+| Implemented through preparation | The source-bound metadata census covers 88 declarations and 246 programs with CUDA uninitialized. Both health specializations have incremental compilation receipts at the same source. The retained full serving-cache compilation covers 86 declarations/244 programs at package `667fad34`; the earlier `94639562` corpus covers 85/241 at its own source. These include dense recipes, packed projections, WO, vocabulary projection, MTP, recurrent decode, attention, mHC, NVFP4 and hierarchical MXFP4 MoE, and HyperConnection. |
 | Hierarchical MXFP4 expert residency implemented | Immutable per-layer profiles and memory budgets prepare HBM and exact-size mapped Grace slabs. Native MXFP8/MXFP4 projections consume compact tier-local routes and produce unfinalized expert outputs for one original-top-k-order FP32 FMA reduction. Checkpoint weight bytes remain unchanged. |
 | Quiescent slot exchange implemented | Declared rollback journals, disjoint canonical-ID pairs, synchronized payload/map commit, stale-generation rejection and fail-closed rollback preserve captured addresses. Portable byte-replay tests pass; SM103 TMA and native-operator exchange parity remain physical gates. |
 | Shared residency subsystem implemented | Standard-library-only placement, observation and generation contracts plus host cache policy; the SM103 adapter supplies numerical admission and copy accounting. Existing imports and schema-1/schema-2 profile hashes are preserved. An opt-in canonical-host W4A16 backend has separate SM120 serving evidence; it does not qualify native SM103 execution. |
@@ -109,6 +119,7 @@ evidence, not physical B300 evidence.
 | Automatic residency implemented | Typed off/profile/auto/monitor modes, balanced cold-start placement, joint HBM/Grace admission, conservative activation, checkpoint/workload/recipe validation, atomic profiles, windowed convergence and drift diagnostics. Serving placement stays static; activation requires an engine-controlled restart. |
 | Prepared counter profiling implemented | CuTe uint64 counters use retained programs and stable storage. Off has no counter node. The SM120 V2 companion supplies explicit decode phase and valid rows through a retained device setter; native SM103 serving wiring remains required. |
 | Experimental read-only health implemented | Optional prepared reduction of existing counters and maps, independent health baselines, overflow/reset/generation guards and asynchronous event-polled readback. Single-worker probes do not pause the scheduler or change policy history. Distributed health completion and physical SM103 serving remain unsupported. |
+| Experimental learned-anchor recovery implemented | An immutable validated learned profile supplies a prepared byte mask for counterfactual cold counts. Explicit re-centering restricts existing candidates/victims without changing score arithmetic. Full-window rechecks and global budgets can decline movement. SM120 serving qualification remains workload-specific; the reference is not a throughput predictor. |
 | Implemented and tested on SM120 | Residency component tests cover quantization, route compaction, ordered-FMA adversaries, invalid int64 IDs, mapped-host reads, live-count reuse and allocation-free CUDA graph replay. Prepared counter tests add sampling, TP ownership, overflow and lifecycle coverage. These tests do not execute SM103 tcgen05 kernels or establish Grace-backed TMA legality. |
 | Implemented, awaiting physical SM103 qualification | Native tcgen05/TMEM dense and expert kernels, HBM/Grace complete-operator parity, Grace-backed TMA operands, architecture launch/resource behavior, complete model execution, chunk-parallel GDN prefill and experimental Station TP2 communication. |
 | Independent PR CI pending | Source-bound local receipts are separate from CI acceptance. The repository's wheel-release workflow has no pull-request trigger. |

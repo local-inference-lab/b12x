@@ -47,7 +47,8 @@ can improve while fewer movement opportunities still limit adaptation.
 `RoutingProfileQuery(history_depth=D)` declares a ring of D complete cumulative
 counter slabs and an equally sized pinned readback ring. Zero is the default and
 allocates no history. History requires owner-rank, decode-only observations; it
-does not require a health reduction. The counter query schema is version 4.
+does not require a health reduction. The counter query schema is version 5;
+the optional [anchor summary](expert-cache-anchor.md) has separate admission.
 
 For layer expert counts `E_l`, the existing counter slab size is:
 

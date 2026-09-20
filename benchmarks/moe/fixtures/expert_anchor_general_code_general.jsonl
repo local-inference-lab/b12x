@@ -1,0 +1,24 @@
+{"text": "Explain how a neighborhood can organize a shared cupboard of tools, including a friendly borrowing agreement.", "workload": "stable_general"}
+{"text": "Describe the small pleasures of taking the same walking route through different seasons.", "workload": "stable_general"}
+{"text": "Write an encouraging guide for someone hosting a potluck dinner for neighbors they do not know well.", "workload": "stable_general"}
+{"text": "Explain why a handwritten thank-you note can feel different from an online message, without dismissing either.", "workload": "stable_general"}
+{"text": "Suggest ways a family can collect stories about an old photograph whose location is uncertain.", "workload": "stable_general"}
+{"text": "Describe how a volunteer might welcome a first-time visitor to a community garden.", "workload": "stable_general"}
+{"text": "Write a balanced discussion of leaving a little unscheduled time in a busy weekend.", "workload": "stable_general"}
+{"text": "Explain how people can respectfully share a small reading room when they prefer different noise levels.", "workload": "stable_general"}
+{"text": "Implement a Python iterator that merges timestamped events from several sorted iterators without loading all events.", "workload": "specialist"}
+{"text": "Write a Rust example of a bounded job queue with a clean shutdown protocol and explain ownership of pending jobs.", "workload": "specialist"}
+{"text": "Design a SQL query that finds consecutive-day attendance streaks per user, including ties in the event timestamps.", "workload": "specialist"}
+{"text": "Implement a TypeScript parser for a small key=value configuration format with comments and quoted values.", "workload": "specialist"}
+{"text": "Write Python code for an LRU cache with explicit capacity checks and explain the invariants after eviction.", "workload": "specialist"}
+{"text": "Show a Go HTTP handler that validates a JSON request and propagates cancellation to a simulated backend call.", "workload": "specialist"}
+{"text": "Implement a Java method that detects a directed graph cycle and returns one example cycle rather than a boolean.", "workload": "specialist"}
+{"text": "Write a C++ RAII wrapper for a temporary file and explain move construction, error cleanup, and ownership.", "workload": "specialist"}
+{"text": "Explain how to start a small informal book exchange at a workplace without creating extra administrative work.", "workload": "return_general"}
+{"text": "Write a warm introduction to a newsletter about a neighborhood repair cafe and the volunteers who run it.", "workload": "return_general"}
+{"text": "Describe an afternoon at a local park from the perspective of someone learning to pay closer attention.", "workload": "return_general"}
+{"text": "Suggest considerate ways to welcome a new household to an apartment building while respecting their privacy.", "workload": "return_general"}
+{"text": "Explain how a group can choose a shared walking destination when its members have different energy levels.", "workload": "return_general"}
+{"text": "Write a short reflection on why people keep postcards from places they have never personally visited.", "workload": "return_general"}
+{"text": "Describe how a public library display might connect books, local memories, and an upcoming seasonal festival.", "workload": "return_general"}
+{"text": "Give practical advice for preserving a favorite family tradition while making room for newcomers to contribute.", "workload": "return_general"}

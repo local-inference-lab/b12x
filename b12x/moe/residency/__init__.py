@@ -17,10 +17,11 @@ from .epoch import (
     ResidencyEpochBudget, ResidencyEpochCoordinator, ResidencyEpochDecision,
     ResidencyLayerDecision,
 )
-from .health import RoutingHealthThresholds
+from .health import RoutingHealthThresholds, RoutingAnchorThresholds
+from .anchor import ResidencyAnchor, compare_anchor
 
 __all__ = [
-    "ExpertPlacement", "LayerRoutingCounts", "ResidencyExchangeSpec",
+    "ResidencyAnchor", "RoutingAnchorThresholds", "compare_anchor", "ExpertPlacement", "LayerRoutingCounts", "ResidencyExchangeSpec",
     "ResidencySlotSnapshot", "ResidencyUpdateCapacity", "ResidencyUpdateError",
     "RoutingObservationSpec", "RoutingSnapshot", "ResidencyCacheConfig",
     "ResidencyCacheController", "ResidencyCacheDecision", "ResidencyCacheOutcome",

@@ -23,7 +23,7 @@ where health control is slower than fixed maintenance.
 
 `RoutingProfileQuery(health_summary=True)` declares the reduction, device
 baseline, descriptors, result storage and pinned result buffer. This option
-requires owner-rank, decode-only counters. Its query schema is version 4;
+requires owner-rank, decode-only counters. Its query schema is version 5;
 health-disabled queries retain the original counting programs and storage.
 The registered `moe.routing_profile` preparation contract owns both programs.
 No kernel is resolved, compiled or allocated during graph replay.

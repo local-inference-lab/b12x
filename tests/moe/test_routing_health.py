@@ -270,3 +270,59 @@ def test_worker_health_reads_leave_policy_and_generation_untouched(monkeypatch):
     worker.model_runner.b12x_expert_cache = None
     with pytest.raises(RuntimeError, match="not prepared"):
         worker.b12x_residency_health("start")
+
+
+def test_anchor_comparison_breadth_identity_and_opt_out(tmp_path):
+    from dataclasses import FrozenInstanceError
+    from b12x.moe.residency import ResidencyAnchor, RoutingAnchorThresholds, ExpertPlacement, compare_anchor
+    placement = ExpertPlacement(total_experts=4, resident_expert_ids=(0, 1), backing_expert_ids=(2, 3))
+    anchor = ResidencyAnchor(profile_id='a'*64, checkpoint='checkpoint', recipe='recipe',
+                             workload='general', placements=(('a', placement), ('b', placement)))
+    hot = anchor.resident_ids
+    counts = {'a': (90, 0, 1, 0), 'b': (90, 0, 1, 0)}
+    gate = RoutingAnchorThresholds(advantage_fraction=.02, minimum_layer_fraction=.75)
+    assert not gate.assess(compare_anchor(counts, hot, hot))['anchor_better']
+    changed = {'a': (1, 2), 'b': (1, 2)}
+    assert gate.assess(compare_anchor(counts, changed, hot))['anchor_better']
+    assert not gate.assess(compare_anchor(counts, hot, changed))['anchor_better']
+    assert not gate.assess(compare_anchor(counts, {**hot, 'a': (1, 2)}, hot))['anchor_better']
+    assert not gate.assess(compare_anchor({n: (0,)*4 for n in hot}, changed, hot))['anchor_better']
+    with pytest.raises(FrozenInstanceError):
+        anchor.profile_id = 'b'*64
+    hot['a'] = (2, 3)
+    assert anchor.resident_ids['a'] == (0, 1)
+    with pytest.raises(ValueError, match='capacities'):
+        compare_anchor(counts, {'a': (1,), 'b': (1, 2)}, anchor.resident_ids)
+    q = RoutingProfileQuery(layers=(('a', 4), ('b', 7)), max_tokens=8, max_top_k=4)
+    h = replace(q, health_summary=True)
+    a = replace(h, anchor_summary=True)
+    assert a.health_device_bytes - h.health_device_bytes == 11 + 2*16
+    assert a.health_host_bytes - h.health_host_bytes == 2*8
+    with pytest.raises(ValueError, match='explicit health'):
+        replace(q, anchor_summary=True)
+    with pytest.raises(ValueError):
+        replace(config(tmp_path), mode='static', anchor_health=True)
+
+
+def test_anchor_analysis_rejects_corrupt_profile_and_foreign_identity(tmp_path):
+    from benchmarks.moe.analyze_residency_anchor import load_anchor
+    from b12x.integration.vllm.expert_cache import digest
+    from b12x.moe.fused_moe.residency import profile_from_counts
+    import json
+    plan = profile_from_counts(counts=(10, 5, 1, 0), hot_count=2, layer='a',
+        model_fingerprint='checkpoint', workload='general', provenance='test', phase='decode')
+    artifact = dict(identity={'checkpoint': 'checkpoint'}, placements={'a': plan.to_dict()})
+    artifact['hash'] = digest(artifact)
+    path = tmp_path/'profile.json'
+    path.write_text(json.dumps(artifact))
+    prepared = dict(profile=artifact['hash'], checkpoint='checkpoint',
+                    layers={'a': dict(experts=4, resident=2)})
+    assert load_anchor(path, prepared)['a'] == plan
+    for changes in ({'profile': 'foreign'}, {'checkpoint': 'foreign'},
+                    {'layers': {'a': dict(experts=5, resident=2)}}):
+        with pytest.raises(ValueError):
+            load_anchor(path, {**prepared, **changes})
+    artifact['identity']['checkpoint'] = 'changed'
+    path.write_text(json.dumps(artifact))
+    with pytest.raises(ValueError, match='hash'):
+        load_anchor(path, prepared)

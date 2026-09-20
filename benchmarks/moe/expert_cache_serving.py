@@ -44,6 +44,7 @@ async def run(args):
         max_pairs_per_layer=args.layer_pairs,
         health_probes=args.control == "health",
         history_depth=args.history_depth,
+        anchor_health=args.anchor_health or args.anchor_advantage is not None,
     )
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -109,6 +110,11 @@ async def run(args):
         ).stdout,
     )
     engine = None
+    from b12x.moe.residency import RoutingAnchorThresholds
+    anchor_gate = (RoutingAnchorThresholds(
+        advantage_fraction=args.anchor_advantage,
+        minimum_layer_fraction=args.anchor_breadth,
+    ) if args.anchor_advantage is not None else None)
     controller, epoch_task, traffic_task = None, None, None
     try:
         engine = AsyncLLM.from_engine_args(engine_args)
@@ -134,6 +140,7 @@ async def run(args):
                     if args.control == "health"
                     else args.cold_threshold,
                     "policy_diagnostics": args.policy_diagnostics,
+                    "anchor_thresholds": anchor_gate,
                 }
                 if args.control in ("maintenance", "health")
                 else {}
@@ -208,6 +215,8 @@ async def run(args):
                         if health_probe is not None:
                             probe = await health_probe.probe()
                             assessment = thresholds.assess(probe["summary"])
+                            if anchor_gate is not None:
+                                assessment.update(anchor_gate.assess(probe["summary"]))
                             record(
                                 "health_probe",
                                 receipt=probe,
@@ -215,7 +224,9 @@ async def run(args):
                                 output_tokens_so_far=tokens_completed,
                             )
                             reason = (
-                                "pressure"
+                                "anchor_advantage"
+                                if assessment.get("anchor_better", False)
+                                else "pressure"
                                 if assessment["health"] == "pressure"
                                 else "maximum_interval"
                                 if tokens_completed - last_maintenance_tokens
@@ -225,7 +236,7 @@ async def run(args):
                             if reason is None:
                                 next_epoch = tokens_completed + args.epoch_tokens
                                 continue
-                        receipt = await controller.run()
+                        receipt = await controller.run(movement_mode="recenter") if reason == "anchor_advantage" else await controller.run()
                         last_maintenance_tokens = tokens_completed
                     if args.healthy_check_max_tokens is not None:
                         check_interval = maintenance_check_interval(
@@ -479,6 +490,9 @@ def main():
         default=1024,
         help="Experimental maximum delivered-token interval for a full snapshot",
     )
+    p.add_argument("--anchor-health", action="store_true", help="Read-only learned-anchor counterfactual")
+    p.add_argument("--anchor-advantage", type=float, help="Experimental recovery threshold; enables anchor health")
+    p.add_argument("--anchor-breadth", type=float, default=0.75)
     p.add_argument("--health-layer-breadth", type=float, default=0.0)
     p.add_argument("--health-layer-threshold", type=float, default=0.15)
     p.add_argument(
@@ -528,6 +542,12 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if (args.anchor_health or args.anchor_advantage is not None) and args.control != "health":
+        p.error("anchor observation/recovery requires explicit adaptive health control")
+    if args.anchor_advantage is not None:
+        from b12x.moe.residency import RoutingAnchorThresholds
+        RoutingAnchorThresholds(advantage_fraction=args.anchor_advantage,
+                                minimum_layer_fraction=args.anchor_breadth)
     if args.history_depth < 0 or (args.history_depth and args.control != "health"):
         p.error("history requires health control and a nonnegative depth")
     if args.control == "health" and (

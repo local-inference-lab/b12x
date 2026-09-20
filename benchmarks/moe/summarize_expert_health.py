@@ -168,7 +168,7 @@ def compare(baseline_path, candidate_path):
             ),
             maintenance_triggers={
                 name: sum(r.get("trigger") == name for r in maintenance)
-                for name in ("pressure", "maximum_interval")
+                for name in ("pressure", "maximum_interval", "anchor_advantage")
             },
             first_pressure_ms=(pressure[0]["time_ns"] - begin) / 1e6
             if pressure

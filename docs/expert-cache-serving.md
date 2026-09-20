@@ -207,6 +207,13 @@ separates checkpoint recording from deferred host policy replay and documents
 wrap, generation and memory rules. Static mode rejects nonzero history depth;
 health without history allocates no ring.
 
+`ExpertCacheServingConfig(anchor_health=True)` optionally compares the same
+recent counts with an immutable learned resident mask. It requires adaptive
+health probes. The [anchor contract](expert-cache-anchor.md) separates this
+read-only counterfactual from explicit, bounded re-centering through the existing
+maintenance adapter. Normal adaptation, static opt-out and profile artifacts
+retain their existing behavior.
+
 A canonical fill drains readers, verifies the device map, copies every selected
 candidate into its victim's fixed VRAM slot, waits for completion, then publishes
 one complete map generation. Every overwritten victim remains reconstructible
