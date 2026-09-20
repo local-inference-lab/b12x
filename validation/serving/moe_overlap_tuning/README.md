@@ -40,9 +40,7 @@ revision, complete commands, all samples and busy GPU telemetry. The candidate
 contains the activation-aware context key. The comparison retains the same
 previously qualified packed attention-output projections and grid-candidate
 extension. It measures the **joint** context/corpus change, not the corpus in
-isolation. The earlier automatic series reached 74.938 C1 steps/s; the saved
-explicit-grid diagnostic reached 74.796. Neither requires a reference-server
-restart to interpret this source-identified comparison.
+isolation.
 
 Recompute every median and reject failed/missing cells with:
 
@@ -74,12 +72,19 @@ compact format stores repeated kernel names once.
 [Startup counters](startup-cost.json) compare fixed-sharing and varied-sharing
 races while retaining the same shared/gate context. Small-MoE measurement
 time increases by **0.359/0.333 seconds per rank**, from 1.315/1.447 to
-1.674/1.780 seconds. The activation-key repeat measures 1.671/1.807 seconds.
+1.674/1.780 seconds.
 These are incremental measurement counters, not a total startup-time claim.
 Cached decisions skip the race; corpus versioning invalidates selections,
 not compiled kernels. Serving qualification is external to startup.
 `extract_startup_costs.py` attributes successive cumulative-counter increments
 at `batch_end`; overlapping request start/end differences are not summed.
+The committed summary groups the extractor's traces under source-identified
+arms and retains phases with nonzero `small_moe_measurement_s`. Within each
+phase it renames `measurement_s` to `all_measurement_s`, removes `failed` and
+`cumulative_seconds`, and retains only `moe.decode` races with token counts
+2 through 8. Trace paths are relative to the validation workspace; their
+SHA-256 values remain unchanged. No timing values are rounded or recomputed
+by this summary transformation.
 
 The PR's corpus/variant file passes 21 CPU tests. The composed source reports
 161 CPU passes and eight CUDA skips; vLLM reports 19 context/ownership passes
