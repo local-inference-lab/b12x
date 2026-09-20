@@ -8,8 +8,14 @@ These host timing counters are not kernel latency or total server startup time.
 import argparse
 import hashlib
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
+
+
+def valid_seconds(value):
+    """Timing counters must be finite, nonnegative numbers."""
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
 def summarize(path):
@@ -34,6 +40,8 @@ def summarize(path):
             queries[event["request"]] = (
                 event["component"], event.get("query", {}).get("num_tokens"))
         measured = event.get("seconds", {}).get("autotuning", previous)
+        if not valid_seconds(measured):
+            raise ValueError(f"Invalid preparation counter in {path}")
         delta = measured - previous
         if delta < -1e-9:
             raise ValueError(f"Nonmonotonic preparation counter in {path}")
@@ -44,6 +52,12 @@ def summarize(path):
             phase["measurement_s"] += delta
         previous = measured
         if event["event"] == "complete":
+            if event.get("failed") is not False:
+                raise ValueError(f"Preparation phase was not explicitly successful in {path}")
+            if not valid_seconds(event["elapsed_s"]) or not all(
+                valid_seconds(value) for value in event["seconds"].values()
+            ):
+                raise ValueError(f"Invalid preparation timing in {path}")
             phase.update({
                 "rank": event["rank"],
                 "elapsed_s": event["elapsed_s"],
