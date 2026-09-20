@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-401",
+  "category": "fix",
+  "summary": "Preserve exact prepared DCP executable identities",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Preparation and frozen-resolution validation can identify the compiled LSE reduce-scatter, gather, and top-k programs without changing their launch API."
+  ],
+  "pull_requests": [
+    401
+  ],
+  "requires": []
+}
