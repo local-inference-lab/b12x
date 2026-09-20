@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -17,6 +18,14 @@ from b12x.moe._shared.kernels.activations import (
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
+
+
+def qsrt_k2_lut_mode() -> str:
+    """Read the plan-time QSRT decoder selection; replay never reads this flag."""
+    value = os.environ.get("B12X_QSRT_K2_LUT_MODE", "auto")
+    if value not in {"auto", "compact", "shared"}:
+        raise ValueError("B12X_QSRT_K2_LUT_MODE must be auto, compact, or shared")
+    return value
 
 
 def prefill_fused_sum_enabled() -> bool:

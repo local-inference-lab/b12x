@@ -7412,6 +7412,7 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     bits: int = 3,
     rate_indexed: bool = True,
     *,
+    in_shared: bool = False,
     loc=None,
     ip=None,
 ):
@@ -7419,8 +7420,8 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
 
     This is the lookup lower-bound primitive: one byte load per reconstructed
     weight. Every slot owns its own address/code registers so all eight
-    global gathers are in flight together; a shared scratch pair would chain
-    them behind full global-memory latency each.
+    gathers are in flight together. With ``in_shared``, the address names a
+    caller-staged shared-memory table instead of a global-memory table.
     """
 
     bits = int(bits)
@@ -7446,13 +7447,19 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
             )
         else:
             extract_lines.append(f"and.b32 w{index}, {source}, 0xffff;")
-        load_lines.append(
-            f"""
+        if in_shared:
+            load_lines.append(
+                f"add.u32 w{index}, w{index}, $4;"
+                f" ld.shared.u8 w{index}, [w{index}];"
+            )
+        else:
+            load_lines.append(
+                f"""
                 cvt.u64.u32 addr{index}, w{index};
                 add.u64 addr{index}, addr{index}, $4;
                 ld.global.u8 w{index}, [addr{index}];
-            """
-        )
+                """
+            )
         if byte_shift:
             pack_lines.append(
                 f"shl.b32 w{index}, w{index}, {byte_shift};"
@@ -7475,7 +7482,10 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
             mov.b32 $1, out1;
         }"""
     )
-    table_base = Int64(direct_lut_addr) + Int64(table_offset)
+    table_base = (
+        Int32(direct_lut_addr) + Int32(table_offset)
+        if in_shared else Int64(direct_lut_addr) + Int64(table_offset)
+    )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
         [
@@ -7484,7 +7494,7 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
             table_base.ir_value(loc=loc, ip=ip),
         ],
         asm,
-        "=r,=r,r,r,l",
+        "=r,=r,r,r,r" if in_shared else "=r,=r,r,r,l",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

@@ -32,8 +32,9 @@ requires_cuda = pytest.mark.skipif(
 @requires_cuda
 @pytest.mark.parametrize("first_slot, slots", [(0, 8), (8, 4), (48, 12), (60, 8)])
 @pytest.mark.parametrize("activation", ["silu", "situ"])
+@pytest.mark.parametrize("capacity", [1, 8, 129])
 def test_canonical_btx_preparation_preserves_source_extent(
-    tmp_path, first_slot, slots, activation
+    tmp_path, first_slot, slots, activation, capacity
 ):
     """Uneven TP extents preserve rotations in preparation, execution and graphs."""
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -91,7 +92,7 @@ def test_canonical_btx_preparation_preserves_source_extent(
         )
     assert actual.coupled_hadamard
 
-    capacity, topk = 129, 2
+    topk = 2
     torch.manual_seed(617)
     source = (torch.randn(capacity, 512, device=_device()) * 0.01).bfloat16()
     route_ids = torch.tensor([0, 1], device=_device(), dtype=torch.int32)
@@ -133,7 +134,7 @@ def test_canonical_btx_preparation_preserves_source_extent(
         state = require_prepared(request.plan, "moe.decode")
         scratch = allocate(state)
         pointers = tuple(t.data_ptr() for t in (*scratch, output))
-        for rows in (1, 8, capacity, 17):
+        for rows in sorted({1, min(8, capacity), capacity, min(17, capacity)}):
             reference = oracle(rows)
             with kernel_resolution_guard("BTX source extent"):
                 binding = bind(state, scratch, rows)
@@ -146,11 +147,11 @@ def test_canonical_btx_preparation_preserves_source_extent(
             with session.capture(), torch.cuda.graph(graph):
                 # Bind initializes synchronization scalars in caller scratch;
                 # capture those writes together with the consuming kernels.
-                captured = state.run(bind(state, scratch, 17))
+                captured = state.run(bind(state, scratch, min(17, capacity)))
             for factor in (-0.5, 2.0):
                 source.mul_(factor)
                 route_weights.copy_(route_weights.flip(-1))
-                reference = oracle(17)
+                reference = oracle(min(17, capacity))
                 for tensor in scratch:
                     tensor.fill_(255)
                 before = torch.cuda.memory_allocated()
