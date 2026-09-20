@@ -2,7 +2,8 @@
 
 Exact FA2 parity is checked for BF16 Q/K width 192, V width 128 and a
 128-by-64 attention tile. Other geometries retain tolerance-based coverage
-in test_varlen.py; bitwise equivalence is not a general attention contract.
+in tests/attention/test_varlen.py; bitwise equivalence is not a general
+attention contract.
 """
 
 import math
