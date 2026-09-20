@@ -37,3 +37,14 @@ def test_acceptance_keeps_registry_and_real_gpu_paths():
     assert "tests/test_registry.py" in HOST
     assert "tests/moe/test_prepared_expert_cache.py" in GPU
     assert "tests/moe/test_routing_profile_gpu.py" in GPU
+
+
+def test_process_manager_force_kill_cannot_pass_serving_acceptance(tmp_path):
+    from scripts.qualify_expert_cache import require_complete
+
+    log = tmp_path / "engine.log"
+    log.write_text(
+        "[shutdown] Process manager: force killing remaining process EngineCore"
+    )
+    with pytest.raises(ValueError, match="unclean shutdown"):
+        require_complete(tmp_path / "receipt.jsonl", log)

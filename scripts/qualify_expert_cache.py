@@ -64,7 +64,8 @@ def require_complete(path, log):
 
     text = log.read_text()
     if any(
-        word in text for word in ("Exception ignored in:", "did not exit", "SIGKILL")
+        word in text
+        for word in ("Exception ignored in:", "did not exit", "SIGKILL", "force killing")
     ):
         raise ValueError(f"unclean shutdown: {log}")
     records = [json.loads(line) for line in path.read_text().splitlines()]
