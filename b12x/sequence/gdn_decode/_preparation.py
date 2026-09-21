@@ -293,7 +293,6 @@ class _GdnState:
         if self._kda and (not math.isfinite(lower_bound) or lower_bound >= 0):
             raise ValueError("KDA lower bound must be finite and negative")
         if self.query.recover_speculative_state:
-            self._check(_binding_tensors(binding))
             self.recurrent(binding, scale=scale, lower_bound=float(lower_bound))
             if apply_output_norm:
                 self._run_norm(binding.output, binding.z, binding.norm_weight, binding.num_tokens, eps)
