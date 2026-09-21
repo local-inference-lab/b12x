@@ -176,3 +176,49 @@ def test_runtime_reservation_counts_only_unaccounted_storage():
     assert twice == adjusted and not accounting["additional_engine_reservation_bytes"]
     with pytest.raises(ValueError, match="resource checkpoints"):
         runtime_reservations(memory, [])
+
+
+def test_static_route_replay_scores_canonical_ids_and_rejects_reset_or_movement():
+    from benchmarks.moe.summarize_expert_cache_capacity import replay_static_cold
+
+    profile, _, _ = fixture()
+    records = [
+        dict(
+            kind="configuration",
+            arguments=dict(control="observe", admission="together"),
+            numerical_recipe="cache_w4a16_bf16_whole_k",
+        ),
+        dict(kind="prepared", status=dict(checkpoint="a" * 64)),
+        dict(
+            kind="routing_boundary",
+            next_request=0,
+            result=[
+                dict(
+                    slots={"layer": dict(generation=0)},
+                    snapshot=dict(layers=[dict(layer="layer", counts=[0, 0, 0, 0])]),
+                )
+            ],
+        ),
+        dict(kind="request", index=0, workload="code"),
+        dict(
+            kind="routing_boundary",
+            next_request=1,
+            result=[
+                dict(
+                    slots={"layer": dict(generation=0)},
+                    snapshot=dict(layers=[dict(layer="layer", counts=[10, 5, 0, 1])]),
+                )
+            ],
+        ),
+        dict(kind="complete"),
+    ]
+    result = replay_static_cold(profile, records)
+    assert result["selections"] == 16 and result["cold"] == 6
+    assert result["windows"][0]["workloads"] == ["code"]
+    records[-2]["result"][0]["slots"]["layer"]["generation"] = 1
+    with pytest.raises(ValueError, match="placement changed"):
+        replay_static_cold(profile, records)
+    records[-2]["result"][0]["slots"]["layer"]["generation"] = 0
+    records[2]["result"][0]["snapshot"]["layers"][0]["counts"][0] = 11
+    with pytest.raises(ValueError, match="counter reset"):
+        replay_static_cold(profile, records)

@@ -88,6 +88,15 @@ backlog, control cost and final control tails. Its replication unit is an engine
 trial. Static cold rates remain absent unless separately measured. Nested timers
 and drains are not added again to serving wall time.
 
+An optional counters-only run uses the existing harness with `--mode adaptive
+--control observe --routing-diagnostics --admission together`. Keep the same
+requests and execution settings; this diagnostic does not enter policy or move
+experts. Pass its completed receipt as `--routing-receipt` and the exact measured
+profile files as `--profiles` to the capacity summarizer. It requires matching
+output IDs, immutable generation-zero maps, complete request boundaries and
+monotonic canonical counts. The resulting cold fractions are counterfactuals
+for that recorded route trace, separate from uninstrumented static timing.
+
 Physical B300 acceptance remains the separate [native qualification](sm103-qualification.md).
 Ripper's measured link is PCIe Gen4 x16. Its movement and direct-host costs do
 not establish a Gen5 or Grace transport ceiling.
