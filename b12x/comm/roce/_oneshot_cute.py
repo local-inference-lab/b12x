@@ -367,7 +367,10 @@ def get_launcher(
 ) -> Callable[..., None]:
     """Compile the launcher for ``key`` once and return it."""
     if isinstance(dtype_name, torch.dtype):
-        dtype_name = _DTYPE_NAMES[dtype_name]
+        try:
+            dtype_name = _DTYPE_NAMES[dtype_name]
+        except KeyError:
+            raise ValueError(f"unsupported RoCE one-shot dtype {dtype_name!r}") from None
     process_key = _process_key(
         dtype_name,
         world_size,
