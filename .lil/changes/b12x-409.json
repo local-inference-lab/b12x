@@ -6,7 +6,7 @@
   "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
   "compatibility": "No user action required.",
   "details": [
-    "Invalid packed metadata raises the intended capacity error; valid kernel arithmetic and launch geometry are unchanged.",
+    "GDN binding rejects token capacity exceeding the bound sequence-by-column packed-metadata capacity; valid kernel arithmetic and launch geometry are unchanged.",
     "Recovery validates static tensors at binding, not again during execution.",
     "The commit contract explicitly defines final-state precedence for aliased destinations and distinguishes Int32 destination IDs from Int64 pool offsets."
   ],
