@@ -112,6 +112,15 @@ def runtime_reservations(baseline, reference):
     )
 
 
+def maximum_envelope(baseline):
+    """Keep observed non-cache storage and every fixed reserve intact."""
+    model = ResidencyServingMemory(**baseline)
+    fixed = model.device_bytes - (
+        model.resident_experts + model.workspace + model.metadata
+    )
+    return model.device_capacity - fixed
+
+
 def plan(profile, counts, baseline, envelope, *, device, capacity=64, layer_pairs=2):
     identity = profile["identity"]
     queries = {
@@ -194,7 +203,12 @@ def main():
     p.add_argument("--calibrated-profile", type=Path, required=True)
     p.add_argument("--calibration-receipt", type=Path, required=True)
     p.add_argument("--reference-receipt", type=Path, required=True)
-    p.add_argument("--cache-gib", type=int, nargs="+", required=True)
+    capacity = p.add_mutually_exclusive_group(required=True)
+    capacity.add_argument("--cache-gib", type=int, nargs="+")
+    capacity.add_argument(
+        "--maximum", action="store_true",
+        help="Use the largest envelope after observed engine storage and fixed reserves",
+    )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args()
@@ -230,14 +244,19 @@ def main():
         reference_memory_accounting=accounting,
     )
     results = []
-    for gib in args.cache_gib:
-        result = {"cache_gib": gib}
+    envelopes = (
+        [("maximum", maximum_envelope(baseline), None)]
+        if args.maximum
+        else [(f"{gib}gib", gib << 30, gib) for gib in args.cache_gib]
+    )
+    for label, envelope, gib in envelopes:
+        result = {"cache_gib": gib, "capacity_selection": label}
         try:
             row, placements = plan(
                 profile,
                 counts,
                 baseline,
-                gib << 30,
+                envelope,
                 device=args.device,
                 capacity=config["arguments"]["capacity"],
                 layer_pairs=config["arguments"]["layer_pairs"],
@@ -250,7 +269,7 @@ def main():
                 construction=provenance,
             )
             artifact["hash"] = digest(artifact)
-            path = args.output / f"profile-{gib}gib.json"
+            path = args.output / f"profile-{label}.json"
             with path.open("x") as stream:
                 json.dump(artifact, stream, indent=2)
             result.update(

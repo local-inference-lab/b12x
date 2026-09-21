@@ -7,6 +7,7 @@ import pytest
 from benchmarks.moe.expert_cache_capacity import (
     allocate,
     calibration_counts,
+    maximum_envelope,
     plan,
     runtime_reservations,
 )
@@ -172,6 +173,11 @@ def test_runtime_reservation_counts_only_unaccounted_storage():
     assert adjusted["other_device"] == 100
     assert adjusted["device_safety"] == 100
     assert accounting["additional_engine_reservation_bytes"] == 50
+    # Dense, KV, graphs, engine storage and safety remain reserved. Only the
+    # expert envelope can consume the remaining bytes, including non-GiB tails.
+    assert maximum_envelope(adjusted) == 500
+    assert maximum_envelope(dict(adjusted, device_capacity=1001)) == 501
+    assert maximum_envelope(dict(adjusted, device_safety=150)) == 450
     twice, accounting = runtime_reservations(adjusted, reference)
     assert twice == adjusted and not accounting["additional_engine_reservation_bytes"]
     with pytest.raises(ValueError, match="resource checkpoints"):
