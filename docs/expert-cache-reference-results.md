@@ -138,6 +138,16 @@ The old registry failure was reproduced: five failed and four passed on the
 initial source. Lazy FP6 API registration and stale/omitted exports were repaired;
 all nine registry tests now pass. No blanket exclusion was added.
 
+The documentation-commit [host run](https://github.com/local-inference-lab/b12x/actions/runs/35547240067)
+subsequently exposed a polling assumption in
+`test_two_ranks_agree_on_cached_choices_and_shard_remaining_races`. It expected
+both ranks to finish a bounded preparation advance in the same poll. Forcing
+either rank to use a shorter advance quantum reproduced the failure. The test
+now waits for both contributions, verifies their common tuning key, and exercises
+all cache combinations with either rank delayed. All 64 preparation-session
+tests pass locally. Preparation runtime code is unchanged; the failed hosted log
+and deterministic reproduction remain in the evidence bundle.
+
 Other retained failures include a missing Triton dependency in the first fresh
 CPU-only environment, a local temporary-directory quota failure, companion pytest
 importing the source checkout instead of its installed wheel, and the first

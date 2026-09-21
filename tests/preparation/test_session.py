@@ -312,9 +312,12 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("cached_ranks", ((), (0,), (1,), (0, 1)))
+@pytest.mark.parametrize("short_quantum_rank", (None, 0, 1))
 def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
-    tmp_path, monkeypatch, cached_ranks,
+    tmp_path, monkeypatch, cached_ranks, short_quantum_rank,
 ):
+    from b12x.preparation import session as implementation
+
     _deterministic_timer(monkeypatch)
     tuning = contract(values=(1, 2, 4, 8))
     for rank in cached_ranks:
@@ -349,14 +352,24 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
     authorizations = [None, None]
     caches = [None, None]
     progress = [None, None]
+
+    def advance(rank, job, authorization, cache):
+        # Independent ranks need not finish a bounded advance together.
+        with monkeypatch.context() as patch:
+            if rank == short_quantum_rank:
+                patch.setattr(implementation, "_ADVANCE_SECONDS", 0.0)
+            return job.advance(tuning=authorization, cache=cache)
+
     for _ in range(100):
         progress = [
-            job.advance(tuning=authorization, cache=cache)
-            for job, authorization, cache in zip(jobs, authorizations, caches, strict=True)
+            advance(rank, job, authorization, cache)
+            for rank, (job, authorization, cache) in enumerate(
+                zip(jobs, authorizations, caches, strict=True)
+            )
         ]
         authorizations = [None, None]
         caches = [None, None]
-        if any(state.ready_cache is not None for state in progress):
+        if all(state.ready_cache is not None for state in progress):
             snapshots = tuple(state.ready_cache for state in progress)
             assert all(snapshot is not None for snapshot in snapshots)
             caches = [snapshots, snapshots]
@@ -365,8 +378,9 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
             for state in progress
             for item in state.ready_tuning
         ]
-        if contributions:
+        if all(state.ready_tuning for state in progress):
             assert len(contributions) == 2
+            assert len({item.key for item in contributions}) == 1
             assert {item.candidate_index for item in contributions} == {0, 1}
             winner = min(
                 contributions,
