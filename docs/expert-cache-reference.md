@@ -15,6 +15,7 @@ It does not select another replacement policy.
 | Learned static; health-triggered decayed-LFU adaptation; optional anchor recovery | Physically tested experimental modes; static allocates no adaptive counters or control state |
 | Short routing history and specialist retention | Research-only; disabled in reference arms |
 | Distributed loader, EP, DBO, LoRA, speculation, non-SiLU/bias variants, input route weighting | Unsupported by this lane and rejected |
+| Qwen3-Next-80B NVFP4 | [Metadata audit and shared-composition integration](expert-cache-large-model.md); complete-model execution unqualified |
 | Other ModelOpt MoE checkpoints satisfying declared geometry/scales | Loader contracts exist; no general model-family qualification |
 | SM103 HBM/Grace native expert execution | Separate implemented prototype; requires physical B300 gates |
 | Native SM103 CPU-source full-model cache serving | Unsupported by the SM120 loader; an MXFP4/MXFP8 source/preparation adapter remains necessary |

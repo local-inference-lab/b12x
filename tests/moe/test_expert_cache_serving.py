@@ -288,3 +288,250 @@ def test_adaptive_omits_fully_resident_layers_from_observations(tmp_path, monkey
     assert value.observed_layers == ("layer",)
     assert value.plans["second"].query.max_pairs == 0
     assert value.counter.query.layers == (("layer", 4),)
+
+
+@pytest.fixture
+def next_checkpoint(tmp_path):
+    """Small complete target schema; no real checkpoint data or CUDA needed."""
+    import struct
+    from b12x.integration.vllm.checkpoint import expected_qwen3_next
+
+    config = dict(
+        architectures=["Qwen3NextForCausalLM"],
+        model_type="qwen3_next",
+        dtype="bfloat16",
+        hidden_act="silu",
+        norm_topk_prob=True,
+        hidden_size=128,
+        moe_intermediate_size=128,
+        num_experts=2,
+        num_hidden_layers=2,
+        num_experts_per_tok=1,
+        vocab_size=8,
+        layer_types=["linear_attention", "full_attention"],
+        shared_expert_intermediate_size=128,
+        head_dim=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+    )
+    excluded = [
+        "lm_head",
+        "*.mlp.gate",
+        "*.mlp.shared_expert_gate",
+        "*.linear_attn.in_proj_ba",
+        "*.linear_attn.in_proj_qkvz",
+        "*.self_attn.q_proj",
+        "*.self_attn.k_proj",
+        "*.self_attn.v_proj",
+    ]
+    scheme = dict(dynamic=False, num_bits=4, type="float", group_size=16)
+    config["quantization_config"] = dict(
+        quant_method="modelopt",
+        quant_algo="NVFP4",
+        ignore=excluded,
+        config_groups={
+            "group_0": dict(
+                targets=["Linear"], weights=scheme, input_activations=scheme
+            )
+        },
+    )
+    quant = dict(
+        quantization=dict(quant_algo="NVFP4", group_size=16, exclude_modules=excluded)
+    )
+    expected = expected_qwen3_next(config, quant)
+    expected["mtp.layers.0.aux.weight"] = dict(shape=[3], dtype="BF16")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(quant))
+
+    def write(changes=None):
+        import math
+        from b12x.integration.vllm.checkpoint import DTYPE_BYTES
+
+        records = {k: dict(v) for k, v in expected.items()}
+        if changes:
+            changes(records)
+        payload, header = bytearray(), {}
+        for name, item in records.items():
+            size = math.prod(item["shape"]) * DTYPE_BYTES[item["dtype"]]
+            data = struct.pack("<f", 1.0) if item["dtype"] == "F32" else bytes(size)
+            header[name] = dict(
+                shape=item["shape"],
+                dtype=item["dtype"],
+                data_offsets=[len(payload), len(payload) + size],
+            )
+            payload.extend(data)
+        raw = json.dumps(header).encode()
+        (tmp_path / "model.safetensors").write_bytes(
+            struct.pack("<Q", len(raw)) + raw + payload
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                dict(
+                    metadata=dict(total_size=len(payload)),
+                    weight_map={k: "model.safetensors" for k in header},
+                )
+            )
+        )
+
+    write()
+    return tmp_path, write
+
+
+def test_metadata_preflight_counts_target_only_and_checks_globals(next_checkpoint):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, _ = next_checkpoint
+    result = audit(path, check_values=True)
+    assert result["classes"]["optional_mtp"]["bytes"] == 6
+    assert result["required_target_bytes"] == sum(
+        r["bytes"] for k, r in result["classes"].items() if k != "optional_mtp"
+    )
+    assert result["routed_source_bytes"] == 2 * 2 * (
+        3 * 128 * 128 // 2 + 3 * 128 * 128 // 16 + 24
+    )
+    assert (
+        result["host_expert_lower_bound_bytes"]
+        == result["routed_source_bytes"] + result["canonical_mapped_bytes"]
+    )
+    from b12x.moe.fused_moe._cache_preparation import tier_layout
+
+    assert result["canonical_mapped_bytes"] == 2 * tier_layout(2, 128, 128)[1]
+    assert result["global_scale_values"].startswith("all_routed")
+    assert result["status"] == "metadata_compatible_execution_unqualified"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.layers.0.mlp.experts.1.down_proj.weight",
+        "model.layers.0.mlp.shared_expert_gate.weight",
+        "model.layers.0.linear_attn.in_proj_qkvz.weight",
+        "model.layers.1.self_attn.q_proj.weight",
+    ],
+)
+def test_metadata_preflight_rejects_missing_target_component(next_checkpoint, name):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, write = next_checkpoint
+    write(lambda records: records.pop(name))
+    with pytest.raises(ValueError, match="target tensor coverage"):
+        audit(path)
+
+
+def test_metadata_preflight_rejects_layout_and_global_scale_changes(next_checkpoint):
+    import struct
+    from b12x.integration.vllm.checkpoint import audit, inventory
+
+    path, write = next_checkpoint
+    key = "model.layers.0.mlp.experts.0.gate_proj.weight_scale_2"
+    tensors, _, _ = inventory(path)
+    with (path / "model.safetensors").open("r+b") as stream:
+        stream.seek(tensors[key]["offset"])
+        stream.write(struct.pack("<f", 2.0))
+    with pytest.raises(ValueError, match="unequal gate/up"):
+        audit(path, check_values=True)
+    write(lambda records: records[key].update(shape=[1]))
+    with pytest.raises(ValueError, match="layout mismatch"):
+        audit(path)
+
+
+def test_metadata_preflight_rejects_unindexed_data_and_truncation(next_checkpoint):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, write = next_checkpoint
+    write(
+        lambda records: records.update(
+            {"model.unhandled.weight": dict(shape=[1], dtype="BF16")}
+        )
+    )
+    with pytest.raises(ValueError, match="unexpected"):
+        audit(path)
+    write()
+    shard = path / "model.safetensors"
+    shard.write_bytes(shard.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="shard length"):
+        audit(path)
+
+
+def test_metadata_preflight_rejects_conflicting_quantization(next_checkpoint):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, _ = next_checkpoint
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization_config"]["ignore"].append("*.mlp.experts.*")
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="metadata disagrees"):
+        audit(path)
+
+
+def test_metadata_range_reader_never_accepts_full_shard_fallback(monkeypatch):
+    from scripts import inspect_expert_cache_checkpoint as script
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, limit):
+            raise AssertionError("full shard response was read")
+
+    monkeypatch.setattr(script, "urlopen", lambda *a, **k: Response())
+    with pytest.raises(ValueError, match="bounded checkpoint range"):
+        script.fetch("https://example.invalid/shard", 8, (0, 7))
+
+
+def test_metadata_export_hash_and_index_bind_every_header(next_checkpoint):
+    import hashlib
+    from b12x.integration.vllm.checkpoint import audit, read_header
+
+    path, _ = next_checkpoint
+    raw = read_header(path / "model.safetensors")
+    (path / "headers").mkdir()
+    header = path / "headers" / "model.safetensors.json"
+    header.write_bytes(raw)
+    (path / "header-manifest.json").write_text(
+        json.dumps(
+            dict(
+                repo="owner/model",
+                revision="a" * 40,
+                shards=[
+                    dict(
+                        shard="model.safetensors",
+                        file_bytes=(path / "model.safetensors").stat().st_size,
+                        header_bytes=len(raw),
+                        header_sha256=hashlib.sha256(raw).hexdigest(),
+                    )
+                ],
+            )
+        )
+    )
+    (path / "model.safetensors").unlink()
+    assert audit(path, headers_only=True)["revision"] == "a" * 40
+    with pytest.raises(ValueError, match="requires local checkpoint"):
+        audit(path, headers_only=True, check_values=True)
+    header.write_bytes(raw.replace(b"BF16", b"FFFF", 1))
+    with pytest.raises(ValueError, match="header export identity"):
+        audit(path, headers_only=True)
+
+
+def test_metadata_rejects_unbounded_header_and_shard_traversal(tmp_path):
+    import struct
+    from b12x.integration.vllm.checkpoint import HEADER_LIMIT, read_header, shard_name
+
+    path = tmp_path / "large.safetensors"
+    path.write_bytes(struct.pack("<Q", HEADER_LIMIT + 1))
+    with pytest.raises(ValueError, match="bounded read"):
+        read_header(path)
+    with pytest.raises(ValueError, match="basename"):
+        shard_name("../outside.safetensors")
