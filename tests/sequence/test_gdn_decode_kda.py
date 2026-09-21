@@ -219,6 +219,11 @@ def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block
         kg_cache=torch.empty((caps.max_state_slots, 32, columns, 256), dtype=torch.bfloat16, device=device),
     )
     binding = _prepare_binding(caps, args, override=gdn.GdnConfig(backend="cutedsl", recurrent_block_v=block_v))
+    with pytest.raises(ValueError, match=rf"{2 * columns} > 1 \* {columns}"):
+        gdn.bind_kda(
+            binding.plan, scratch=binding.scratch,
+            **{**args, "state_indices": binding.state_indices[:1]},
+        )
     gdn.run_kda(binding)
     torch.testing.assert_close(binding.recurrent_state, before, rtol=0, atol=0)
     actual = binding.output[:columns + 1].float()
