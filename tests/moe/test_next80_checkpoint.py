@@ -18,7 +18,7 @@ def test_parameter_inventory_distinguishes_cuda_host_views():
     from b12x.sequence._shared.disk_table import MappedHostAllocation
     from b12x.testing.lifecycle import parameter_storage
 
-    owner = MappedHostAllocation((16,), torch.float32, torch.device("cuda"))
+    owner = MappedHostAllocation((16,), torch.float32, torch.device("cuda", 0))
     try:
         model = torch.nn.Module()
         model.mapped = torch.nn.Parameter(owner.device_view, requires_grad=False)
