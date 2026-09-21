@@ -143,6 +143,101 @@ def inventory(directory, *, headers_only=False):
     return tensors, shards, manifest
 
 
+def validate_block_scales(directory):
+    """Check native target NVFP4 E4M3 scale bytes without loading expert weights.
+
+    Zero scales are valid for zero blocks. Negative scales and either NaN
+    encoding fail closed. Auxiliary MTP tensors are outside this target gate.
+    """
+    import numpy as np
+
+    directory = Path(directory)
+    tensors, _, _ = inventory(directory)
+    config = read_json(directory / "config.json")
+    expected = expected_qwen3_next(
+        config, read_json(directory / "hf_quant_config.json")
+    )
+    by_shard = defaultdict(list)
+    for name, spec in expected.items():
+        if name.endswith(".weight_scale") and spec["dtype"] == "F8_E4M3":
+            by_shard[tensors[name]["shard"]].append((name, tensors[name]))
+    checked = total = zero = 0
+    for shard, rows in by_shard.items():
+        with (directory / shard).open("rb") as stream:
+            for name, tensor in sorted(rows, key=lambda row: row[1]["offset"]):
+                stream.seek(tensor["offset"])
+                remaining = tensor["bytes"]
+                while remaining:
+                    chunk = stream.read(min(remaining, 8 << 20))
+                    if not chunk:
+                        raise ValueError(f"truncated block scales: {name}")
+                    values = np.frombuffer(chunk, dtype=np.uint8)
+                    if not np.all((values < 127) | (values == 128)):
+                        raise ValueError(
+                            f"nonfinite or negative target block scale: {name}"
+                        )
+                    zero += int(np.count_nonzero((values == 0) | (values == 128)))
+                    remaining -= len(chunk)
+                    total += len(chunk)
+                checked += 1
+    return dict(
+        tensors=checked,
+        bytes=total,
+        zero_scales=zero,
+        status="finite_nonnegative_native_e4m3_target_scales",
+    )
+
+
+def validate_loader_coverage(directory, coverage):
+    """Compare actual load callbacks with the strict Qwen3-Next target inventory."""
+    tensors, _, _ = inventory(directory)
+    expected = expected_qwen3_next(
+        read_json(Path(directory) / "config.json"),
+        read_json(Path(directory) / "hf_quant_config.json"),
+    )
+    if coverage.get("status") != "completed":
+        raise ValueError("checkpoint loader did not complete")
+    records = coverage["tensors"]
+    if set(records) - set(tensors) or set(expected) - set(records):
+        raise ValueError(
+            "actual loader checkpoint inventory differs from required target"
+        )
+    destinations, classes = {}, defaultdict(lambda: dict(tensors=0, bytes=0))
+    for name, spec in expected.items():
+        record = records[name]
+        accepted = [r for r in record["destinations"] if r["accepted"]]
+        if len(accepted) != 1:
+            raise ValueError(
+                f"target tensor requires one accepted loader destination: {name}"
+            )
+        if (
+            record["shape"] != spec["shape"]
+            or record["bytes"] != tensors[name]["bytes"]
+        ):
+            raise ValueError(f"loader tensor layout differs from checkpoint: {name}")
+        target = accepted[0]
+        if spec["kind"] == "routed" and target["device"] != "cpu":
+            raise ValueError(f"routed source materialized outside CPU: {name}")
+        if spec["kind"] != "routed" and not target["device"].startswith("cuda"):
+            raise ValueError(
+                f"ordinary target tensor is not on its resident device: {name}"
+            )
+        destinations[target["parameter"]] = target["device"]
+        classes[spec["kind"]]["tensors"] += 1
+        classes[spec["kind"]]["bytes"] += record["bytes"]
+    optional = set(tensors) - set(expected)
+    for name in optional:
+        if not name.startswith("mtp.") or records.get(name, {}).get("destinations"):
+            raise ValueError(f"auxiliary tensor was not excluded: {name}")
+    return dict(
+        status="complete_target_consumed_once_optional_mtp_excluded",
+        target_tensors=len(expected),
+        optional_mtp_tensors=len(optional),
+        destination_parameters=len(destinations),
+        classes=dict(classes),
+    )
+
+
 def expected_qwen3_next(config, quant):
     """Describe the target model implemented by the maintained companion.
 

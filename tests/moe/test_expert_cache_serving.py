@@ -17,6 +17,37 @@ from b12x.moe.fused_moe.residency import profile_from_counts
 from tests.moe.test_prepared_expert_cache import source
 
 
+def test_checkpoint_receipt_reuses_hash_and_rejects_same_size_mutation(tmp_path, monkeypatch):
+    from b12x.integration.vllm.checkpoint_identity import checkpoint_identity
+
+    root = tmp_path / "model"
+    root.mkdir()
+    shard = root / "model.safetensors"
+    shard.write_bytes(b"original")
+    receipt = tmp_path / "identity.json"
+    first = checkpoint_identity(root, output=receipt)
+    assert checkpoint_identity(root, receipt=receipt) == first
+    shard.write_bytes(b"mutation")
+    with pytest.raises(ValueError, match="stale"):
+        checkpoint_identity(root, receipt=receipt)
+
+
+def test_checkpoint_receipt_rejects_added_inventory_and_does_not_change_digest(tmp_path):
+    import hashlib
+    from b12x.integration.vllm.checkpoint_identity import checkpoint_identity
+
+    root = tmp_path / "model"
+    root.mkdir()
+    (root / "a.safetensors").write_bytes(b"weights")
+    receipt = tmp_path / "identity.json"
+    document = checkpoint_identity(root, output=receipt)
+    expected = hashlib.sha256(b"a.safetensors\0" + (7).to_bytes(8, 'little') + b"weights")
+    assert document['fingerprint'] == expected.hexdigest()
+    (root / "config.json").write_text('{}')
+    with pytest.raises(ValueError, match="stale"):
+        checkpoint_identity(root, receipt=receipt)
+
+
 def test_experimental_check_cadence_backs_off_only_on_observed_health():
     from benchmarks.moe.expert_cache_serving import maintenance_check_interval
 
@@ -403,6 +434,43 @@ def test_metadata_preflight_counts_target_only_and_checks_globals(next_checkpoin
     assert result["canonical_mapped_bytes"] == 2 * tier_layout(2, 128, 128)[1]
     assert result["global_scale_values"].startswith("all_routed")
     assert result["status"] == "metadata_compatible_execution_unqualified"
+
+
+def test_local_block_scales_accept_zero_and_reject_nan(next_checkpoint):
+    from b12x.integration.vllm.checkpoint import inventory, validate_block_scales
+
+    path, _ = next_checkpoint
+    result = validate_block_scales(path)
+    assert result['bytes'] == result['zero_scales'] > 0
+    tensors, _, _ = inventory(path)
+    name = 'model.layers.0.mlp.experts.0.gate_proj.weight_scale'
+    with (path / tensors[name]['shard']).open('r+b') as stream:
+        stream.seek(tensors[name]['offset'])
+        stream.write(bytes([127]))
+    with pytest.raises(ValueError, match='nonfinite or negative'):
+        validate_block_scales(path)
+
+
+def test_actual_loader_coverage_requires_callbacks_and_excludes_mtp(next_checkpoint):
+    from b12x.integration.vllm.checkpoint import (
+        inventory, expected_qwen3_next, read_json, validate_loader_coverage)
+
+    path, _ = next_checkpoint
+    tensors, _, _ = inventory(path)
+    expected = expected_qwen3_next(read_json(path / 'config.json'), read_json(path / 'hf_quant_config.json'))
+    coverage = dict(status='completed', tensors={n: dict(
+        shape=t['shape'], bytes=t['bytes'], destinations=[dict(
+            parameter=n, device='cpu' if expected[n]['kind'] == 'routed' else 'cuda:0', accepted=True)]
+            if n in expected else []) for n,t in tensors.items()})
+    assert validate_loader_coverage(path, coverage)['target_tensors'] == len(expected)
+    name = next(iter(expected))
+    destination = coverage['tensors'][name]['destinations'].pop()
+    with pytest.raises(ValueError, match='one accepted'):
+        validate_loader_coverage(path, coverage)
+    coverage['tensors'][name]['destinations'].append(destination)
+    coverage['tensors']['mtp.layers.0.aux.weight']['destinations'].append(destination)
+    with pytest.raises(ValueError, match='auxiliary tensor'):
+        validate_loader_coverage(path, coverage)
 
 
 @pytest.mark.parametrize(

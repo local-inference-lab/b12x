@@ -1,0 +1,8 @@
+{"text":"Describe how a neighborhood can organize a book exchange, including labeling, weather protection and a fair way to keep it supplied.","workload":"calibration_general"}
+{"text":"Compare taking a train and driving for a family weekend away. Explain which practical details matter when planning either option.","workload":"calibration_general"}
+{"text":"Write a Python function that groups dated expense records by calendar month and returns totals. Explain input validation and a small example.","workload":"calibration_code"}
+{"text":"Show a JavaScript implementation of a bounded queue with enqueue and dequeue operations. Explain how it handles empty and full states.","workload":"calibration_code"}
+{"text":"A garden rectangle has perimeter 54 metres and one side is twice the other. Derive both side lengths and the area, explaining each step.","workload":"calibration_math"}
+{"text":"Explain why the sum of the first n odd positive integers is n squared. Give both an algebraic argument and a geometric interpretation.","workload":"calibration_math"}
+{"text":"En español, explica cómo preparar una visita a una biblioteca pública y qué preguntas puede hacer una persona que se registra por primera vez.","workload":"calibration_multilingual"}
+{"text":"日本語で、家庭で食品の無駄を減らすための具体的な方法を説明してください。買い物、保存、残り物の活用を含めてください。","workload":"calibration_multilingual"}

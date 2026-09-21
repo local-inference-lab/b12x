@@ -1,8 +1,7 @@
 """CPU checkpoint ownership for deferred expert-cache preparation."""
 
 from dataclasses import dataclass
-import hashlib
-from pathlib import Path
+import os
 
 import torch
 
@@ -122,20 +121,12 @@ class ExpertWeightSource:
 def checkpoint_fingerprint(directory):
     """Hash local checkpoint/config contents with bounded CPU memory.
 
-    Call once per checkpoint admission, before creating model parameters.
-    Download revision labels alone are not accepted as content verification.
+    An explicit B12X_CHECKPOINT_IDENTITY receipt avoids rescanning immutable
+    files across engine trials. File replacement or modification fails closed.
+    Download revision labels alone are not content verification.
     """
-    root = Path(directory)
-    files = sorted(
-        (*root.glob("*.safetensors"), *root.glob("*.json")), key=lambda p: p.name
-    )
-    if not any(p.suffix == ".safetensors" for p in files):
-        raise ValueError("checkpoint directory has no safetensors shards")
-    digest = hashlib.sha256()
-    for path in files:
-        digest.update(path.name.encode() + b"\0")
-        digest.update(path.stat().st_size.to_bytes(8, "little"))
-        with path.open("rb") as stream:
-            while block := stream.read(8 << 20):
-                digest.update(block)
-    return digest.hexdigest()
+    from b12x.integration.vllm.checkpoint_identity import checkpoint_identity
+
+    return checkpoint_identity(
+        directory, receipt=os.environ.get("B12X_CHECKPOINT_IDENTITY")
+    )["fingerprint"]

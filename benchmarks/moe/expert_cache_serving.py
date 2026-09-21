@@ -38,12 +38,12 @@ async def run(args):
         activation="w4a16",
         profile_path=str(args.profile),
         workload=args.workload,
-        expert_device_bytes=args.cache_gib << 30,
+        expert_device_bytes=args.cache_bytes if args.cache_bytes is not None else args.cache_gib << 30,
         host_bytes=args.host_gib << 30,
         kv_reserved_bytes=args.kv_gib << 30,
         graph_reserved_bytes=512 << 20,
         device_safety_bytes=1 << 30,
-        host_safety_bytes=1 << 30,
+        host_safety_bytes=args.host_safety_gib << 30,
         max_pairs_per_layer=args.layer_pairs,
         health_probes=args.control == "health",
         history_depth=args.history_depth,
@@ -51,11 +51,17 @@ async def run(args):
     )
     engine_args = AsyncEngineArgs(
         model=args.model,
+        generation_config='vllm',
+        model_loader_extra_config=({"tensor_coverage_path": str(args.loader_coverage)}
+                                   if args.loader_coverage else {}),
         dtype="bfloat16",
         max_model_len=args.context,
         max_num_seqs=args.concurrency,
         max_num_batched_tokens=args.capacity,
         kv_cache_memory_bytes=args.kv_gib << 30,
+        offload_config=({'offload_backend': 'uva', 'uva': {
+            'cpu_offload_gb': args.expert_offload_gib, 'cpu_offload_params': ['experts']}}
+            if args.expert_offload_gib else {}),
         enable_prefix_caching=False,
         kv_cache_dtype="bfloat16",
         attention_config={"backend": "FLASHINFER"},
@@ -280,7 +286,7 @@ async def run(args):
             queue = await engine.add_request(
                 f"cache-{index}",
                 prompt["text"],
-                SamplingParams(temperature=0, max_tokens=args.tokens, ignore_eos=True),
+                SamplingParams(temperature=0, max_tokens=args.tokens, ignore_eos=not args.natural_eos),
             )
             admitted.set()
             complete = False
@@ -305,7 +311,7 @@ async def run(args):
                     else engine.generate(
                         prompt["text"],
                         SamplingParams(
-                            temperature=0, max_tokens=args.tokens, ignore_eos=True
+                            temperature=0, max_tokens=args.tokens, ignore_eos=not args.natural_eos
                         ),
                         request_id=f"cache-{index}",
                     )
@@ -514,6 +520,11 @@ def main():
     p.add_argument("--shutdown-case", default="normal", choices=("normal", "health-pending",
                    "health-completed", "health-cancelled", "maintenance-cancelled"))
     p.add_argument("--model", required=True)
+    p.add_argument('--natural-eos', action='store_true', help='Allow model EOS in correctness smokes')
+    p.add_argument('--expert-offload-gib', type=float, default=0,
+                   help='Ordinary native UVA control, selecting only routed experts by exact name segment')
+    p.add_argument("--loader-coverage", type=Path,
+                   help="Load-time tensor destinations; requires the companion coverage diagnostic")
     p.add_argument(
         "--mode", choices=("profile", "static", "adaptive", "native"), required=True
     )
@@ -522,7 +533,9 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--workload", default="general")
     p.add_argument("--cache-gib", type=int, default=8)
+    p.add_argument('--cache-bytes', type=int, help='Exact planner-derived expert envelope; overrides --cache-gib')
     p.add_argument("--host-gib", type=int, default=40)
+    p.add_argument('--host-safety-gib', type=int, default=1)
     p.add_argument("--kv-gib", type=int, default=2)
     p.add_argument("--context", type=int, default=2048)
     p.add_argument("--capacity", type=int, default=64)
@@ -614,6 +627,8 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if args.expert_offload_gib < 0 or (args.expert_offload_gib and args.mode != 'native'):
+        p.error('selective UVA offload requires native mode and a nonnegative envelope')
     if args.repeat_lifecycle < 1:
         p.error("repeat lifecycle must be positive")
     if args.shutdown_case != "normal" and (args.mode != "adaptive" or args.control != "health"):

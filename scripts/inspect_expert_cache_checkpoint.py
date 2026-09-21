@@ -111,13 +111,27 @@ def main():
     )
     group.add_argument("--repository", help="Fetch metadata only from Hugging Face")
     parser.add_argument("--revision")
+    parser.add_argument(
+        "--check-block-scales",
+        action="store_true",
+        help="Validate all native Qwen3-Next target block-scale values locally",
+    )
     parser.add_argument("--metadata-output", type=Path)
     parser.add_argument("--device-bytes", type=int, required=True)
     parser.add_argument("--host-bytes", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--identity-output",
+        type=Path,
+        help="Hash local contents once and write a reusable immutable-file receipt",
+    )
     args = parser.parse_args()
     if args.output.exists():
         parser.error("report path already exists")
+    if args.identity_output and not args.model:
+        parser.error("content identity requires complete local files")
+    if args.check_block_scales and not args.model:
+        parser.error("block scale values require complete local files")
     if min(args.device_bytes, args.host_bytes) <= 0:
         parser.error("memory capacities must be positive")
     if args.repository:
@@ -128,6 +142,16 @@ def main():
     result = audit(
         directory, headers_only=args.model is None, check_values=args.model is not None
     )
+    if args.identity_output:
+        from b12x.integration.vllm.checkpoint_identity import checkpoint_identity
+
+        result["content_identity"] = checkpoint_identity(
+            directory, output=args.identity_output
+        )
+    if args.check_block_scales:
+        from b12x.integration.vllm.checkpoint import validate_block_scales
+
+        result["block_scale_values"] = validate_block_scales(directory)
     result.update(
         source=source_identity(ROOT),
         command=sys.argv,
