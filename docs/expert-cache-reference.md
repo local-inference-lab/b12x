@@ -36,17 +36,17 @@ artifact and receipt directories. The companion branch is
 
 Build prerequisites are Python 3.12, a CUDA development toolkit compatible with
 Torch 2.13, a C++ toolchain, CMake/Ninja, Rust/Cargo, and libdw/elfutils development
-headers. The recorded environment uses CUDA 13.3 and CUTLASS DSL 4.6.2. Install
-companion runtime and build requirements into the isolated environment, then
-b12x with its pinned CUTLASS packages. Do not overlay Python sources onto a wheel
-from another companion revision.
+headers. The recorded environment uses CUDA 13.3, CUDA bindings 13.0.3, and
+CUTLASS DSL 4.6.2. Install companion runtime and build requirements into the
+isolated environment, then b12x with its pinned CUTLASS packages. Do not overlay
+Python sources onto a wheel from another companion revision.
 
 ```bash
 uv venv --python 3.12 "$ENV_DIR"
 . "$ENV_DIR/bin/activate"
 uv pip install -r "$VLLM_SOURCE/requirements/cuda.txt" \
   -r "$VLLM_SOURCE/requirements/build/cuda.txt"
-uv pip install -e "$B12X_SOURCE[dev]"
+uv pip install -e "$B12X_SOURCE[dev]" "cuda-python==13.0.3"
 export TORCH_CUDA_ARCH_LIST=12.0
 export MAX_JOBS=16 NVCC_THREADS=2
 bash "$B12X_SOURCE/scripts/build_expert_cache_companion.sh" \
@@ -97,9 +97,10 @@ Omit `--calibration-prompts` to use an explicitly supplied validated profile.
 The serving runner checks ordinary non-cache serving, then alternates static and
 adaptive order across three pairs. Exact paired token equality, captured graph
 and cache addresses, at least one actual promotion, explicit shutdown, and
-released cache owners are acceptance gates. GPU skips fail GPU acceptance;
-architecture-dependent host skips remain visible in JUnit and do not qualify GPU
-work. Registry failures are never excluded.
+released cache owners are acceptance gates. GPU skips fail GPU acceptance.
+Host-only runs retain individual GPU requirements and documented contract
+exclusions in JUnit; skips do not qualify GPU work. Registry failures are never
+excluded.
 
 The fixed reference settings are 8 GiB cache envelope, 40 GiB host envelope,
 2 GiB BF16 KV, context 2048, prepared capacity 64, two prepared pairs per layer,
@@ -171,3 +172,7 @@ SM120 source-built serving does not supply native SM103 loading, tcgen05/TMEM,
 or Grace TMA acceptance. Ripper measurements describe **PCIe Gen4 x16**; record
 negotiated link state under load. Gen5 transport and B300 performance require
 separate measurements.
+
+See the [source-bound qualification report](expert-cache-reference-results.md)
+for measured lifecycle bounds, serving samples, retained failures and deferred
+physical gates.

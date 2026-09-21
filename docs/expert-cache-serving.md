@@ -1,8 +1,7 @@
 # Prepared SM120 expert-cache serving
 
 Status: **implemented experimental serving path**. The companion vLLM branch
-`codex/b12x-expert-cache` at `1d1f870bd6`, based on the maintained PreparationSession branch at
-`ef1aeaf080879865febd27a92c5644233d157987`, loads routed expert parameters on CPU
+`codex/b12x-expert-cache` loads routed expert parameters on CPU
 and submits their placement to b12x before CUDA graph capture. This path requires
 physical SM120, one GPU, native ModelOpt NVFP4 weights and explicitly selected
 W4A16 routed activations. It is opt-in; ordinary vLLM loading and static SM103
