@@ -184,6 +184,52 @@ def test_model_admission_counts_existing_device_use_once_and_bootstraps_fairly(
     assert value.counter is not None
 
 
+def test_calibration_starts_after_warmup_and_saves_only_new_counts(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from b12x.moe.residency.contracts import LayerRoutingCounts, RoutingSnapshot
+    import b12x.integration.vllm.expert_cache as module
+
+    value = model(tmp_path, monkeypatch)
+    value.declare(ExecutionCapacity(max_tokens=4, top_k=4))
+    with pytest.raises(ValueError, match="must start"):
+        value.save_profile(quiescent=True)
+    with pytest.raises(ValueError, match="prepared, drained"):
+        value.start_profile(quiescent=True)
+    startup = RoutingSnapshot(epoch=1, rank=0, layers=tuple(
+        LayerRoutingCounts(layer=name, phase="decode", counts=(9, 0, 0, 0))
+        for name in value.sources))
+    counters = Mock(snapshot=Mock(return_value=startup))
+    value._counters = counters
+    with pytest.raises(ValueError, match="prepared, drained"):
+        value.start_profile()
+    counters.reset.assert_not_called()
+    result = value.start_profile(quiescent=True)
+    assert result["discarded_startup_observations"]["layers"][0]["counts"] == (9, 0, 0, 0)
+    counters.reset.assert_called_once_with(quiescent=True)
+    counters.set_token_limit.assert_called_once_with(0)
+    with pytest.raises(RuntimeError, match="already started"):
+        value.start_profile(quiescent=True)
+    calibrated = replace(startup, epoch=2, layers=tuple(
+        replace(row, counts=(0, 3, 2, 10)) for row in startup.layers))
+    counters.snapshot.return_value = calibrated
+    monkeypatch.setattr(module.moe, "routing_profile_state", lambda _: counters)
+    value.save_profile(quiescent=True)
+    artifact = json.loads((tmp_path / "profile.json").read_text())
+    assert all(p["selection_counts"] == [0, 3, 2, 10]
+               for p in artifact["placements"].values())
+
+
+@pytest.mark.parametrize("mode", ["static", "adaptive"])
+def test_calibration_reset_cannot_reset_a_serving_observer(tmp_path, mode):
+    from unittest.mock import Mock
+
+    value = ExpertCacheModel(config(tmp_path, mode=mode), "a" * 64, "cuda:0")
+    value._counters = Mock()
+    with pytest.raises(ValueError, match="explicit profile mode"):
+        value.start_profile(quiescent=True)
+    value._counters.reset.assert_not_called()
+
+
 def write_profile(value, hot_count=2):
     value.capacity = ExecutionCapacity(max_tokens=4, top_k=4)
     placements = {

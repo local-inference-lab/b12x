@@ -143,6 +143,11 @@ async def run(args):
         if args.resources:
             record("resources", result=await engine.collective_rpc(
                 "b12x_lifecycle_resources", args=("graphs_ready",)))
+        if args.mode == "profile":
+            await engine.pause_generation(mode="keep", clear_cache=False)
+            record("profile_start", result=await engine.collective_rpc(
+                "b12x_expert_cache_start_profile", kwargs={"quiescent": True}))
+            await engine.resume_generation()
         if args.mode == "adaptive" and args.control != "observe":
             controller_type = (
                 VllmResidencyMaintenance

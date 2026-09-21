@@ -364,6 +364,13 @@ class ResidencyEpochWorkerExtension:
                 "generation": plan.prepared.state.updates.snapshot().generation if plan.prepared.state.updates else 0}
                 for name,plan in model.plans.items()}}
 
+    def b12x_expert_cache_start_profile(self, *, quiescent=False):
+        """Exclude startup work after the caller completes engine pause/drain."""
+        model = getattr(self.model_runner, "b12x_expert_cache", None)
+        if model is None:
+            raise RuntimeError("model has no prepared canonical expert cache")
+        return model.start_profile(quiescent=quiescent)
+
     def b12x_expert_cache_save_profile(self, *, quiescent=False):
         """Caller must first complete the engine pause/drain protocol."""
         model = getattr(self.model_runner, "b12x_expert_cache", None)

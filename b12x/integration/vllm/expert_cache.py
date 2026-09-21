@@ -109,6 +109,7 @@ class ExpertCacheModel:
         self.capacity = None
         self.source_reserved_bytes = 0
         self._counters = None
+        self._profile_started = False
         self.observed_layers = ()
         self.load_device_peak_bytes = 0
 
@@ -138,6 +139,7 @@ class ExpertCacheModel:
         self.plans.clear()
         self.placements.clear()
         self.source_reserved_bytes = 0
+        self._profile_started = False
 
     def add_source(self, source):
         name = source.weights.layer_name
@@ -481,9 +483,25 @@ class ExpertCacheModel:
                 self.counter, layer=name, phase="decode", topk_ids=ids
             ).run()
 
+    def start_profile(self, *, quiescent=False):
+        """Begin calibration after engine warmup, retaining discarded observations."""
+        if self.config.mode != "profile":
+            raise ValueError("calibration start requires explicit profile mode")
+        if quiescent is not True or self._counters is None:
+            raise ValueError("calibration start requires a prepared, drained engine")
+        if self._profile_started:
+            raise RuntimeError("calibration has already started")
+        before = self._counters.snapshot(quiescent=True)
+        self._counters.reset(quiescent=True)
+        self._counters.set_token_limit(0)
+        self._profile_started = True
+        return {"discarded_startup_observations": asdict(before)}
+
     def save_profile(self, *, quiescent=False):
         if self.config.mode != "profile":
             raise ValueError("only explicit profile mode may write a learned artifact")
+        if not self._profile_started:
+            raise ValueError("calibration must start after engine warmup before saving")
         snapshot = moe.routing_profile_state(self.counter).snapshot(quiescent=quiescent)
         rows = {row.layer: row for row in snapshot.layers}
         if any(not sum(row.counts) for row in rows.values()):
