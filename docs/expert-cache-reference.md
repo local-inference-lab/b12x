@@ -176,3 +176,8 @@ separate measurements.
 See the [source-bound qualification report](expert-cache-reference-results.md)
 for measured lifecycle bounds, serving samples, retained failures and deferred
 physical gates.
+
+The [resident-capacity experiment](expert-cache-capacity.md) reuses these gates
+with capacity-specific profiles derived from immutable calibration counts.
+It separates intentionally constrained expert envelopes from feasible
+all-resident execution while keeping KV and graph reservations fixed.

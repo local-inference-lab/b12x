@@ -82,6 +82,36 @@ def allocate(queries, envelope, counter_bytes, memory):
             return counts, rows, used
 
 
+def runtime_reservations(baseline, reference):
+    """Charge observed engine storage beyond the pre-preparation reservation.
+
+    CUDA free-memory readings include Torch pools and native allocations. Only
+    their excess over already charged device storage is added; safety remains
+    an additional fixed reserve rather than paying for known engine storage.
+    """
+    model = ResidencyServingMemory(**baseline)
+    observations = [
+        r
+        for event in reference
+        if event["kind"] == "resources"
+        for r in event["result"]
+        if r["stage"] in ("graphs_ready", "serving_finished")
+    ]
+    if not observations or any(
+        r["device_total"] != model.device_capacity for r in observations
+    ):
+        raise ValueError("reference needs matching graph/serving resource checkpoints")
+    observed = max(r["device_total"] - r["device_free"] for r in observations)
+    additional = max(0, observed - (model.device_bytes - model.device_safety))
+    adjusted = replace(model, other_device=model.other_device + additional)
+    return asdict(adjusted), dict(
+        observed_device_used_bytes=observed,
+        additional_engine_reservation_bytes=additional,
+        declared_model_memory=baseline,
+        adjusted_model_memory=asdict(adjusted),
+    )
+
+
 def plan(profile, counts, baseline, envelope, *, device, capacity=64, layer_pairs=2):
     identity = profile["identity"]
     queries = {
@@ -168,6 +198,12 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args()
+    import torch
+
+    if torch.cuda.get_device_capability(args.device) != (12, 0):
+        raise ValueError(
+            "capacity preflight requires the physical SM120 reference device"
+        )
     args.output.mkdir(parents=True, exist_ok=False)
     profile = json.loads(args.calibrated_profile.read_text())
     calibration = [
@@ -181,14 +217,17 @@ def main():
     config = next(r for r in reference if r["kind"] == "configuration")
     if status["checkpoint"] != profile["identity"]["checkpoint"]:
         raise ValueError("reference checkpoint differs from calibration")
+    baseline, accounting = runtime_reservations(status["memory"], reference)
     provenance = dict(
         source=source_identity(Path(__file__).resolve().parents[2]),
+        device=str(torch.cuda.get_device_properties(args.device)),
         calibrated_profile_sha256=sha256(args.calibrated_profile),
         calibration_receipt_sha256=sha256(args.calibration_receipt),
         reference_receipt_sha256=sha256(args.reference_receipt),
         canonical_counts_sha256=digest(counts),
         calibration_arguments=calibration[0]["arguments"],
         reference_arguments=config["arguments"],
+        reference_memory_accounting=accounting,
     )
     results = []
     for gib in args.cache_gib:
@@ -197,7 +236,7 @@ def main():
             row, placements = plan(
                 profile,
                 counts,
-                status["memory"],
+                baseline,
                 gib << 30,
                 device=args.device,
                 capacity=config["arguments"]["capacity"],

@@ -124,11 +124,12 @@ compile-only resource census.
 
 ## Companion, Grace and Station boundaries
 
-The companion vLLM branch needs adaptation to preparation sessions before
-full-model tests. Preserve its GLM selection compaction, speculative pool
-history and unmapped-slot guards. Run eager, graph and speculative modes on
-the same checkpoint and requests, recording accuracy and repeatability.
-Historical fixed-request passes do not waive the recorded failed GLM gates.
+The companion vLLM branch has a PreparationSession integration and a qualified
+experimental SM120 NVFP4 cache lane. Native SM103 full-model tests still require
+an MXFP4/MXFP8 source/preparation adapter. Preserve the companion's GLM selection
+compaction, speculative pool history and unmapped-slot guards when qualifying
+those separate model paths. Historical fixed-request passes do not waive the
+recorded failed GLM gates or establish speculative support for the cache lane.
 
 Engram device/mapped-host owners must outlive every binding and graph. Grace
 placement requires live coherence/capability probes. Disk lookups are

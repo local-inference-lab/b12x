@@ -4,7 +4,12 @@ from dataclasses import replace
 
 import pytest
 
-from benchmarks.moe.expert_cache_capacity import allocate, calibration_counts, plan
+from benchmarks.moe.expert_cache_capacity import (
+    allocate,
+    calibration_counts,
+    plan,
+    runtime_reservations,
+)
 from b12x.integration.vllm.expert_cache import digest
 from b12x.moe.fused_moe._cache_preparation import ExpertCacheMemory, ExpertCacheQuery
 from b12x.moe.fused_moe.residency import profile_from_counts
@@ -139,3 +144,35 @@ def test_capacity_projection_keeps_counts_and_noncache_reservations(monkeypatch)
             device="cpu",
             capacity=4,
         )
+
+
+def test_runtime_reservation_counts_only_unaccounted_storage():
+    memory = dict(
+        device_capacity=1000,
+        host_capacity=1000,
+        resident_experts=100,
+        backing_experts=200,
+        dense_model=100,
+        kv=100,
+        workspace=100,
+        graphs=100,
+        metadata=0,
+        host_staging=0,
+        device_safety=100,
+        host_safety=100,
+        other_device=50,
+    )
+    reference = [
+        dict(
+            kind="resources",
+            result=[dict(stage="graphs_ready", device_total=1000, device_free=400)],
+        )
+    ]
+    adjusted, accounting = runtime_reservations(memory, reference)
+    assert adjusted["other_device"] == 100
+    assert adjusted["device_safety"] == 100
+    assert accounting["additional_engine_reservation_bytes"] == 50
+    twice, accounting = runtime_reservations(adjusted, reference)
+    assert twice == adjusted and not accounting["additional_engine_reservation_bytes"]
+    with pytest.raises(ValueError, match="resource checkpoints"):
+        runtime_reservations(memory, [])

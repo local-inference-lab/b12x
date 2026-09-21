@@ -128,7 +128,7 @@ evidence, not physical B300 evidence.
 | Experimental learned-anchor recovery implemented | An immutable validated learned profile supplies a prepared byte mask for counterfactual cold counts. Explicit re-centering restricts existing candidates/victims without changing score arithmetic. Full-window rechecks and global budgets can decline movement. SM120 serving qualification remains workload-specific; the reference is not a throughput predictor. |
 | Implemented and tested on SM120 | Residency component tests cover quantization, route compaction, ordered-FMA adversaries, invalid int64 IDs, mapped-host reads, live-count reuse and allocation-free CUDA graph replay. Prepared counter tests add sampling, TP ownership, overflow and lifecycle coverage. These tests do not execute SM103 tcgen05 kernels or establish Grace-backed TMA legality. |
 | Implemented, awaiting physical SM103 qualification | Native tcgen05/TMEM dense and expert kernels, HBM/Grace complete-operator parity, Grace-backed TMA operands, architecture launch/resource behavior, complete model execution, chunk-parallel GDN prefill and experimental Station TP2 communication. |
-| Independent PR CI pending | Source-bound local receipts are separate from CI acceptance. The repository's wheel-release workflow has no pull-request trigger. |
+| Independent host CI implemented and qualified | The isolated `expert-cache-host.yml` workflow exercises imports, registry, preparation and cache contracts on pull requests and the working branch. The [reference qualification report](expert-cache-reference-results.md) identifies passing hosted runs. Host CI does not qualify physical SM103 execution. |
 | Companion integration | The maintained PreparationSession base has an opt-in SM120 CPU-source loader and prepared canonical cache in `codex/b12x-expert-cache`. Native SM103 loading/serving remains deferred. The [serving guide](expert-cache-serving.md) separates supported scope, configuration and measured evidence. |
 | Unsupported or research-only | Separate tiny-M and pipelined-TMEM MoE strategies, concurrent residency adaptation, distributed cache-loader serving, measured HBM/Grace overlap, direct HBM RDMA and frozen QSRT coupled high-rate conversion. |
 
@@ -147,8 +147,9 @@ preparation corpus passes **86 declarations / 244 programs**. The
 record the separate physical SM120 serving, kernel and engine-build gates.
 The focused physical suite passes 25 cases and targeted memcheck/synccheck;
 the source-built companion passes ten engine/loader cases plus adaptive and
-ordinary graph-serving smoke tests. The five MXFP6 registry failures reproduce
-on untouched `b067db4` and remain a separate unresolved gate.
+ordinary graph-serving smoke tests. The five MXFP6 registry failures reproduced
+on untouched `b067db4` in that historical run. The [reference qualification](expert-cache-reference-results.md)
+records their subsequent fix and passing independent host acceptance.
 The extraction results below remain historical evidence for their own source.
 
 The shared-residency extraction evidence binds package SHA256
@@ -161,7 +162,7 @@ independently of documentation and the subsequent commit.
 | Gate | Result and scope |
 | --- | --- |
 | Host preparation, architecture and selected MoE suites | 1,052 passed, 66 skipped, including 15 shared-contract/import/artifact tests, 16 recent-frequency policy tests and exchange/automatic-residency regressions. |
-| Repository-wide registry check | 4 passed, 5 failed; the same five MXFP6 metadata/registry failures reproduce on untouched `181e234b`. This separate gate is unresolved. |
+| Historical repository-wide registry check | 4 passed, 5 failed; the same five MXFP6 metadata/registry failures reproduce on untouched `181e234b`. These failures belong to that source; the reference qualification records their later resolution. |
 | Portable residency, counters, exchange and policy loop | 22 passed, 11 physical-SM103 skips on SM120. The policy tests run existing counters, partitioner and slot copies through changing workloads, preserving payload bytes, graph identity, addresses and allocator counters. |
 | Policy-loop sanitizers | 2 passed, 2 SM103-only skips under each of memcheck and synccheck, zero errors. Portable byte probes do not execute native SM103 expert MMA. |
 | Fresh focused SM103 compilation | Static residency, update-enabled residency and routing profiling: 3 declarations, 14 distinct programs/native CuTe exports, CUDA uninitialized. Extraction adds no kernel and changes no preparation query. |

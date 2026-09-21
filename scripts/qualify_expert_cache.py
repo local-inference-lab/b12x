@@ -130,9 +130,11 @@ def main(argv=None):
         schema="b12x-expert-cache-acceptance/v1",
         status="running",
         tier=args.tier,
-        serving_scope="all-resident-static"
-        if args.all_resident_static
-        else "static-adaptive",
+        serving_scope=(
+            "all-resident-static" if args.all_resident_static else "static-adaptive"
+        )
+        if args.tier == "serving"
+        else None,
         command=sys.argv if argv is None else argv,
         source=source_identity(ROOT),
         source_files=source_files(),

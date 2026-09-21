@@ -18,7 +18,10 @@ constructor with a different admitted resident count; it does not edit a profile
 budget or reuse evaluation routes. Every capacity uses identical rankings and
 counts, including deterministic expert-ID tie breaking. Profile construction
 records the calibration and reference-receipt hashes. Non-cache reservations and
-retained CPU-source bytes come from the completed reference run. Live loader
+retained CPU-source bytes come from the completed reference run. The report also
+charges observed graph/serving device use beyond the loader's pre-preparation
+reservation. It adds only the unaccounted increment, including native allocations
+and allocator pools, while retaining the fixed safety reserve. Live loader
 admission remains authoritative, including changes in free memory.
 
 ```bash

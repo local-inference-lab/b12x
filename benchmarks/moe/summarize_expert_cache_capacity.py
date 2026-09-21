@@ -67,6 +67,26 @@ def trial(path):
         memory=status["memory"],
         load_device_peak_bytes=status["load_device_peak_bytes"],
         resource_stages=resource_stages,
+        resource_checkpoints=[
+            {
+                k: r.get(k)
+                for k in (
+                    "stage",
+                    "time_ns",
+                    "allocated",
+                    "reserved",
+                    "peak_allocated",
+                    "device_free",
+                    "device_total",
+                    "mapped_bytes",
+                    "cpu_source_bytes",
+                    "graph_owners",
+                    "pending_health",
+                    "status",
+                )
+            }
+            for r in resources
+        ],
         backlog=backlog,
         pair_cap_saturation=sum(e["selected_pairs"] == cap for e in epochs)
         / len(epochs)

@@ -153,12 +153,12 @@ def test_model_admission_counts_existing_device_use_once_and_bootstraps_fairly(
     assert value.counter is not None
 
 
-def write_profile(value):
+def write_profile(value, hot_count=2):
     value.capacity = ExecutionCapacity(max_tokens=4, top_k=4)
     placements = {
         name: profile_from_counts(
             counts=(1, 2, 20, 30),
-            hot_count=2,
+            hot_count=hot_count,
             layer=name,
             model_fingerprint="a" * 64,
             workload="general",
@@ -193,6 +193,25 @@ def test_static_and_adaptive_start_from_identical_learned_profile(
     assert static.counter is None and adaptive.counter is not None
     assert all(p.query.max_pairs == 0 for p in static.plans.values())
     assert all(p.query.max_pairs == 2 for p in adaptive.plans.values())
+
+
+def test_all_resident_static_is_admitted_but_adaptive_is_rejected(
+    tmp_path, monkeypatch
+):
+    static = model(tmp_path, monkeypatch, mode="static", expert_device_bytes=300000)
+    write_profile(static, hot_count=4)
+    static.declare(ExecutionCapacity(max_tokens=4, top_k=4))
+    assert static.counter is None
+    assert all(
+        p.query.resident == p.query.experts and not p.query.max_pairs
+        for p in static.plans.values()
+    )
+    adaptive = model(tmp_path, monkeypatch, mode="adaptive", expert_device_bytes=300000)
+    with pytest.raises(
+        ValueError, match="requires at least one layer with nonresident"
+    ):
+        adaptive.declare(ExecutionCapacity(max_tokens=4, top_k=4))
+    assert all(p.prepared is None for p in adaptive.plans.values())
 
 
 @pytest.mark.parametrize(
