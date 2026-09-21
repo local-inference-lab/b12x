@@ -12,6 +12,26 @@ from b12x.moe.fused_moe.cache_source import ExpertWeightSource, checkpoint_finge
 from b12x.preparation import PreparationSession, PreparedCall
 
 
+def test_parameter_inventory_distinguishes_cuda_host_views():
+    if not torch.cuda.is_available():
+        pytest.skip("physical CUDA device required")
+    from b12x.sequence._shared.disk_table import MappedHostAllocation
+    from b12x.testing.lifecycle import parameter_storage
+
+    owner = MappedHostAllocation((16,), torch.float32, torch.device("cuda"))
+    try:
+        model = torch.nn.Module()
+        model.mapped = torch.nn.Parameter(owner.device_view, requires_grad=False)
+        model.resident = torch.nn.Parameter(torch.empty(16, device="cuda"))
+        rows = {r["name"]: r for r in parameter_storage(model)}
+        assert rows["mapped"]["mapped_host"]
+        assert not rows["resident"]["mapped_host"]
+        assert rows["mapped"]["bytes"] == rows["resident"]["bytes"] == 64
+        del model
+    finally:
+        owner.close()
+
+
 def shared_module(checkpoint, layer, values):
     from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.linear import ReplicatedLinear

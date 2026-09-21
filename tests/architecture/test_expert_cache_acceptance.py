@@ -48,3 +48,15 @@ def test_process_manager_force_kill_cannot_pass_serving_acceptance(tmp_path):
     )
     with pytest.raises(ValueError, match="unclean shutdown"):
         require_complete(tmp_path / "receipt.jsonl", log)
+
+
+def test_parameter_inventory_does_not_treat_marker_as_mapped_storage():
+    import torch
+    from b12x.testing.lifecycle import parameter_storage
+
+    model = torch.nn.Linear(3, 2, bias=False)
+    model.weight._vllm_is_uva_offloaded = True
+    row, = parameter_storage(model)
+    assert row["bytes"] == 24 and row["shape"] == [2, 3]
+    assert row["offload_marker"] and not row["mapped_host"]
+    assert row["device"] == "cpu" and not row["cpu_pinned"]

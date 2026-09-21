@@ -64,6 +64,11 @@ def worker_resources(worker):
 
 def record_worker_resources(worker, stage, path):
     result = dict(stage=stage, time_ns=time.time_ns(), **worker_resources(worker))
+    if (
+        stage == "after_model_loading"
+        and os.environ.get("B12X_PARAMETER_STORAGE") == "1"
+    ):
+        result["parameters"] = parameter_storage(worker.model_runner.get_model())
     artifact = os.environ.get("B12X_ACCEPTANCE_BUILD_MANIFEST")
     if artifact:
         from .artifacts import verify_from_file
@@ -73,4 +78,41 @@ def record_worker_resources(worker, stage, path):
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a") as stream:
         stream.write(json.dumps(result) + "\n")
+    return result
+
+
+def parameter_storage(model):
+    """Inspect post-load parameter storage, including CUDA views of host memory.
+
+    This explicit diagnostic records no values and runs outside serving. CUDA
+    pointer attributes, rather than tensor.device or an offloader marker alone,
+    identify mapped host storage after quantization replaces parameters.
+    """
+    result = []
+    for name, parameter in model.named_parameters():
+        storage = parameter.untyped_storage()
+        row = dict(
+            name=name,
+            shape=list(parameter.shape),
+            dtype=str(parameter.dtype),
+            device=str(parameter.device),
+            bytes=parameter.numel() * parameter.element_size(),
+            storage_pointer=storage.data_ptr(),
+            storage_bytes=storage.nbytes(),
+            offload_marker=bool(getattr(parameter, "_vllm_is_uva_offloaded", False)),
+        )
+        if parameter.device.type == "cuda" and parameter.numel():
+            from cuda.bindings import runtime
+
+            error, attributes = runtime.cudaPointerGetAttributes(parameter.data_ptr())
+            if error != runtime.cudaError_t.cudaSuccess:
+                raise RuntimeError(f"cannot inspect parameter storage: {name}: {error}")
+            row["cuda_memory_type"] = int(attributes.type)
+            row["mapped_host"] = (
+                attributes.type == runtime.cudaMemoryType.cudaMemoryTypeHost
+            )
+        else:
+            row["mapped_host"] = False
+            row["cpu_pinned"] = parameter.is_pinned()
+        result.append(row)
     return result
