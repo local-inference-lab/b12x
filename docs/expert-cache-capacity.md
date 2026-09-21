@@ -6,6 +6,8 @@ checkpoint, whole-K BF16/W4A16 arithmetic, KV reservation, context, graph capaci
 controlled admission and adaptive settings fixed. An envelope includes private
 workspace and metadata; its size is not the fraction of expert payload resident.
 No benefit from spending freed memory on additional KV or concurrency is measured.
+The [source-bound capacity results](expert-cache-capacity-results.md) report the
+measured curve, all-resident control and calibration sensitivity.
 
 Use the verified companion artifacts and explicit paths from the reference
 guide. Run its bounded serving smoke before planning, and serialize timed runs
