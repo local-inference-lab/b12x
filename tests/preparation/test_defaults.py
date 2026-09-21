@@ -124,8 +124,10 @@ def test_packed_search_equivalence_uses_logical_k_split_clamping():
         effective_a16_config(query, config) for _, config in eligible.candidates if config.mode == "a16"
     ]
     assert (64, 64, 3) in effective
-    assert len(effective) == len(set(effective)) == 10
-    assert len(eligible.candidates) == 11
+    assert (64, 256, 1) in effective
+    assert (128, 256, 1) in effective
+    assert len(effective) == len(set(effective)) == 12
+    assert len(eligible.candidates) == 13
 
 
 @pytest.mark.parametrize("workspace_form", ["owned", "provided"])

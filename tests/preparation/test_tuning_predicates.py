@@ -70,12 +70,12 @@ CANDIDATES = {
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m2 auto'): (17, 17),
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m4 auto'): (17, 17),
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m8 auto'): (17, 17),
-    ('gemm.blockscaled_precision', 'nvfp4 n1152 k4304:4320 m65536 a16'): (12, 12),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m1 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m128 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m2 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m4 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m8 a16'): (16, 16),
+    ('gemm.blockscaled_precision', 'nvfp4 n1152 k4304:4320 m65536 a16'): (12, 54),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m1 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m128 a16'): (16, 72),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m2 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m4 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m8 a16'): (16, 24),
     # moe.decode
     ('moe.decode', 'nvfp4 rows10'): (195, 13),
     ('moe.decode', 'nvfp4 rows1250'): (4, 4),
@@ -456,6 +456,8 @@ def test_recorded_selections_stay_eligible(key):
     if key[0] == "moe.decode":
         # The recorded programs use unshared input and monolithic NVFP4 execution.
         values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False)
+    if key[0] == "gemm.blockscaled_precision":
+        values["tile_m"] = 16 if values["mode"] == "a16" else None
     assignment = FrozenMapping(values)
     contract.parameter_space(query, IDENTITY).validate(assignment)
     contract.lower(query, IDENTITY, assignment)
@@ -549,12 +551,42 @@ def test_a16_wide_tile_needs_more_than_one_n_tile():
         out_features=48,
     )
     space = TUNING.parameter_space(narrow, IDENTITY)
-    assignment = dict(mode="a16", tile_n=64, tile_k=64, split_k=1)
+    assignment = dict(mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1)
     space.validate(assignment)
     with pytest.raises(ValueError, match="predicates"):
         space.validate({**assignment, "tile_n": 128})
     wide = TUNING.parameter_space(replace(narrow, out_features=128), IDENTITY)
     wide.validate({**assignment, "tile_n": 128})
+
+
+def test_iq2_transposed_tiles_are_raced_without_split_k():
+    from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledConfig, BlockscaledQuery
+
+    query = BlockscaledQuery(recipe="iq2_xs", num_tokens=8, in_features=768,
+                             padded_in_features=768, out_features=136)
+    assignment = dict(mode="a16", tile_m=8, tile_n=128, tile_k=256, split_k=1)
+    TUNING.parameter_space(query, IDENTITY).validate(assignment)
+    TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
+    with pytest.raises(ValueError, match="split-K"):
+        TUNING.validate_config(query, BlockscaledConfig(**{**assignment, "split_k": 2}), IDENTITY)
+    for recipe in ("nvfp4", "mxfp8"):
+        with pytest.raises(ValueError, match="predicates"):
+            TUNING.parameter_space(replace(query, recipe=recipe), IDENTITY).validate(
+                {**assignment, "tile_k": 128})
+
+
+def test_nvfp4_a16_races_k256_tiles():
+    from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledConfig, BlockscaledQuery
+
+    query = BlockscaledQuery(recipe="nvfp4", num_tokens=64, in_features=800,
+                             padded_in_features=800, out_features=136, activation_mode="a16")
+    for tile_m in (16, 32, 64):
+        assignment = dict(mode="a16", tile_m=tile_m, tile_n=128, tile_k=256, split_k=4)
+        TUNING.parameter_space(query, IDENTITY).validate(assignment)
+        TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
+    with pytest.raises(ValueError, match="predicates"):
+        TUNING.parameter_space(replace(query, recipe="mxfp8", global_scale_kind="none"), IDENTITY).validate(
+            {**assignment, "tile_m": 16})
 
 
 def test_gate_mean_partitions_span_one_warp_to_the_covering_block():

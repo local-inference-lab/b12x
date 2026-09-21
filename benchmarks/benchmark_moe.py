@@ -10,6 +10,7 @@ deterministic top-k + softmax routing step in the measured closure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -50,7 +51,7 @@ from b12x.moe._shared.kernels.activations import (
     normalize_moe_activation,
 )
 from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
-from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes, nvidia_smi_gpu_mode_snapshot
 from tests._reference.w4a16_reference import moe_reference_w4a16
 
 from b12x.moe import fused_moe
@@ -318,6 +319,31 @@ class ModelProfile:
 
 
 MODEL_PROFILES = {
+    "puzzle3-iq2-xs": ModelProfile(
+        label="Puzzle 3 IQ2_XS/NVFP4",
+        checkpoint_family="puzzle3_iq2_xs",
+        default_layer_idx=1,
+        tp_size=1,
+        hf_repo_id=None,
+        default_activation="relu2",
+        default_quant_mode="w4a16",
+    ),
+    "qwen36-35b-nvfp4": ModelProfile(
+        label="Qwen3.6-35B-A3B NVFP4",
+        checkpoint_family="qwen",
+        default_layer_idx=0,
+        tp_size=1,
+        hf_repo_id="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        default_quant_mode="w4a16",
+    ),
+    "qwen36-35b-iq2-xs": ModelProfile(
+        label="Qwen3.6-35B-A3B IQ2_XS/NVFP4",
+        checkpoint_family="qwen_iq2_xs",
+        default_layer_idx=0,
+        tp_size=1,
+        hf_repo_id=None,
+        default_quant_mode="w4a16",
+    ),
     "qwen38-flash-next": ModelProfile(
         label="Qwen3.8 Flash Next",
         checkpoint_family="qwen",
@@ -614,14 +640,14 @@ MODEL_PATH = _default_model_path()
 class ExpertWeights:
     layer_idx: int
     spec: ModelSpec
-    w13_permuted: torch.Tensor
-    w13_scale: torch.Tensor
-    down_permuted: torch.Tensor
-    down_scale: torch.Tensor
+    w13_permuted: torch.Tensor | None
+    w13_scale: torch.Tensor | None
+    down_permuted: torch.Tensor | None
+    down_scale: torch.Tensor | None
     w13_weight: torch.Tensor
-    w13_blockscale_swizzled: torch.Tensor
+    w13_blockscale_swizzled: torch.Tensor | None
     w2_weight: torch.Tensor
-    w2_blockscale_swizzled: torch.Tensor
+    w2_blockscale_swizzled: torch.Tensor | None
     w13_input_scale: torch.Tensor
     w2_input_scale: torch.Tensor
     w13_input_scale_quant: torch.Tensor
@@ -694,7 +720,7 @@ def _slice_v41_tp_shard(
     return source.narrow(dimension, offset, shard_width).contiguous()
 
 
-def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0) -> ModelSpec:
+def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0, layer_idx: int | None = None) -> ModelSpec:
     tp = tp_size_override if tp_size_override is not None else profile.tp_size
     if profile.shape is not None:
         return ModelSpec(
@@ -707,6 +733,15 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
         )
 
     cfg = _load_config(model_path)
+    if profile.checkpoint_family == "puzzle3_iq2_xs":
+        selected = profile.default_layer_idx if layer_idx is None else layer_idx
+        block = cfg["block_configs"][selected]
+        if cfg.get("model_type") != "nemotron_h_puzzle" or block["block_type"] != "moe":
+            raise ValueError("Puzzle 3 IQ2_XS requires a Nemotron Puzzle MoE layer")
+        return ModelSpec(hidden_size=block["moe_latent_size"],
+                         intermediate_size=block["moe_intermediate_size"],
+                         num_experts=block["n_routed_experts"],
+                         top_k=block["num_experts_per_tok"], tp_size=tp, tp_rank=tp_rank)
     if profile.checkpoint_family == "deepseek_v41_flash":
         if cfg.get("model_type") != "deepseek_v41_text":
             raise ValueError("DeepSeek V4.1 Flash requires its V4.1 text config, not V4.0")
@@ -724,7 +759,7 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
             tp_size=tp,
             tp_rank=tp_rank,
         )
-    if profile.checkpoint_family == "qwen":
+    if profile.checkpoint_family in {"qwen", "qwen_iq2_xs"}:
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["moe_intermediate_size"],
@@ -901,6 +936,30 @@ def make_shape_only_expert_weights(
     )
 
 
+def load_iq2_xs_expert_weights(model_path, spec, *, layer_idx, activation, device="cuda") -> ExpertWeights:
+    """Keep CPU source blocks for the oracle and prepare compact device storage."""
+    from benchmarks.iq2_xs_checkpoint import load_iq2_xs_layer
+
+    layer = load_iq2_xs_layer(model_path, layer=layer_idx, tp_size=spec.tp_size, tp_rank=spec.tp_rank)
+    if activation != layer.activation:
+        raise ValueError(f"the IQ2_XS checkpoint requires {layer.activation}")
+    if (layer.hidden_size, layer.intermediate_size, layer.route_num_experts, layer.top_k) != (spec.hidden_size, spec.I_tp, spec.num_experts, spec.top_k):
+        raise ValueError("IQ2_XS checkpoint geometry differs from the benchmark specification")
+    unit = torch.ones(spec.num_experts, device=device, dtype=torch.float32)
+    return ExpertWeights(
+        layer_idx=layer_idx, spec=spec,
+        w13_permuted=None, w13_scale=None, down_permuted=None, down_scale=None,
+        w13_weight=layer.weights.w13, w2_weight=layer.weights.w2,
+        w13_blockscale_swizzled=None, w2_blockscale_swizzled=None,
+        w13_input_scale=unit[:1], w2_input_scale=unit[:1],
+        w13_input_scale_quant=unit[:1], w2_input_scale_quant=unit[:1],
+        w13_input_scale_per_expert=unit, w2_input_scale_per_expert=unit,
+        w13_input_scale_quant_per_expert=unit, w2_input_scale_quant_per_expert=unit,
+        g1_alphas=unit, g2_alphas=unit, g1_alphas_per_expert=unit, g2_alphas_per_expert=unit,
+        source_format="iq2_xs", w13_layout="w31",
+    )
+
+
 def load_expert_weights(
     model_path: pathlib.Path,
     spec: ModelSpec,
@@ -911,6 +970,9 @@ def load_expert_weights(
     keep_flashinfer_oracle_copy: bool = False,
 ) -> ExpertWeights:
     activation = normalize_moe_activation(activation)
+
+    if checkpoint_family in {"qwen_iq2_xs", "puzzle3_iq2_xs"}:
+        return load_iq2_xs_expert_weights(model_path, spec, layer_idx=layer_idx, activation=activation)
 
     device = torch.device("cuda")
     E = spec.num_experts
@@ -1812,6 +1874,17 @@ def prepare_b12x_benchmark_weights(
             w4a16_native=w4a16_native,
             activation_params=activation_params,
         )
+    if weights.source_format == "iq2_xs":
+        if quant_mode != "w4a16":
+            raise ValueError("IQ2_XS benchmark requires W4A16")
+        experts = fused_moe.prepare_weights(
+            plan=plan,
+            weights=fused_moe.IQ2XSWeights(
+                weights.w13_weight.to(params.g1_alphas.device),
+                weights.w2_weight.to(params.g2_alphas.device),
+            ),
+        )
+        return experts, params
     if quant_mode == "w4a16":
         w1_global_scale, w2_global_scale, _ = get_w4a16_prepare_scales(weights, params)
     elif quant_mode == "w4a8_mx":
@@ -2330,6 +2403,18 @@ def make_oracle_reference(
     activation_params = activation_params or ActivationParams()
     spec = weights.spec
     quant_mode = quant_mode.lower()
+    if weights.source_format == "iq2_xs":
+        from b12x.testing.iq2_xs_reference import moe_reference_iq2_xs
+
+        if quant_mode != "w4a16" or oracle_mode != "w4a16":
+            raise ValueError("IQ2_XS requires the independent W4A16 block oracle")
+        if activation_params.swiglu_alpha is not None or activation_params.swiglu_beta is not None:
+            raise ValueError("IQ2_XS oracle supports SiLU without alpha/beta overrides")
+        return moe_reference_iq2_xs(
+            x, weights.w13_weight, weights.w2_weight, topk_ids, topk_weights,
+            activation=activation, w13_layout=weights.w13_layout,
+            swiglu_limit=activation_params.swiglu_limit,
+        )
     if quant_mode == "w4a16":
         if oracle_mode == "nvfp4":
             raise ValueError("--oracle-mode nvfp4 is not valid with --quant-mode w4a16")
@@ -2710,6 +2795,7 @@ def prepare_moe_execution(
     top_k: int,
     inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     outputs: dict[int, torch.Tensor],
+    route_mode: str = "auto",
 ) -> object:
     """Prepare each exact benchmark M before binding its real caller buffers."""
     capacity = fused_moe.ExecutionCapacity(
@@ -2717,7 +2803,17 @@ def prepare_moe_execution(
         top_k=top_k,
         warmup_token_counts=tuple(inputs),
     )
-    declaration = fused_moe.plan_execution(experts=experts, capacity=capacity)
+    override = None
+    if route_mode != "auto":
+        override = fused_moe.MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            w4a16_route_mode=route_mode,
+        )
+    declaration = fused_moe.plan_execution(
+        experts=experts, capacity=capacity, override=override
+    )
     calls = {
         m: prepared_call(
             output=outputs[m],
@@ -2733,11 +2829,23 @@ def prepare_moe_execution(
         )
         for m in getattr(declaration, "token_counts", (capacity.max_tokens,))
     }
+    def race_call(state, *, tokens):
+        call = calls[tokens](state)
+        source = inputs[tokens][0].clone()
+        return replace(
+            call, produce=lambda: inputs[tokens][0].copy_(source),
+            owners=(*call.owners, source),
+        )
+
+    benchmark_calls = {
+        m: (lambda state, m=m: race_call(state, tokens=m)) for m in calls
+    }
     session.prepare((
         request_for_capacity(
             declaration,
             name=name,
             calls=calls,
+            benchmark_calls=benchmark_calls,
         ),
     ))
     execution = declaration
@@ -3088,6 +3196,7 @@ def bench_e2e() -> None:
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=None, help="Assigned CUDA ordinal within the existing visibility mask")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
@@ -3098,6 +3207,7 @@ def bench_e2e() -> None:
     )
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
+    parser.add_argument("--raw-samples-jsonl", type=pathlib.Path)
     parser.add_argument(
         "--routing-repeat-period",
         type=int,
@@ -3258,6 +3368,10 @@ def bench_e2e() -> None:
         default="none",
     )
     parser.add_argument(
+        "--profile-graphs", action="store_true",
+        help="Expose one cold-L2 CUDA graph replay per case to CUDA profiling.",
+    )
+    parser.add_argument(
         "--fast-math",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3275,6 +3389,11 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
+    if args.profile_graphs and (
+        not args.graph_only or not args.cuda_graph or args.graph_mode != "single-op"
+        or args.profile_once != "none" or not args.flush_l2
+    ):
+        parser.error("--profile-graphs requires cold-L2 single-op --graph-only execution")
     model_profile = MODEL_PROFILES[args.model_profile]
     if args.activation is None:
         args.activation = model_profile.default_activation
@@ -3314,6 +3433,12 @@ def bench_e2e() -> None:
     )
     model_path = resolve_model_path(model_profile, args.model_path)
     layer_idx = model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
+
+    if model_profile.checkpoint_family in {"qwen_iq2_xs", "puzzle3_iq2_xs"}:
+        if args.quant_mode != "w4a16" or args.reference != "none" or args.oracle_mode != "w4a16":
+            raise ValueError("IQ2_XS requires W4A16 with its block oracle and no FP4 external reference")
+        if args.w4a16_native or args.force_mxfp4:
+            raise ValueError("IQ2_XS uses compact descriptor preparation")
 
     if args.scale_contract == "per-expert" and args.reference == "flashinfer":
         raise ValueError("--reference flashinfer is only valid with --scale-contract shared")
@@ -3366,6 +3491,8 @@ def bench_e2e() -> None:
         raise ValueError(
             "--routing-repeat-period cannot exceed any requested batch size"
         )
+    if args.device is not None:
+        torch.cuda.set_device(args.device)
     require_sm120()
     torch.empty(1, device="cuda")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3396,7 +3523,7 @@ def bench_e2e() -> None:
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     spec = build_model_spec(
-        model_path, model_profile, tp_size_override=args.tp_size, tp_rank=args.tp_rank,
+        model_path, model_profile, tp_size_override=args.tp_size, tp_rank=args.tp_rank, layer_idx=layer_idx,
     )
     if args.top_k is not None:
         if model_profile.shape is None:
@@ -3475,6 +3602,8 @@ def bench_e2e() -> None:
     print()
 
     if args.graph_mode == "multi-layer":
+        if args.raw_samples_jsonl is not None:
+            raise ValueError("raw sample evidence currently requires single-op graphs")
         bench_multilayer_graph_mode(args, model_path, model_profile, spec, batch_sizes, device)
         return
 
@@ -3486,6 +3615,25 @@ def bench_e2e() -> None:
         checkpoint_family=model_profile.checkpoint_family,
         keep_flashinfer_oracle_copy=keep_flashinfer_oracle_copy,
     )
+    if args.raw_samples_jsonl is not None:
+        from b12x._lib.compiler import b12x_package_fingerprint
+
+        args.raw_samples_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        payload_hashes = {}
+        if weights.source_format == "iq2_xs":
+            payload_hashes = {
+                name: hashlib.sha256(memoryview(tensor.numpy())).hexdigest()
+                for name, tensor in (("w13", weights.w13_weight), ("w2", weights.w2_weight))
+            }
+        with args.raw_samples_jsonl.open("x") as handle:
+            handle.write(json.dumps(dict(
+                kind="manifest", command=sys.argv, model=str(model_path), layer=layer_idx,
+                spec=vars(spec), options=vars(args), torch=torch.__version__,
+                source_fingerprint=b12x_package_fingerprint(), payload_sha256=payload_hashes,
+                benchmark_sha256=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
+                device=nvidia_smi_gpu_mode_snapshot(),
+                metric="cold-L2 graph replay microseconds; lower is better",
+            ), default=str) + "\n")
     if args.force_mxfp4:
         source_params = get_quant_mode_params(weights, args.scale_contract, "w4a8_nvfp4")
         weights = force_convert_nvfp4_weights_to_mxfp4(
@@ -3502,7 +3650,8 @@ def bench_e2e() -> None:
         activation_params=activation_params,
         w4a16_native=args.w4a16_native,
     )
-    if args.validate == "oracle" and getattr(weight_plan, "reuses_source_storage", False):
+    precomputed_oracles: dict[int, torch.Tensor] = {}
+    if args.validate == "oracle" and weight_plan._impl.reuses_source_storage:
         print(
             "  Precomputing oracle outputs before destructive weight "
             "preparation...",
@@ -3586,6 +3735,7 @@ def bench_e2e() -> None:
         top_k=spec.top_k,
         inputs={1: (x_warm, topk_ids_w, topk_weights_w)},
         outputs={1: warmup_output},
+        route_mode=args.w4a16_route_policy,
     )
     warmup_binding = bind_prepared_moe(
         warmup_execution,
@@ -3604,7 +3754,7 @@ def bench_e2e() -> None:
     if args.tp_parallel and spec.tp_size > 1:
         print("  Loading TP-parallel ranks...", end="", flush=True)
         for r in range(spec.tp_size):
-            rspec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size, tp_rank=r)
+            rspec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size, tp_rank=r, layer_idx=layer_idx)
             rw = load_expert_weights(
                 model_path, rspec, layer_idx=layer_idx,
                 activation=args.activation, checkpoint_family=model_profile.checkpoint_family,
@@ -3663,6 +3813,10 @@ def bench_e2e() -> None:
         )
         local_routes = topk_ids >= 0
         active_experts = int(torch.unique(topk_ids[local_routes]).numel())
+        packed_expert_bytes = (
+            sum(t[0].numel() * t.element_size() for t in (weights.w13_weight, weights.w2_weight))
+            if weights.source_format == "iq2_xs" else None
+        )
         active_density = int(local_routes.sum().item()) / max(active_experts, 1)
         print(
             f"  routing: {active_experts} active experts, "
@@ -3695,6 +3849,7 @@ def bench_e2e() -> None:
             top_k=spec.top_k,
             inputs={batch_size: (x, topk_ids, topk_weights)},
             outputs={batch_size: backend_output},
+            route_mode=args.w4a16_route_policy,
         )
         backend_binding = bind_prepared_moe(
             backend_execution,
@@ -3835,6 +3990,11 @@ def bench_e2e() -> None:
                     min_cosine=args.min_cosine,
                 )
             )
+            if weights.source_format == "iq2_xs":
+                reference_norm = oracle_ref.float().norm().item()
+                relative_l2 = (backend_out.float() - oracle_ref.float()).norm().item() / max(reference_norm, 1e-30)
+                if not torch.isfinite(backend_out).all() or not torch.count_nonzero(backend_out) or reference_norm == 0 or backend_metrics.cos < 0.999 or relative_l2 > 0.01:
+                    accuracy_failures.append(f"  bs={batch_size} IQ2_XS: finite/nonzero/cosine/relative-L2 gate failed ({relative_l2=:.6f})")
             if ref_output is not None and ref_name is not None:
                 ref_metrics = compare_to_reference(ref_output, oracle_ref)
                 print(f"  {format_oracle_metrics(f'{ref_name} vs oracle', ref_metrics)}")
@@ -3958,6 +4118,7 @@ def bench_e2e() -> None:
 
                     # Warm graph replay separately; replay latency is the value
                     # that should drive the default summary.
+                    device_before = nvidia_smi_gpu_mode_snapshot() if args.raw_samples_jsonl is not None else None
                     graph_runs = [
                         bench_events(
                             replay,
@@ -3968,8 +4129,34 @@ def bench_e2e() -> None:
                         for _ in range(args.repeats)
                     ]
                     stats = summarize_timing_runs(graph_runs)
+                    if args.raw_samples_jsonl is not None:
+                        with args.raw_samples_jsonl.open("a") as handle:
+                            handle.write(json.dumps(dict(
+                                kind="case", rows=batch_size, backend=name,
+                                active_experts=active_experts,
+                                topk_ids=topk_ids.cpu().tolist(),
+                                packed_expert_bytes=packed_expert_bytes,
+                                unique_packed_weight_bytes=(
+                                    active_experts * packed_expert_bytes
+                                    if packed_expert_bytes is not None else None
+                                ),
+                                samples_us=[[sample * 1000 for sample in run] for run in graph_runs],
+                                device_before=device_before, device_after=nvidia_smi_gpu_mode_snapshot(),
+                                validation=args.validate, accuracy_failures=list(accuracy_failures),
+                            )) + "\n")
                     graph_stats_by_name[name] = stats
                     print(f" {fmt_timing_stats(stats)}")
+                    if args.profile_graphs:
+                        if accuracy_failures:
+                            raise RuntimeError("cannot profile a failed oracle check")
+                        l2_flush()
+                        torch.cuda.synchronize()
+                        torch.cuda.profiler.start()
+                        try:
+                            graph.replay()
+                            torch.cuda.synchronize()
+                        finally:
+                            torch.cuda.profiler.stop()
                 except Exception as exc:
                     print(f" FAILED ({type(exc).__name__}: {exc})")
 

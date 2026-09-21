@@ -202,6 +202,18 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    if query.source_format == "iq2_xs":
+        if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
+            raise ValueError("IQ2_XS requires BF16 W4A16 execution")
+        if query.activation not in {"silu", "relu2"} or query.hidden_size % 256 or query.intermediate_size % 256:
+            raise ValueError("IQ2_XS requires aligned SiLU or ReLU² geometry")
+        if config.w4a16_route_mode == "direct":
+            from ._impl import _w4a16_direct_routing_supported
+            if not _w4a16_direct_routing_supported(query):
+                raise ValueError(
+                    "IQ2_XS direct routing requires nondeterministic SiLU or ReLU² capacity <= 8, "
+                    "without activation amax or input router weights"
+                )
     if query.quant_mode == "multi":
         if config.backend == "w4a16":
             if "w4a16" not in query.quant_modes:
@@ -447,7 +459,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=8,
+    query_schema_version=9,
     config_schema_version=4,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
@@ -457,7 +469,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=4,
+    candidate_contract_version=7,
     knobs=(
         Knob(name="backend", values=("micro", "dynamic", "w4a16"), binding=ParameterBinding.COMPILE),
         Knob(name="route_planner", values=("internal", "triton"), binding=ParameterBinding.COMPILE),

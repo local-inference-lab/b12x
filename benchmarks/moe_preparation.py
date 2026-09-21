@@ -30,11 +30,15 @@ def scratch_for(plan: object) -> tuple[torch.Tensor, ...]:
     )
 
 def request_for_capacity(declaration: object, *, name: str,
-                         calls: dict[int, Callable[[object], PreparedCall]]):
+                         calls: dict[int, Callable[[object], PreparedCall]],
+                         benchmark_calls: dict[int, Callable[[object], PreparedCall]] | None = None):
     """Make the scalar or exact-M composite request without a legacy warmup path."""
     counts = getattr(declaration, "token_counts", None)
     if counts is None:
         if len(calls) != 1:
             raise ValueError("scalar MoE declaration requires one prepared call")
-        return declaration.request(name=name, prepare_call=next(iter(calls.values())))
-    return declaration.request(name=name, prepare_calls=calls)
+        return declaration.request(
+            name=name, prepare_call=next(iter(calls.values())),
+            benchmark_call=None if benchmark_calls is None else next(iter(benchmark_calls.values())),
+        )
+    return declaration.request(name=name, prepare_calls=calls, benchmark_calls=benchmark_calls)

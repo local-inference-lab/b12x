@@ -291,20 +291,20 @@ def test_w4a16_raw_scale_identity_and_rounding(kind):
     torch.testing.assert_close(storage.view(torch.uint8), original, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
-def test_a16_frozen_callable_and_graph_replay(recipe, monkeypatch):
+@pytest.mark.parametrize("recipe,tile_m", [("nvfp4", 16), ("nvfp4", 32), ("nvfp4", 64), ("mxfp8", 16)])
+def test_a16_frozen_callable_and_graph_replay(recipe, tile_m, monkeypatch):
     require_b12x()
     weight, decoded, storage = make_weight(recipe, 136, 256)
     saved = storage.view(torch.uint8).clone()
-    config = BlockscaledConfig(mode="a16", tile_n=64, tile_k=128, split_k=4)
-    source = torch.randn(32, 256, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(32, 136, device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(mode="a16", tile_m=tile_m, tile_n=64, tile_k=128, split_k=4)
+    source = torch.randn(65, 256, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(65, 136, device="cuda", dtype=torch.bfloat16)
     workspace = make_workspace(
         source, weight, activation_mode="a16", out=output, config=config
     )
     with ExitStack() as stack:
         plans = {}
-        for m in (1, 2, 4, 8, 16, 19, 32):
+        for m in (1, 2, 4, 8, 16, 19, 32, 33, 65):
             _, plans[m] = stack.enter_context(prepared_execution(
                 source[:m], weight, activation_mode="a16", out=output[:m],
                 workspace=workspace, config=config, expected_m=m,
@@ -319,7 +319,7 @@ def test_a16_frozen_callable_and_graph_replay(recipe, monkeypatch):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 blockscaled.mm(source, weight, out=output, workspace=workspace,
-                               plan=plans[32])
+                               plan=plans[65])
             pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
             for _ in range(3):
                 source.normal_()
@@ -332,7 +332,7 @@ def test_a16_frozen_callable_and_graph_replay(recipe, monkeypatch):
             with monkeypatch.context() as patch:
                 patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("unexpected device allocation"))
                 blockscaled.mm(source, weight, out=output, workspace=workspace,
-                               plan=plans[32])
+                               plan=plans[65])
             graph.reset()
 
 
@@ -557,7 +557,45 @@ def test_a16_short_scale_tile_tail(recipe, k):
         source, weight, activation_mode="a16", config=config,
     ) as (_, plan):
         actual = blockscaled.mm(source, weight, plan=plan)
-        assert_close(actual, source.float() @ decoded.T)
+    assert_close(actual, source.float() @ decoded.T)
+
+
+@pytest.mark.parametrize("tile_m", [16, 32, 64])
+@pytest.mark.parametrize("tile_n", [64, 128])
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("k", [768, 800])
+def test_nvfp4_k256_dynamic_graph_replay(tile_m, tile_n, split, k):
+    require_b12x()
+    from b12x.preparation import require_prepared
+
+    weight, decoded, _ = make_weight("nvfp4", 136, k)
+    source = torch.randn(65, k, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(65, 136, device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(mode="a16", tile_m=tile_m, tile_n=tile_n, tile_k=256, split_k=split)
+    workspace = make_workspace(source, weight, activation_mode="a16", out=output, config=config)
+    with prepared_execution(source, weight, activation_mode="a16", out=output,
+                            workspace=workspace, config=config) as (_, plan):
+        state = require_prepared(plan, "gemm.blockscaled_precision", source.device)
+        program = state.programs["gemm"]
+        pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
+        with kernel_resolution_guard("NVFP4 K256 capacity replay"):
+            for m in (1, 3, 8, 17, 65):
+                x, y = source[:m], output[:m]
+                expected = x.float() @ decoded.T
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    blockscaled.mm(x, weight, out=y, workspace=workspace, plan=plan)
+                x.neg_()
+                y.fill_(float("nan"))
+                workspace.fill_(255)
+                allocated = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                assert_close(y, -expected)
+                assert state.programs["gemm"] is program
+                assert pointers == (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
+                graph.reset()
 
 
 def test_a16_rejects_tma_misalignment():
