@@ -117,6 +117,10 @@ def main():
         help="Validate all native Qwen3-Next target block-scale values locally",
     )
     parser.add_argument("--metadata-output", type=Path)
+    parser.add_argument(
+        "--loader-coverage", type=Path,
+        help="Validate an actual CPU-source loader receipt against local target tensors",
+    )
     parser.add_argument("--device-bytes", type=int, required=True)
     parser.add_argument("--host-bytes", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -132,6 +136,8 @@ def main():
         parser.error("content identity requires complete local files")
     if args.check_block_scales and not args.model:
         parser.error("block scale values require complete local files")
+    if args.loader_coverage and not args.model:
+        parser.error("loader coverage requires complete local files")
     if min(args.device_bytes, args.host_bytes) <= 0:
         parser.error("memory capacities must be positive")
     if args.repository:
@@ -152,6 +158,17 @@ def main():
         from b12x.integration.vllm.checkpoint import validate_block_scales
 
         result["block_scale_values"] = validate_block_scales(directory)
+    if args.loader_coverage:
+        from b12x.integration.vllm.checkpoint import validate_loader_coverage
+        from b12x.testing.artifacts import sha256
+
+        if args.loader_coverage.stat().st_size > 256 << 20:
+            raise ValueError("loader coverage exceeds the bounded report size")
+        with args.loader_coverage.open() as stream:
+            result["loader_coverage"] = validate_loader_coverage(
+                directory, json.load(stream)
+            )
+        result["loader_coverage_sha256"] = sha256(args.loader_coverage)
     result.update(
         source=source_identity(ROOT),
         command=sys.argv,
