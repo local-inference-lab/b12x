@@ -435,7 +435,7 @@ def _bind(
     if token_capacity > sequence_capacity * state_index_columns:
         raise ValueError(
             "token capacity must fit the bound packed metadata geometry, got "
-            f"{token_capacity} > {sequence_capacity} * {query_columns}"
+            f"{token_capacity} > {sequence_capacity} * {state_index_columns}"
         )
     _require_row_contiguous(
         "mixed_qkv",
@@ -655,7 +655,7 @@ def _bind_kda(
     if token_capacity > sequence_capacity * query_columns:
         raise ValueError(
             "token capacity must fit the bound packed metadata geometry, got "
-            f"{token_capacity} > {sequence_capacity} * {state_index_columns}"
+            f"{token_capacity} > {sequence_capacity} * {query_columns}"
         )
     _require_row_contiguous(
         "mixed_qkv",
