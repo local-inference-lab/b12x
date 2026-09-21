@@ -17,6 +17,22 @@ retained. Header/index coverage includes **299,545 tensors**. This is an invento
 audit, not proof that a running loader consumes every tensor or that packed
 weights pass an arithmetic oracle.
 
+Metadata SHA-256 identities:
+
+| File | SHA-256 |
+|---|---|
+| `config.json` | `deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80` |
+| `generation_config.json` | `e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e` |
+| `hf_quant_config.json` | `331ad11d57c8bc374554579977198084e0d4d0933d5b3558f125f6f670aba0e8` |
+| `model.safetensors.index.json` | `660414e8300728ba80062e6a3c81cb76a65e2ab136ac9e9ceb450ba0c51c3c0d` |
+| Model card | `e3ed0cb89950ef0f41e8df344ba1cc15c67e1baf91e1cb5305a7344e58a8d975` |
+
+Repository metadata retains each shard's LFS digest and file size. These are
+published content identities; only headers and scalar ranges were independently
+hashed. The generation configuration defaults to sampling (temperature 1,
+top-k 20, top-p 0.95). A future paired greedy qualification must override sampling
+explicitly; no generation settings were used to claim serving here.
+
 The source baseline is b12x `1c20f10bc66e65b7e5cde0124e7d7b416b0b6251` and companion
 vLLM `019b9df5cbd9122d6e9670485879a8108a65ee8b`. Both working branches were clean.
 Live default heads were b12x `f20ab3bad7def65f6211403fb73f9b1e8a33dfb0` and companion
@@ -118,6 +134,10 @@ whole-K recipe, and no routed bias. Block-scale values and full packed bytes
 remain unchecked. No requantization or arithmetic change is authorized by this
 metadata result. A promotion copies **2,764,808 payload bytes**; 32 pairs copy
 84.375 MiB plus the existing map/publication accounting, below 128 MiB.
+Each layer has 1,258,291,200 packed weight bytes and 1,415,589,888 source bytes
+including scales. Each source expert occupies 2,764,824 bytes; canonical storage
+omits input scales and the redundant equal gate/up global scalar. Alignment is
+charged per canonical field rather than by rounding each expert independently.
 
 ## PLE placement and ownership
 
@@ -134,6 +154,10 @@ selected outputs are produced on device; no full-table GPU copy is required.
 Its capture boundary and request history remain engine-owned. The b12x PLE
 implementation also has prepared mapped-host FP8 lookup/storage and a disk path.
 No additional PLE cache or new lookup kernel is needed for this audit.
+Host placement is explicit: the standard path uses Engram CPU offload; the
+b12x path accepts `additional_config.ple_table_memory="ram"` (mapped host).
+The b12x default is device storage unless an offload setting selects otherwise.
+The memory figures here assume that explicit host path, not the device default.
 
 Four composition gates prevent a ready-to-download recommendation:
 
@@ -141,6 +165,8 @@ Four composition gates prevent a ready-to-download recommendation:
    selects `modelopt_mixed`. The mixed config overrides `get_quant_method` and
    bypasses cache dispatch. A per-prefix NVFP4 handoff is needed; removing the
    provider guard alone is incorrect.
+   `Worker.load_model` constructs the provider before loading model weights,
+   so an explicitly requested cache rejects this combination before allocation.
 2. Selecting the b12x MoE backend also selects b12x PLE through `uses_b12x`.
    That path reads `ple_embedding_dtype`, whose config default is BF16; the
    NVIDIA config omits it. The standard PLE path derives FP8 from mixed
@@ -234,3 +260,56 @@ Until those gates pass, 80B is the cleaner complete-model residency experiment.
 No authorized Station endpoint was configured; physical SM103 remains deferred
 under the [existing qualification runbook](sm103-qualification.md). All SM120
 physical checks remain PCIe Gen4 x16 evidence, with no Grace/Gen5 extrapolation.
+
+## Validation receipt
+
+Executable changes were frozen at b12x
+`6d080eb97228d9031cbd0c7959c3686a8e4f8a6b`; subsequent documentation commits do not
+change the tested code. Physical checks used its archive export and the unchanged
+complete companion wheel for `019b9df5cbd9122d6e9670485879a8108a65ee8b`. The wheel's
+SHA-256 is `8154450892adc23a97b60adc0faaa9fd97fcbf9fcce810b454cddd3505414258`.
+Installed Python files and loaded native libraries were verified against the
+wheel manifest. No Python overlay from another companion revision was used.
+
+| Check | Result and scope |
+|---|---|
+| Existing host acceptance | 1,118 passed, 67 reported skips; GPU skips do not qualify execution |
+| [Independent host CI](https://github.com/local-inference-lab/b12x/actions/runs/35639108827) | Passed on `6d080eb9` |
+| Existing SM120 acceptance | 42 passed, no skips |
+| Qwen3.8 H2560/I640, top-10 synthetic expert test | Passed with reduced 16-expert geometry; resident/mixed same-graph promotion, exact outputs and no replay allocation |
+| Small mapped FP8 PLE test | Passed; changing lookup IDs, fixed pointers, no replay allocation, graph retirement before explicit mapped-owner release |
+| Targeted memcheck / synccheck | Both tests passed under each tool; zero reported errors |
+| Companion cache, maintenance, Qwen3.8 configuration/loading and PLE tests | 100 passed, 26 unrelated fused PLE cases deliberately deselected |
+| Pinned configuration diagnostic | Standard PLE selects FP8; b12x selects BF16; mixed-cache provider rejects before model weight allocation |
+| Qwen3-30B ordinary non-cache smoke | 256 generated tokens; clean explicit shutdown |
+| Qwen3-30B C4 static/adaptive regression | 1,024 tokens per arm, exact paired IDs, 320 promotions, graph/storage and generation checks passed |
+
+The GPU was `GPU-47363510-b87a-13a5-4824-2542e97df76c` (RTX PRO 4000 Blackwell,
+SM120, PCIe Gen4 x16), driver 580.173.02. Loaded Torch was 2.13.0 with CUDA 13.3;
+loaded CUTLASS DSL was **4.6.2** from the virtual environment. A shadowed system
+4.5.2 distribution also appears in package enumeration; it was not the loaded
+compiler. The retained `loaded-dependencies.json` records module paths and hashes
+so a package-name dictionary cannot misidentify it.
+
+The serving regression used the reference 8-GiB envelope and the existing
+held-out chat/code fixture, C4, 64 output tokens per request, one pair. Static
+allocated no observer. Both cache arms recorded 1,793,372,160 bytes (1.67 GiB)
+of checkpoint-loading GPU allocation before preparation. All three serving arms
+ended with zero mapped bytes, CPU expert-source bytes, graph owners and pending
+health reads. Output IDs, full control tails and lifecycle snapshots are retained.
+These are regression checks, not a repeated performance result or a Qwen3.8 load.
+
+The operator-retained bundle `b12x-qwen38-audit-20260921` contains metadata,
+published shard identities, scalar-range bytes/hashes, source/artifact identities,
+exact commands, JUnit, raw output IDs and resource receipts. It retains the
+initial synthetic-fixture JSON serialization failure and a diagnostic wrapper's
+obsolete `vllm._C` import failure; the corrected wrapper uses the engine's actual
+kernel import hook. Neither failure was counted as acceptance.
+
+The pinned-config and ordinary serving logs also reproduce an optional
+`triton_kernels.matmul_ogs` import diagnostic from the GPT-OSS precision-config
+path. Selected NVFP4 tests and serving completed; that optional backend is not
+qualified. Transformer warnings about Qwen multimodal RoPE keys remain in the
+pinned-config log. No log filtering or exception suppression was added. Complete
+Qwen3.8 loading, real checkpoint arithmetic, multimodal serving, MTP, joint PLE
+lifecycle and large-scale pinned allocation remain unqualified.
