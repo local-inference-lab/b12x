@@ -8,6 +8,10 @@ The [SM120 reference guide](expert-cache-reference.md) remains the qualified
 Qwen3-30B configuration. This document does not extend its serving claim to
 Qwen3-Next.
 
+The [Qwen3.8 compatibility audit](expert-cache-qwen38-audit.md) retains this 80B
+candidate as the immediate target. Qwen3.8 has compatible routed metadata but
+requires mixed-precision cache dispatch and PLE admission/lifecycle integration.
+
 ## Compatibility boundary
 
 The target has 48 routed MoE layers, each with 512 experts, hidden size 2048,

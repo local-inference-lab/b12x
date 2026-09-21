@@ -1,4 +1,4 @@
-"""Bounded, CPU-only checkpoint inventory for the Qwen3-Next NVFP4 cache lane.
+"""Bounded, CPU-only checkpoint inventory for experimental MoE cache candidates.
 
 Header acceptance proves tensor coverage and layout, not execution correctness.
 Full checkpoint hashing, native value validation and live memory admission remain
@@ -15,7 +15,7 @@ import struct
 
 
 HEADER_LIMIT = 64 << 20
-DTYPE_BYTES = {"U8": 1, "F8_E4M3": 1, "BF16": 2, "F32": 4}
+DTYPE_BYTES = {"U8": 1, "F8_E4M3": 1, "BF16": 2, "F32": 4, "I64": 8}
 
 
 def _unique(pairs):
@@ -282,9 +282,15 @@ def audit(directory, *, headers_only=False, check_values=False):
     directory = Path(directory)
     config = read_json(directory / "config.json")
     quant = read_json(directory / "hf_quant_config.json")
-    expected = expected_qwen3_next(config, quant)
+    qwen4 = config.get("model_type") in ("qwen4_exp", "qwen3_8_flash_next")
+    if qwen4:
+        from .checkpoint_qwen4 import expected_qwen4
+
+        expected = expected_qwen4(config, quant)
+    else:
+        expected = expected_qwen3_next(config, quant)
     tensors, shards, manifest = inventory(directory, headers_only=headers_only)
-    target = {n for n in tensors if not n.startswith("mtp.")}
+    target = set(tensors) if qwen4 else {n for n in tensors if not n.startswith("mtp.")}
     missing, unexpected = set(expected) - target, target - set(expected)
     if missing or unexpected:
         raise ValueError(
@@ -340,8 +346,9 @@ def audit(directory, *, headers_only=False, check_values=False):
                     f"unequal gate/up global scales; no requantization: {name}"
                 )
         values = "all_routed_global_scales_positive_finite_and_gate_up_equal"
+    geometry_config = config["text_config"] if qwen4 else config
     e, h, i, layers = (
-        config[k]
+        geometry_config[k]
         for k in (
             "num_experts",
             "hidden_size",
@@ -366,7 +373,7 @@ def audit(directory, *, headers_only=False, check_values=False):
         )
     )
     required = sum(r["bytes"] for n, r in totals.items() if n != "optional_mtp")
-    return dict(
+    result = dict(
         schema=1,
         status="metadata_compatible_execution_unqualified",
         architecture=config["architectures"][0],
@@ -393,7 +400,7 @@ def audit(directory, *, headers_only=False, check_values=False):
             experts=e,
             hidden=h,
             intermediate=i,
-            top_k=config["num_experts_per_tok"],
+            top_k=geometry_config["num_experts_per_tok"],
         ),
         global_scale_values=values,
         remaining_gates=[
@@ -404,3 +411,27 @@ def audit(directory, *, headers_only=False, check_values=False):
             "source-matched complete-model execution and lifecycle",
         ],
     )
+    if qwen4:
+        ple = totals["ple_table"]["bytes"]
+        result.update(
+            status="metadata_audited_cache_integration_required",
+            complete_checkpoint_tensor_bytes=sum(t["bytes"] for t in tensors.values()),
+            text_only_target_bytes=required - totals["vision"]["bytes"],
+            ple_table_bytes=ple,
+            host_with_ple_lower_bound_bytes=result["host_expert_lower_bound_bytes"]
+            + ple,
+            mapped_experts_and_ple_bytes=canonical + ple,
+            non_routed_non_ple_text_bytes=required
+            - totals["vision"]["bytes"]
+            - totals["routed"]["bytes"]
+            - ple,
+            promotion_payload_bytes=3 * h * i // 2 + 3 * h * i // 16 + 8,
+            integration_gates=[
+                "per-prefix ModelOpt mixed-precision cache dispatch; existing provider rejects modelopt_mixed",
+                "derive PLE FP8 storage from quantization metadata before allocation",
+                "account PLE allocation and sources jointly with expert-cache admission",
+                "explicit PLE owner release after graph/stream readers retire",
+                "full-model V2 QSA/GDN/PLE and cache lifecycle qualification without MTP",
+            ],
+        )
+    return result

@@ -137,6 +137,10 @@ def main():
         > args.device_bytes,
         expert_representations_exceed_host=result["host_expert_lower_bound_bytes"]
         > args.host_bytes,
+        combined_host_lower_bound_exceeds_host=result.get(
+            "host_with_ple_lower_bound_bytes", result["host_expert_lower_bound_bytes"]
+        )
+        > args.host_bytes,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")

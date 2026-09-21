@@ -162,6 +162,42 @@ def test_host_layout_matches_16_head_320m_table_partition(tp_rank):
     assert layout.weight_shape == (80_000_384, 160)
 
 
+def test_fp8_mapped_table_graph_and_explicit_release():
+    """A small immutable host PLE table outlives graphs and closes explicitly."""
+    device = require_b12x()
+    caps = _small_caps(device, quant_mode="fp8_e4m3_per_tensor", table_memory="mapped_host")
+    geometry = _small_geometry(caps)
+    layout = ple_embedding.storage_layout(caps, geometry=geometry)
+    storage = ple_embedding.allocate_storage(layout)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        storage.weight_load_view.copy_(_fp8_weight(layout.weight_shape, "cpu"))
+        storage.weight_scale.fill_(0.25)
+        with ExitStack() as resources:
+            geometry_tensors = ple_embedding.allocate_geometry(geometry, device=caps.device)
+            tensors = _tensors(layout, geometry_tensors)
+            tensors.update(weight=storage.weight, weight_scale=storage.weight_scale)
+            binding, _, _, session, _ = _prepared_binding(resources, caps, tensors=tensors)
+            pointers = storage.weight.data_ptr(), binding.out.data_ptr()
+            with session.capture(), torch.cuda.graph(graph):
+                ple_embedding.run(binding=binding)
+            session.freeze()
+            for token in (3, 4, 3):
+                tensors["token_ids"].fill_(token)
+                expected = _reference(binding)
+                before = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+                torch.testing.assert_close(binding.out, expected, atol=0, rtol=0)
+                assert (storage.weight.data_ptr(), binding.out.data_ptr()) == pointers
+            graph.reset()
+    finally:
+        graph.reset()
+        storage.close()
+    assert all(a._closed for a in storage._mapped_allocations)
+
+
 def test_caps_reject_unsupported_storage_contracts():
     common = dict(device="cpu", max_tokens=2, max_seqs=1, vocab_size=100, eos_token_id=99,
         max_order=3, heads_per_order=2, dense_layer_ordinal=0, base_table_size=5,

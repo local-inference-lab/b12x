@@ -12,9 +12,8 @@ from b12x.moe.residency import ResidencyUpdateError
 from tests.moe.test_residency_updates import HostTransfer
 
 
-def source(h=128, i=128):
+def source(h=128, i=128, e=4):
     torch.manual_seed(472)
-    e = 4
     plan = moe.plan_weights(
         source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w31"),
         activation=moe.ActivationSpec(
@@ -141,6 +140,14 @@ def test_prepared_native_cache_graph_matches_resident_reference(
         pytest.skip("physical SM120 required")
     h, i, capacity = geometry
     _graph_parity(tmp_path, dtype, source(h, i), capacity, 4, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="physical SM120 required")
+def test_qwen4_main_geometry_same_graph_with_synthetic_weights(tmp_path):
+    """Exercise the NVIDIA main-expert dimensions/top-k, not checkpoint values."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("physical SM120 required")
+    _graph_parity(tmp_path, torch.int32, source(2560, 640, 16), 4, 10, 8)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="physical SM120 required")

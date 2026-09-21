@@ -535,3 +535,216 @@ def test_metadata_rejects_unbounded_header_and_shard_traversal(tmp_path):
         read_header(path)
     with pytest.raises(ValueError, match="basename"):
         shard_name("../outside.safetensors")
+
+
+@pytest.fixture
+def qwen4_checkpoint(tmp_path):
+    """Small main/PLE/vision/MTP inventory with the pinned NVIDIA recipes."""
+    import json
+    import math
+    import struct
+    from b12x.integration.vllm.checkpoint import DTYPE_BYTES
+    from b12x.integration.vllm.checkpoint_qwen4 import expected_qwen4
+
+    text = dict(
+        dtype="bfloat16",
+        hidden_act="silu",
+        norm_topk_prob=True,
+        hidden_size=128,
+        moe_intermediate_size=128,
+        num_experts=2,
+        num_hidden_layers=2,
+        num_experts_per_tok=2,
+        vocab_size=8,
+        layer_types=["linear_attention", "full_attention"],
+        shared_expert_intermediate_size=128,
+        head_dim=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        hc_count=4,
+        hc_lowrank=16,
+        output_gate_type="sigmoid",
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=64,
+        mtp_num_hidden_layers=1,
+        mtp=dict(num_hidden_layers=1, layer_types=["full_attention"]),
+        ple_layer_ids=[2],
+        ple_embed_dim=128,
+        ple_conv_kernel_size=4,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=5,
+        make_ngram_vocab_size_divisible_by=8,
+        split_ngram_parts=2,
+    )
+    nvfp4 = dict(dynamic=False, num_bits=4, type="float", group_size=16)
+    block = dict(dynamic=False, num_bits=8, type="float", group_size=128)
+    routed = [f"model.language_model.layers.{l}.mlp.experts" for l in range(2)]
+    ple = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    mtp = "mtp.layers.0.mlp.experts"
+    algorithms = {n: dict(quant_algo="NVFP4", group_size=16) for n in routed}
+    algorithms.update(
+        {
+            ple: dict(quant_algo="FP8"),
+            mtp: dict(quant_algo="FP8_BLOCK_SCALES", group_size=128),
+        }
+    )
+    groups = dict(
+        routed=dict(targets=routed, weights=nvfp4, input_activations=nvfp4),
+        ple=dict(targets=[ple], weights=dict(dynamic=False, num_bits=8, type="float")),
+        draft=dict(
+            targets=[mtp], weights=block, input_activations=dict(block, dynamic=True)
+        ),
+    )
+    config = dict(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        model_type="qwen4_exp",
+        dtype="bfloat16",
+        text_config=text,
+        vision_config=dict(
+            hidden_size=16,
+            intermediate_size=32,
+            depth=1,
+            in_channels=3,
+            temporal_patch_size=2,
+            patch_size=2,
+            num_position_embeddings=8,
+            spatial_merge_size=2,
+            out_hidden_size=128,
+        ),
+        quantization_config=dict(
+            quant_method="modelopt",
+            quant_algo="MIXED_PRECISION",
+            ignore=[],
+            quantized_layers=algorithms,
+            config_groups=groups,
+        ),
+    )
+    quant = dict(
+        quantization=dict(
+            quant_algo="MIXED_PRECISION",
+            group_size=16,
+            exclude_modules=[],
+            quantized_layers=algorithms,
+        )
+    )
+    expected = expected_qwen4(config, quant)
+
+    def write(change=None):
+        records = {n: dict(v) for n, v in expected.items()}
+        if change:
+            change(records)
+        payload, header = bytearray(), {}
+        for name, v in records.items():
+            size = math.prod(v["shape"]) * DTYPE_BYTES[v["dtype"]]
+            data = struct.pack("<f", 1.0) if v["dtype"] == "F32" else bytes(size)
+            header[name] = dict(
+                shape=v["shape"],
+                dtype=v["dtype"],
+                data_offsets=[len(payload), len(payload) + size],
+            )
+            payload.extend(data)
+        raw = json.dumps(header).encode()
+        (tmp_path / "model.safetensors").write_bytes(
+            struct.pack("<Q", len(raw)) + raw + payload
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                dict(
+                    metadata=dict(total_size=len(payload)),
+                    weight_map={n: "model.safetensors" for n in header},
+                )
+            )
+        )
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "hf_quant_config.json").write_text(json.dumps(quant))
+
+    write()
+    return tmp_path, config, quant, write
+
+
+def test_qwen4_audit_keeps_ple_and_mtp_outside_routed_cache(qwen4_checkpoint):
+    from b12x.integration.vllm.checkpoint import audit
+    from b12x.moe.fused_moe._cache_preparation import tier_layout
+
+    path, _, _, _ = qwen4_checkpoint
+    r = audit(path, check_values=True)
+    assert r["status"] == "metadata_audited_cache_integration_required"
+    assert r["routed_weight_lower_bound_bytes"] == 2 * 2 * 3 * 128 * 128 // 2
+    assert r["canonical_mapped_bytes"] == 2 * tier_layout(2, 128, 128)[1]
+    assert r["promotion_payload_bytes"] == 3 * 128 * 128 * 9 // 16 + 8
+    assert r["classes"]["optional_mtp"]["bytes"] > 0
+    assert r["classes"]["optional_mtp"]["packed_bytes"] == 0
+    assert (
+        r["complete_checkpoint_tensor_bytes"]
+        == r["required_target_bytes"] + r["classes"]["optional_mtp"]["bytes"]
+    )
+    assert (
+        r["text_only_target_bytes"]
+        == r["required_target_bytes"] - r["classes"]["vision"]["bytes"]
+    )
+    assert (
+        r["host_with_ple_lower_bound_bytes"]
+        == r["host_expert_lower_bound_bytes"] + r["ple_table_bytes"]
+    )
+    assert r["global_scale_values"].startswith("all_routed")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale",
+        "model.language_model.layers.1.self_attn.indexer.index_qk_proj.weight",
+        "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+        "model.language_model.layers.0.attn_hyper_connection.block_inject_weight.weight",
+        "model.language_model.layers.0.mlp.experts.1.up_proj.weight_scale_2",
+        "mtp.layers.0.mlp.experts.1.down_proj.weight_scale_inv",
+    ],
+)
+def test_qwen4_inventory_rejects_missing_component(qwen4_checkpoint, name):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, _, _, write = qwen4_checkpoint
+    write(lambda records: records.pop(name))
+    with pytest.raises(ValueError, match="coverage mismatch"):
+        audit(path)
+
+
+def test_qwen4_mixed_quantization_alias_and_conflict(qwen4_checkpoint):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, config, quant, write = qwen4_checkpoint
+    import copy
+
+    config["quantization_config"]["quantized_layers"] = copy.deepcopy(
+        quant["quantization"]["quantized_layers"]
+    )
+    entry = config["quantization_config"]["quantized_layers"][
+        "mtp.layers.0.mlp.experts"
+    ]
+    entry["quant_algo"] = "FP8_PB_WO"
+    write()
+    assert audit(path)["status"] == "metadata_audited_cache_integration_required"
+    entry["group_size"] = 64
+    write()
+    with pytest.raises(ValueError, match="mixed-precision metadata"):
+        audit(path)
+
+
+def test_qwen4_rejects_fp8_ple_relabelled_as_bf16(qwen4_checkpoint):
+    from b12x.integration.vllm.checkpoint import audit
+
+    path, _, _, write = qwen4_checkpoint
+    name = (
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    )
+    write(lambda records: records[name].update(dtype="BF16"))
+    with pytest.raises(ValueError, match="layout mismatch"):
+        audit(path)
