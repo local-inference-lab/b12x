@@ -297,16 +297,17 @@ def test_recovery_reads_live_paged_fields_without_aliasing(large_stride):
     before = baseline.recurrent_state.clone()
     expected_state = before.clone()
     expected_output = _reference(baseline, expected_state)
+    page_bytes = 4 * ((1 << 31) + 32768) if large_stride else 67584
+    # One allocation shares the untouched gap and fits a 16 GiB GPU. Each
+    # field's second page still starts beyond the Int32 element-offset limit.
+    storage = torch.empty((page_bytes + 67584,), dtype=torch.uint8, device=device)
+    if not large_stride:
+        storage.fill_(123)
+    checkpoint = storage.view(torch.float32).as_strided((2, 1, 128, 128), (page_bytes // 4, 16384, 128, 1))
+    correction = storage[65536:].view(torch.float32).as_strided((2, 1, 1, 128), (page_bytes // 4, 128, 128, 1))
+    kg = storage[66048:].view(torch.bfloat16).as_strided((2, 1, 1, 256), (page_bytes // 2, 256, 256, 1))
     if large_stride:
-        step = (1 << 31) + 32768
-        checkpoint = torch.empty_strided((2, 1, 128, 128), (step, 16384, 128, 1), device=device)
-        correction = torch.empty_strided((2, 1, 1, 128), (step, 128, 128, 1), device=device)
-        kg = torch.empty_strided((2, 1, 1, 256), (step, 256, 256, 1), device=device, dtype=torch.bfloat16)
-    else:
-        storage = torch.full((2 * 67584,), 123, dtype=torch.uint8, device=device)
-        checkpoint = storage.view(torch.float32).as_strided((2, 1, 128, 128), (16896, 16384, 128, 1))
-        correction = storage[65536:].view(torch.float32).as_strided((2, 1, 1, 128), (16896, 128, 128, 1))
-        kg = storage[66048:].view(torch.bfloat16).as_strided((2, 1, 1, 256), (33792, 256, 256, 1))
+        assert all(tensor.stride(0) > 1 << 31 for tensor in (checkpoint, correction, kg))
     checkpoint.copy_(before)
     args = {name: getattr(baseline, name) for name in (
         "mixed_qkv", "raw_g", "raw_beta", "z", "A_log", "dt_bias", "norm_weight",

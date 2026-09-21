@@ -16,7 +16,8 @@ class KdaCommitBinding:
 
     Address tables must reference live pools with the head layout of the decode
     plan. Their owner must keep the pools alive through graph replay. Different
-    requests must not write the same non-null checkpoint. Source/final/boundary
+    requests must not write the same non-null checkpoint, and a written slot
+    must not be another request's source in the same call. Source/final/boundary
     slots within one request may alias. Counts and indices are trusted device
     metadata; no CPU synchronization is performed when binding.
     """
@@ -52,6 +53,8 @@ def bind_kda_commit(
     A null source/final slot or zero commit length leaves all state unchanged.
     Null boundary slots suppress checkpoint export. No allocations or writes
     occur here; the caller owns preparation of all metadata and address tables.
+    Base-address tables contain raw byte addresses. Block-stride tables contain
+    element counts in their respective pool dtypes, not byte strides.
     """
     state = require_prepared(plan, "attention.gdn")
     q, caps = state.query, state.layout.caps
@@ -71,9 +74,20 @@ def bind_kda_commit(
         kg_cache_base_addrs,
         kg_cache_block_strides,
     )
-    for table in tables:
+    for name, table in zip(
+        (
+            "state_base_addrs",
+            "state_block_strides",
+            "correction_cache_base_addrs",
+            "correction_cache_block_strides",
+            "kg_cache_base_addrs",
+            "kg_cache_block_strides",
+        ),
+        tables,
+        strict=True,
+    ):
         _require_tensor(
-            "pool table",
+            name,
             table,
             shape=(layers,),
             device=caps.device,
@@ -109,9 +123,18 @@ def bind_kda_commit(
         boundary_state_indices,
         boundary_recovery_lens,
     )
-    for tensor in metadata:
+    for name, tensor in zip(
+        (
+            "commit_lens",
+            "final_state_indices",
+            "boundary_state_indices",
+            "boundary_recovery_lens",
+        ),
+        metadata,
+        strict=True,
+    ):
         _require_tensor(
-            "commit metadata",
+            name,
             tensor,
             shape=(batch,),
             device=caps.device,

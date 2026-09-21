@@ -19,7 +19,9 @@ The record shapes are ``[slot, head, window, 128]`` and
 ``[slot, head, window, 256]``; ``state_index_columns`` sets the maximum window.
 ``bind_kda_commit`` / ``run_kda_commit`` apply accepted records across a group
 of layers and optionally export an aligned boundary checkpoint. This mode uses
-CuTe for both recurrence and recovery, and retains the gated output norm.
+CuTe for both recurrence and recovery. Gated output normalization is enabled by
+default; ``run_kda(..., apply_output_norm=False)`` returns the unnormalized
+recurrence output. Only recovery mode supports disabling output normalization.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
