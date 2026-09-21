@@ -1,12 +1,15 @@
 # Larger-than-VRAM checkpoint qualification
 
-Status: **metadata-compatible candidate; complete-model execution unqualified**.
+Status: **complete pinned checkpoint physically exercised on SM120**.
+The [full-checkpoint report](expert-cache-next80-results.md) records actual loader
+coverage, arithmetic, memory, serving and lifecycle results. The earlier
+metadata and integration evidence below remains attached to its original sources.
 The candidate is
 [`nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4` at revision
 `8fb2682f136cf94d932a498f18cb1e428832a912`](https://huggingface.co/nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4/tree/8fb2682f136cf94d932a498f18cb1e428832a912).
 The [SM120 reference guide](expert-cache-reference.md) remains the qualified
-Qwen3-30B configuration. This document does not extend its serving claim to
-Qwen3-Next.
+Qwen3-30B configuration. Qwen3-Next qualification has its own explicit capacity,
+host-memory and numerical boundaries in the full-checkpoint report.
 
 The [Qwen3.8 compatibility audit](expert-cache-qwen38-audit.md) retains this 80B
 candidate as the immediate target. Qwen3.8 has compatible routed metadata but
@@ -46,8 +49,9 @@ all 296,175 target tensors, including every routed projection, scale, shared
 gate, attention projection and recurrent parameter. Missing target tensors,
 unexpected target names, quantization-exclusion conflicts, shape/dtype changes,
 corrupt offsets and inconsistent index entries fail before source allocation.
-Header coverage is not a report of tensors actually consumed by a running
-loader; that remains a physical qualification gate.
+Header coverage alone does not prove tensors were consumed by a running loader.
+The full-checkpoint report separately validates actual load callbacks against
+this inventory.
 
 | Storage class | Tensor bytes | GiB |
 |---|---:|---:|
@@ -113,9 +117,12 @@ python scripts/inspect_expert_cache_checkpoint.py \
 ```
 
 Local scale validation requires finite positive global scales and exact gate/up
-equality. It does not silently reconcile scales. Block-scale value validation
-remains with `ExpertWeightSource`. The engine still computes the full content
-fingerprint for profile identity; metadata hashes cannot replace it.
+equality. It does not silently reconcile scales. `--check-block-scales` streams
+target block-scale values; `ExpertWeightSource` also validates loaded values.
+`--identity-output` hashes complete contents once and retains an immutable-file
+receipt for subsequent launches through `B12X_CHECKPOINT_IDENTITY`. Metadata
+hashes cannot replace the checkpoint content fingerprint. `--loader-coverage`
+checks an actual load-time callback manifest against the strict inventory.
 
 The pinned remote checkpoint also passed a bounded scalar-value audit: all
 73,728 routed global scales were finite and positive, and all 24,576 gate/up
@@ -197,10 +204,11 @@ and an initial build failure caused by missing `libjemalloc.so.2` are retained;
 the bounded read was increased and the dependency installed inside the build
 container before successful verification. No host limits were changed.
 
-## Qualification still requiring the complete checkpoint
+## Full-checkpoint qualification procedure
 
-No full checkpoint download or complete-model execution is implied by the
-metadata audit. The staged acceptance is:
+The metadata audit alone does not establish full-model execution. The
+[physical results](expert-cache-next80-results.md) apply the following gates to
+the supplied pinned checkpoint:
 
 1. Supply the immutable checkpoint and verify local metadata, scale values and
    the full content fingerprint. Retain actual loader coverage, distinguishing
