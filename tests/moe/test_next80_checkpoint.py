@@ -221,11 +221,44 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
     config, source, ordinary = load_layer(Path(location), layer)
     assert config["model_type"] == "qwen3_next"
     torch.manual_seed(131 + layer)
-    x = (torch.randn(4, config["hidden_size"], device="cuda") * 0.125).bfloat16()
+    bounded = os.environ.get("B12X_TEST_NEXT80_ROUTE_SUBSET") == "1"
+    rows = 1 if bounded else 4
+    x = (torch.randn(rows, config["hidden_size"], device="cuda") * 0.125).bfloat16()
     logits = torch.nn.functional.linear(x, ordinary["gate.weight"].cuda())
     scores = logits.float().softmax(-1)
     weights, ids = torch.topk(scores, config["num_experts_per_tok"], dim=-1)
     weights = weights / weights.sum(-1, keepdim=True)
+    if bounded:
+        # Sanitizer control retains real selected rows and weights, with an
+        # explicit compact-to-checkpoint ID table. Full geometry is tested above
+        # this optional mode; this is not a 512-expert sanitizer claim.
+        from dataclasses import replace
+        import faulthandler
+
+        faulthandler.dump_traceback_later(90, repeat=True)
+        selected = sorted(set(ids.cpu().flatten().tolist()))
+        selected += [e for e in range(512) if e not in selected][: 16 - len(selected)]
+        index = torch.tensor(selected)
+        fields = {
+            name: value[index].contiguous()
+            for name, value in vars(source.weights).items()
+            if isinstance(value, torch.Tensor)
+        }
+        source = replace(
+            source,
+            plan=replace(
+                source.plan, geometry=replace(source.plan.geometry, num_experts=16)
+            ),
+            weights=replace(source.weights, **fields),
+        )
+        ids.copy_(
+            torch.tensor(
+                [[selected.index(int(e)) for e in row] for row in ids.cpu()],
+                device="cuda",
+            )
+        )
+        print("bounded sanitizer compact-to-checkpoint IDs:", selected, flush=True)
+    experts = source.plan.geometry.num_experts
     # Preserve actual router selections/weights in one case; adversarial cases
     # separately exercise duplicate and reversed logical routes.
     routes = [(ids.clone(), weights.clone()), (ids.flip(-1), weights.flip(-1))]
@@ -239,11 +272,11 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
     plans = [
         moe.plan_execution(
             experts=source,
-            capacity=moe.ExecutionCapacity(max_tokens=4, top_k=10),
+            capacity=moe.ExecutionCapacity(max_tokens=rows, top_k=10),
             placement=moe.ExpertResidencyPlan(
-                total_experts=512,
+                total_experts=experts,
                 hbm_expert_ids=tuple(range(n)),
-                grace_expert_ids=tuple(range(n, 512)),
+                grace_expert_ids=tuple(range(n, experts)),
                 layer=source.weights.layer_name,
                 model_fingerprint=source.weights.checkpoint_fingerprint,
                 workload="real checkpoint layer qualification",
@@ -252,9 +285,9 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
             memory_budget=moe.ExpertMemoryBudget(
                 hbm_bytes=2 << 30, grace_bytes=2 << 30
             ),
-            updates=moe.ResidencyUpdateCapacity(max_pairs=1) if n < 512 else None,
+            updates=moe.ResidencyUpdateCapacity(max_pairs=1) if n < experts else None,
         )
-        for n in (512, 256, 1)
+        for n in (experts, experts // 2, 1)
     ]
 
     def prepare(state):
@@ -376,7 +409,9 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                 for plan in plans[1:]:
                     state = plan.prepared.state
                     state.updates.apply(
-                        ((511, 0),), expected=state.updates.snapshot(), quiescent=True
+                        ((experts - 1, 0),),
+                        expected=state.updates.snapshot(),
+                        quiescent=True,
                     )
                 for graph, _binding, _ in graphs:
                     graph.replay()
@@ -392,3 +427,5 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
         for graph, _, _ in graphs:
             graph.reset()
     assert all(p.prepared is None for p in plans)
+    if bounded:
+        faulthandler.cancel_dump_traceback_later()

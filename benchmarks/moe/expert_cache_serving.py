@@ -59,9 +59,9 @@ async def run(args):
         max_num_seqs=args.concurrency,
         max_num_batched_tokens=args.capacity,
         kv_cache_memory_bytes=args.kv_gib << 30,
-        offload_config=({'offload_backend': 'uva', 'uva': {
-            'cpu_offload_gb': args.expert_offload_gib, 'cpu_offload_params': ['experts']}}
-            if args.expert_offload_gib else {}),
+        offload_backend='uva' if args.expert_offload_gib else 'auto',
+        cpu_offload_gb=args.expert_offload_gib,
+        cpu_offload_params={'experts'} if args.expert_offload_gib else set(),
         enable_prefix_caching=False,
         kv_cache_dtype="bfloat16",
         attention_config={"backend": "FLASHINFER"},
