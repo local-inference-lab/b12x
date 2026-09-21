@@ -49,7 +49,7 @@ def replay_static_cold(profile, records):
     windows = []
     previous, previous_maps = None, None
     for boundary in boundaries:
-        result = boundary["result"]
+        result = boundary["receipt"]
         if len(result) != 1:
             raise ValueError("route replay requires one worker")
         value = result[0]
