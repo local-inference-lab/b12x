@@ -58,7 +58,9 @@ def declaration(s, capacity=4, top_k=4, hot_count=2):
         capacity=moe.ExecutionCapacity(max_tokens=capacity, top_k=top_k),
         placement=placement,
         memory_budget=moe.ExpertMemoryBudget(hbm_bytes=2 << 30, grace_bytes=2 << 30),
-        updates=moe.ResidencyUpdateCapacity(max_pairs=2) if hot_count < e else None,
+        updates=moe.ResidencyUpdateCapacity(max_pairs=min(2, hot_count, e - hot_count))
+        if hot_count < e
+        else None,
     )
 
 
@@ -139,6 +141,14 @@ def test_prepared_native_cache_graph_matches_resident_reference(
         pytest.skip("physical SM120 required")
     h, i, capacity = geometry
     _graph_parity(tmp_path, dtype, source(h, i), capacity, 4, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="physical SM120 required")
+@pytest.mark.parametrize("hot_count", [1, 3, 4])
+def test_capacity_extremes_match_all_resident_whole_k(tmp_path, hot_count):
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("physical SM120 required")
+    _graph_parity(tmp_path, torch.int32, source(), 4, 4, hot_count)
 
 
 def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count):
@@ -242,14 +252,13 @@ def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count):
                 moe.run(binding=binding)
             graphs.append((graph, binding, ref))
         session.freeze()
-        for pairs in (
-            ((hot_count, 0), (e - 1, 1)),
-            ((0, hot_count), (1, e - 1)),
-            ((hot_count, 0),),
-        ):
+        pair_count = min(2, hot_count, e - hot_count)
+        forward = ((hot_count, 0), (e - 1, 1))[:pair_count]
+        backward = tuple((b, a) for a, b in forward)
+        for pairs in (forward, backward, forward[:1]):
             ids.random_(0, e)
-            ids[0, 0] = hot_count
-            ids[0, 1] = hot_count
+            ids[0, 0] = min(hot_count, e - 1)
+            ids[0, 1] = min(hot_count, e - 1)
             ids[0, 2] = e - 1
             ids[0, 3] = 2**40 if dtype == torch.int64 else -1
             a.mul_(0.9375)
@@ -258,9 +267,10 @@ def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count):
                 graph.replay()
                 original_outputs.append(binding.output.clone())
             torch.cuda.synchronize()
-            state.updates.apply(
-                pairs, expected=state.updates.snapshot(), quiescent=True
-            )
+            if pairs:
+                state.updates.apply(
+                    pairs, expected=state.updates.snapshot(), quiescent=True
+                )
             for (graph, binding, ref), original_output in zip(
                 graphs, original_outputs, strict=True
             ):

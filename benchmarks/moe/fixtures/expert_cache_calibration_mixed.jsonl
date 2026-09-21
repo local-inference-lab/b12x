@@ -1,0 +1,8 @@
+{"workload":"general","text":"Explain why a ceramic mug feels cooler than a wooden spoon in the same kitchen, using everyday language."}
+{"workload":"general","text":"Write a warm scene about neighbors repairing a bicycle together on a rainy afternoon."}
+{"workload":"code","text":"Implement a Python function that merges overlapping appointment intervals, with tests for empty input and touching intervals. Explain the invariant."}
+{"workload":"code","text":"Design a small TypeScript queue with cancellation tokens. Show how a caller enqueues a job and cancels it before execution."}
+{"workload":"math","text":"Derive a formula for the sum of the first n odd positive integers. Give both an algebraic proof and a geometric explanation."}
+{"workload":"math","text":"A bag contains four green and five yellow counters. Two counters are drawn without replacement. Calculate the probability of matching colors and explain each step."}
+{"workload":"multilingual","text":"Escribe una guía breve para organizar un intercambio de libros en un barrio. Incluye una invitación amable y consejos prácticos."}
+{"workload":"multilingual","text":"Expliquez en français comment préparer une randonnée d'une journée avec des débutants. Donnez un itinéraire raisonnable et une liste de matériel."}

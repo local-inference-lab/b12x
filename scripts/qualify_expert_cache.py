@@ -28,6 +28,7 @@ HOST = [
             "residency_epoch",
             "vllm_residency_epoch",
             "expert_cache_serving",
+            "expert_cache_capacity",
             "routing_health",
             "prepared_expert_cache",
             "residency_updates",
@@ -65,7 +66,12 @@ def require_complete(path, log):
     text = log.read_text()
     if any(
         word in text
-        for word in ("Exception ignored in:", "did not exit", "SIGKILL", "force killing")
+        for word in (
+            "Exception ignored in:",
+            "did not exit",
+            "SIGKILL",
+            "force killing",
+        )
     ):
         raise ValueError(f"unclean shutdown: {log}")
     records = [json.loads(line) for line in path.read_text().splitlines()]
@@ -87,6 +93,12 @@ def main(argv=None):
     p.add_argument("--pairs", type=int, default=3)
     p.add_argument("--tokens", type=int, default=256)
     p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--workload", default="general")
+    p.add_argument(
+        "--all-resident-static",
+        action="store_true",
+        help="Qualify repeated all-resident static runs; no adaptive acceptance claim",
+    )
     p.add_argument("--cache-gib", type=int, default=8)
     p.add_argument("--host-gib", type=int, default=40)
     p.add_argument("--kv-gib", type=int, default=2)
@@ -110,12 +122,17 @@ def main(argv=None):
         p.error("GPU acceptance requires the supplied NVFP4 checkpoint")
     if args.sanitizer and args.tier != "gpu":
         p.error("sanitizer is a separate GPU diagnostic")
+    if args.all_resident_static and args.tier != "serving":
+        p.error("all-resident static is a serving qualification scope")
     args.output.mkdir(parents=True)
     out = args.output.resolve()
     receipt = dict(
         schema="b12x-expert-cache-acceptance/v1",
         status="running",
         tier=args.tier,
+        serving_scope="all-resident-static"
+        if args.all_resident_static
+        else "static-adaptive",
         command=sys.argv if argv is None else argv,
         source=source_identity(ROOT),
         source_files=source_files(),
@@ -254,6 +271,8 @@ def main(argv=None):
                     str(out / f"{name}-resources.jsonl"),
                     "--mode",
                     mode,
+                    "--workload",
+                    args.workload,
                     "--tokens",
                     str(tokens),
                     "--concurrency",
@@ -311,7 +330,36 @@ def main(argv=None):
             receipt["profile_sha256"] = sha256(profile)
             receipt["prompts_sha256"] = sha256(args.prompts)
             serve("ordinary", "native", args.prompts, 16)
+            static_hash = None
             for pair in range(args.pairs):
+                if args.all_resident_static:
+                    name = f"pair-{pair}-static"
+                    summary = serve(name, "static", args.prompts, args.tokens)
+                    records = [
+                        json.loads(r)
+                        for r in (out / f"{name}.jsonl").read_text().splitlines()
+                    ]
+                    status = next(
+                        r["status"] for r in records if r["kind"] == "prepared"
+                    )
+                    if not status["layers"] or any(
+                        row["resident"] != row["experts"]
+                        or row["max_pairs"]
+                        or row["generation"]
+                        for row in status["layers"].values()
+                    ):
+                        raise RuntimeError(
+                            "all-resident static requires every expert resident and no updates"
+                        )
+                    if (
+                        static_hash is not None
+                        and static_hash != summary["output_token_sha256"]
+                    ):
+                        raise RuntimeError("repeated all-resident output mismatch")
+                    static_hash = summary["output_token_sha256"]
+                    if sha256(profile) != receipt["profile_sha256"]:
+                        raise RuntimeError("learned profile changed during serving")
+                    continue
                 arms = (
                     ("static", "adaptive") if pair % 2 == 0 else ("adaptive", "static")
                 )
