@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-409",
+  "category": "fix",
+  "summary": "Keep GDN binding errors precise and avoid duplicate KDA recovery validation.",
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Invalid packed metadata raises the intended capacity error; valid kernel arithmetic and launch geometry are unchanged.",
+    "Recovery validates static tensors at binding, not again during execution.",
+    "The commit contract explicitly defines final-state precedence for aliased destinations and distinguishes Int32 destination IDs from Int64 pool offsets."
+  ],
+  "pull_requests": [409],
+  "requires": ["b12x-408"],
+  "evidence": [
+    "https://github.com/local-inference-lab/rtx6kpro/blob/master/benchmarks/glm53-kda-recovery-lmcache.md"
+  ]
+}
