@@ -113,6 +113,86 @@ equality. It does not silently reconcile scales. Block-scale value validation
 remains with `ExpertWeightSource`. The engine still computes the full content
 fingerprint for profile identity; metadata hashes cannot replace it.
 
+The pinned remote checkpoint also passed a bounded scalar-value audit: all
+73,728 routed global scales were finite and positive, and all 24,576 gate/up
+pairs were exactly equal. The audit read 591,320 bytes of tensor data through
+validated ranges. It did not download packed weights, validate block-scale
+values or replace the eventual complete-checkpoint fingerprint.
+
+For this geometry, one canonical promotion copies 1,769,480 payload bytes;
+map publication adds 8,192 bytes per affected layer. These are accounting
+values from the existing transaction contract, not measured transfer timings.
+The unchanged 32-pair allowance fits inside the 128-MiB byte cap for this
+geometry. Per-layer capacity and policy eligibility remain separate limits.
+
+## Source-bound integration checks, 2026-09-21
+
+These checks qualify the reusable integration change and the original reference
+regression. They do **not** qualify Qwen3-Next full-model loading or serving.
+
+| Identity | Tested value |
+|---|---|
+| b12x frozen source export | `b86602bdb47f9e4c2b44a5b083433fc09e78aa7e` |
+| Companion source | `019b9df5cbd9122d6e9670485879a8108a65ee8b` |
+| Complete source-built wheel SHA-256 | `8154450892adc23a97b60adc0faaa9fd97fcbf9fcce810b454cddd3505414258` |
+| GPU | RTX PRO 4000 Blackwell, `GPU-47363510-b87a-13a5-4824-2542e97df76c` |
+| Driver / Torch / toolkit / CUTLASS | 580.173.02 / 2.13.0 / CUDA 13.3 / 4.6.2 |
+| Observed loaded PCIe link | Gen4 x16; idle samples also downshifted |
+
+The rebuilt wheel uses the changed companion source, with precompiled-wheel
+downloads disabled. Existing unchanged native build objects were reused by the
+build system. The artifact verifier checked 2,761 installed Python/native files
+against the wheel and 2,548 repository Python files against the committed source.
+Serving workers verified their loaded artifacts. The wheel version suffix is not
+the build identity.
+
+| Gate | Result |
+|---|---|
+| Independent host acceptance on b12x `b86602bd` | [1,108 passed, 66 skipped](https://github.com/local-inference-lab/b12x/actions/runs/35605667068) |
+| Companion cache/maintenance tests against rebuilt wheel | 24 passed, no skips |
+| Existing SM120 GPU acceptance with Qwen3-30B checkpoint | 41 passed, no skips |
+| Shared-composition memcheck and synccheck | Two tests passed under each tool; zero errors |
+| Ordinary non-cache Qwen3-30B serving | 256 generated tokens; clean explicit shutdown |
+| Qwen3-30B static/adaptive cache regression | 1,024 tokens per arm; exact paired outputs; 320 promotions |
+
+The shared-composition tests execute the prepared native routed cache with a
+synthetic gated shared module, covering serial and actual asynchronous shared
+dispatch, same-graph promotion, fixed pointers and no replay allocations. They
+do not substitute for a real Qwen3-Next shared-layer arithmetic oracle. Both
+sanitizers ran the asynchronous test revision; a later test-only portability
+change replaced equivalent Torch CUDA synchronization/statistics calls with
+Torch accelerator calls. The exact final test source passed the 24-test suite.
+Earlier serial/shared-stream sanitizer receipts are retained separately.
+
+The serving regression used the existing C4 controlled-admission chat/code
+fixture, 64 output tokens per request, the unchanged 8-GiB Qwen3-30B learned
+profile and one static/adaptive pair. It retained equal output-token hashes,
+unchanged graph/cache addresses and valid generations. The cache loading peak
+was 1,793,372,160 Torch-allocated bytes (1.67 GiB), before cache preparation.
+All three engine runs ended with zero mapped cache bytes, CPU source bytes,
+graph owners, health-result storage and pending health work. Remaining Torch
+allocation/reservation was approximately 459/508 MiB for each cache worker;
+process/runtime pools are not reported as released model owners. Normal shutdown
+took approximately 6.31 seconds for ordinary serving and 9.96/10.00 seconds for
+static/adaptive serving, without forced termination or destructor exceptions.
+
+Raw smoke rates were 89.48 static and 105.77 adaptive generated tokens/s. This
+single short regression pair is not a repeated performance comparison and says
+nothing about Qwen3-Next throughput or an external offloading baseline. Historical
+capacity results remain attached to their original sources.
+
+Raw evidence is retained outside the repository at
+`/home/jasonc/b12x-next80-evidence-20260921` on the development host and
+`/home/jasonc/b12x-next80-results-20260921` on ripper. The wheel and complete build
+logs are under `/models/b12x-next80-build-20260921` on ripper. Key receipts are
+`preflight-b86602bd.json`, `artifact-reviewed.json`, `raw/gpu-final/acceptance.json`,
+`raw/companion-final.xml`, `raw/shared-async-{memcheck,synccheck}.log`, and
+`raw/qwen30-regression/acceptance.json`. They retain commands, loaded hashes,
+resource checkpoints, output IDs and raw timings. A truncated first index read
+and an initial build failure caused by missing `libjemalloc.so.2` are retained;
+the bounded read was increased and the dependency installed inside the build
+container before successful verification. No host limits were changed.
+
 ## Qualification still requiring the complete checkpoint
 
 No full checkpoint download or complete-model execution is implied by the
