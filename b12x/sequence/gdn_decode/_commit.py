@@ -18,7 +18,9 @@ class KdaCommitBinding:
     plan. Their owner must keep the pools alive through graph replay. Different
     requests must not write the same non-null checkpoint, and a written slot
     must not be another request's source in the same call. Source/final/boundary
-    slots within one request may alias. Counts and indices are trusted device
+    slots within one request may alias. If boundary and final destinations
+    alias, the final state takes precedence; retaining an earlier boundary
+    requires a distinct destination. Counts and indices are trusted device
     metadata; no CPU synchronization is performed when binding.
     """
 
@@ -55,6 +57,11 @@ def bind_kda_commit(
     occur here; the caller owns preparation of all metadata and address tables.
     Base-address tables contain raw byte addresses. Block-stride tables contain
     element counts in their respective pool dtypes, not byte strides.
+    Source indices use the plan's index dtype. Destination indices and recovery
+    lengths must be Int32; destination slot IDs must fit that signed range.
+    Pool-offset multiplication and pointer arithmetic are Int64 regardless of
+    the index storage dtype. Binding rejects other destination dtypes; it does
+    not cast or truncate them.
     """
     state = require_prepared(plan, "attention.gdn")
     q, caps = state.query, state.layout.caps

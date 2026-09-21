@@ -195,7 +195,7 @@ def _reference(binding: gdn.KdaBinding, state: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("columns", [1, 4, 8])
 @pytest.mark.parametrize("block_v", [16, 32])
-def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block_v, record_property):
+def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block_v, record_property, monkeypatch):
     """Record production must not mutate checkpoints or commit rejected tokens."""
     device = require_sm120()
     torch.manual_seed(591)
@@ -224,6 +224,10 @@ def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block
             binding.plan, scratch=binding.scratch,
             **{**args, "state_indices": binding.state_indices[:1]},
         )
+    def unexpected_revalidation(*_args):
+        raise AssertionError("Recovery run must use the already validated binding")
+
+    monkeypatch.setattr(type(require_prepared(binding.plan, "attention.gdn")), "_check", unexpected_revalidation)
     gdn.run_kda(binding)
     torch.testing.assert_close(binding.recurrent_state, before, rtol=0, atol=0)
     actual = binding.output[:columns + 1].float()
@@ -261,6 +265,11 @@ def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block
     torch.testing.assert_close(binding.recurrent_state[columns + 1], expected_state[columns + 1], rtol=1e-5, atol=1e-6)
     if columns > 1:
         torch.testing.assert_close(binding.recurrent_state[2], expected_state[2], rtol=1e-5, atol=1e-6)
+        binding.recurrent_state.copy_(before)
+        boundary[0] = final[0]
+        boundary_lens[0] = 1
+        gdn.run_kda_commit(commit)
+        torch.testing.assert_close(binding.recurrent_state[1], expected_state[columns], rtol=1e-5, atol=1e-6)
 
     binding.recurrent_state.copy_(before)
     graph = torch.cuda.CUDAGraph()
