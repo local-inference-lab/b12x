@@ -10,6 +10,6 @@
     "Existing tuning results report zero rejections; kernel arithmetic and winner selection are unchanged."
   ],
   "authors": ["voipmonitor"],
-  "pull_requests": [],
+  "pull_requests": [414],
   "requires": []
 }
