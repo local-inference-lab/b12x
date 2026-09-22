@@ -71,6 +71,26 @@ def test_calibration_counts_require_receipt_and_identity():
         calibration_counts(profile, receipt)
 
 
+@pytest.mark.parametrize("world", [2, 3, 4])
+def test_capacity_uses_agreed_tp_calibration_without_summing_replicas(world):
+    from copy import deepcopy
+
+    profile, receipt, expected = fixture()
+    profile["identity"]["tp_size"] = world
+    profile["hash"] = digest({k: v for k, v in profile.items() if k != "hash"})
+    owner = receipt[0]["result"][0]
+    owner["hash"] = profile["hash"]
+    receipt[0]["result"] = []
+    for rank in reversed(range(world)):
+        result = deepcopy(owner)
+        result["snapshot"]["rank"] = rank
+        receipt[0]["result"].append(result)
+    assert calibration_counts(profile, receipt) == expected
+    receipt[0]["result"][0]["snapshot"]["layers"][0]["counts"][0] += 1
+    with pytest.raises(ValueError, match="disagree"):
+        calibration_counts(profile, receipt)
+
+
 def test_fair_capacity_includes_workspace_and_never_exceeds_experts():
     q = ExpertCacheQuery(
         experts=4,

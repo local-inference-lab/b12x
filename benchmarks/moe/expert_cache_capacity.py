@@ -29,12 +29,28 @@ def calibration_counts(profile, receipt):
         raise ValueError("calibration requires one completed profile receipt")
     results = records[0]["result"]
     if isinstance(results, list):
-        if len(results) != 1:
-            raise ValueError("capacity study requires single-worker calibration")
+        world = profile["identity"].get("tp_size", 1)
+        if len(results) != world:
+            raise ValueError("calibration must include every TP participant")
+        if world > 1:
+            if {r["snapshot"]["rank"] for r in results} != set(range(world)):
+                raise ValueError("calibration TP ranks are missing or duplicated")
+            owner = next(r for r in results if r["snapshot"]["rank"] == 0)
+            for result in results:
+                if (
+                    result["hash"] != owner["hash"]
+                    or result["snapshot"]["layers"] != owner["snapshot"]["layers"]
+                ):
+                    raise ValueError("TP calibration counts or profile disagree")
+            results = [owner]
         results = results[0]
     if results["hash"] != profile["hash"]:
         raise ValueError("calibration receipt belongs to a different profile")
-    counts = {r["layer"]: tuple(r["counts"]) for r in results["snapshot"]["layers"]}
+    counts = {
+        r["layer"]: tuple(r["counts"])
+        for r in results["snapshot"]["layers"]
+        if r.get("phase", "decode") == "decode"
+    }
     identity = profile["identity"]
     if (
         set(counts) != set(identity["layers"])
@@ -206,7 +222,8 @@ def main():
     capacity = p.add_mutually_exclusive_group(required=True)
     capacity.add_argument("--cache-gib", type=int, nargs="+")
     capacity.add_argument(
-        "--maximum", action="store_true",
+        "--maximum",
+        action="store_true",
         help="Use the largest envelope after observed engine storage and fixed reserves",
     )
     p.add_argument("--output", type=Path, required=True)
