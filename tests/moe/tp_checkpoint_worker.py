@@ -43,7 +43,10 @@ p = argparse.ArgumentParser()
 p.add_argument("--layer", type=int, default=0)
 p.add_argument("--checkpoint", type=Path, required=True)
 p.add_argument("--output", type=Path, required=True)
+p.add_argument("--resident-counts", type=int, nargs="+", default=[512, 256, 1])
 args = p.parse_args()
+if any(n < 1 or n > 512 for n in args.resident_counts):
+    p.error("resident counts must be between 1 and the checkpoint's 512 experts")
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(rank)
 checkpoint = args.checkpoint
@@ -161,7 +164,7 @@ with set_current_vllm_config(config), torch.inference_mode():
         progress(f"layer-{args.layer}:route-all-gather-return")
         reports = []
         placement_reference = None
-        for resident in (512, 256, 1):
+        for resident in args.resident_counts:
             plan = moe.plan_execution(
                 experts=source,
                 capacity=moe.ExecutionCapacity(max_tokens=4, top_k=10),

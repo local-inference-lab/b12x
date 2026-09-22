@@ -108,6 +108,7 @@ def main(argv=None):
     p.add_argument("--deadline", type=float, default=300)
     p.add_argument("--kernel-filter")
     p.add_argument("--layers", type=int, nargs="+", default=[0])
+    p.add_argument("--resident-counts", type=int, nargs="+", default=[512, 256, 1])
     p.add_argument("--oracle-device", choices=("cpu", "cuda"), default="cuda")
     p.add_argument("--rank-child", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
@@ -115,6 +116,10 @@ def main(argv=None):
         p.error("ranks and deadline must be positive")
     if args.stage in ("layer", "compact") and args.ranks != 1:
         p.error("single-rank checkpoint tests require --ranks 1")
+    if args.resident_counts != [512, 256, 1] and args.stage != "tp-layer":
+        p.error("resident-count selection applies only to the TP layer fixture")
+    if any(n < 1 or n > 512 for n in args.resident_counts):
+        p.error("resident counts must be between 1 and 512")
     out = args.output.resolve()
     if args.rank_child:
         rank = int(os.environ.get("RANK", 0))
@@ -144,6 +149,8 @@ def main(argv=None):
             args.oracle_device,
             "--layers",
             *(str(layer) for layer in args.layers),
+            "--resident-counts",
+            *(str(count) for count in args.resident_counts),
         ]
         (out / f"rank-{rank}-command.json").write_text(
             json.dumps(command, indent=2) + "\n"
@@ -177,6 +184,7 @@ def main(argv=None):
         command=command,
         stage=args.stage,
         layers=args.layers,
+        resident_counts=args.resident_counts if args.stage == "tp-layer" else None,
         oracle_device=args.oracle_device,
         scope="filtered component" if args.kernel_filter else "whole program",
         kernel_filter=args.kernel_filter,

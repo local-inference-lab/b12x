@@ -33,6 +33,7 @@ def main():
     )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--layers", type=int, nargs="+", default=[0])
+    p.add_argument("--resident-counts", type=int, nargs="+", default=[512, 256, 1])
     p.add_argument("--oracle-device", choices=("cpu", "cuda"), default="cuda")
     args = p.parse_args()
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -167,6 +168,8 @@ def main():
                     str(layer),
                     "--output",
                     str(args.output / f"layer-{layer}"),
+                    "--resident-counts",
+                    *(str(count) for count in args.resident_counts),
                 ]
                 runpy.run_path(
                     str(Path(__file__).parents[1] / "moe/tp_checkpoint_worker.py"),
@@ -221,6 +224,8 @@ def main():
         world_size=world,
         completed=True,
         oracle_device=args.oracle_device,
+        layers=args.layers,
+        resident_counts=args.resident_counts if args.stage == "tp-layer" else None,
         torch=torch.__version__,
         torch_cuda=torch.version.cuda,
         device=str(torch.cuda.get_device_properties(rank)),

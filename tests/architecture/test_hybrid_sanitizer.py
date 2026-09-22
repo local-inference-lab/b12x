@@ -1,6 +1,7 @@
 """Sanitizer completion cannot be inferred from a quiet or partial log."""
 
 from scripts.qualify_hybrid_sanitizer import classify, diagnostic_inventory
+import pytest
 
 
 def test_requires_completion_from_every_rank_and_zero_summaries():
@@ -39,3 +40,27 @@ def test_probe_attribution_requires_stack_and_complete_accounting():
         )
     )["initialization_probe_only"]
     assert classify(99, False, {0: [1]}, {0}, 1, False) == "failed"
+
+
+@pytest.mark.parametrize(
+    "stage,counts", [("cuda", [1]), ("tp-layer", [0]), ("tp-layer", [513])]
+)
+def test_placement_scope_rejects_invalid_or_unrelated_controls(tmp_path, stage, counts):
+    from scripts.qualify_hybrid_sanitizer import main
+
+    output = tmp_path / "unstarted"
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--stage",
+                stage,
+                "--output",
+                str(output),
+                "--sanitizer",
+                "/unavailable",
+                "--resident-counts",
+                *map(str, counts),
+            ]
+        )
+    assert error.value.code == 2
+    assert not output.exists()
