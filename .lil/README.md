@@ -28,6 +28,6 @@ Use a component-prefixed identifier that matches the filename. For example,
 ```
 
 The fragment belongs in the implementation PR or in the commit series that
-imports the reviewed change. Preserve contributor attribution. Once a container
-release has published a fragment, do not edit or delete it; add a corrective
+imports the runtime-affecting change. Preserve contributor attribution. Once a
+container release has published a fragment, do not edit or delete it; add a corrective
 fragment instead.
