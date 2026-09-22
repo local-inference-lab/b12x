@@ -270,6 +270,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                 source.plan, geometry=replace(source.plan.geometry, num_experts=16)
             ),
             weights=replace(source.weights, **fields),
+            shard=replace(source.shard, experts=16),
         )
         ids.copy_(
             torch.tensor(
