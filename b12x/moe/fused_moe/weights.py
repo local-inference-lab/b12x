@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from .._shared.kernels.w4a16.btx import BtxLayer
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -110,6 +111,31 @@ class TrellisWeights:
             )
 
 
+@dataclass(frozen=True, kw_only=True)
+class BtxWeights:
+    """One validated CPU atom extent and its destination CUDA device.
+
+    Preparation stages bounded expert batches. The complete source payload
+    need not reside on the GPU beside its prepared representation.
+    """
+
+    layer: "BtxLayer"
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        from .._shared.kernels.w4a16.btx import BtxLayer
+
+        if not isinstance(self.layer, BtxLayer):
+            raise TypeError("BtxWeights.layer must be a BtxLayer")
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            raise ValueError("BtxWeights.device must identify a CUDA device")
+        object.__setattr__(self, "device", device)
+        self.layer.manifest.validate_extent(
+            self.layer.first_slot, self.layer.slot_count
+        )
+
+
 @dataclass(frozen=True)
 class PackedWeights:
     """Ordinary packed MoE checkpoint tensors, without runtime policy fields.
@@ -185,6 +211,7 @@ class PreparedExperts:
 
 
 __all__ = [
+    "BtxWeights",
     "PackedWeights",
     "PreparedExperts",
     "PreparedWeightFormat",

@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 # Maximum message capacity qualified for the TP16 island runtime. Callers use
 # this shared policy instead of duplicating an implementation-specific limit.
 ISLAND_RS_MAX_BYTES = 160 * 1024
+# Partial islands use the leader path without the equal-quarter alternative.
+# Keep default dispatch below its measured NCCL crossover for decode vectors.
+PARTIAL_ISLAND_MAX_BYTES = 32 * 1024
 
 
 def _algorithm_override() -> str:
@@ -65,18 +68,21 @@ def _algorithm_override() -> str:
 
 
 def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -> int:
-    """Return the capacity recommendation while preserving larger caller limits.
+    """Return the default dispatch capacity for the selected topology.
 
     Enabled TP2 graph peer-push needs at least 512 KiB. Callers must still use
     shape and execution-mode routing before selecting it over NCCL. Forced
-    island reduce-scatter advertises its full supported capacity; other modes
-    retain the caller's default.
+    island reduce-scatter advertises its full supported capacity. Partial
+    islands cap the default at 32 KiB; explicit caller overrides remain a
+    caller policy, and larger native collectives remain supported.
     """
 
     if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() == "island_rs":
         return max(default, ISLAND_RS_MAX_BYTES)
     if world_size == 2 and _tp2_plain_remote_push_enabled():
         return max(default, TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES)
+    if world_size in (9, 10):
+        return min(default, PARTIAL_ISLAND_MAX_BYTES)
     return default
 
 
@@ -103,8 +109,8 @@ def _algorithm_for_world_size(world_size: int) -> str:
 class PCIeAllReduce:
     """Select a peer-safe all-reduce implementation from the world size.
 
-    Worlds through TP8 use the low-latency all-peer oneshot runtime. TP12 and
-    TP16 use bounded-degree four-GPU islands so no CUDA context maps more than
+    Worlds through TP8 use the low-latency all-peer oneshot runtime. TP9,
+    TP10, TP12 and TP16 use islands of up to four GPUs so no context maps more than
     six peers. Other worlds fail closed instead of exceeding the CUDA peer
     connection limit.
     """

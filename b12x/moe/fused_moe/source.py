@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TypeAlias
 
+from .._shared.btx_schema import BtxManifest
 from .config import TrellisConfig
 
 
@@ -37,10 +38,22 @@ class PackedSource:
         object.__setattr__(self, "w13_layout", W13Layout(self.w13_layout))
 
 
-WeightSource: TypeAlias = PackedSource | TrellisConfig
+@dataclass(frozen=True, kw_only=True)
+class BtxSource:
+    """Trellis atom encoding with checkpoint-global transform coordinates."""
+
+    manifest: BtxManifest
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest, BtxManifest):
+            raise TypeError("BtxSource.manifest must be a BtxManifest")
+
+
+WeightSource: TypeAlias = PackedSource | TrellisConfig | BtxSource
 
 
 __all__ = [
+    "BtxSource",
     "PackedSource",
     "PackedSourceFormat",
     "W13Layout",

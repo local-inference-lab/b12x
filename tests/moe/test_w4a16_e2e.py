@@ -65,6 +65,176 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source_format", ["modelopt_nvfp4", "fp4_e8m0_k32"])
+@pytest.mark.parametrize("fused_sum", [False, True])
+@pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize("capacity", [14, 129])
+def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
+    source_format, fused_sum, mapped, capacity, monkeypatch
+):
+    """One declared capacity serves changed inputs and live lengths without JIT."""
+    from b12x.moe import fused_moe
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
+
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", str(int(fused_sum)))
+    torch.manual_seed(81281)
+    experts, hidden, intermediate, topk = 8, 256, 192, 4
+    x = (torch.randn(capacity, hidden, device="cuda") * 0.125).to(torch.bfloat16)
+    ids = torch.randint(experts, (capacity, topk), device="cuda", dtype=torch.int32)
+    expert_map = None
+    if mapped:
+        expert_map = torch.arange(experts - 1, -1, -1, dtype=torch.int32, device="cuda")
+        expert_map[-1] = -1
+    weights = torch.softmax(torch.randn(capacity, topk, device="cuda"), dim=-1)
+    if source_format == "modelopt_nvfp4":
+        raw = _make_weights(
+            experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation="silu",
+        )
+    else:
+        raw = (
+            torch.randint(
+                256,
+                (experts, intermediate * 2, hidden // 2),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+            _pattern_e8m0((experts, intermediate * 2, hidden // 32)),
+            torch.ones(experts, device="cuda"),
+            torch.randint(
+                256,
+                (experts, hidden, intermediate // 2),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+            _pattern_e8m0((experts, hidden, intermediate // 32), offset=1),
+            torch.ones(experts, device="cuda"),
+        )
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat(source_format)
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A16,
+            nonlinearity="silu",
+            io_dtype=x.dtype,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+        ),
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            w13=raw[0].clone(),
+            w13_block_scales=raw[1].clone(),
+            w13_global_scales=raw[2].clone(),
+            w2=raw[3].clone(),
+            w2_block_scales=raw[4].clone(),
+            w2_global_scales=raw[5].clone(),
+        ),
+    )
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
+        routing=fused_moe.RoutingSpec(),
+    )
+    # Numerical controls must come from the declaration, not from bind-time env.
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "0")
+    output = torch.empty_like(x)
+
+    def allocate(state):
+        return tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=s.device)
+            for s in state.scratch.scratch_specs()
+        )
+
+    def primer(state):
+        scratch = allocate(state)
+        binding = state.bind(
+            scratch=scratch,
+            a=x,
+            experts=prepared,
+            topk_weights=weights,
+            topk_ids=ids,
+            output=output,
+            route_expert_map=expert_map,
+        )
+        return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+
+    def expected(rows):
+        oracle_ids, oracle_weights = ids[:rows], weights[:rows]
+        if expert_map is not None:
+            oracle_ids = expert_map[oracle_ids.long()]
+            oracle_weights = oracle_weights.masked_fill(oracle_ids < 0, 0.0)
+            oracle_ids = oracle_ids.clamp_min(0)
+        if source_format == "fp4_e8m0_k32":
+            return moe_reference_w4a16_fp4_e8m0_k32(
+                x[:rows],
+                *raw,
+                oracle_ids,
+                oracle_weights,
+                experts,
+                hidden,
+                intermediate,
+                activation="silu",
+                swiglu_limit=None,
+                w13_layout="w13",
+            )
+        return _reference_w4a16(
+            x[:rows], *raw, oracle_ids, oracle_weights, activation="silu"
+        )
+
+    with PreparationSession(device=x.device, autotune=False) as session:
+        request = plan.request(name="prefill-reduction-capacity", prepare_call=primer)
+        session.prepare((request,))
+        state = require_prepared(request.plan, "moe.decode")
+        assert state.scratch._core_workspace_plan.prefill_fused_sum_fp32 == fused_sum
+        scratch = allocate(state)
+        pointers = tuple(t.data_ptr() for t in scratch)
+        launchers = set()
+        for rows in (capacity, min(17, capacity), 1, capacity - 1):
+            oracle = expected(rows)
+            with kernel_resolution_guard():
+                binding = fused_moe.bind(
+                    request.plan,
+                    scratch=scratch,
+                    a=x[:rows],
+                    experts=prepared,
+                    topk_weights=weights[:rows],
+                    topk_ids=ids[:rows],
+                    output=output[:rows],
+                    route_expert_map=expert_map,
+                )
+                actual = binding.run()
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+            _assert_matches_oracle(actual, oracle, activation="silu")
+            launchers.add(id(binding.fused_launch))
+        assert len(launchers) == 1
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = binding.run()
+        for factor in (-0.5, 2.0):
+            x.mul_(factor)
+            oracle = expected(capacity - 1)
+            for tensor in scratch:
+                tensor.fill_(255)
+            before = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == before
+            assert pointers == tuple(t.data_ptr() for t in scratch)
+            assert torch.isfinite(captured).all() and torch.count_nonzero(captured)
+            _assert_matches_oracle(captured, oracle, activation="silu")
+        del graph
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("host_barrier_reset", [False, True])
 def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
     host_barrier_reset: bool,

@@ -11,7 +11,54 @@ from b12x.moe.fused_moe._preparation import (
     _FusedMoeCapacityState,
     _W4A16PrimaryLaunches,
     variant_for,
+    _control_snapshot,
 )
+
+
+@pytest.mark.parametrize("mode", ["auto", "compact", "shared"])
+def test_qsrt_decoder_control_is_frozen_at_declaration(monkeypatch, mode):
+    monkeypatch.setenv("B12X_QSRT_K2_LUT_MODE", mode)
+    controls = _control_snapshot()
+    monkeypatch.setenv("B12X_QSRT_K2_LUT_MODE", "invalid")
+    assert controls["qsrt_k2_lut_mode"] == mode
+    with pytest.raises(ValueError, match="B12X_QSRT_K2_LUT_MODE"):
+        _control_snapshot()
+
+
+@pytest.mark.parametrize("rows,mode,expected,shared_limit", [
+    (1, "auto", True, 101376), (8, "auto", True, 101376),
+    (16, "auto", True, 101376), (17, "auto", False, 101376),
+    (8, "compact", False, 101376), (8, "shared", True, 101376),
+    (8, "auto", False, 65536),
+])
+def test_qsrt_direct_table_preserves_cooperative_residency(
+    monkeypatch, rows, mode, expected, shared_limit,
+):
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: SimpleNamespace(
+        multi_processor_count=188, shared_memory_per_block_optin=shared_limit,
+    ))
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_SMEM", "1")
+    kernel = W4A16FusedMoeKernel(
+        size_m=rows, hidden_size=3584, intermediate_size=384,
+        num_experts=512, top_k=16, activation="silu",
+        apply_router_weight_on_input=False, zero_fc2_output=False,
+        fc1_tile_n=128, fc1_tile_k=128, fc2_tile_n=128, fc2_tile_k=128,
+        moe_block_size=8, max_m_blocks=1024, element_dtype="fp16",
+        weight_layout="trellis_t256", scale_format="e4m3_k32",
+        w13_layout="trellis_t256_proj", trellis_bits=2,
+        full_rotation=True, intermediate_rotation=True, coupled_hadamard=True,
+        qsrt_k2_lut_mode=mode,
+    )
+    assert kernel.trellis_direct_lut == expected
+    assert kernel.shared_words * 4 <= kernel.fc1.max_shared_mem
+    if expected:
+        assert kernel.blocks_per_sm == 1
+        assert kernel.sqg_xor_cheb_t12_smem
+        assert kernel.fc1.trellis_direct_lut and kernel.fc2.trellis_direct_lut
 
 
 class _Variant:
@@ -137,6 +184,20 @@ def test_repacked_grid_override_namespace_uses_prepared_capacity(
     )
     with pytest.raises(NamespaceResolved):
         _impl._launch_dynamic_flat(**arguments)
+
+
+@pytest.mark.parametrize("tokens, expected", [(4, 4), (11, 128)])
+def test_public_route_dispatch_selects_retained_capacity(monkeypatch, tokens, expected):
+    from b12x.moe.fused_moe import api
+
+    plan = object()
+    binding = SimpleNamespace(plan=plan, hidden_states=torch.empty(tokens, 16))
+    variants = {
+        count: SimpleNamespace(route=lambda bound, count=count: (count, bound))
+        for count in (4, 128)
+    }
+    monkeypatch.setattr(api, "require_prepared", lambda *_args: SimpleNamespace(variants=variants))
+    assert api.route(plan, binding=binding) == (expected, binding)
 
 
 def _launches(*, direct, route_pack, route_mode="auto"):

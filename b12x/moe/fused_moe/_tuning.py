@@ -162,6 +162,8 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("query must be MoeDecodeQuery")
     if not isinstance(query.controls, FrozenMapping):
         raise TypeError("MoE controls must be frozen declaration metadata")
+    if query.controls.get("qsrt_k2_lut_mode", "auto") not in {"auto", "compact", "shared"}:
+        raise ValueError("QSRT decoder mode must be auto, compact, or shared")
     if query.io_dtype not in {"bfloat16", "float16"}:
         raise TypeError("MoE I/O dtype must be bfloat16 or float16")
     if query.route_logits_dtype not in {None, "float16", "bfloat16", "float32"}:
@@ -526,7 +528,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=8,
+    query_schema_version=10,
     config_schema_version=5,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),

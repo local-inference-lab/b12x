@@ -66,10 +66,12 @@ from b12x._lib.intrinsics import (
     packed_decode_sqg_fp16_d3l_to_bfloat2x4,
     packed_decode_sqg_fp16_d3l_to_half2x4,
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
+    packed_decode_trellis_sqg_direct_lut_to_e4m3x8,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
     red_add_global_bf16x2,
+    red_add_global_v4_f32,
     red_add_global_release_i32,
     red_max_global_f32_nonnegative,
     shared_ptr_to_u32,
@@ -87,7 +89,10 @@ from b12x._lib.intrinsics import (
     trellis_align_stream_u32x2,
     warp_reduce,
 )
-from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
+from b12x._lib.quant.sqg_e4m3 import (
+    sqg_xor_cheb_t12_direct_lut,
+    sqg_xor_cheb_t12_lut,
+)
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
 )
@@ -109,6 +114,8 @@ from b12x.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
+    prefill_fused_sum_eligible,
+    prefill_fused_sum_enabled,
     select_route_block_size_m,
     validate_activation,
 )
@@ -285,10 +292,12 @@ def _gather_native_scale_bytes(a: Uint32, b: Uint32, c: Uint32, d: Uint32, byte:
 
 
 def _trellis256_execution_lut(
-    device: torch.device | str, codebook: str
+    device: torch.device | str, codebook: str, *, direct_lut: bool = False
 ) -> torch.Tensor:
     if codebook == SQG_FP16:
         return sqg_fp16_d3l_descriptors(device)
+    if direct_lut:
+        return sqg_xor_cheb_t12_direct_lut(device)
     return sqg_xor_cheb_t12_lut(device)
 
 # TC-decode runs on the packed W4A16 object and folds the top-k sum into the FC2
@@ -770,6 +779,7 @@ class W4A16FusedMoeCompileResult:
     use_expert_map: bool = False
     scale_format: str = "e4m3_k16"
     tc_decode_fused_sum: bool = False
+    prefill_fused_sum_fp32: bool = False
     collect_activation_amax: bool = False
     schedule_whole_tiles: bool = False
     intermediate_rotation: bool = False
@@ -785,6 +795,7 @@ class W4A16FusedMoeCompileResult:
     shared_memory_bytes: int = -1
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
+    trellis_direct_lut: bool = False
 
 
 @dataclass(frozen=True)
@@ -931,6 +942,7 @@ class W4A16GemmKernel:
         dual_a: bool = False,
         route_major_a: bool = False,
         fused_topk_sum: bool = False,
+        fused_sum_fp32: bool = False,
         fused_sum_topk: int = 1,
         schedule_whole_tiles: bool = False,
         dynamic_num_experts: bool = False,
@@ -1104,6 +1116,7 @@ class W4A16GemmKernel:
             static_pair_rates.get(trellis_pair_kind, (3, 3))
         )
         self.sqg_xor_cheb_t12_smem = False
+        self.trellis_direct_lut = False
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1170,6 +1183,7 @@ class W4A16GemmKernel:
         if self.route_major_a and not self.dual_a:
             raise ValueError("route_major_a requires the exact dual-A FC1 path")
         self.fused_topk_sum = bool(fused_topk_sum)
+        self.fused_sum_fp32 = bool(fused_sum_fp32)
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
         # CTA over the full K (grid-strided waves, ragged last wave), skipping
@@ -1196,10 +1210,10 @@ class W4A16GemmKernel:
             raise ValueError(
                 "schedule_whole_tiles requires direct_topk_routes or trellis_t256"
             )
-        if self.fused_topk_sum and not self.direct_topk_routes:
-            raise ValueError("fused_topk_sum requires direct_topk_routes")
         if self.fused_topk_sum and self.fused_sum_topk < 1:
             raise ValueError("fused_sum_topk must be >= 1")
+        if self.fused_sum_fp32 and not self.fused_topk_sum:
+            raise ValueError("fused_sum_fp32 requires fused_topk_sum")
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         self.max_m_blocks = int(max_m_blocks)
@@ -1212,6 +1226,7 @@ class W4A16GemmKernel:
         else:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        self.max_shared_mem = max_shared_mem
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
@@ -1345,7 +1360,9 @@ class W4A16GemmKernel:
             self.dual_a,
             self.route_major_a,
             self.fused_topk_sum,
+            self.fused_sum_fp32,
             self.fused_sum_topk,
+            self.size_m if self.fused_sum_fp32 else None,
             self.cta_m_blocks,
             self.uses_m_block_8,
             self.shared_words,
@@ -1356,6 +1373,7 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles,
             self.schedule_route_block_factor,
             self.sqg_xor_cheb_t12_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
         )
 
@@ -3697,13 +3715,19 @@ class W4A16GemmKernel:
                     win_a, win_b, trellis_lut_addr, int(bits)
                 )
         else:
-            e_lo, e_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-                win_a,
-                win_b,
-                trellis_lut_addr,
-                int(bits),
-                t12_in_shared=self.sqg_xor_cheb_t12_smem,
-            )
+            if cutlass.const_expr(self.trellis_direct_lut):
+                e_lo, e_hi = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+                    win_a, win_b, trellis_lut_addr, int(bits),
+                    in_shared=self.sqg_xor_cheb_t12_smem,
+                )
+            else:
+                e_lo, e_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+                    win_a,
+                    win_b,
+                    trellis_lut_addr,
+                    int(bits),
+                    t12_in_shared=self.sqg_xor_cheb_t12_smem,
+                )
             if cutlass.const_expr(self.is_fp16):
                 o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
                 o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
@@ -5111,14 +5135,32 @@ class W4A16GemmKernel:
                     # to token = route_index // top_k.  bf16x2 add lands two
                     # consecutive hidden lanes per word.
                     token_idx = route_index // Int32(self.fused_sum_topk)
-                    out_idx = Int64(token_idx) * Int64(c_gl_stride) + Int64(
-                        c_gl_wr % c_gl_stride
-                    )
-                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int64(8))
-                    red_add_global_bf16x2(out_addr, q0)
-                    red_add_global_bf16x2(out_addr + Int64(4), q1)
-                    red_add_global_bf16x2(out_addr + Int64(8), q2)
-                    red_add_global_bf16x2(out_addr + Int64(12), q3)
+                    col_word = c_gl_wr % c_gl_stride
+                    if cutlass.const_expr(self.fused_sum_fp32):
+                        out_elem = (
+                            Int64(token_idx) * Int64(self.size_n)
+                            + Int64(col_word) * Int64(8)
+                        )
+                        out_addr = get_ptr_as_int64(c_bf16_flat, out_elem)
+                        q00, q01 = self._elem2_to_f32x2(q0)
+                        q10, q11 = self._elem2_to_f32x2(q1)
+                        q20, q21 = self._elem2_to_f32x2(q2)
+                        q30, q31 = self._elem2_to_f32x2(q3)
+                        red_add_global_v4_f32(out_addr, q00, q01, q10, q11)
+                        red_add_global_v4_f32(
+                            out_addr + Int64(16), q20, q21, q30, q31
+                        )
+                    else:
+                        out_idx = Int64(token_idx) * Int64(c_gl_stride) + Int64(
+                            col_word
+                        )
+                        out_addr = get_ptr_as_int64(
+                            c_bf16_flat, out_idx * Int64(8)
+                        )
+                        red_add_global_bf16x2(out_addr, q0)
+                        red_add_global_bf16x2(out_addr + Int64(4), q1)
+                        red_add_global_bf16x2(out_addr + Int64(8), q2)
+                        red_add_global_bf16x2(out_addr + Int64(12), q3)
                 else:
                     st_global_v4_u32(
                         get_ptr_as_int64(c_bf16_flat, true_idx * Int64(8)),
@@ -5173,12 +5215,32 @@ class W4A16GemmKernel:
                     q3 = self._relu2_elem2(q3)
                 if cutlass.const_expr(self.fused_topk_sum):
                     token_idx = route_index // Int32(self.fused_sum_topk)
-                    out_idx = Int64(token_idx) * Int64(c_gl_stride) + Int64(col_word)
-                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int64(8))
-                    red_add_global_bf16x2(out_addr, q0)
-                    red_add_global_bf16x2(out_addr + Int64(4), q1)
-                    red_add_global_bf16x2(out_addr + Int64(8), q2)
-                    red_add_global_bf16x2(out_addr + Int64(12), q3)
+                    if cutlass.const_expr(self.fused_sum_fp32):
+                        out_elem = (
+                            Int64(token_idx) * Int64(self.size_n)
+                            + Int64(col_word) * Int64(8)
+                        )
+                        out_addr = get_ptr_as_int64(c_bf16_flat, out_elem)
+                        q00, q01 = self._elem2_to_f32x2(q0)
+                        q10, q11 = self._elem2_to_f32x2(q1)
+                        q20, q21 = self._elem2_to_f32x2(q2)
+                        q30, q31 = self._elem2_to_f32x2(q3)
+                        red_add_global_v4_f32(out_addr, q00, q01, q10, q11)
+                        red_add_global_v4_f32(
+                            out_addr + Int64(16), q20, q21, q30, q31
+                        )
+                    else:
+                        out_idx = (
+                            Int64(token_idx) * Int64(c_gl_stride)
+                            + Int64(col_word)
+                        )
+                        out_addr = get_ptr_as_int64(
+                            c_bf16_flat, out_idx * Int64(8)
+                        )
+                        red_add_global_bf16x2(out_addr, q0)
+                        red_add_global_bf16x2(out_addr + Int64(4), q1)
+                        red_add_global_bf16x2(out_addr + Int64(8), q2)
+                        red_add_global_bf16x2(out_addr + Int64(12), q3)
                 else:
                     st_global_v4_u32(
                         get_ptr_as_int64(c_bf16_flat, true_idx * Int64(8)),
@@ -5755,6 +5817,7 @@ class W4A16FusedMoeKernel:
         direct_topk_routes: bool = False,
         use_expert_map: bool = False,
         tc_decode_fused_sum: bool = False,
+        prefill_fused_sum_fp32: bool = False,
         tc_zero_output: bool = True,
         collect_activation_amax: bool = False,
         schedule_whole_tiles: bool = False,
@@ -5763,6 +5826,7 @@ class W4A16FusedMoeKernel:
         coupled_hadamard: bool = False,
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
+        qsrt_k2_lut_mode: str = "auto",
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -5784,20 +5848,33 @@ class W4A16FusedMoeKernel:
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
+        self.prefill_fused_sum_fp32 = bool(prefill_fused_sum_fp32)
+        if self.tc_decode_fused_sum and self.prefill_fused_sum_fp32:
+            raise ValueError(
+                "TC-decode and large-M FP32 route reduction are mutually exclusive"
+            )
         # When two TC-decode launches share one pre-zeroed output, only the
         # first must zero it. Default True preserves single-launch behavior.
         self.tc_zero_output = bool(tc_zero_output)
         self.collect_activation_amax = bool(collect_activation_amax)
         if self.collect_activation_amax and bool(direct_topk_routes):
             raise ValueError("activation amax collection requires route-packed W4A16")
-        if self.collect_activation_amax and self.tc_decode_fused_sum:
+        if self.collect_activation_amax and (
+            self.tc_decode_fused_sum or self.prefill_fused_sum_fp32
+        ):
             raise ValueError(
-                "activation amax collection is incompatible with TC-decode"
+                "activation amax collection is incompatible with fused route reduction"
             )
         if self.tc_decode_fused_sum and not bool(direct_topk_routes):
             raise ValueError("tc_decode_fused_sum requires direct_topk_routes")
         if self.tc_decode_fused_sum and element_dtype != "bf16":
             raise ValueError("tc_decode_fused_sum currently requires bf16 activations")
+        if self.prefill_fused_sum_fp32 and element_dtype != "bf16":
+            raise ValueError("prefill_fused_sum_fp32 requires bf16 activations")
+        if self.prefill_fused_sum_fp32 and int(size_m) <= _TC_DECODE_MAX_M:
+            raise ValueError(
+                "prefill_fused_sum_fp32 requires a token capacity above the decode range"
+            )
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -5946,8 +6023,8 @@ class W4A16FusedMoeKernel:
                 raise ValueError("full_rotation requires fp16 GEMM operands")
             if self.rotation_input_dtype not in {"bf16", "fp16"}:
                 raise ValueError("full_rotation input dtype must be 'bf16' or 'fp16'")
-            if self.tc_decode_fused_sum:
-                raise ValueError("full_rotation is incompatible with TC decode")
+            if self.tc_decode_fused_sum or self.prefill_fused_sum_fp32:
+                raise ValueError("full_rotation is incompatible with fused route reduction")
             if self.apply_router_weight_on_input:
                 raise ValueError(
                     "full_rotation applies router weights only in the fp32 top-k sum"
@@ -6030,7 +6107,10 @@ class W4A16FusedMoeKernel:
             ),
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
-            fused_topk_sum=self.tc_decode_fused_sum,
+            fused_topk_sum=(
+                self.tc_decode_fused_sum or self.prefill_fused_sum_fp32
+            ),
+            fused_sum_fp32=self.prefill_fused_sum_fp32,
             fused_sum_topk=int(top_k),
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
@@ -6044,9 +6124,38 @@ class W4A16FusedMoeKernel:
         self.sms = self.fc1.sms
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
-        self.sqg_xor_cheb_t12_smem = (
+        if qsrt_k2_lut_mode not in {"auto", "compact", "shared"}:
+            raise ValueError("QSRT decoder mode must be auto, compact, or shared")
+        compact_smem = (
             self.trellis_codebook == SQG_E4M3
             and _sqg_xor_cheb_t12_smem_enabled()
+        )
+        lut_offset = (self.shared_words * 4 + 15) // 16 * 16
+        # The cooperative grid must retain its occupancy contract. A direct
+        # table is eligible only when it fits without reducing resident CTAs.
+        direct_eligible = (
+            self.weight_layout == "trellis_t256"
+            and self.trellis_codebook == SQG_E4M3
+            and self.coupled_hadamard
+            and self.trellis_bits == 2
+            and self.fc1_trellis_pair_kind is None
+            and self.fc2_trellis_pair_kind is None
+            and self.blocks_per_sm == 1
+            and lut_offset + 65536 <= self.fc1.max_shared_mem
+        )
+        if qsrt_k2_lut_mode == "shared" and not direct_eligible:
+            raise ValueError(
+                "shared QSRT K2 table is incompatible with the planned kernel geometry"
+            )
+        self.trellis_direct_lut = direct_eligible and (
+            qsrt_k2_lut_mode == "shared"
+            or (qsrt_k2_lut_mode == "auto" and compact_smem and size_m <= 16)
+        )
+        self.fc1.trellis_direct_lut = self.trellis_direct_lut
+        self.fc2.trellis_direct_lut = self.trellis_direct_lut
+        self.sqg_xor_cheb_t12_smem = compact_smem or self.trellis_direct_lut
+        self.trellis_lut_smem_bytes = (
+            65536 if self.trellis_direct_lut else _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES
         )
         self.sqg_xor_cheb_t12_smem_off = 0
         if self.sqg_xor_cheb_t12_smem:
@@ -6055,8 +6164,10 @@ class W4A16FusedMoeKernel:
             ) // 16 * 16
             self.shared_words = (
                 self.sqg_xor_cheb_t12_smem_off
-                + _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES
+                + self.trellis_lut_smem_bytes
             ) // 4
+            if self.shared_words * 4 > self.fc1.max_shared_mem:
+                raise ValueError(f"QSRT shared table requires {self.shared_words * 4} bytes")
             self.fc1.sqg_xor_cheb_t12_smem = True
             self.fc2.sqg_xor_cheb_t12_smem = True
         self.barrier_count_off = self.sms * 4
@@ -6100,6 +6211,7 @@ class W4A16FusedMoeKernel:
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.sqg_xor_cheb_t12_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -6476,15 +6588,15 @@ class W4A16FusedMoeKernel:
         fc1_trellis_lut_addr = get_ptr_as_int64(fc1_trellis_lut_flat, Int32(0))
         fc2_trellis_lut_addr = get_ptr_as_int64(fc2_trellis_lut_flat, Int32(0))
 
-        # The emit hooks receive the staged T12 table's shared byte offset
-        # through the LUT ABI slot.
+        # The LUT ABI slot carries the shared byte offset for either the
+        # compact staircase or the complete K2 codeword table.
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
         if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
             self._sqg_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
-                _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+                self.trellis_lut_smem_bytes,
                 tid,
             )
             cute.arch.sync_threads()
@@ -6669,34 +6781,34 @@ class W4A16FusedMoeKernel:
                     active_m,
                 )
             self._grid_barrier(locks_i32_flat, tid, grid_x)
-        if cutlass.const_expr(self.tc_decode_fused_sum):
-            # The TC-decode FC2 epilogue atomically accumulates per-route
-            # partials directly into the per-token output, so the output must be
-            # pre-zeroed. Previously this was a SEPARATE host-side output.zero_()
-            # kernel launch on the latency-bound decode critical path (an extra
-            # launch + its grid-fill memset before the fused kernel even starts).
-            # Fold it into the fused kernel prologue here: every CTA zeroes a
-            # grid-strided slice of the output BEFORE FC1, and the EXISTING
-            # post-FC1 grid barrier (already required to order FC1 writes before
-            # the activation/FC2 read) makes all zero stores globally visible
-            # before the first FC2 atomic -- so no extra barrier is added. The
-            # tiny m*hidden bf16 memset (decode: <=4*4096 elems) is dwarfed by
-            # FC1's whole-K FP4-weight stream, but we delete one whole kernel
-            # launch from the per-decode chain. The TC-decode output is per-token
-            # (top_k routes atomically summed into the SAME token row), so the
-            # zero span is active_m*hidden_size -- NOT the per-route
-            # active_m*top_k*hidden_size of _zero_fc2_output.
-            # tc_zero_output=False skips the zero (a paired earlier launch has
-            # already zeroed the shared output); the grid barrier below is
-            # unconditional so ordering is preserved either way.
+        if cutlass.const_expr(
+            self.tc_decode_fused_sum or self.prefill_fused_sum_fp32
+        ):
+            # FC2 route reduction atomically accumulates into one row per token.
+            # Every CTA zeroes a grid-strided slice before FC1. The mandatory
+            # post-FC1 grid barrier orders these stores before every FC2 atomic.
+            # ``tc_zero_output=False`` is valid only when a paired launch has
+            # already zeroed the same output and participates in that barrier.
             if cutlass.const_expr(self.tc_zero_output):
                 zidx = cta * Int32(self.cta_threads) + tid
                 zstride = grid_x * Int32(self.cta_threads)
-                ztotal = active_m * Int32(self.hidden_size)
-                zzero = self._cast_elem(cutlass.Float32(0.0))
-                while zidx < ztotal:
-                    fc2_bf16_flat[zidx] = zzero
-                    zidx += zstride
+                zzero = (
+                    cutlass.Float32(0.0)
+                    if cutlass.const_expr(self.prefill_fused_sum_fp32)
+                    else self._cast_elem(cutlass.Float32(0.0))
+                )
+                if cutlass.const_expr(self.prefill_fused_sum_fp32):
+                    zidx_i64 = Int64(zidx)
+                    zstride_i64 = Int64(zstride)
+                    ztotal_i64 = Int64(active_m) * Int64(self.hidden_size)
+                    while zidx_i64 < ztotal_i64:
+                        fc2_bf16_flat[zidx_i64] = zzero
+                        zidx_i64 += zstride_i64
+                else:
+                    ztotal = active_m * Int32(self.hidden_size)
+                    while zidx < ztotal:
+                        fc2_bf16_flat[zidx] = zzero
+                        zidx += zstride
 
         if cutlass.const_expr(self.activation_is_gated):
             self.fc1._run_persistent_gemm(
@@ -6802,7 +6914,7 @@ class W4A16FusedMoeKernel:
                 grid_x,
                 active_m,
             )
-        if cutlass.const_expr(self.zero_fc2_output):
+        if cutlass.const_expr(self.zero_fc2_output and not self.prefill_fused_sum_fp32):
             self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x, active_m)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
         self.fc2._run_persistent_gemm(
@@ -9090,6 +9202,7 @@ def compile_w4a16_fused_moe(
     fast_math: bool = True,
     sms: int,
     max_shared_mem: int,
+    direct_token_capacity: int | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -9103,6 +9216,7 @@ def compile_w4a16_fused_moe(
     direct_topk_routes: bool = False,
     use_expert_map: bool = False,
     tc_decode_fused_sum: bool = False,
+    prefill_fused_sum_fp32: bool = False,
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     intermediate_rotation: bool = False,
@@ -9110,6 +9224,7 @@ def compile_w4a16_fused_moe(
     coupled_hadamard: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
+    qsrt_k2_lut_mode: str = "auto",
     _require_cached: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
@@ -9159,10 +9274,17 @@ def compile_w4a16_fused_moe(
     direct_topk_routes = bool(direct_topk_routes)
     use_expert_map = bool(use_expert_map)
     tc_decode_fused_sum = bool(tc_decode_fused_sum)
+    prefill_fused_sum_fp32 = bool(prefill_fused_sum_fp32)
+    if tc_decode_fused_sum and prefill_fused_sum_fp32:
+        raise ValueError(
+            "TC-decode and large-M FP32 route reduction are mutually exclusive"
+        )
     if use_expert_map and not direct_topk_routes:
         raise ValueError("use_expert_map requires direct_topk_routes")
     collect_activation_amax = bool(collect_activation_amax)
-    if collect_activation_amax and (direct_topk_routes or tc_decode_fused_sum):
+    if collect_activation_amax and (
+        direct_topk_routes or tc_decode_fused_sum or prefill_fused_sum_fp32
+    ):
         raise ValueError(
             "W4A16 activation amax collection requires the route-packed fused path"
         )
@@ -9181,8 +9303,8 @@ def compile_w4a16_fused_moe(
             raise ValueError(
                 "rotation_input_dtype must be 'bf16' or 'fp16' for full_rotation"
             )
-        if tc_decode_fused_sum:
-            raise ValueError("full_rotation is incompatible with TC decode")
+        if tc_decode_fused_sum or prefill_fused_sum_fp32:
+            raise ValueError("full_rotation is incompatible with fused route reduction")
         if apply_router_weight_on_input:
             raise ValueError(
                 "full_rotation requires apply_router_weight_on_input=False"
@@ -9487,12 +9609,14 @@ def compile_w4a16_fused_moe(
         direct_topk_routes=direct_topk_routes,
         use_expert_map=use_expert_map,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        prefill_fused_sum_fp32=prefill_fused_sum_fp32,
         collect_activation_amax=collect_activation_amax,
         intermediate_rotation=intermediate_rotation,
         full_rotation=full_rotation,
         coupled_hadamard=coupled_hadamard,
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
+        qsrt_k2_lut_mode=qsrt_k2_lut_mode,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -9508,9 +9632,14 @@ def compile_w4a16_fused_moe(
             "count before capturing"
         )
 
+    # Packed routes use rounded storage capacity; native direct launches use
+    # the exact planned row count, which may be smaller than that bucket.
+    direct_m = size_m if direct_token_capacity is None else int(direct_token_capacity)
+    if not 0 < direct_m <= size_m:
+        raise ValueError("direct token capacity must be within packed capacity")
     small_m_direct_launches = []
     if (not collect_activation_amax) and _small_m_direct_supported(
-        m=size_m,
+        m=direct_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -9527,7 +9656,7 @@ def compile_w4a16_fused_moe(
     ):
         for ids_dtype in (torch.int32, torch.int64):
             direct = _compile_w4a16_small_m_direct(
-                m=size_m,
+                m=direct_m,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 num_experts=num_experts,
@@ -9596,8 +9725,9 @@ def compile_w4a16_fused_moe(
         assumed_align=16,
     )
     fc2_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
-        (compile_routed_rows * hidden_size,),
+        cutlass.Float32 if kernel.prefill_fused_sum_fp32 else cutlass_dtype,
+        ((compile_size_m if kernel.prefill_fused_sum_fp32 else compile_routed_rows)
+         * hidden_size,),
         assumed_align=16,
     )
     pair_metadata_cutlass_dtype = (
@@ -9753,6 +9883,7 @@ def compile_w4a16_fused_moe(
         use_expert_map=kernel.use_expert_map,
         scale_format=scale_format,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+        prefill_fused_sum_fp32=bool(prefill_fused_sum_fp32),
         collect_activation_amax=collect_activation_amax,
         schedule_whole_tiles=kernel.schedule_whole_tiles,
         intermediate_rotation=intermediate_rotation,
@@ -9768,6 +9899,7 @@ def compile_w4a16_fused_moe(
         shared_memory_bytes=kernel.shared_words * 4,
         broadcast_suh=bool(broadcast_suh),
         small_m_direct_launches=tuple(small_m_direct_launches),
+        trellis_direct_lut=kernel.trellis_direct_lut,
     )
     attach_programs(result, compiled, *(launch.compiled for launch in small_m_direct_launches))
     _FUSED_CACHE[cache_key] = result
@@ -10342,6 +10474,7 @@ def _w4a16_fused_moe_launch_flat(
     fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
+    prefill_fused_sum_fp32: bool,
     collect_activation_amax: bool,
     stream_int: int,
     expert_map: torch.Tensor | None = None,
@@ -10449,6 +10582,7 @@ def _w4a16_fused_moe_launch_flat(
         direct_topk_routes=bool(direct_topk_routes),
         use_expert_map=use_expert_map,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+        prefill_fused_sum_fp32=bool(prefill_fused_sum_fp32),
         collect_activation_amax=collect_activation_amax,
         # The custom-op boundary cannot carry the compiled launch object. Re-pin
         # its selected geometry so tile-specific packs resolve the
@@ -10469,7 +10603,7 @@ def _w4a16_fused_moe_launch_flat(
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     if weight_layout == "trellis_t256" and trellis_codebook != "mcg":
         trellis_rank_lut = _trellis256_execution_lut(
-            a_input.device, trellis_codebook
+            a_input.device, trellis_codebook, direct_lut=fused.trellis_direct_lut
         )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
@@ -10781,6 +10915,7 @@ def _w4a16_fused_moe_launch_op(
         fc2_tile_n=fc2_tile_n,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        prefill_fused_sum_fp32=False,
         collect_activation_amax=False,
         stream_int=stream_int,
     )
@@ -10938,6 +11073,7 @@ def _w4a16_fused_moe_calibrated_launch_op(
         fc2_tile_n=fc2_tile_n,
         direct_topk_routes=False,
         tc_decode_fused_sum=False,
+        prefill_fused_sum_fp32=False,
         collect_activation_amax=True,
         stream_int=stream_int,
     )
@@ -11764,6 +11900,7 @@ def run_w4a16_moe(
     intermediate_cache13: torch.Tensor,
     intermediate_cache2: torch.Tensor,
     output: torch.Tensor,
+    prefill_sum_accum: torch.Tensor | None = None,
     fc1_c_tmp: torch.Tensor | None = None,
     fc2_c_tmp: torch.Tensor | None = None,
     packed_route_indices: torch.Tensor | None = None,
@@ -12219,6 +12356,9 @@ def run_w4a16_moe(
     # ``tc_decode_fused_sum``; accept it through the binding path. A runtime
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
+    preplanned_prefill_fused_sum = bool(
+        getattr(fused_launch, "prefill_fused_sum_fp32", False)
+    )
     prefer_tc_decode = route_mode == "direct" or (
         route_mode == "auto"
         and _w4a16_tc_decode_preferred(
@@ -12286,6 +12426,38 @@ def run_w4a16_moe(
             "planned W4A16 direct routing is unsupported for this launch shape"
         )
 
+    prefill_fused_sum_requested = (
+        preplanned_prefill_fused_sum
+        if fused_launch is not None
+        else prefill_fused_sum_enabled()
+    )
+    use_prefill_fused_sum = prefill_fused_sum_eligible(
+        dtype=element_dtype,
+        m=int(fused_launch.size_m) if fused_launch is not None else m,
+        full_rotation=full_rotation,
+        weight_layout=weight_layout,
+        collect_activation_amax=collect_activation_amax,
+        enabled=prefill_fused_sum_requested,
+    )
+    use_fused_topk_sum = bool(use_tc_decode or use_prefill_fused_sum)
+
+    if use_prefill_fused_sum:
+        required_accum_elements = (
+            int(fused_launch.size_m) if fused_launch is not None else int(m)
+        ) * hidden_size
+        if (
+            prefill_sum_accum is None
+            or prefill_sum_accum.dtype != torch.float32
+            or prefill_sum_accum.device != a_input.device
+            or not prefill_sum_accum.is_contiguous()
+            or prefill_sum_accum.numel() < required_accum_elements
+        ):
+            raise ValueError(
+                "W4A16 prefill fused sum requires a contiguous FP32 accumulator "
+                f"with at least {required_accum_elements} elements on "
+                f"{a_input.device}"
+            )
+
     # A preplanned TC-decode launch atomically accumulates FC2 partials into the
     # (pre-zeroed) output and emits no separate top-k sum. If it was selected but
     # the decode preconditions don't hold, running it would corrupt the output,
@@ -12294,6 +12466,11 @@ def run_w4a16_moe(
         raise RuntimeError(
             "preplanned TC-decode W4A16 launch requires small-M packed bf16 "
             f"decode (m <= {_TC_DECODE_MAX_M}, cuda int32/int64 topk_ids)"
+        )
+    if preplanned_prefill_fused_sum and not use_prefill_fused_sum:
+        raise RuntimeError(
+            "preplanned W4A16 prefill fused-sum launch requires the enabled "
+            "large-M packed or modelopt BF16 route-reduction contract"
         )
 
     route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
@@ -12304,6 +12481,13 @@ def run_w4a16_moe(
             int(block_size_m),
             route_num_experts,
         )
+        if route_pack_launches is not None:
+            # A retained small-M GEMM can use a route packer prepared for a
+            # larger capacity. Its kernels initialize every planned route slot;
+            # do not shrink those views to the selected GEMM's live-row bucket.
+            route_slots_capacity = max(
+                route_slots_capacity, route_pack_launches.max_packed_routes
+            )
         route_blocks_capacity = (route_slots_capacity + int(block_size_m) - 1) // int(
             block_size_m
         )
@@ -12384,8 +12568,12 @@ def run_w4a16_moe(
         topk=topk,
         route_num_experts=route_num_experts,
         sms=sms,
+        dtype=(prepared_dtype if full_rotation else a_input.dtype),
         full_rotation=full_rotation,
         block_size_m=block_size_m,
+        weight_layout=weight_layout,
+        collect_activation_amax=collect_activation_amax,
+        prefill_fused_sum=use_prefill_fused_sum,
     )
     intermediate_size = int(prepared.intermediate_size)
     fc1_cols = buffer_plan.fc1_cols
@@ -12451,6 +12639,7 @@ def run_w4a16_moe(
             direct_topk_routes=use_direct_topk_routes,
             use_expert_map=mapped_direct and use_direct_topk_routes,
             tc_decode_fused_sum=use_tc_decode,
+            prefill_fused_sum_fp32=use_prefill_fused_sum,
             collect_activation_amax=collect_activation_amax,
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
@@ -12495,6 +12684,8 @@ def run_w4a16_moe(
             fc2_trellis_pair_kind,
             bool(use_direct_topk_routes),
             mapped_direct and use_direct_topk_routes,
+            bool(use_tc_decode),
+            bool(use_prefill_fused_sum),
             bool(collect_activation_amax),
             block_size_m,
             bool(intermediate_rotation_scales is not None),
@@ -12537,6 +12728,8 @@ def run_w4a16_moe(
             getattr(fused_launch, "fc2_trellis_pair_kind", None),
             bool(getattr(fused_launch, "direct_topk_routes", False)),
             bool(getattr(fused_launch, "use_expert_map", False)),
+            bool(getattr(fused_launch, "tc_decode_fused_sum", False)),
+            bool(getattr(fused_launch, "prefill_fused_sum_fp32", False)),
             bool(getattr(fused_launch, "collect_activation_amax", False)),
             int(fused_launch.moe_block_size),
             bool(getattr(fused_launch, "intermediate_rotation", False)),
@@ -12556,12 +12749,22 @@ def run_w4a16_moe(
         fused = fused_launch
     capacity_m = int(fused.size_m)
     capacity_routed_rows = capacity_m * topk
-    if intermediate_cache13_flat.numel() < capacity_routed_rows * max(
-        fc1_cols, hidden_size
-    ):
+    required_cache13_elements = (
+        capacity_routed_rows * fc1_cols
+        if use_prefill_fused_sum
+        else capacity_routed_rows * max(fc1_cols, hidden_size)
+    )
+    if intermediate_cache13_flat.numel() < required_cache13_elements:
         raise ValueError(
             "intermediate_cache13 is smaller than the selected W4A16 launch capacity: "
-            f"capacity_rows={capacity_m}, topk={topk}"
+            f"capacity_rows={capacity_m}, topk={topk}, "
+            f"available_elements={intermediate_cache13_flat.numel()}, "
+            f"required_elements={required_cache13_elements}, "
+            f"fused_topk_sum={use_fused_topk_sum}, "
+            f"prefill_fused_sum={use_prefill_fused_sum}, "
+            f"collect_activation_amax={collect_activation_amax}, "
+            f"full_rotation={full_rotation}, weight_layout={weight_layout}, "
+            f"element_dtype={element_dtype}"
         )
     if intermediate_cache2_flat.numel() < capacity_routed_rows * intermediate_size:
         raise ValueError(
@@ -12570,14 +12773,13 @@ def run_w4a16_moe(
         )
     fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
     activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
-    if use_tc_decode:
+    if use_prefill_fused_sum:
+        assert prefill_sum_accum is not None
+        fc2_out = prefill_sum_accum[: capacity_m * hidden_size]
+    elif use_tc_decode:
         # FC2 atomically accumulates per-route partials directly into the
-        # per-token output, so the output is the FC2 store target and must be
-        # pre-zeroed. The fused tc_decode kernel now zeroes the output in its
-        # own prologue (before FC1, made visible by the existing post-FC1 grid
-        # barrier), so the separate host-side output.zero_() launch is removed
-        # from the decode critical path here. This drops the separate top-k-sum
-        # launch as well.
+        # per-token output. The fused kernel zeroes the output in its prologue
+        # before the mandatory post-FC1 grid barrier.
         fc2_out = output.view(-1)
     else:
         fc2_out = intermediate_cache13_flat[: capacity_routed_rows * hidden_size]
@@ -12711,6 +12913,7 @@ def run_w4a16_moe(
         or _intermediate_rotation
         or weight_layout == "trellis_t256"
         or (mapped_direct and use_direct_topk_routes)
+        or use_prefill_fused_sum
     ):
         # Native t256 bypasses the registered torch op so its shape-derived
         # bitrate reaches compilation without widening the stable public op ABI.
@@ -12817,6 +13020,7 @@ def run_w4a16_moe(
             fc2_tile_n=_lt_fc2tn,
             direct_topk_routes=bool(use_direct_topk_routes),
             tc_decode_fused_sum=bool(use_tc_decode),
+            prefill_fused_sum_fp32=bool(use_prefill_fused_sum),
             collect_activation_amax=False,
             stream_int=int(stream),
             expert_map=expert_map if use_direct_topk_routes else None,
@@ -12843,6 +13047,10 @@ def run_w4a16_moe(
             int(stream),
         )
 
+    if use_prefill_fused_sum:
+        assert prefill_sum_accum is not None
+        output.copy_(prefill_sum_accum[: m * hidden_size].view(m, hidden_size))
+        return output
     if use_tc_decode:
         # FC2 already wrote the top-k-summed result into `output`.
         return output
