@@ -197,6 +197,14 @@ def assert_checkpoint_close(actual, expected, **kwargs):
     torch.testing.assert_close(actual.cpu(), expected.cpu(), **kwargs)
 
 
+def observed_cold_candidate(route_ids, resident_count):
+    """Require the graph to read the expert whose physical tier changes."""
+    candidate = max(route_ids, default=-1)
+    if candidate < resident_count:
+        raise ValueError("checkpoint routes do not exercise a cold promotion candidate")
+    return candidate
+
+
 def checkpoint_progress(location):
     """Retain the last completed boundary when an instrumented run times out."""
     root = os.environ.get("CHECKPOINT_TEST_PROGRESS")
@@ -322,6 +330,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
         )
         print("bounded sanitizer compact-to-checkpoint IDs:", selected, flush=True)
     experts = source.plan.geometry.num_experts
+    candidate = observed_cold_candidate(ids.cpu().flatten().tolist(), experts // 2)
     # Preserve actual router selections/weights in one case; adversarial cases
     # separately exercise duplicate and reversed logical routes.
     routes = [(ids.clone(), weights.clone()), (ids.flip(-1), weights.flip(-1))]
@@ -473,10 +482,14 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                 combined, shared_expected + results[1], atol=0, rtol=0
             )
             if case == 0:
+                checkpoint_progress(
+                    f"layer-{layer}:promote-{candidate}:observed-hits-"
+                    f"{int((ids.cpu() == candidate).sum())}"
+                )
                 for plan in plans[1:]:
                     state = plan.prepared.state
                     state.updates.apply(
-                        ((experts - 1, 0),),
+                        ((candidate, 0),),
                         expected=state.updates.snapshot(),
                         quiescent=True,
                     )

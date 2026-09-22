@@ -305,7 +305,10 @@ with set_current_vllm_config(config), torch.inference_mode():
                 oracle.assert_checkpoint_close(combined_graph, combined, atol=0, rtol=0)
                 if resident < 512:
                     slots = state.updates.snapshot()
-                    pairs = ((resident, 0),)
+                    candidate = oracle.observed_cold_candidate(
+                        original_ids.cpu().flatten().tolist(), resident
+                    )
+                    pairs = ((candidate, 0),)
                     state.updates.stage(pairs, expected=slots, quiescent=True)
                     get_tp_group().barrier()
                     state.updates.publish_staged()
@@ -332,6 +335,9 @@ with set_current_vllm_config(config), torch.inference_mode():
                         exact_placement=True,
                         exact_shared_composition=True,
                         no_replay_allocations=True,
+                        promoted_route_id=candidate if resident < 512 else None,
+                        promoted_route_hits=int((original_ids.cpu() == candidate).sum())
+                        if resident < 512 else 0,
                         arithmetic=arithmetic,
                     )
                 )
