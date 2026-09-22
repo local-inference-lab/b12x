@@ -105,6 +105,8 @@ class PhaseTiming:
             self.events[len(self.records) - 1][1].synchronize()
         for record, (start, end) in zip(self.records, self.events, strict=False):
             record["model_device_ms"] = start.elapsed_time(end)
+            record["model_start_ms"] = self.events[0][0].elapsed_time(start)
+            record["model_end_ms"] = self.events[0][0].elapsed_time(end)
         # A span includes gaps between chunk executions. Sum of model events
         # excludes those gaps. Neither includes admission or token delivery.
         requests = {}
