@@ -7,6 +7,7 @@ Kernel intervals overlap and are deliberately not converted to throughput.
 import argparse
 import hashlib
 import json
+import math
 import statistics
 from pathlib import Path
 
@@ -15,6 +16,11 @@ def require(condition, message):
     """Reject invalid evidence even when Python assertions are disabled."""
     if not condition:
         raise ValueError(message)
+
+
+def positive_finite(value):
+    """Accept measured positive numbers, not Boolean or nonfinite values."""
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
 def main():
@@ -36,7 +42,7 @@ def main():
                 f"{name}: explicit grid override is not automatic selection")
         prefill = []
         for cell in arm["prefill"]:
-            require(not cell.get("skipped") and cell["tok_per_sec"] > 0,
+            require(not cell.get("skipped") and positive_finite(cell["tok_per_sec"]),
                     f"{name}: invalid prefill")
             require(cell["server_validation"]["cached_tokens"] == 0,
                     f"{name}: prefill reused cached tokens")
@@ -51,8 +57,10 @@ def main():
                     "failure_reason", "num_errors", "loop_detected", "underfilled",
                     "warmup_timed_out", "capacity_limited",
                 )), f"{name}: failed C{concurrency} window")
-                require(cell["aggregate_tps"] > 0 and cell["server_steps_per_s"] > 0,
-                        f"{name}: missing throughput")
+                for field in ("aggregate_tps", "server_steps_per_s",
+                              "server_spec_accept_length"):
+                    require(positive_finite(cell[field]),
+                            f"{name}: invalid C{concurrency} {field}")
             for field, label in (("aggregate_tps", "output"),
                                  ("server_steps_per_s", "verifier"),
                                  ("server_spec_accept_length", "accepted")):

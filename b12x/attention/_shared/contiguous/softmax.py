@@ -106,9 +106,19 @@ class Softmax(ParamsBase):
             sink_val is not None and isinstance(sink_val, cute.Tensor)
         ):
             assert cute.size(sink_val) == self.num_rows
-        self.row_sum.store(
-            cute_ops.warp_reduce(self.row_sum.load(), operator.add, width=4)
-        )
+        if cutlass.const_expr(self.softmax_scale is not None):
+            # Match the four-lane reduction order of FlashAttention 2.
+            # Reversing these additions can change BF16 output rounding and
+            # the LSE weights used to merge disjoint context chunks.
+            for r in range(int(self.num_rows)):
+                total = self.row_sum[r]
+                total += cute.arch.shuffle_sync_bfly(total, offset=2)
+                total += cute.arch.shuffle_sync_bfly(total, offset=1)
+                self.row_sum[r] = total
+        else:
+            self.row_sum.store(
+                cute_ops.warp_reduce(self.row_sum.load(), operator.add, width=4)
+            )
         row_scale = cute.make_rmem_tensor(self._row_layout(), Float32)
 
         for r in range(int(self.num_rows)):
@@ -128,10 +138,17 @@ class Softmax(ParamsBase):
                 cutlass.select_(row_sum_is_zero_or_nan, 1.0, row_sum_cur)
             )
             row_scale[r] = cute.arch.rcp_approx(safe_row_sum) * final_scale
-            row_lse = (
-                self.row_max[r] * self.scale_log2
-                + cute.math.log2(safe_row_sum, fastmath=True)
-            ) * math.log(2.0)
+            if cutlass.const_expr(self.softmax_scale is not None):
+                # Retain the original scale: a log2 -> natural-log round trip
+                # needlessly changes the normalization of merged attention.
+                row_lse = self.row_max[r] * self.softmax_scale + cute.math.log(
+                    safe_row_sum, fastmath=True
+                )
+            else:
+                row_lse = (
+                    self.row_max[r] * self.scale_log2
+                    + cute.math.log2(safe_row_sum, fastmath=True)
+                ) * math.log(2.0)
             self.row_sum[r] = Float32(
                 cutlass.select_(row_sum_is_zero_or_nan, -Float32.inf, row_lse)
             )

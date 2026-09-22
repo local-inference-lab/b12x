@@ -17,10 +17,35 @@ from .test_defaults import contract
 from .test_session import _deterministic_timer, declaration
 
 
+# Ordinals 0 and 2 are the same part sold under two product labels, whose
+# reported total memory differs by a few MiB; ordinal 3 is different silicon.
+_TEST_GPU_A = SimpleNamespace(
+    name="Test GPU A", major=12, minor=0, multi_processor_count=170,
+    total_memory=32 * 1024**3,
+)
+_TEST_GPUS = {
+    0: _TEST_GPU_A,
+    1: _TEST_GPU_A,
+    2: SimpleNamespace(
+        name="Test GPU B", major=12, minor=0, multi_processor_count=170,
+        total_memory=32 * 1024**3 - 10 * 1024**2,
+    ),
+    3: SimpleNamespace(
+        name="Test GPU C", major=12, minor=1, multi_processor_count=148,
+        total_memory=120 * 1024**3,
+    ),
+}
+
+
 @pytest.fixture
 def cache_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", lambda *_args: nullcontext())
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda ordinal: "Test GPU B" if ordinal == 2 else "Test GPU A")
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name", lambda ordinal: _TEST_GPUS[ordinal].name
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda ordinal: _TEST_GPUS[ordinal]
+    )
     monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: ("device_uuid", f"gpu-{ordinal}"))
     monkeypatch.delenv("B12X_TUNING_CACHE_VERSION", raising=False)
 
@@ -54,10 +79,14 @@ def test_invalid_tuning_version_fails_before_cache_access(cache_device, monkeypa
         cache_identity({}, 0)
 
 
-def test_decisions_remain_device_name_and_model_specific(cache_device):
+def test_decisions_track_silicon_rather_than_product_label(cache_device):
     assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "b"}, 0)
     assert cache_identity({"model": "a"}, 0) == cache_identity({"model": "a"}, 1)
-    assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 2)
+    # Ordinal 2 is ordinal 0's part under a different product label, and its
+    # reported total memory even differs by a few MiB.
+    assert cache_identity({"model": "a"}, 0) == cache_identity({"model": "a"}, 2)
+    # Different silicon still gets its own decisions.
+    assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 3)
 
 
 def test_stream_gated_measurement_keeps_prior_choices_in_a_separate_cache(cache_device, tmp_path):
@@ -152,13 +181,26 @@ def test_cache_agreement_rejects_incompatible_or_incomplete_peer_results(
     _save_choice(cache)
     peer = json.loads(json.dumps(cache.records))
     if failure == "identity":
-        identity = {**identity, "device_name": "Another GPU"}
+        identity = {**identity, "sm_count": identity["sm_count"] + 1}
         message = "identities differ"
     else:
         peer["shape"]["coverage"]["measured_count"] = 1
         message = "only completed exhaustive"
     with pytest.raises(ValueError, match=message):
         cache.reconcile((TuningCacheRequirement((0, 1), identity, peer),))
+    assert cache.get("shape")["assignment"]["width"] == 2
+
+
+def test_ranks_share_decisions_when_one_part_carries_two_product_labels(
+    cache_device, tmp_path,
+):
+    """A tensor-parallel group may mix product labels for the same part."""
+    cache = SelectionCache(tmp_path, cache_identity({"model": "a"}, 0))
+    _save_choice(cache)
+    peer = SelectionCache(tmp_path, cache_identity({"model": "a"}, 2))
+    assert peer.path == cache.path
+    assert peer.get("shape") is not None
+    cache.reconcile((TuningCacheRequirement((0, 2), peer.identity, peer.records),))
     assert cache.get("shape")["assignment"]["width"] == 2
 
 

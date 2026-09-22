@@ -8,7 +8,9 @@ model-specific or GPU-specific grid is pinned.
 
 Status: **implemented**; the DeepSeek V4 Flash serving and CPU checks below
 are **qualified**.
-Cross-model release qualification is separate and remains pending. Loaded
+Cross-model release qualification is recorded in the
+[serving report](https://github.com/local-inference-lab/rtx6kpro/blob/master/benchmarks/karmic-kraken-serving.md).
+That matrix qualifies the composed release, not this PR in isolation. Loaded
 microbenchmarks outside their declared clock envelope are **research-only**
 and are not the source of the serving speedup claim.
 
@@ -43,9 +45,14 @@ KV tokens. There is no measured prefill/C8 deficit beyond run variability.
 [Raw results](results.json) include both source/image identities, checkpoint
 revision, complete commands, all samples and busy GPU telemetry. The candidate
 contains the activation-aware context key. The comparison retains the same
-previously qualified packed attention-output projections and grid-candidate
-extension. It measures the **joint** context/corpus change, not the corpus in
-isolation.
+packed attention-output projection control from
+[B12X #396](https://github.com/local-inference-lab/b12x/pull/396) and
+[vLLM #812](https://github.com/local-inference-lab/vllm/pull/812), and the
+resident-grid candidate extension from
+[B12X #397](https://github.com/local-inference-lab/b12x/pull/397).
+Those controls are unchanged between the two source-identified arms in
+`results.json`. The comparison measures the **joint** context/corpus change,
+not the corpus in isolation.
 
 Recompute every median and reject failed/missing cells with:
 
@@ -84,9 +91,12 @@ Cached decisions skip the race; corpus versioning invalidates selections,
 not compiled kernels. Serving qualification is external to startup.
 `extract_startup_costs.py` attributes successive cumulative-counter increments
 at `batch_end`; overlapping request start/end differences are not summed.
+It rejects failed or unmarked preparation phases and nonfinite timing values
+before exporting any summary.
 The committed summary groups the extractor's traces under source-identified
 arms and retains phases with nonzero `small_moe_measurement_s`. Within each
-phase it renames `measurement_s` to `all_measurement_s`, removes `failed` and
+phase it renames `measurement_s` to `all_measurement_s`, removes the verified
+`failed: false` flag and
 `cumulative_seconds`, and retains only `moe.decode` races with token counts
 2 through 8. Trace paths are relative to the validation workspace; their
 SHA-256 values remain unchanged. No timing values are rounded or recomputed

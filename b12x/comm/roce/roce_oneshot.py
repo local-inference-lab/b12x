@@ -31,7 +31,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from . import _allgather_cute
-from ._oneshot_cute import PACK_BYTES, get_launcher, is_launcher_prepared
+from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import Layout, Proxy, load as _load_proxy_library
 
 logger = logging.getLogger(__name__)
@@ -308,6 +308,7 @@ class RoceOneshotAllReduce:
             else None,
             "world_size": self.world_size,
             "hca_count": len(self.hca_names),
+            "traffic_class": self._proxy.traffic_class if error is None else None,
             "slot_bytes": slot_bytes,
             "slots": self._layout.slots,
             "flag_stride": self._layout.flag_stride,
@@ -348,11 +349,12 @@ class RoceOneshotAllReduce:
             raise RuntimeError("RoCE all-reduce connect failed: " + "; ".join(failures))
         if self.rank == 0:
             logger.info(
-                "RoCEnante ready: world=%d hcas=%s gid_index=%d max_size=%d",
+                "RoCEnante ready: world=%d hcas=%s gid_index=%d max_size=%d traffic_class=%d",
                 self.world_size,
                 ",".join(self.hca_names),
                 self.gid_index,
                 self.max_size,
+                self._proxy.traffic_class,
             )
 
     @staticmethod
@@ -537,7 +539,7 @@ class RoceOneshotAllReduce:
                 raise ValueError(
                     "out must be a contiguous tensor on the input's device matching the input"
                 )
-            key = self._launcher_key(inp.dtype)
+            self._launcher_key(inp.dtype)
             nbytes = inp.numel() * inp.element_size()
             context = (
                 torch.cuda.stream(stream) if stream is not None else _nullcontext()
