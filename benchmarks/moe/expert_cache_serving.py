@@ -106,6 +106,9 @@ async def run(args):
         attention_config={"backend": "FLASHINFER"},
         profiler_config=({"profiler": "torch", "torch_profiler_dir": str(args.torch_profile.resolve()),
                           "torch_profiler_with_stack": False, "torch_profiler_record_shapes": True,
+                          # Aggregate exported traces offline: key_averages builds
+                          # a large Python event graph retained through shutdown.
+                          "torch_profiler_dump_cuda_time_total": False,
                           "ignore_frontend": True} if args.torch_profile else {}),
         enforce_eager=args.eager,
         enable_chunked_prefill=True,
