@@ -6,6 +6,12 @@ serving and phase measurements for the ModelOpt NVFP4 adapter, together with
 uncompleted gates. The [single-GPU control](expert-cache-next80-results.md)
 remains attached to its preceding source pair.
 
+The [continuation report](hybrid-continuation-results.md) keeps sanitizer
+isolation, matched W4A16 prompt controls and TP2 exchange-value analysis separate
+from the frozen qualification. It also documents the distinction between
+completed production-component checks and a zero-error whole-stack sanitizer
+result.
+
 The system distinguishes three serving tiers:
 
 | Tier | Placement and execution |
