@@ -31,6 +31,8 @@ HOST = [
             "vllm_residency_epoch",
             "expert_cache_serving",
             "expert_cache_capacity",
+            "phase_profile",
+            "hybrid_prefill_summary",
             "routing_health",
             "prepared_expert_cache",
             "residency_updates",
