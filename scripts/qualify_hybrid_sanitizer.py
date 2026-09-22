@@ -34,6 +34,21 @@ def classify(returncode, timed_out, summaries, completed, ranks, filtered):
     return "component_pass" if filtered else "whole_program_pass"
 
 
+def retired_incomplete_rank(output, ranks):
+    """An exited application cannot participate in a peer's pending collective."""
+    for rank in range(ranks):
+        path = output / f"rank-{rank}-exit.json"
+        if not path.exists() or (output / f"rank-{rank}-complete.json").exists():
+            continue
+        try:
+            result = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            # The child may still be writing its exit receipt.
+            continue
+        return dict(rank=rank, returncode=result["returncode"])
+    return None
+
+
 def diagnostic_inventory(text):
     """Recognize initialization probes without suppressing or passing their errors."""
     counts = {}
@@ -202,6 +217,7 @@ def main(argv=None):
                 "LD_PRELOAD",
                 "CUDA_VISIBLE_DEVICES",
                 "B12X_ACCEPTANCE_BUILD_MANIFEST",
+                "TRITON_LIBCUDA_PATH",
             )
         },
         started_ns=time.time_ns(),
@@ -211,6 +227,7 @@ def main(argv=None):
     manifest.write_text(json.dumps(receipt, indent=2) + "\n")
     begin = time.monotonic()
     timed_out = False
+    retired_rank = None
     with (out / "launcher.log").open("w") as stream:
         process = subprocess.Popen(
             command,
@@ -219,17 +236,28 @@ def main(argv=None):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        try:
-            code = process.wait(timeout=args.deadline)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
+        while True:
+            remaining = args.deadline - (time.monotonic() - begin)
+            retired_rank = retired_incomplete_rank(out, args.ranks)
+            if remaining <= 0 or retired_rank is not None:
+                timed_out = remaining <= 0
+                break
+            try:
+                code = process.wait(timeout=min(1.0, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if timed_out or retired_rank is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-            code = 124
+            code = 124 if timed_out else (retired_rank["returncode"] or 1)
     summaries = {}
     diagnostics = {}
     for rank in range(args.ranks):
@@ -249,7 +277,7 @@ def main(argv=None):
         for rank in range(args.ranks)
         if (out / f"rank-{rank}-exit.json").is_file()
     }
-    launcher_code = code
+    launcher_code = process.returncode
     if not timed_out and (
         set(rank_exits) != set(range(args.ranks)) or any(rank_exits.values())
     ):
@@ -259,6 +287,7 @@ def main(argv=None):
         launcher_returncode=launcher_code,
         rank_returncodes=rank_exits,
         timed_out=timed_out,
+        retired_incomplete_rank=retired_rank,
         elapsed_s=time.monotonic() - begin,
         summaries=summaries,
         diagnostics=diagnostics,

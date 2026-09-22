@@ -156,6 +156,9 @@ def main():
             destroy_model_parallel()
             destroy_distributed_environment()
     else:
+        import faulthandler
+
+        faulthandler.dump_traceback_later(90, repeat=True)
         os.environ["B12X_CHECKPOINT_PROGRESS"] = str(args.output)
         os.environ["B12X_CHECKPOINT_ORACLE_DEVICE"] = args.oracle_device
         if args.stage == "tp-layer":
@@ -205,6 +208,7 @@ def main():
                 raise RuntimeError(
                     f"real checkpoint tests incomplete: exit={code}, counts={counts}"
                 )
+        faulthandler.cancel_dump_traceback_later()
     torch.cuda.synchronize()
     mark("released")
     paths = sorted(

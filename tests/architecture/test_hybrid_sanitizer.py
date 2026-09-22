@@ -1,6 +1,7 @@
 """Sanitizer completion cannot be inferred from a quiet or partial log."""
 
 from scripts.qualify_hybrid_sanitizer import classify, diagnostic_inventory
+import json
 import pytest
 
 
@@ -17,6 +18,17 @@ def test_requires_completion_from_every_rank_and_zero_summaries():
 
 def test_filter_never_qualifies_whole_program():
     assert classify(0, False, {0: [0], 1: [0]}, {0, 1}, 2, True) == "component_pass"
+
+
+def test_completed_sanitizer_error_flushes_peers_but_failed_application_retires(tmp_path):
+    from scripts.qualify_hybrid_sanitizer import retired_incomplete_rank
+
+    (tmp_path / "rank-0-exit.json").write_text(json.dumps({"returncode": 99}))
+    assert retired_incomplete_rank(tmp_path, 3) == dict(rank=0, returncode=99)
+    (tmp_path / "rank-0-complete.json").write_text("{}")
+    assert retired_incomplete_rank(tmp_path, 3) is None
+    (tmp_path / "rank-2-exit.json").write_text(json.dumps({"returncode": 1}))
+    assert retired_incomplete_rank(tmp_path, 3) == dict(rank=2, returncode=1)
 
 
 def test_probe_attribution_requires_stack_and_complete_accounting():
