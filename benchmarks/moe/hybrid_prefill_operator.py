@@ -142,6 +142,15 @@ def main():
                 graph.replay()
             torch.cuda.synchronize()
             session.freeze()
+            # Profiler-only runs have no timing samples, but must establish the
+            # same replay ownership and allocation invariants before reporting them.
+            for mode, graph in graphs.items():
+                before = torch.cuda.memory_stats()["allocation.all.allocated"]
+                with kernel_resolution_guard("matched prefill replay qualification"):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
+                assert pointers[mode] == plans[mode].prepared.state.pointers()
             resident = bindings["resident"].output.cpu()
             torch.testing.assert_close(
                 resident, bindings["mapped"].output.cpu(), atol=0, rtol=0

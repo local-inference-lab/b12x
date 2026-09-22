@@ -92,9 +92,9 @@ def test_placement_scope_rejects_invalid_or_unrelated_controls(tmp_path, stage, 
         )
     assert error.value.code == 2
     assert not output.exists()
-def test_distributed_layers_require_fresh_process_groups():
-    import pytest
 
+
+def test_distributed_layers_require_fresh_process_groups():
     from scripts.qualify_hybrid_sanitizer import validate_layer_scope
 
     for layer in (0, 24, 47):
