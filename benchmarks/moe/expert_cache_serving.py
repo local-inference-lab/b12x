@@ -68,6 +68,9 @@ async def run(args):
         enable_prefix_caching=False,
         kv_cache_dtype="bfloat16",
         attention_config={"backend": "FLASHINFER"},
+        profiler_config=({"profiler": "torch", "torch_profiler_dir": str(args.torch_profile.resolve()),
+                          "torch_profiler_with_stack": False, "torch_profiler_record_shapes": True,
+                          "ignore_frontend": True} if args.torch_profile else {}),
         enforce_eager=args.eager,
         enable_chunked_prefill=True,
         kernel_config={
@@ -203,6 +206,8 @@ async def run(args):
             raise ValueError("real serving benchmark requires a nonempty prompt corpus")
         if args.phase_timing:
             record("phase_timing_start", result=await engine.collective_rpc("b12x_phase_timing_start"))
+        if args.torch_profile:
+            await engine.start_profile()
         if args.execution_trace:
             record(
                 "trace_begin",
@@ -413,6 +418,8 @@ async def run(args):
         if epoch_task is not None:
             await epoch_task
         elapsed = time.perf_counter_ns() - begin
+        if args.torch_profile:
+            await engine.stop_profile()
         if args.phase_timing:
             record("phase_timing", result=await engine.collective_rpc("b12x_phase_timing_finish"))
         if args.routing_diagnostics:
@@ -609,6 +616,8 @@ def main():
     )
     p.add_argument("--eager", action="store_true")
     p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--torch-profile", type=Path,
+                   help="Opt-in engine profiler directory; diagnostic timings only")
     p.add_argument("--phase-timing", action="store_true",
                    help="Opt-in bounded model CUDA timing, separately from client TTFT")
     p.add_argument("--phase-observations", action="store_true",

@@ -126,3 +126,33 @@ def test_staged_payload_cannot_execute_or_publish_twice():
         state.publish_staged()
     state.finish_staged()
     state.require_executable()
+
+
+@pytest.mark.parametrize("world", [1, 2, 3, 4])
+def test_delayed_participant_blocks_publication(world):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    engine, control, states, rpc, events = group(world)
+    control.run(rpc)
+    engine.counts = snapshot({n: (0, 0, 10, 0) for n in ("a", "b")}, 1)
+    reached, release = Event(), Event()
+    worker = engine.workers[world // 2]
+    original = worker.b12x_residency_stage
+
+    def delayed(*args):
+        reached.set()
+        if not release.wait(5):
+            raise TimeoutError("test participant was not released")
+        return original(*args)
+
+    worker.b12x_residency_stage = delayed
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(control.run, rpc)
+        try:
+            assert reached.wait(5)
+            assert not future.done()
+            assert all(s.snapshot().generation == 0 for local in states for s in local.values())
+        finally:
+            release.set()
+        assert future.result(timeout=5)["status"] == "complete"
