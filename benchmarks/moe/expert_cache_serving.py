@@ -53,6 +53,7 @@ async def run(args):
     engine_args = AsyncEngineArgs(
         model=args.model,
         tensor_parallel_size=args.tp_size,
+        disable_custom_all_reduce=args.disable_custom_all_reduce,
         generation_config='vllm',
         model_loader_extra_config=({"tensor_coverage_path": str(args.loader_coverage)}
                                    if args.loader_coverage else {}),
@@ -533,6 +534,8 @@ def main():
     p.add_argument("--shutdown-case", default="normal", choices=("normal", "health-pending",
                    "health-completed", "health-cancelled", "maintenance-cancelled"))
     p.add_argument("--model", required=True)
+    p.add_argument("--disable-custom-all-reduce", action="store_true",
+                   help="Use the engine's NCCL collective path for TP qualification")
     p.add_argument('--natural-eos', action='store_true', help='Allow model EOS in correctness smokes')
     p.add_argument('--expert-offload-gib', type=float, default=0,
                    help='Ordinary native UVA control, selecting only routed experts by exact name segment')

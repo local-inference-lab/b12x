@@ -15,9 +15,21 @@ def classify_iteration(scheduled, computed, prompt_lengths):
         prompt += prefill
         decode += count - prefill
         chunks.append(prefill)
-    phase = "mixed" if prompt and decode else "prefill" if prompt else "decode" if decode else "empty"
-    return {"phase": phase, "prompt_tokens": prompt, "decode_tokens": decode,
-            "prompt_chunks": chunks}
+    phase = (
+        "mixed"
+        if prompt and decode
+        else "prefill"
+        if prompt
+        else "decode"
+        if decode
+        else "empty"
+    )
+    return {
+        "phase": phase,
+        "prompt_tokens": prompt,
+        "decode_tokens": decode,
+        "prompt_chunks": chunks,
+    }
 
 
 def observation_ranges(scheduled, computed, prompt_lengths):
@@ -43,9 +55,13 @@ class PhaseTiming:
 
     def __init__(self, capacity):
         import torch
+
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("phase timing capacity must be positive")
-        self.events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(capacity)]
+        self.events = [
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(capacity)
+        ]
         for pair in self.events:
             for event in pair:
                 event.record()
@@ -58,9 +74,18 @@ class PhaseTiming:
         if len(self.records) == len(self.events):
             self.overflow = True
             return
-        record = classify_iteration(batch.num_scheduled_tokens, batch.num_computed_tokens_np, batch.prefill_len_np)
-        record.update(requests=list(batch.req_ids), scheduled=batch.num_scheduled_tokens.tolist(),
-            computed=batch.num_computed_tokens_np.tolist(), host_submit_start_ns=perf_counter_ns())
+        record = classify_iteration(
+            batch.num_scheduled_tokens,
+            batch.num_computed_tokens_np,
+            batch.prefill_len_np,
+        )
+        record.update(
+            requests=list(batch.req_ids),
+            scheduled=batch.num_scheduled_tokens.tolist(),
+            computed=batch.num_computed_tokens_np.tolist(),
+            prompt_lengths=batch.prefill_len_np.tolist(),
+            host_submit_start_ns=perf_counter_ns(),
+        )
         self.events[len(self.records)][0].record()
         self.pending = record
 
@@ -73,12 +98,45 @@ class PhaseTiming:
 
     def finish(self):
         if self.pending is not None or self.overflow:
-            raise RuntimeError("phase timing is incomplete or exceeded its prepared capacity")
+            raise RuntimeError(
+                "phase timing is incomplete or exceeded its prepared capacity"
+            )
         if self.records:
             self.events[len(self.records) - 1][1].synchronize()
         for record, (start, end) in zip(self.records, self.events, strict=False):
             record["model_device_ms"] = start.elapsed_time(end)
-        result = {"schema": 1, "scope": "model CUDA elapsed time; not client TTFT or scheduler wall time",
-                  "iterations": self.records}
+        # A span includes gaps between chunk executions. Sum of model events
+        # excludes those gaps. Neither includes admission or token delivery.
+        requests = {}
+        for index, record in enumerate(self.records):
+            for request, chunk, before, length in zip(
+                record["requests"],
+                record["prompt_chunks"],
+                record["computed"],
+                record["prompt_lengths"],
+                strict=True,
+            ):
+                if not chunk:
+                    continue
+                row = requests.setdefault(
+                    request, {"first": index, "chunks": [], "complete": False}
+                )
+                row["chunks"].append(chunk)
+                row["last"] = index
+                row["complete"] = before + chunk >= length
+        for row in requests.values():
+            row["prefill_span_ms"] = self.events[row["first"]][0].elapsed_time(
+                self.events[row["last"]][1]
+            )
+            row["includes_mixed_iteration"] = any(
+                self.records[i]["phase"] == "mixed"
+                for i in range(row["first"], row["last"] + 1)
+            )
+        result = {
+            "schema": 1,
+            "scope": "model CUDA elapsed time; not client TTFT or scheduler wall time",
+            "iterations": self.records,
+            "requests": requests,
+        }
         self.events.clear()
         return result
