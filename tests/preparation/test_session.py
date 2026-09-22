@@ -955,6 +955,27 @@ def test_gpu_steps_share_a_bounded_advance_without_changing_order(tmp_path, monk
         job.result()
 
 
+def test_tuning_contribution_preserves_rejected_candidate_count():
+    from b12x.preparation import TuningRequirement
+
+    winner = TuningRequirement("query", (0, 1), {"width": 2}, 1.0, 0)
+    empty = TuningRequirement("query", (0, 1), None, None, None, rejected_count=2)
+    consolidated = replace(winner, rejected_count=empty.rejected_count + 1)
+    assert winner.rejected_count == 0
+    assert consolidated.rejected_count == 3
+    assert consolidated.assignment == winner.assignment
+    assert consolidated.latency_us == winner.latency_us
+    assert consolidated.candidate_index == winner.candidate_index
+
+
+@pytest.mark.parametrize("count", (-1, True, 1.5, "2"))
+def test_tuning_contribution_rejects_invalid_rejection_counts(count):
+    from b12x.preparation import TuningRequirement
+
+    with pytest.raises(ValueError, match="rejected candidate count"):
+        TuningRequirement("query", (0, 1), None, None, None, rejected_count=count)
+
+
 @pytest.mark.parametrize("boundary", ("compile", "collective", "tuning", "cache"))
 def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
     from b12x.preparation.types import PreparationResult, TuningCacheRequirement, TuningRequirement

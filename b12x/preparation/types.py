@@ -267,6 +267,7 @@ class TuningRequirement:
     assignment: FrozenMapping | None
     latency_us: float | None
     candidate_index: int | None
+    rejected_count: int = 0
 
     def __post_init__(self):
         ranks = tuple(self.ranks)
@@ -276,6 +277,8 @@ class TuningRequirement:
             raise ValueError("tuning requirements need a key and nonnegative ranks")
         if ranks != tuple(sorted(set(ranks))):
             raise ValueError("tuning ranks must be sorted and unique")
+        if type(self.rejected_count) is not int or self.rejected_count < 0:
+            raise ValueError("rejected candidate count must be a nonnegative integer")
         empty = self.assignment is None
         if empty != (self.latency_us is None) or empty != (self.candidate_index is None):
             raise ValueError("a tuning contribution must be either complete or empty")
