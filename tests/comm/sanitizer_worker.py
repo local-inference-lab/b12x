@@ -38,8 +38,20 @@ def main():
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     args.output.mkdir(parents=True, exist_ok=True)
     progress = args.output / f"rank-{rank}-progress.jsonl"
+    libraries = {}
 
     def mark(location):
+        for line in Path("/proc/self/maps").read_text().splitlines():
+            path = line.split()[-1]
+            if (
+                path.startswith("/")
+                and any(name in path for name in ("libnccl", "libcuda.", "libcudart"))
+                and path not in libraries
+            ):
+                libraries[path] = sha256(path)
+        (args.output / f"rank-{rank}-libraries.json").write_text(
+            json.dumps(libraries, indent=2) + "\n"
+        )
         row = dict(
             rank=rank,
             location=location,

@@ -21,9 +21,15 @@ def classify(returncode, timed_out, summaries, completed, ranks, filtered):
     """Completion, zero errors and full rank coverage are independent requirements."""
     if timed_out:
         return "timeout"
-    if returncode != 0 or any(value != 0 for value in summaries):
+    if returncode != 0 or any(
+        value != 0 for values in summaries.values() for value in values
+    ):
         return "failed"
-    if len(summaries) < ranks or completed != set(range(ranks)):
+    if (
+        set(summaries) != set(range(ranks))
+        or any(not v for v in summaries.values())
+        or completed != set(range(ranks))
+    ):
         return "incomplete"
     return "component_pass" if filtered else "whole_program_pass"
 
@@ -147,7 +153,9 @@ def main(argv=None):
         (out / f"rank-{rank}-exit.json").write_text(
             json.dumps({"returncode": status}) + "\n"
         )
-        return status
+        # Let every instrumented rank flush its summary before the launcher
+        # observes failure. The parent requires all recorded rank exit codes.
+        return 0
     if out.exists():
         p.error("output must be a new directory")
     out.mkdir(parents=True)
@@ -214,22 +222,34 @@ def main(argv=None):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
             code = 124
-    summaries = []
+    summaries = {}
     diagnostics = {}
     for rank in range(args.ranks):
         path = out / f"rank-{rank}-sanitizer.log"
         if not path.is_file():
             continue
         diagnostics[str(rank)] = diagnostic_inventory(path.read_text())
-        summaries.extend(
+        summaries[rank] = [
             int(n)
             for n in re.findall(r"ERROR SUMMARY: (\d+) errors?", path.read_text())
-        )
+        ]
     completed = {
         r for r in range(args.ranks) if (out / f"rank-{r}-complete.json").is_file()
     }
+    rank_exits = {
+        rank: json.loads((out / f"rank-{rank}-exit.json").read_text())["returncode"]
+        for rank in range(args.ranks)
+        if (out / f"rank-{rank}-exit.json").is_file()
+    }
+    launcher_code = code
+    if not timed_out and (
+        set(rank_exits) != set(range(args.ranks)) or any(rank_exits.values())
+    ):
+        code = next((v for v in rank_exits.values() if v), code or 1)
     receipt.update(
         returncode=code,
+        launcher_returncode=launcher_code,
+        rank_returncodes=rank_exits,
         timed_out=timed_out,
         elapsed_s=time.monotonic() - begin,
         summaries=summaries,
