@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import runpy
 
 import torch
 import torch.distributed as dist
@@ -19,10 +20,20 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--stage",
-        choices=("cuda", "nccl-init", "collective", "production"),
+        choices=(
+            "cuda",
+            "nccl-init",
+            "collective",
+            "production",
+            "layer",
+            "compact",
+            "tp-layer",
+        ),
         required=True,
     )
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--layers", type=int, nargs="+", default=[0])
+    p.add_argument("--oracle-device", choices=("cpu", "cuda"), default="cuda")
     args = p.parse_args()
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     args.output.mkdir(parents=True, exist_ok=True)
@@ -86,7 +97,7 @@ def main():
             mark("collective-return")
             comm.destroy()
         dist.destroy_process_group()
-    else:
+    elif args.stage == "production":
         from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
         from vllm.distributed import (
             destroy_distributed_environment,
@@ -131,6 +142,39 @@ def main():
             mark("production-graph-return")
             destroy_model_parallel()
             destroy_distributed_environment()
+    else:
+        os.environ["B12X_CHECKPOINT_PROGRESS"] = str(args.output)
+        os.environ["B12X_CHECKPOINT_ORACLE_DEVICE"] = args.oracle_device
+        if args.stage == "tp-layer":
+            for layer in args.layers:
+                sys.argv = [
+                    "tp_checkpoint_worker.py",
+                    "--checkpoint",
+                    os.environ["B12X_TEST_NEXT80_CHECKPOINT"],
+                    "--layer",
+                    str(layer),
+                    "--output",
+                    str(args.output / f"layer-{layer}"),
+                ]
+                runpy.run_path(
+                    str(Path(__file__).parents[1] / "moe/tp_checkpoint_worker.py"),
+                    run_name="__main__",
+                )
+        else:
+            import pytest
+
+            if args.stage == "compact":
+                os.environ["B12X_TEST_NEXT80_ROUTE_SUBSET"] = "1"
+            tests = [
+                str(Path(__file__).parents[1] / "moe/test_next80_checkpoint.py")
+                + f"::test_real_next80_routes_graph_and_independent_arithmetic[{layer}]"
+                for layer in args.layers
+            ]
+            code = pytest.main(
+                [*tests, "-q", "-s", "-o", f"cache_dir={args.output / 'pytest-cache'}"]
+            )
+            if code:
+                raise RuntimeError(f"real checkpoint pytest exit code {code}")
     torch.cuda.synchronize()
     mark("released")
     paths = sorted(
@@ -149,6 +193,7 @@ def main():
         rank=rank,
         world_size=world,
         completed=True,
+        oracle_device=args.oracle_device,
         torch=torch.__version__,
         torch_cuda=torch.version.cuda,
         device=str(torch.cuda.get_device_properties(rank)),

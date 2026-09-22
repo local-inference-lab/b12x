@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import time
 
 import pytest
 import torch
@@ -191,8 +192,24 @@ def load_layer(checkpoint, layer):
     )
 
 
-def routed_oracle(source, x, ids, weights):
+def checkpoint_progress(location):
+    """Retain the last completed boundary when an instrumented run times out."""
+    root = os.environ.get("B12X_CHECKPOINT_PROGRESS")
+    if root:
+        rank = int(os.environ.get("RANK", 0))
+        with (Path(root) / f"rank-{rank}-progress.jsonl").open("a") as stream:
+            stream.write(
+                json.dumps(dict(location=location, rank=rank, time_ns=time.time_ns()))
+                + "\n"
+            )
+        print(f"CHECKPOINT_PROGRESS rank={rank} {location}", flush=True)
+
+
+def routed_oracle(source, x, ids, weights, *, device=None):
     """Independent FP32 matvec with the declared BF16 boundaries and ordered sum."""
+    output_device = x.device
+    device = device or os.environ.get("B12X_CHECKPOINT_ORACLE_DEVICE", str(x.device))
+    x, ids, weights = (value.to(device) for value in (x, ids, weights))
     w = source.weights
     lut = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
@@ -227,7 +244,25 @@ def routed_oracle(source, x, ids, weights):
             ).bfloat16()
             contribution = (down.float() * weights[row, rank]).bfloat16()
             result[row] = (result[row].float() + contribution.float()).bfloat16()
-    return result
+    return result.to(output_device)
+
+
+def test_real_next80_cpu_oracle_matches_device():
+    """Host reference evaluation retains the routed recipe's BF16 boundaries."""
+    location = os.environ.get("B12X_TEST_NEXT80_CHECKPOINT")
+    if not location or not torch.cuda.is_available():
+        pytest.skip("complete pinned Next80 checkpoint and physical SM120 required")
+    config, source, ordinary = load_layer(Path(location), 0)
+    torch.manual_seed(131)
+    x = (torch.randn(1, config["hidden_size"], device="cuda") * 0.125).bfloat16()
+    logits = torch.nn.functional.linear(x, ordinary["gate.weight"].cuda())
+    weights, ids = logits.float().softmax(-1).topk(10)
+    weights /= weights.sum(-1, keepdim=True)
+    for route_ids in (ids, ids.flip(-1), ids[:, :1].expand_as(ids)):
+        host = routed_oracle(source, x, route_ids, weights, device="cpu")
+        device = routed_oracle(source, x, route_ids, weights, device="cuda")
+        assert torch.isfinite(host).all() and torch.count_nonzero(host)
+        torch.testing.assert_close(host, device, atol=1e-4, rtol=0.01)
 
 
 @pytest.mark.parametrize("layer", [0, 24, 47])
@@ -238,7 +273,9 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
     if not location or not torch.cuda.is_available():
         pytest.skip("complete pinned Next80 checkpoint and physical SM120 required")
     assert torch.cuda.get_device_capability() == (12, 0)
+    checkpoint_progress(f"layer-{layer}:load-enter")
     config, source, ordinary = load_layer(Path(location), layer)
+    checkpoint_progress(f"layer-{layer}:load-return")
     assert config["model_type"] == "qwen3_next"
     torch.manual_seed(131 + layer)
     bounded = os.environ.get("B12X_TEST_NEXT80_ROUTE_SUBSET") == "1"
@@ -287,6 +324,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
     repeated[:, 1] = repeated[:, 0]
     routes.append((repeated, weights.clone()))
     shared, engine_config, loaded = shared_module(Path(location), layer, ordinary)
+    checkpoint_progress(f"layer-{layer}:shared-loaded")
     assert "shared.expert_gate.weight" in loaded
     from vllm.config import set_current_vllm_config
 
@@ -329,6 +367,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                 for n, p in enumerate(plans)
             )
         )
+        checkpoint_progress(f"layer-{layer}:prepared")
         graphs = []
         for plan in plans:
             binding = plan.prepared.state.bind(a=x, topk_ids=ids, topk_weights=weights)
@@ -383,6 +422,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
 
         for _ in range(3):
             combined = composed()
+        checkpoint_progress(f"layer-{layer}:composed")
         assert len(calls) == 3
         # Decompose the actual ModelOpt shared MLP at its established BF16
         # activation/output boundaries and apply the checkpoint sigmoid gate.
@@ -405,6 +445,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
             ids.copy_(route_ids)
             weights.copy_(route_weights)
             oracle = routed_oracle(source, x, ids, weights)
+            checkpoint_progress(f"layer-{layer}:oracle-{case}")
             results = []
             for plan, (graph, binding, pointers) in zip(plans, graphs, strict=True):
                 before = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -444,9 +485,11 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                 torch.testing.assert_close(
                     combined, shared_expected + results[1], atol=0, rtol=0
                 )
+            checkpoint_progress(f"layer-{layer}:case-{case}-passed")
         graph_shared.reset()
         for graph, _, _ in graphs:
             graph.reset()
     assert all(p.prepared is None for p in plans)
+    checkpoint_progress(f"layer-{layer}:released")
     if bounded:
         faulthandler.cancel_dump_traceback_later()

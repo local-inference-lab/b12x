@@ -78,10 +78,12 @@ spec = importlib.util.spec_from_file_location(
 )
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
+progress = oracle.checkpoint_progress
 with set_current_vllm_config(config), torch.inference_mode():
     from vllm.distributed.parallel_state import set_custom_all_reduce
 
     set_custom_all_reduce(False)
+    progress(f"layer-{args.layer}:model-parallel-init-enter")
     init_distributed_environment(
         world_size=world, rank=rank, local_rank=rank, distributed_init_method="env://"
     )
@@ -89,6 +91,7 @@ with set_current_vllm_config(config), torch.inference_mode():
         tensor_model_parallel_size=world, pipeline_model_parallel_size=1
     )
     init_workspace_manager(torch.device("cuda", rank))
+    progress(f"layer-{args.layer}:model-parallel-init-return")
     try:
         torch.set_default_dtype(torch.bfloat16)
         prefix = f"model.layers.{args.layer}."
@@ -118,6 +121,7 @@ with set_current_vllm_config(config), torch.inference_mode():
         method = routed.quant_method
         model = method.provider.model
         source = model.sources[method.prefix]
+        progress(f"layer-{args.layer}:loaded")
         assert source.plan.geometry.intermediate_size == 512 // world
         # Full matrices below belong only to the independent layer oracle, not the runtime source.
         _, full, _ = oracle.load_layer(checkpoint, args.layer)
@@ -147,8 +151,10 @@ with set_current_vllm_config(config), torch.inference_mode():
         ids = ids.clone()
         weights = weights.clone()
         gathered = [torch.empty_like(ids) for _ in range(world)]
+        progress(f"layer-{args.layer}:route-all-gather-enter")
         dist.all_gather(gathered, ids)
         assert all(torch.equal(ids, v) for v in gathered)
+        progress(f"layer-{args.layer}:route-all-gather-return")
         reports = []
         placement_reference = None
         for resident in (512, 256, 1):
@@ -184,6 +190,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                 cache_dir=root / f"tp-layer-cache-{rank}",
             ) as session:
                 session.prepare((plan.request(name="layer", prepare_call=prepare),))
+                progress(f"layer-{args.layer}:resident-{resident}:prepared")
                 state = plan.prepared.state
                 model.plans[method.prefix] = plan
                 binding = state.bind(a=x, topk_ids=ids, topk_weights=weights)
@@ -211,7 +218,9 @@ with set_current_vllm_config(config), torch.inference_mode():
                         before == torch.cuda.memory_stats()["allocation.all.allocated"]
                     )
                     assert pointers == state.pointers()
-                    assert torch.isfinite(binding.output).all() and torch.count_nonzero(binding.output)
+                    assert torch.isfinite(binding.output).all() and torch.count_nonzero(
+                        binding.output
+                    )
                     expected_local = oracle.routed_oracle(source, x, ids, weights)
                     torch.testing.assert_close(
                         binding.output, expected_local, atol=0.001, rtol=0.03
@@ -219,14 +228,30 @@ with set_current_vllm_config(config), torch.inference_mode():
                     reduced = tensor_model_parallel_all_reduce(binding.output.clone())
                     expected = oracle.routed_oracle(full, x, ids, weights)
                     torch.testing.assert_close(reduced, expected, atol=0.003, rtol=0.06)
-                    arithmetic.append(dict(
-                        routes=case,
-                        local_max_abs=float((binding.output.float() - expected_local.float()).abs().max()),
-                        reduced_max_abs=float((reduced.float() - expected.float()).abs().max()),
-                        reduced_relative_l2=float((reduced.float() - expected.float()).norm() / expected.float().norm()),
-                        reduced_cosine=float(torch.nn.functional.cosine_similarity(
-                            reduced.float().flatten(), expected.float().flatten(), dim=0)),
-                    ))
+                    arithmetic.append(
+                        dict(
+                            routes=case,
+                            local_max_abs=float(
+                                (binding.output.float() - expected_local.float())
+                                .abs()
+                                .max()
+                            ),
+                            reduced_max_abs=float(
+                                (reduced.float() - expected.float()).abs().max()
+                            ),
+                            reduced_relative_l2=float(
+                                (reduced.float() - expected.float()).norm()
+                                / expected.float().norm()
+                            ),
+                            reduced_cosine=float(
+                                torch.nn.functional.cosine_similarity(
+                                    reduced.float().flatten(),
+                                    expected.float().flatten(),
+                                    dim=0,
+                                )
+                            ),
+                        )
+                    )
                     if case == "ordinary":
                         if placement_reference is None:
                             placement_reference = reduced.clone()
@@ -234,6 +259,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                             torch.testing.assert_close(
                                 reduced, placement_reference, atol=0, rtol=0
                             )
+                    progress(f"layer-{args.layer}:resident-{resident}:case-{case}")
                 ids.copy_(original_ids)
                 weights.copy_(original_weights)
                 # Exercise the real model wrapper and its shared-expert/final-reduction ownership.
@@ -275,7 +301,9 @@ with set_current_vllm_config(config), torch.inference_mode():
                     before = torch.cuda.memory_stats()["allocation.all.allocated"]
                     whole_graph.replay()
                     torch.cuda.synchronize()
-                    assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
+                    assert (
+                        before == torch.cuda.memory_stats()["allocation.all.allocated"]
+                    )
                     assert pointers == state.pointers()
                     torch.testing.assert_close(combined_graph, combined, atol=0, rtol=0)
                     assert state.updates.snapshot().generation == 1
@@ -295,6 +323,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                 graph.reset()
                 del owners, binding
                 model.plans.clear()
+                progress(f"layer-{args.layer}:resident-{resident}:released")
         (root / f"tp-layer-{args.layer}-rank{rank}.json").write_text(
             json.dumps(reports, indent=2, default=str)
         )
@@ -304,3 +333,4 @@ with set_current_vllm_config(config), torch.inference_mode():
         reset_workspace_manager()
         destroy_model_parallel()
         destroy_distributed_environment()
+        progress(f"layer-{args.layer}:released")

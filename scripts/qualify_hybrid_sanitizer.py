@@ -32,7 +32,15 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--stage",
-        choices=("cuda", "nccl-init", "collective", "production"),
+        choices=(
+            "cuda",
+            "nccl-init",
+            "collective",
+            "production",
+            "layer",
+            "compact",
+            "tp-layer",
+        ),
         required=True,
     )
     p.add_argument("--output", type=Path, required=True)
@@ -41,10 +49,14 @@ def main(argv=None):
     p.add_argument("--tool", choices=("memcheck", "synccheck"), default="memcheck")
     p.add_argument("--deadline", type=float, default=300)
     p.add_argument("--kernel-filter")
+    p.add_argument("--layers", type=int, nargs="+", default=[0])
+    p.add_argument("--oracle-device", choices=("cpu", "cuda"), default="cuda")
     p.add_argument("--rank-child", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if args.ranks < 1 or args.deadline <= 0:
         p.error("ranks and deadline must be positive")
+    if args.stage in ("layer", "compact") and args.ranks != 1:
+        p.error("single-rank checkpoint tests require --ranks 1")
     out = args.output.resolve()
     if args.rank_child:
         rank = int(os.environ.get("RANK", 0))
@@ -70,6 +82,10 @@ def main(argv=None):
             args.stage,
             "--output",
             str(out),
+            "--oracle-device",
+            args.oracle_device,
+            "--layers",
+            *(str(layer) for layer in args.layers),
         ]
         (out / f"rank-{rank}-command.json").write_text(
             json.dumps(command, indent=2) + "\n"
@@ -100,6 +116,8 @@ def main(argv=None):
         source_files=source_files(),
         command=command,
         stage=args.stage,
+        layers=args.layers,
+        oracle_device=args.oracle_device,
         scope="filtered component" if args.kernel_filter else "whole program",
         kernel_filter=args.kernel_filter,
         deadline_s=args.deadline,
@@ -144,7 +162,10 @@ def main(argv=None):
                 process.wait()
             code = 124
     summaries = []
-    for path in sorted(out.glob("rank-*-sanitizer.log")):
+    for rank in range(args.ranks):
+        path = out / f"rank-{rank}-sanitizer.log"
+        if not path.is_file():
+            continue
         summaries.extend(
             int(n)
             for n in re.findall(r"ERROR SUMMARY: (\d+) errors?", path.read_text())
@@ -164,7 +185,7 @@ def main(argv=None):
         logs={
             path.name: sha256(path)
             for path in sorted(out.iterdir())
-            if path != manifest
+            if path != manifest and path.is_file()
         },
         last_progress={
             path.name: path.read_text().splitlines()[-1:]
