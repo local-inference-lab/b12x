@@ -81,9 +81,9 @@ class ExpertStorageContract:
     resident: ExpertRepresentation
     mode: BackingMode
     direct_cold_execution: bool
+    rollback: str
     source_transform: str | None = None
     promotion_transform: str | None = None
-    rollback: str = "canonical_restore"
 
     def __post_init__(self):
         for name in ("adapter", "checkpoint", "layer", "recipe", "rollback"):
@@ -103,6 +103,11 @@ class ExpertStorageContract:
                 raise ValueError("resident-only storage has no executable backing")
         elif not isinstance(self.backing, ExpertRepresentation):
             raise TypeError("host-backed storage requires a backing representation")
+        if self.backing is not None and self.source != self.backing and self.source_transform is None:
+            raise ValueError("different source/backing representations require a source transform")
+        if (self.mode == BackingMode.RESIDENT_ONLY and self.source != self.resident
+                and self.source_transform is None and self.promotion_transform is None):
+            raise ValueError("different source/resident representations require a preparation transform")
         if self.mode in (BackingMode.DIRECT, BackingMode.PREPARED) and not self.direct_cold_execution:
             raise ValueError("direct/prepared canonical storage requires cold execution")
         if self.mode == BackingMode.PREPARED and self.source_transform is None:

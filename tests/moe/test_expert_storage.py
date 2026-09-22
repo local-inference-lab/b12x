@@ -17,6 +17,7 @@ def contract(**changes):
         shard=ExpertShard(experts=7, hidden=256, intermediate=128, global_intermediate=128),
         source=fp8, backing=fp8, resident=fp8, mode=BackingMode.DIRECT,
         direct_cold_execution=True,
+        rollback="canonical_restore",
     ) | changes))
 
 
@@ -57,6 +58,23 @@ def test_mxfp4_scale_geometry_is_an_adapter_property():
     assert value.resident.bytes_per_expert == 901
     with pytest.raises(ValueError, match="power of two"):
         replace(row, alignment=96)
+
+
+def test_representation_changes_require_explicit_preparation_capabilities():
+    value = contract()
+    foreign = ExpertRepresentation(encoding="compressed_source", bytes_per_expert=111)
+    with pytest.raises(ValueError, match="source transform"):
+        replace(value, source=foreign)
+    prepared = replace(value, source=foreign, mode=BackingMode.PREPARED,
+                       source_transform="decode_at_load")
+    assert prepared.direct_cold_execution
+    with pytest.raises(ValueError, match="preparation transform"):
+        replace(value, source=foreign, backing=None, mode=BackingMode.RESIDENT_ONLY,
+                direct_cold_execution=False, rollback="slot_journal")
+    resident = replace(value, source=foreign, backing=None, mode=BackingMode.RESIDENT_ONLY,
+                       direct_cold_execution=False, source_transform="decode_at_load",
+                       rollback="slot_journal")
+    assert resident.source != resident.resident
 
 
 def test_nvfp4_adapter_implements_storage_and_rejects_foreign_execution():

@@ -118,6 +118,7 @@ class ExpertWeightSource:
             ),
             backing=canonical, resident=canonical, mode=BackingMode.PREPARED,
             direct_cold_execution=True, source_transform="swizzle_k16_scales",
+            rollback="canonical_restore",
         )
 
     @property
