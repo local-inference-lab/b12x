@@ -44,6 +44,8 @@ def worker_resources(worker):
     host_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
     return dict(
         **process_resources(),
+        rank=worker.rank,
+        tp_size=worker.vllm_config.parallel_config.tensor_parallel_size,
         allocated=torch.cuda.memory_allocated(),
         reserved=torch.cuda.memory_reserved(),
         peak_allocated=torch.cuda.max_memory_allocated(),
