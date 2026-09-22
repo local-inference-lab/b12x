@@ -22,6 +22,7 @@ from vllm.distributed import (
     destroy_model_parallel,
     destroy_distributed_environment,
     tensor_model_parallel_all_reduce,
+    get_tp_group,
 )
 from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import set_forward_context
@@ -150,10 +151,13 @@ with set_current_vllm_config(config), torch.inference_mode():
         )
         ids = ids.clone()
         weights = weights.clone()
-        gathered = [torch.empty_like(ids) for _ in range(world)]
+        cpu_ids = ids.cpu()
+        gathered = [torch.empty_like(cpu_ids) for _ in range(world)]
         progress(f"layer-{args.layer}:route-all-gather-enter")
-        dist.all_gather(gathered, ids)
-        assert all(torch.equal(ids, v) for v in gathered)
+        # Route agreement is a host assertion, not a model collective. Use the
+        # engine's CPU control group instead of creating another NCCL context.
+        dist.all_gather(gathered, cpu_ids, group=get_tp_group().cpu_group)
+        assert all(torch.equal(cpu_ids, v) for v in gathered)
         progress(f"layer-{args.layer}:route-all-gather-return")
         reports = []
         placement_reference = None
@@ -293,11 +297,11 @@ with set_current_vllm_config(config), torch.inference_mode():
                     slots = state.updates.snapshot()
                     pairs = ((resident, 0),)
                     state.updates.stage(pairs, expected=slots, quiescent=True)
-                    dist.barrier()
+                    get_tp_group().barrier()
                     state.updates.publish_staged()
-                    dist.barrier()
+                    get_tp_group().barrier()
                     state.updates.finish_staged()
-                    dist.barrier()
+                    get_tp_group().barrier()
                     before = torch.cuda.memory_stats()["allocation.all.allocated"]
                     whole_graph.replay()
                     torch.cuda.synchronize()

@@ -28,6 +28,58 @@ def classify(returncode, timed_out, summaries, completed, ranks, filtered):
     return "component_pass" if filtered else "whole_program_pass"
 
 
+def diagnostic_inventory(text):
+    """Recognize initialization probes without suppressing or passing their errors."""
+    counts = {}
+    unknown = []
+    for block in re.split(r"(?m)^=========\s*$", text):
+        lines = [
+            line.removeprefix("========= ")
+            for line in block.splitlines()
+            if line.startswith("========= ")
+        ]
+        if not lines:
+            continue
+        # The banner may share the first block with the first diagnostic.
+        lines = [line for line in lines if line != "COMPUTE-SANITIZER"]
+        if not lines or lines[0].startswith("ERROR SUMMARY:"):
+            continue
+        heading = lines[0]
+        probe = "ncclInitKernelsForDevice" in block and "libnccl.so" in block
+        category = None
+        if probe:
+            if heading.startswith(
+                "Program hit cudaErrorNoKernelImageForDevice (error 209)"
+            ) and any(
+                f"call to {api}." in heading
+                for api in ("cudaFuncGetAttributes", "cudaGetLastError")
+            ):
+                category = "unavailable_nccl_kernel_image"
+            elif re.fullmatch(
+                r"CUDA API Error: Kernel \(_Z\w*ncclSymkDevKernel\w*f8\w*\) cannot be found in library due to compilation error",
+                heading,
+            ):
+                category = "nccl_fp8_symmetric_kernel_compilation"
+            elif (
+                heading
+                == "CUDA API Error: To get more information, use the CU_JIT_ERROR_LOG_BUFFER and CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES environment variables"
+            ):
+                category = "nccl_kernel_jit_information"
+        if category:
+            counts[category] = counts.get(category, 0) + 1
+        else:
+            unknown.append(heading)
+    summaries = [int(n) for n in re.findall(r"ERROR SUMMARY: (\d+) errors?", text)]
+    accounted = bool(summaries) and sum(counts.values()) == sum(summaries)
+    return dict(
+        categories=counts,
+        unclassified=unknown,
+        summaries=summaries,
+        all_errors_accounted=accounted and not unknown,
+        initialization_probe_only=bool(counts) and accounted and not unknown,
+    )
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -131,6 +183,7 @@ def main(argv=None):
             for k in (
                 "VLLM_NCCL_SO_PATH",
                 "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
                 "CUDA_VISIBLE_DEVICES",
                 "B12X_ACCEPTANCE_BUILD_MANIFEST",
             )
@@ -162,10 +215,12 @@ def main(argv=None):
                 process.wait()
             code = 124
     summaries = []
+    diagnostics = {}
     for rank in range(args.ranks):
         path = out / f"rank-{rank}-sanitizer.log"
         if not path.is_file():
             continue
+        diagnostics[str(rank)] = diagnostic_inventory(path.read_text())
         summaries.extend(
             int(n)
             for n in re.findall(r"ERROR SUMMARY: (\d+) errors?", path.read_text())
@@ -178,6 +233,7 @@ def main(argv=None):
         timed_out=timed_out,
         elapsed_s=time.monotonic() - begin,
         summaries=summaries,
+        diagnostics=diagnostics,
         completed_ranks=sorted(completed),
         status=classify(
             code, timed_out, summaries, completed, args.ranks, bool(args.kernel_filter)

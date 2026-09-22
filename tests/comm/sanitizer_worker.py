@@ -162,6 +162,7 @@ def main():
                 )
         else:
             import pytest
+            from scripts.qualify_sm103 import junit_counts
 
             if args.stage == "compact":
                 os.environ["B12X_TEST_NEXT80_ROUTE_SUBSET"] = "1"
@@ -170,11 +171,25 @@ def main():
                 + f"::test_real_next80_routes_graph_and_independent_arithmetic[{layer}]"
                 for layer in args.layers
             ]
+            junit = args.output / "checkpoint-tests.xml"
             code = pytest.main(
-                [*tests, "-q", "-s", "-o", f"cache_dir={args.output / 'pytest-cache'}"]
+                [
+                    *tests,
+                    "-q",
+                    "-s",
+                    "--junitxml",
+                    str(junit),
+                    "-o",
+                    f"cache_dir={args.output / 'pytest-cache'}",
+                ]
             )
-            if code:
-                raise RuntimeError(f"real checkpoint pytest exit code {code}")
+            counts = junit_counts(junit)
+            if code or counts != dict(
+                tests=len(args.layers), failures=0, errors=0, skipped=0
+            ):
+                raise RuntimeError(
+                    f"real checkpoint tests incomplete: exit={code}, counts={counts}"
+                )
     torch.cuda.synchronize()
     mark("released")
     paths = sorted(
