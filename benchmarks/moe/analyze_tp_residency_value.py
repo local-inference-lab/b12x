@@ -22,9 +22,15 @@ def snapshots(records):
         if worker["status"] != "complete":
             raise ValueError("maintenance did not complete")
         ranks = worker["workers"]
-        if set(map(int, ranks)) != set(range(len(ranks))):
+        if not ranks or set(map(int, ranks)) != set(range(len(ranks))):
             raise ValueError("rank inventory is incomplete")
         owner = ranks["0"]
+        if epochs and (
+            worker["baseline"]
+            or owner["checkpoint_id"] != epochs[0]["checkpoint_id"]
+            or owner["initial_profile_id"] != epochs[0]["profile_id"]
+        ):
+            raise ValueError("identity or baseline changed within the run")
 
         def counts(report):
             rows = report["snapshot"]["layers"]
@@ -164,6 +170,10 @@ def analyze(records):
                 positive += counts[candidate] > counts[victim]
                 if counts[candidate]:
                     generations.add(mapping["generation"])
+                after = epochs[end]["after"][name]["expert_map"]
+                if after[candidate][0] != 0 or after[victim][0] != 1:
+                    ended = True
+                    break
             lifetimes.append(
                 dict(
                     layer=name,
@@ -232,6 +242,9 @@ def main():
             dict(
                 path=str(path),
                 sha256=hashlib.sha256(data).hexdigest(),
+                analysis_script_sha256=hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
                 analysis=analyze([json.loads(line) for line in data.splitlines()]),
             )
         )

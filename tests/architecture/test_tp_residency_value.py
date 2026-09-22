@@ -81,6 +81,7 @@ def test_lifetime_stops_when_exchange_is_undone_and_keeps_eviction_demand():
 
 def test_final_transaction_has_no_invented_future_hits():
     result = analyze(records()[:3])
+    assert not result["transactions"][0]["pairs"][0]["right_censored"]
     last = result["transactions"][-1]
     assert last["unobserved_pairs"] == 1
     assert last["zero_hit_observed_pairs"] == 0
@@ -108,4 +109,12 @@ def test_unrecorded_map_change_is_rejected():
         rank["layers"]["layer"]["slots"]["generation"] += 1
     rows[2]["receipt"]["worker"]["layers"]["layer"]["generation"] += 1
     with pytest.raises(ValueError, match="placement changed"):
+        analyze(rows)
+
+
+def test_profile_change_between_epochs_is_rejected():
+    rows = records()
+    for rank in rows[2]["receipt"]["worker"]["workers"].values():
+        rank["initial_profile_id"] = "another-profile"
+    with pytest.raises(ValueError, match="identity or baseline changed"):
         analyze(rows)
