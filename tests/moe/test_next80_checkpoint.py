@@ -199,7 +199,7 @@ def assert_checkpoint_close(actual, expected, **kwargs):
 
 def checkpoint_progress(location):
     """Retain the last completed boundary when an instrumented run times out."""
-    root = os.environ.get("B12X_CHECKPOINT_PROGRESS")
+    root = os.environ.get("CHECKPOINT_TEST_PROGRESS")
     if root:
         rank = int(os.environ.get("RANK", 0))
         with (Path(root) / f"rank-{rank}-progress.jsonl").open("a") as stream:
@@ -213,7 +213,7 @@ def checkpoint_progress(location):
 def routed_oracle(source, x, ids, weights, *, device=None):
     """Independent FP32 matvec with the declared BF16 boundaries and ordered sum."""
     output_device = x.device
-    device = device or os.environ.get("B12X_CHECKPOINT_ORACLE_DEVICE", str(x.device))
+    device = device or os.environ.get("CHECKPOINT_TEST_ORACLE_DEVICE", str(x.device))
     x, ids, weights = (value.to(device) for value in (x, ids, weights))
     w = source.weights
     lut = torch.tensor(

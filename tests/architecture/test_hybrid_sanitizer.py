@@ -31,6 +31,22 @@ def test_completed_sanitizer_error_flushes_peers_but_failed_application_retires(
     assert retired_incomplete_rank(tmp_path, 3) == dict(rank=2, returncode=1)
 
 
+def test_checkpoint_diagnostics_do_not_change_kernel_compile_identity(monkeypatch):
+    from b12x._lib.compiler import _compile_environment_key
+
+    try:
+        monkeypatch.setenv("CHECKPOINT_TEST_PROGRESS", "/first/receipt")
+        monkeypatch.setenv("CHECKPOINT_TEST_ORACLE_DEVICE", "cuda")
+        _compile_environment_key.cache_clear()
+        before = _compile_environment_key()
+        monkeypatch.setenv("CHECKPOINT_TEST_PROGRESS", "/second/receipt")
+        monkeypatch.setenv("CHECKPOINT_TEST_ORACLE_DEVICE", "cpu")
+        _compile_environment_key.cache_clear()
+        assert _compile_environment_key() == before
+    finally:
+        _compile_environment_key.cache_clear()
+
+
 def test_probe_attribution_requires_stack_and_complete_accounting():
     log = """========= COMPUTE-SANITIZER
 ========= Program hit cudaErrorNoKernelImageForDevice (error 209) due to "no kernel image is available for execution on the device" on CUDA API call to cudaFuncGetAttributes.

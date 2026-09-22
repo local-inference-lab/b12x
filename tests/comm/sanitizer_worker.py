@@ -159,8 +159,8 @@ def main():
         import faulthandler
 
         faulthandler.dump_traceback_later(90, repeat=True)
-        os.environ["B12X_CHECKPOINT_PROGRESS"] = str(args.output)
-        os.environ["B12X_CHECKPOINT_ORACLE_DEVICE"] = args.oracle_device
+        os.environ["CHECKPOINT_TEST_PROGRESS"] = str(args.output)
+        os.environ["CHECKPOINT_TEST_ORACLE_DEVICE"] = args.oracle_device
         if args.stage == "tp-layer":
             for layer in args.layers:
                 sys.argv = [
