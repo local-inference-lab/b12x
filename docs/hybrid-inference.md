@@ -1,9 +1,10 @@
 # Hybrid expert inference
 
 Status: **implemented experimental contracts**. Physical qualification is
-source-bound. The [Qwen3-Next report](expert-cache-next80-results.md) qualifies
-the single-GPU ModelOpt NVFP4 adapter at its recorded revisions; it does not
-qualify later storage, TP, or observation changes.
+source-bound. The [hybrid qualification report](hybrid-inference-results.md) records TP1/TP2
+serving and phase measurements for the ModelOpt NVFP4 adapter, together with
+uncompleted gates. The [single-GPU control](expert-cache-next80-results.md)
+remains attached to its preceding source pair.
 
 The system distinguishes three serving tiers:
 
@@ -24,7 +25,10 @@ W4A4 and W4A16 is a deployment comparison, not isolated cache overhead.
 rank-local source, backing and resident representations. Each representation
 declares its encoding, per-expert payload, shared layer bytes and alignment.
 Payload arithmetic does not include slab padding, workspaces, graphs, journals,
-or engine reserves; the prepared adapter admits those separately.
+or engine reserves; the prepared adapter admits those separately. This contract
+uses a uniform declared row size within a layer. Variable-length compressed rows
+would require a bounded allocation/cost extension; the EXL3 fixture does not
+claim compatibility with an actual EXL3 checkpoint or decoder.
 
 `ExpertShard` declares logical expert count, hidden width, local intermediate
 extent and its position in the global intermediate axis. Rank is not part of
@@ -39,8 +43,10 @@ precision, source format, packing, and execution recipe selection.
 | `resident_only` | No host execution representation exists |
 
 Source transformation and promotion transformation are separate declarations.
-An adapter with different backing and resident representations must declare a
-promotion transform. A cold-execution backend rejects adapters without that
+An adapter with different source and backing representations must declare a
+source transform; different backing and resident representations require a
+promotion transform. A resident-only adapter also declares any required source
+preparation. Rollback ownership is explicit for every adapter. A cold-execution backend rejects adapters without that
 capability. Declaring a capability does not register an executable backend.
 
 The NVFP4 adapter retains `ExpertWeightSource` compatibility. It validates
@@ -72,7 +78,9 @@ Profiles bind TP world size and local/global geometry; rank-local preparation
 IDs and addresses may differ. Logical membership, slot rows and generations
 must agree. The supported loader contract uses uniform intermediate shards;
 model divisibility and adapter alignment may restrict eligible world sizes.
-The coordinator itself has no two-rank specialization.
+The coordinator itself has no two-rank specialization. TP serving currently
+rejects routing history and anchor recovery; their existing TP1 research paths
+remain available. This qualification enables ordinary adaptation only.
 
 The distributed transaction validates all ranks, stages local payloads while
 readers remain drained, waits for every staged acknowledgement, publishes maps,
@@ -111,6 +119,9 @@ use the maximum rank duration, never the sum. These event durations include
 collectives but do not isolate communication time. Use the harness's explicit
 `--torch-profile` diagnostic for kernel and collective attribution; its serving
 times are not headline samples.
+The harness exports complete traces without constructing the optional in-worker
+summary table. Aggregation belongs offline: the table's retained Python event
+tree caused profiler-only teardown failures in both ordinary and cache serving.
 
 After phase calibration, `benchmarks/moe/balance_expert_profile.py` constructs
 one experimental static placement with equal normalized prefill/decode weight
@@ -142,3 +153,73 @@ qualification or physical serving measurements.
 Qwen3.8 remains [deferred](expert-cache-qwen38-audit.md). No additional checkpoint,
 PLE integration or speculative execution is enabled by these contracts. SM103
 continues to require the [physical native gates](sm103-qualification.md).
+
+## Reproduce the added gates
+
+Use the source-matched environment and immutable checkpoint receipt from the
+[reference guide](expert-cache-reference.md) and
+[Qwen3-Next qualification](expert-cache-next80-results.md#reproduce-the-gates).
+The [current results](hybrid-inference-results.md) identify the tested source
+pair and artifact hashes. Supply explicit paths; none of these commands downloads
+a checkpoint or installs a runner.
+
+Run host acceptance and the existing portable GPU tier first. The physical TP
+layer worker uses the maintained model loader and final reduction. For two
+authorized local devices, run the real early, middle and late layers:
+
+```bash
+export B12X_TEST_NEXT80_CHECKPOINT="$MODEL"
+export B12X_CHECKPOINT_IDENTITY="$CHECKPOINT_IDENTITY"
+export B12X_ACCEPTANCE_BUILD_MANIFEST="$BUILD_MANIFEST"
+export VLLM_ENABLE_PCIE_ALLREDUCE=0
+for layer in 0 24 47; do
+  python -m torch.distributed.run --standalone --nproc-per-node=2 \
+    tests/moe/tp_checkpoint_worker.py --checkpoint "$MODEL" \
+    --layer "$layer" --output "$RESULTS/layer-$layer"
+done
+```
+
+The process count above selects the physical experiment. The transaction
+implementation is tested separately at N=1/2/3/4. Model geometry must satisfy its
+own divisibility and alignment requirements.
+
+For TP calibration and serving, add `--tp-size "$TP_SIZE"
+--disable-custom-all-reduce` to the existing serving harness. Generate a new
+TP-bound profile; a TP1 artifact cannot be relabeled TP2. Use a conservative
+admitted calibration envelope, record `--resources` and `--loader-coverage`,
+then reuse `expert_cache_capacity --maximum` with that calibration receipt.
+Inspect every rank's observed memory and release receipt before timing. The
+reported maximum envelope is specific to the recorded source, geometry and
+reservations.
+
+The reference adaptive arm adds `--mode adaptive --control health
+--epoch-tokens 16 --cold-threshold .15 --health-max-tokens 1024
+--epoch-pairs 32 --epoch-mib 128`. The byte envelope is per rank. History,
+specialist protection and anchor recovery remain disabled. Static uses the
+identical initial profile with `--mode static` and allocates no observer.
+
+For prompt measurements, supply independently retained prompt fixtures, use
+`--tokens 1 --phase-timing`, and keep the context, prepared token capacity and
+admission grouping fixed. Summarize the completed receipt with:
+
+```bash
+python -m benchmarks.moe.summarize_hybrid_prefill \
+  "$RESULTS/prefill.jsonl" --output "$RESULTS/prefill-summary.json"
+```
+
+Collect route coverage in a separate `--mode adaptive --control observe
+--phase-observations --routing-diagnostics` run. Require generation zero and
+matching output IDs against its static timing control. Subtract the retained
+initial counter boundary; startup routes are not evaluation traffic.
+
+To construct the single balanced-profile experiment, enable
+`--phase-observations` during disjoint calibration, retain its complete receipt,
+and run `benchmarks/moe/balance_expert_profile.py --help` for the explicit input
+and output arguments. This constructs one fixed equal-phase objective. Compare
+it with the decode-only placement built from the same calibration, and retain
+the historical profile as a separate control.
+
+The existing `--shutdown-case health-pending`, `--shutdown-case
+maintenance-cancelled` and `--repeat-lifecycle 2` options exercise engine-owned
+control completion and reconstruction. Require zero cache-owned mapped bytes,
+CPU sources, graphs and pending health state on every worker after release.

@@ -3,8 +3,10 @@
 Status: **implemented experimental serving path**. The companion vLLM branch
 `codex/b12x-expert-cache` loads routed expert parameters on CPU
 and submits their placement to b12x before CUDA graph capture. This path requires
-physical SM120, one GPU, native ModelOpt NVFP4 weights and explicitly selected
-W4A16 routed activations. It is opt-in; ordinary vLLM loading and static SM103
+physical SM120, a single tensor-parallel group, native ModelOpt NVFP4 weights
+and explicitly selected W4A16 routed activations. TP1 and TP2 have separate
+[source-bound qualification](hybrid-inference-results.md); other world sizes
+require model divisibility, adapter alignment and physical qualification. It is opt-in; ordinary vLLM loading and static SM103
 residency retain their existing behavior.
 
 The [SM103 HBM/Grace backend](expert-residency.md) has a different numerical and
@@ -47,10 +49,13 @@ the ordinary split-K W4A16 result. The profile recipe explicitly records
 are rejected. Prepared native ModelOpt W4A16 also exposes this schedule through
 `RoutingSpec(deterministic_output=True)`, with decode query schema 9.
 
-The qualified loader scope is TP/DP/PP=1, BF16 I/O, gated SiLU without bias,
-H and local I divisible by 128, and one declared top-k across layers. EP, DBO,
-speculation, LoRA, modified SwiGLU and router weighting on the input are rejected.
-Distributed epoch contract tests do not qualify a distributed checkpoint loader.
+The loader supports one TP group with DP/PP=1, BF16 I/O, gated SiLU without
+bias, H and local I divisible by 128, and one declared top-k across layers.
+EP, sequence/context parallelism, DBO, speculation, LoRA, modified SwiGLU and
+router weighting on the input are rejected. Qwen3-Next TP2 qualification
+covers actual loader shards, real checkpoint arithmetic, logical generations
+and full-model serving. Arbitrary-N coordinator tests alone do not qualify
+additional physical world sizes. See the [TP contract](hybrid-inference.md#tensor-parallel-residency).
 
 ## Preparation and storage
 
@@ -118,10 +123,12 @@ valid per-layer placements supplied by a model planner.
 
 Host sources are admitted before parameter allocation. Full canonical backing
 and fill buffers are admitted before preparation, against both the configured
-host envelope and available physical host pages. The loader qualification is
-single-rank, so it cannot independently promise the same host pool to several
-ranks. Preparation failure requires reload; a partial declaration is not a
-usable admitted model.
+host envelope and available physical host pages. Each TP worker admits its
+local representation; the physical-host check conservatively multiplies pending
+backing and safety requirements by TP world size. Source bytes already loaded
+are reflected in available host memory. GPU admission remains per rank. A logical
+placement must fit every participant. Preparation failure requires reload;
+a partial declaration is not a usable admitted model.
 
 ## Configuration and profile lifecycle
 
@@ -157,9 +164,10 @@ The engine's actual KV reservation must match the declared admission value.
   counter, phase setter, fill buffers or background epoch loop.
 - `adaptive` starts from the same pinned learned profile and prepares counters
   and bounded canonical fills. The application explicitly drives epochs through
-  `VllmResidencyEpochs`, or single-rank
+  `VllmResidencyEpochs`, or
   [scheduler-owned maintenance](expert-cache-maintenance.md) through
-  `VllmResidencyMaintenance`. Neither driver installs an automatic cadence.
+  `VllmResidencyMaintenance`. TP maintenance uses the engine-owned distributed
+  transaction described in the [hybrid guide](hybrid-inference.md). Neither driver installs an automatic cadence.
 
 The artifact wrapper uses version 1 and SHA256 integrity. Its identity includes
 checkpoint contents, numerical recipe, workload, top-k, layer names, E/H/I and

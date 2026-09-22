@@ -1,6 +1,8 @@
 # Scheduler-owned expert-cache maintenance
 
-Status: **experimental, opt-in, single-rank SM120 serving**. Static placement
+Status: **experimental, opt-in SM120 serving**. The worker-local protocol below
+describes TP1. The [distributed hybrid protocol](hybrid-inference.md#tensor-parallel-residency)
+adds engine-owned staging, publication and acknowledgement across a TP group. Static placement
 remains the default. The shared policy and engine boundary are suitable for
 other residency backends, but they do not qualify SM103 execution or Grace TMA.
 

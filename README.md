@@ -15,6 +15,14 @@ The library is experimental. Architecture recognition does not establish
 operator support or production readiness; consult each operator's capability
 query and planning contract.
 
+The [hybrid inference system](docs/hybrid-inference.md) combines ordinary
+selective expert offload, learned static residency, and optional adaptive
+residency. Storage capabilities, numerical recipes and tensor-parallel shards
+have separate contracts. ModelOpt NVFP4 is the first qualified storage adapter;
+other format declarations do not imply executable support. See the
+[source-bound qualification](docs/hybrid-inference-results.md) for physical
+TP1/TP2 results, prefill and decode measurements, and remaining limits.
+
 ## Install
 
 ```bash

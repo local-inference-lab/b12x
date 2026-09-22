@@ -14,8 +14,8 @@ It does not select another replacement policy.
 | CPU routed source parameters, fixed VRAM slots, full cacheable pinned/mapped canonical backing | Implemented and physically tested; no full-expert GPU load peak |
 | Learned static; health-triggered decayed-LFU adaptation; optional anchor recovery | Physically tested experimental modes; static allocates no adaptive counters or control state |
 | Short routing history and specialist retention | Research-only; disabled in reference arms |
-| Distributed loader, EP, DBO, LoRA, speculation, non-SiLU/bias variants, input route weighting | Unsupported by this lane and rejected |
-| Qwen3-Next-80B NVFP4, pinned revision, single SM120 | [Full-checkpoint qualification](expert-cache-next80-results.md); separate host envelope, learned profile and admitted resident geometry |
+| EP, DP/PP expansion, sequence/context parallelism, DBO, LoRA, speculation, non-SiLU/bias variants, input route weighting | Unsupported by this lane and rejected |
+| Qwen3-Next-80B NVFP4, pinned revision, SM120 TP1/TP2 | [Hybrid qualification](hybrid-inference-results.md); separate rank-local host envelopes, learned profiles and admitted resident geometry |
 | Other ModelOpt MoE checkpoints satisfying declared geometry/scales | Loader contracts exist; no general model-family qualification |
 | SM103 HBM/Grace native expert execution | Separate implemented prototype; requires physical B300 gates |
 | Native SM103 CPU-source full-model cache serving | Unsupported by the SM120 loader; an MXFP4/MXFP8 source/preparation adapter remains necessary |
@@ -103,7 +103,7 @@ Host-only runs retain individual GPU requirements and documented contract
 exclusions in JUnit; skips do not qualify GPU work. Registry failures are never
 excluded.
 
-The fixed reference settings are 8 GiB cache envelope, 40 GiB host envelope,
+The Qwen3-30 reference settings are 8 GiB cache envelope, 40 GiB host envelope,
 2 GiB BF16 KV, context 2048, prepared capacity 64, two prepared pairs per layer,
 health checks every 16 delivered tokens, cold threshold 0.15, maximum full
 snapshot interval 1024 tokens, decayed LFU, and at most 32 pairs / 128 MiB per
