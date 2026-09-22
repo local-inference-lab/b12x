@@ -17,6 +17,12 @@ from scripts.qualify_expert_cache import source_files
 from b12x.testing.artifacts import sha256
 
 
+def validate_layer_scope(stage, layers):
+    """Distributed layer qualification owns one process group per fresh job."""
+    if stage == "tp-layer" and len(layers) != 1:
+        raise ValueError("tp-layer requires one layer per fresh distributed job")
+
+
 def classify(returncode, timed_out, summaries, completed, ranks, filtered):
     """Completion, zero errors and full rank coverage are independent requirements."""
     if timed_out:
@@ -127,6 +133,10 @@ def main(argv=None):
     p.add_argument("--oracle-device", choices=("cpu", "cuda"), default="cuda")
     p.add_argument("--rank-child", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    try:
+        validate_layer_scope(args.stage, args.layers)
+    except ValueError as error:
+        p.error(str(error))
     if args.ranks < 1 or args.deadline <= 0:
         p.error("ranks and deadline must be positive")
     if args.stage in ("layer", "compact") and args.ranks != 1:

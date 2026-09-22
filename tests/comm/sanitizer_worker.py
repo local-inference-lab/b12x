@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from b12x.testing.artifacts import sha256, verify_from_file
+from scripts.qualify_hybrid_sanitizer import validate_layer_scope
 
 
 def main():
@@ -36,6 +37,10 @@ def main():
     p.add_argument("--resident-counts", type=int, nargs="+", default=[512, 256, 1])
     p.add_argument("--oracle-device", choices=("cpu", "cuda"), default="cuda")
     args = p.parse_args()
+    try:
+        validate_layer_scope(args.stage, args.layers)
+    except ValueError as error:
+        p.error(str(error))
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     args.output.mkdir(parents=True, exist_ok=True)
     progress = args.output / f"rank-{rank}-progress.jsonl"
@@ -162,22 +167,22 @@ def main():
         os.environ["CHECKPOINT_TEST_PROGRESS"] = str(args.output)
         os.environ["CHECKPOINT_TEST_ORACLE_DEVICE"] = args.oracle_device
         if args.stage == "tp-layer":
-            for layer in args.layers:
-                sys.argv = [
-                    "tp_checkpoint_worker.py",
-                    "--checkpoint",
-                    os.environ["B12X_TEST_NEXT80_CHECKPOINT"],
-                    "--layer",
-                    str(layer),
-                    "--output",
-                    str(args.output / f"layer-{layer}"),
-                    "--resident-counts",
-                    *(str(count) for count in args.resident_counts),
-                ]
-                runpy.run_path(
-                    str(Path(__file__).parents[1] / "moe/tp_checkpoint_worker.py"),
-                    run_name="__main__",
-                )
+            layer = args.layers[0]
+            sys.argv = [
+                "tp_checkpoint_worker.py",
+                "--checkpoint",
+                os.environ["B12X_TEST_NEXT80_CHECKPOINT"],
+                "--layer",
+                str(layer),
+                "--output",
+                str(args.output / f"layer-{layer}"),
+                "--resident-counts",
+                *(str(count) for count in args.resident_counts),
+            ]
+            runpy.run_path(
+                str(Path(__file__).parents[1] / "moe/tp_checkpoint_worker.py"),
+                run_name="__main__",
+            )
         else:
             import pytest
             from scripts.qualify_sm103 import junit_counts
