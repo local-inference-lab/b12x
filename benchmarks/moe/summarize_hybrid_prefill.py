@@ -6,8 +6,10 @@ are excluded from pure-prefill rates instead of assigning time by token ratio.
 """
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
+import re
 
 
 def summarize(records):
@@ -19,7 +21,21 @@ def summarize(records):
     results = [r["result"] for r in records if r["kind"] == "phase_timing"]
     if len(results) != 1 or len(results[0]) != config.get("tp_size", 1):
         raise ValueError("phase timing must include every TP rank exactly once")
-    ranks = results[0]
+    ranks = deepcopy(results[0])
+
+    def logical_request(name):
+        match = re.fullmatch(r"(cache-\d+)(?:-[0-9a-f]{8})?", name)
+        if match is None:
+            raise ValueError("unexpected request identity in phase timing")
+        return match[1]
+
+    for rank in ranks:
+        for row in rank["iterations"]:
+            row["requests"] = [logical_request(n) for n in row["requests"]]
+        mapped = {logical_request(n): r for n, r in rank["requests"].items()}
+        if len(mapped) != len(rank["requests"]):
+            raise ValueError("duplicate logical request in phase timing")
+        rank["requests"] = mapped
     iterations = ranks[0]["iterations"]
     fields = ("requests", "scheduled", "computed", "prompt_lengths", "phase")
     for rank in ranks:

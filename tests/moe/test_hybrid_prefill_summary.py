@@ -59,3 +59,12 @@ def test_tp_metadata_disagreement_rejected():
     records[2]["result"][1]["iterations"][0]["scheduled"] = [32]
     with pytest.raises(ValueError, match="metadata differs"):
         summarize(records)
+
+
+def test_engine_request_suffix_preserves_logical_admission():
+    records = fixture()
+    for rank in records[2]["result"]:
+        for row in rank["iterations"]:
+            row["requests"] = ["cache-0-abcd1234"]
+        rank["requests"] = {"cache-0-abcd1234": dict(complete=True)}
+    assert summarize(records)["groups"][0]["prompt_tokens"] == 128

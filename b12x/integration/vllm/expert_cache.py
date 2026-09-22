@@ -195,6 +195,7 @@ class ExpertCacheModel:
         self.load_device_peak_bytes = torch.cuda.max_memory_allocated(self.device)
         c = self.config
         profile = None
+        profile_phase = "decode"
         if c.mode != "profile":
             profile = json.loads(Path(c.profile_path).read_text())
             expected = profile.pop("hash", None)
@@ -206,6 +207,10 @@ class ExpertCacheModel:
                     "expert cache profile hash, checkpoint, workload, geometry or recipe mismatch"
                 )
             self.profile_id = expected
+            if "placement_objective" in profile:
+                from .phase_profile import validate
+                validate(profile)
+                profile_phase = "all"
         else:
             self.profile_id = "calibration:" + digest(self._identity())
         queries, minimum = {}, {}
@@ -284,10 +289,10 @@ class ExpertCacheModel:
                 or p.total_experts != q.experts
                 or p.model_fingerprint != self.checkpoint_id
                 or p.workload != c.workload
-                or p.phase != "decode"
+                or p.phase != profile_phase
             ):
                 raise ValueError(
-                    "learned placement differs from checkpoint, workload, layer or decode phase"
+                    "learned placement differs from checkpoint, workload, layer or observation phase"
                 )
             pairs = (
                 min(

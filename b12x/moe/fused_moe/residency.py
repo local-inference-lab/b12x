@@ -151,6 +151,34 @@ def profile_from_counts(*, counts: Iterable[int], hot_count: int | None = None,
     )
 
 
+def balanced_phase_profile(*, prefill_counts, decode_counts, hot_count, **metadata):
+    """Equal normalized phase weights per layer; exact integer ranking and ID ties.
+
+    Selection counts retain the actual combined observations. They are not the
+    normalized objective, which is recorded separately by the artifact owner.
+    """
+    prefill, decode = tuple(prefill_counts), tuple(decode_counts)
+    if not prefill or len(prefill) != len(decode):
+        raise ValueError("balanced phases require matching expert geometry")
+    for count in (*prefill, *decode):
+        _integer("phase selection count", count)
+    ptotal, dtotal = sum(prefill), sum(decode)
+    if not ptotal or not dtotal:
+        raise ValueError("balanced placement requires both observed phases")
+    _integer("hot_count", hot_count)
+    if hot_count > len(prefill):
+        raise ValueError("hot_count exceeds the expert count")
+    ranked = sorted(range(len(prefill)), key=lambda e: (
+        -(prefill[e] * dtotal + decode[e] * ptotal), e))
+    return ExpertResidencyPlan(
+        total_experts=len(prefill),
+        hbm_expert_ids=tuple(sorted(ranked[:hot_count])),
+        grace_expert_ids=tuple(sorted(ranked[hot_count:])),
+        selection_counts=tuple(p+d for p, d in zip(prefill, decode, strict=True)),
+        phase="all", **metadata,
+    )
+
+
 def profiles_from_trace(records: Iterable[Mapping], *, experts_per_layer: Mapping[str, int],
                         hot_count: int | Mapping[str, int] | None = None,
                         hot_bytes: int | Mapping[str, int] | None = None,

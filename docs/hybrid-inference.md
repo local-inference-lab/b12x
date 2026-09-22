@@ -104,6 +104,32 @@ including repeated IDs. Static timing allocates no observer. Health-triggered
 reference adaptation keeps its existing decode-only observation contract.
 Phase observations do not enable prefill promotions or runtime profile switching.
 
+`benchmarks/moe/summarize_hybrid_prefill.py` reports pure model execution and the
+elapsed span across prompt chunks separately from client TTFT. Mixed iterations
+retain their complete duration and do not enter a pure-prefill rate. TP reports
+use the maximum rank duration, never the sum. These event durations include
+collectives but do not isolate communication time. Use the harness's explicit
+`--torch-profile` diagnostic for kernel and collective attribution; its serving
+times are not headline samples.
+
+After phase calibration, `benchmarks/moe/balance_expert_profile.py` constructs
+one experimental static placement with equal normalized prefill/decode weight
+per layer. Integer cross multiplication preserves exact ranking and ID tie
+breaking. The artifact retains both raw count sets, combined observed counts,
+the objective and the source calibration hash. Its profile hash binds all of
+them. Resident counts, checkpoint, TP geometry and execution recipe remain
+unchanged. Loading validates the objective and reconstructs its membership;
+ordinary decode-only profiles retain their original meaning.
+
+`benchmarks/moe/nvfp4_repeatability.py` is an isolated ordinary Qwen3-Next W4A4
+diagnostic. It takes a complete local checkpoint, a validated checkpoint receipt,
+verified companion artifacts and a frozen tensor fixture containing input rows,
+logical top-k IDs and route weights. It compares eager, captured and perturbed
+executions, hashes postprocessed parameters before and after, and optionally
+replays recorded FlashInfer tactics. Its independent GEMM/reference reduction
+uses the native activation quantizer. A bounded fixture result does not establish
+bitwise equivalence to the b12x W4A16 recipe or qualify arbitrary model inputs.
+
 ## Acceptance boundaries
 
 Host acceptance includes non-NVFP4 storage capabilities and N=1/2/3/4 transaction
