@@ -198,6 +198,7 @@ def analyze(records):
         transactions.append(
             dict(
                 epoch=index,
+                completion_time_ns=epoch["time_ns"],
                 proposed=worker["proposed_pairs"],
                 selected=len(lifetimes),
                 backlog=worker["proposal_backlog"],
@@ -224,6 +225,11 @@ def analyze(records):
         ranks=len(epochs[0]["worker"]["workers"]),
         scope="complete decode-counter windows; routing counterfactual, not time saved",
         final_demand_tail="unobserved; final transaction remains right-censored",
+        request_admissions=[
+            {k: row[k] for k in ("index", "workload", "start_wall_ns")}
+            for row in records
+            if row["kind"] == "request"
+        ],
         intervals=[
             {k: v for k, v in row.items() if k != "counts"} for row in intervals
         ],

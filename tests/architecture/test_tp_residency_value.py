@@ -119,3 +119,11 @@ def test_profile_change_between_epochs_is_rejected():
         rank["initial_profile_id"] = "another-profile"
     with pytest.raises(ValueError, match="identity or baseline changed"):
         analyze(rows)
+
+
+def test_request_boundaries_remain_retrospective_timestamps():
+    rows = records()
+    result = analyze(rows + [dict(kind="request", index=0, workload="held-out", start_wall_ns=2)])
+    assert result["transactions"][0]["completion_time_ns"] == 1
+    assert result["request_admissions"] == [dict(index=0, workload="held-out", start_wall_ns=2)]
+    assert result["transactions"] == analyze(rows)["transactions"]
