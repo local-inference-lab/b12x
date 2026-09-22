@@ -192,6 +192,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                     binding.run()
                 pointers = state.pointers()
                 original_ids, original_weights = ids.clone(), weights.clone()
+                arithmetic = []
                 for case in ("ordinary", "reordered", "duplicate"):
                     ids.copy_(
                         original_ids if case != "reordered" else original_ids.flip(-1)
@@ -210,6 +211,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                         before == torch.cuda.memory_stats()["allocation.all.allocated"]
                     )
                     assert pointers == state.pointers()
+                    assert torch.isfinite(binding.output).all() and torch.count_nonzero(binding.output)
                     expected_local = oracle.routed_oracle(source, x, ids, weights)
                     torch.testing.assert_close(
                         binding.output, expected_local, atol=0.001, rtol=0.03
@@ -217,6 +219,14 @@ with set_current_vllm_config(config), torch.inference_mode():
                     reduced = tensor_model_parallel_all_reduce(binding.output.clone())
                     expected = oracle.routed_oracle(full, x, ids, weights)
                     torch.testing.assert_close(reduced, expected, atol=0.003, rtol=0.06)
+                    arithmetic.append(dict(
+                        routes=case,
+                        local_max_abs=float((binding.output.float() - expected_local.float()).abs().max()),
+                        reduced_max_abs=float((reduced.float() - expected.float()).abs().max()),
+                        reduced_relative_l2=float((reduced.float() - expected.float()).norm() / expected.float().norm()),
+                        reduced_cosine=float(torch.nn.functional.cosine_similarity(
+                            reduced.float().flatten(), expected.float().flatten(), dim=0)),
+                    ))
                     if case == "ordinary":
                         if placement_reference is None:
                             placement_reference = reduced.clone()
@@ -262,8 +272,10 @@ with set_current_vllm_config(config), torch.inference_mode():
                     dist.barrier()
                     state.updates.finish_staged()
                     dist.barrier()
+                    before = torch.cuda.memory_stats()["allocation.all.allocated"]
                     whole_graph.replay()
                     torch.cuda.synchronize()
+                    assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
                     assert pointers == state.pointers()
                     torch.testing.assert_close(combined_graph, combined, atol=0, rtol=0)
                     assert state.updates.snapshot().generation == 1
@@ -276,6 +288,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                         exact_placement=True,
                         exact_shared_composition=True,
                         no_replay_allocations=True,
+                        arithmetic=arithmetic,
                     )
                 )
                 whole_graph.reset()
