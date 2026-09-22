@@ -19,10 +19,15 @@ from ..conftest import require_b12x
 
 @pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize("intermediate", [160, 192, 320])
-@pytest.mark.parametrize("tile_m,planner", [(16, "internal"), (16, "triton"), (32, "internal")])
-def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, fast_math):
+@pytest.mark.parametrize("tile_m,planner,share_input,topk", [
+    (16, "internal", False, 2), (16, "triton", False, 2),
+    (32, "internal", False, 2),
+    (16, "internal", True, 2), (16, "triton", True, 2),
+    (16, "triton", True, 8), (16, "triton", True, 10),
+])
+def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, share_input, topk, fast_math):
     device = require_b12x()
-    capacity, hidden, num_experts, topk = 33, 512, 4, 2
+    capacity, hidden, num_experts = min(33, 256 // topk), 512, max(4, 2 * topk)
     weights = _make_nvfp4_weights(
         device, seed=819, num_experts=num_experts, hidden_size=hidden,
         intermediate_size=intermediate,
@@ -32,6 +37,8 @@ def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, fast_math
     # independently tested subnormal-scale decoder contract. Keep the physical
     # weights unchanged when varying each expert's activation quantization scale.
     a1_scale = torch.linspace(32., 64., num_experts, device=device)
+    if share_input:
+        a1_scale.fill_(64.)
     a2_scale = torch.linspace(256., 512., num_experts, device=device)
     weights = replace(weights,
         a1_scale=a1_scale, a2_scale=a2_scale,
@@ -51,9 +58,11 @@ def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, fast_math
         w13_global_scales=weights.w1_alpha * weights.a1_scale,
         w2_global_scales=weights.w2_alpha * weights.a2_scale,
         input_scale=weights.a1_scale, intermediate_scale=weights.a2_scale,
+        immutable_input_scales=share_input,
     ))
     config = fused_moe.MoeDecodeConfig(backend="dynamic", route_planner=planner,
-        max_active_clusters=None, dynamic_tile_m=tile_m, dynamic_route_mode="grouped")
+        max_active_clusters=None, dynamic_tile_m=tile_m, dynamic_route_mode="grouped",
+        nvfp4_share_input=share_input)
     plan = fused_moe.plan_execution(experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
         invocation={"fast_math": fast_math}, override=config)
@@ -72,7 +81,7 @@ def test_swapped_token_tile_live_replay(intermediate, tile_m, planner, fast_math
                         for spec in plan.scratch_specs())
         output = torch.empty_like(inputs.a)
         session.freeze()
-        for rows in (1, 17, capacity):
+        for rows in (1, 8, 16, 17, capacity):
             binding = fused_moe.bind(plan, a=inputs.a[:rows], topk_ids=inputs.topk_ids[:rows],
                 topk_weights=inputs.topk_weights[:rows], scratch=scratch, output=output[:rows],
                 input_scales_static=True)

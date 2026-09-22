@@ -16,6 +16,7 @@ from ._linear import (
 )
 from . import META
 from ._a16 import NVFP4LinearWeight, w4a16, w8a16
+from ._iq2_xs import IQ2XSLinearWeight
 
 
 def workspace_size(plan: Plan) -> int:
@@ -116,6 +117,7 @@ __all__ = [
     "query_from_call",
     "Weight",
     "NVFP4LinearWeight",
+    "IQ2XSLinearWeight",
     "is_supported",
     "mm",
     "mm_block_fp8",

@@ -13,7 +13,7 @@ import shlex
 import statistics
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.metadata import PackageNotFoundError, version
 from typing import Callable, Mapping
 
@@ -1095,6 +1095,7 @@ def _make_uniform_paged_inputs(
     dtype: torch.dtype,
     seed: int,
     combined_kv_cache: bool = False,
+    num_cache_pages: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1112,6 +1113,10 @@ def _make_uniform_paged_inputs(
     capture_cache_seqlen = max(cache_seqlen, capture_cache_seqlen or cache_seqlen)
     capture_pages_per_request = (capture_cache_seqlen + page_size - 1) // page_size
     num_pages = batch * capture_pages_per_request
+    if num_cache_pages is not None:
+        if num_cache_pages < num_pages:
+            raise ValueError("declared KV pool cannot hold the benchmark sequences")
+        num_pages = num_cache_pages
     if combined_kv_cache:
         combined_cache = (
             torch.randn(
@@ -1871,6 +1876,8 @@ def _make_decode_bucket_shared_inputs(
     seed: int,
     strict_check: bool = True,
     combined_kv_cache: bool = False,
+    num_cache_pages: int | None = None,
+    q_strides: tuple[int, ...] | None = None,
 ) -> DecodeBucketSharedInputs:
     (
         q,
@@ -1897,7 +1904,10 @@ def _make_decode_bucket_shared_inputs(
         dtype=dtype,
         seed=seed,
         combined_kv_cache=combined_kv_cache,
+        num_cache_pages=num_cache_pages,
     )
+    if q_strides is not None:
+        q = torch.empty_strided(q.shape, q_strides, dtype=q.dtype, device=q.device).copy_(q)
     if os.environ.get("B12X_PAGED_DEBUG_IDENTICAL_KV_HEADS", "0") == "1":
         k_cache.copy_(k_cache[:, :, :1, :].expand_as(k_cache))
         v_cache.copy_(v_cache[:, :, :1, :].expand_as(v_cache))
@@ -1949,6 +1959,7 @@ def _make_decode_bucket_shared_inputs(
 @dataclass
 class B12XDecodeGraphBucket:
     shared: DecodeBucketSharedInputs
+    preparation: object
     scratch_plan: object
     scratch_storage: torch.Tensor
     binding: object
@@ -2632,6 +2643,7 @@ def _capture_b12x_decode_graph_bucket(
     shared: DecodeBucketSharedInputs,
     policy: DecodeGraphBucketPolicy,
     warmup: int,
+    serving_declaration: dict | None = None,
 ) -> B12XDecodeGraphBucket:
     if policy.batch != shared.batch:
         raise ValueError("decode graph policy batch does not match shared inputs")
@@ -2662,22 +2674,49 @@ def _capture_b12x_decode_graph_bucket(
         # copies introduced solely by the benchmark harness.
         copy_runtime_metadata=False,
     )
-    scratch_plan = paged.plan(caps)
-    scratch_plan.prepare_decode_graph_replay_state(
-        batch=shared.batch,
-        total_q_capacity=shared.batch,
-        max_page_table_width=policy.capture_page_count,
-        max_cache_page_count=policy.capture_page_count,
-    )
-    (scratch_spec,) = scratch_plan.scratch_specs()
-    scratch_storage = torch.empty(
-        scratch_spec.shape,
-        dtype=scratch_spec.dtype,
-        device=scratch_spec.device,
-    )
+    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+
+    if serving_declaration is not None:
+        payload = dict(serving_declaration["invocation"]["caps"])
+        payload["dtype"] = getattr(torch, payload["dtype"])
+        payload["kv_dtype"] = getattr(torch, payload["kv_dtype"])
+        caps = paged.Caps(device=shared.q.device, **payload)
+
     replay_cache_seqlens = shared.capture_cache_seqlens.clone()
     guarded_output = _allocate_guarded_output(shared.q)
     output = guarded_output.output
+    operands = dict(
+        q=shared.q, k_cache=shared.k_cache, v_cache=shared.v_cache, output=output,
+        page_table=shared.capture_page_table, cache_seqlens=replay_cache_seqlens,
+        cu_seqlens_q=shared.cu_seqlens_q, k_descale=shared.k_descale, v_descale=shared.v_descale,
+    )
+    invocation = paged.invocation_from_tensors(caps, **operands)
+    if serving_declaration is not None:
+        actual = json.loads(json.dumps(invocation["operands"].to_dict()))
+        expected = serving_declaration["invocation"]["operands"]
+        if actual != expected:
+            differences = {name: {"actual": actual.get(name), "expected": expected.get(name)}
+                           for name in actual.keys() | expected.keys()
+                           if actual.get(name) != expected.get(name)}
+            raise ValueError(f"benchmark operand metadata differs from the serving declaration: {differences}")
+    scratch_plan = paged.plan(caps, invocation=invocation)
+    source_values = shared.q.clone()
+
+    def prepare(state):
+        spec = state.scratch_plan.scratch_specs()[0]
+        storage = torch.empty(spec.shape, dtype=spec.dtype, device=caps.device)
+        binding = state.bind(scratch=storage, active_total_q=shared.batch, **operands)
+        return PreparedCall(run=lambda: state.run(binding),
+                            produce=lambda: shared.q.copy_(source_values),
+                            owners=(storage, binding), capture_safe=False)
+
+    preparation = PreparationSession(device=caps.device, autotune=True, compile_workers=1)
+    preparation.prepare((scratch_plan.request(name="paged-decode", prepare_call=prepare,
+                                              benchmark_call=prepare),))
+    preparation.freeze()
+    state = require_prepared(scratch_plan, "attention.gqa", caps.device)
+    (scratch_spec,) = state.scratch_plan.scratch_specs()
+    scratch_storage = torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=caps.device)
     captured_binding: object | None = None
 
     def run() -> None:
@@ -2731,6 +2770,7 @@ def _capture_b12x_decode_graph_bucket(
         read_only_inputs = None
     return B12XDecodeGraphBucket(
         shared=shared,
+        preparation=preparation,
         scratch_plan=scratch_plan,
         scratch_storage=scratch_storage,
         binding=captured_binding,
@@ -3309,6 +3349,23 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
 
     speedups: list[float] = []
     for bucket_idx, batch in enumerate(sorted(dict.fromkeys(batch_buckets))):
+        serving_declaration = None
+        if args.preparation_queries is not None:
+            for line in args.preparation_queries.read_text().splitlines():
+                record = json.loads(line)
+                if (record.get("component") == "attention.gqa"
+                        and record["invocation"]["caps"]["mode"] == "decode"
+                        and record["invocation"]["caps"]["max_batch"] == batch):
+                    serving_declaration = record
+            if serving_declaration is None:
+                raise ValueError(f"no serving decode declaration for batch={batch}")
+            declared = serving_declaration["invocation"]["caps"]
+            geometry = (declared["num_q_heads"], declared["num_kv_heads"], declared["head_dim_qk"], declared["page_size"])
+            if geometry != (args.q_heads, args.kv_heads, args.head_dim, args.page_size):
+                raise ValueError("benchmark attention geometry differs from serving declaration")
+            capture_context = declared["max_page_table_width"] * args.page_size - 1
+        else:
+            capture_context = int(args.capture_context)
         bucket_policy = _resolve_decode_graph_bucket_policy(
             batch=batch,
             q_dtype=dtype,
@@ -3318,11 +3375,18 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             kv_heads=args.kv_heads,
             head_dim=args.head_dim,
             decode_contexts=decode_contexts,
-            capture_context_override=int(args.capture_context),
+            capture_context_override=capture_context,
             fixed_split_pages_override=int(args.fixed_split_pages),
             graph_ctas_per_sm_override=int(args.graph_ctas_per_sm),
             max_chunks_per_request_override=int(args.max_chunks_per_request),
         )
+        if serving_declaration is not None:
+            bucket_policy = replace(
+                bucket_policy, max_work_items=declared["max_work_items"],
+                max_partial_rows=declared["max_partial_rows"],
+                max_chunks_per_request=declared["max_partial_rows"] // batch,
+                source="serving-declaration",
+            )
         shared = _make_decode_bucket_shared_inputs(
             batch=batch,
             capture_context_tokens=bucket_policy.capture_context_tokens,
@@ -3335,11 +3399,15 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             seed=1 + bucket_idx,
             strict_check=args.check,
             combined_kv_cache=args.combined_kv_cache,
+            num_cache_pages=None if serving_declaration is None else declared["num_cache_pages"],
+            q_strides=(None if serving_declaration is None else
+                       tuple(serving_declaration["invocation"]["operands"]["q"]["strides"])),
         )
         b12x_bucket = _capture_b12x_decode_graph_bucket(
             shared=shared,
             policy=bucket_policy,
             warmup=args.warmup,
+            serving_declaration=serving_declaration,
         )
         print(
             f"decode-graph-bucket "
@@ -3787,6 +3855,8 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             print(line + check_suffix)
 
         del fa2_bucket
+        b12x_bucket.graph.reset()
+        b12x_bucket.preparation.close()
         del b12x_bucket
         del shared
         torch.cuda.empty_cache()
@@ -3820,6 +3890,8 @@ def main(argv: list[str] | None = None) -> None:
         "--decode-contexts", type=str, default="128,16384,32768,65536,131072"
     )
     parser.add_argument("--capture-context", type=int, default=0)
+    parser.add_argument("--preparation-queries", type=pathlib.Path,
+                        help="Replay the last recorded decode declaration per batch from a serving query log")
     parser.add_argument("--q-seqlens", type=str, default="1")
     parser.add_argument("--cache-seqlens", type=str, default="64,512,2048,8192")
     parser.add_argument("--page-size", type=int, default=64)

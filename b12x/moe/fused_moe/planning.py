@@ -12,11 +12,13 @@ from ._impl import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
+    prepare_b12x_iq2_xs_weights,
 )
 from .config import TrellisConfig
 from .source import PackedSource, WeightSource
 from .weights import (
     PackedWeights,
+    IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
     ScaleEncoding,
@@ -177,6 +179,7 @@ def _prepared_format(
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
         weights = (
+            WeightEncoding.IQ2_XS if source.format.value == "iq2_xs" else
             WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
             else WeightEncoding.FP4_E2M1
@@ -227,6 +230,7 @@ def plan_weights(
             if constraints.required_packing not in {
                 WeightPacking.SOURCE_NATIVE,
                 WeightPacking.MMA_PACKED,
+                WeightPacking.IQ2_XS_COMPACT,
             }:
                 raise ValueError(
                     "A16 preparation requires source_native or mma_packed packing"
@@ -299,13 +303,17 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if isinstance(plan.source, TrellisConfig):
+    if isinstance(plan.source, PackedSource) and plan.source.format.value == "iq2_xs":
+        if not isinstance(weights, IQ2XSWeights):
+            raise TypeError("IQ2_XS preparation requires IQ2XSWeights")
+        prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
+    elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")
         prepared = prepare_b12x_trellis_v2_weights(

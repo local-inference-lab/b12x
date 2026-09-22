@@ -70,19 +70,19 @@ CANDIDATES = {
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m2 auto'): (17, 17),
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m4 auto'): (17, 17),
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m8 auto'): (17, 17),
-    ('gemm.blockscaled_precision', 'nvfp4 n1152 k4304:4320 m65536 a16'): (12, 12),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m1 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m128 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m2 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m4 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m8 a16'): (16, 16),
+    ('gemm.blockscaled_precision', 'nvfp4 n1152 k4304:4320 m65536 a16'): (12, 54),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m1 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m128 a16'): (16, 72),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m2 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m4 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m8 a16'): (16, 24),
     # moe.decode
     ('moe.decode', 'nvfp4 rows10'): (195, 13),
     ('moe.decode', 'nvfp4 rows1250'): (4, 4),
     ('moe.decode', 'nvfp4 rows1280'): (4, 4),
     ('moe.decode', 'nvfp4 rows20'): (195, 14),
-    ('moe.decode', 'nvfp4 rows40'): (194, 14),
-    ('moe.decode', 'nvfp4 rows80'): (194, 15),
+    ('moe.decode', 'nvfp4 rows40'): (194, 15),
+    ('moe.decode', 'nvfp4 rows80'): (194, 17),
     ('moe.decode', 'w4a16 rows10'): (2, 2),
     ('moe.decode', 'w4a16 rows1250'): (1, 1),
     ('moe.decode', 'w4a16 rows1280'): (1, 1),
@@ -456,6 +456,8 @@ def test_recorded_selections_stay_eligible(key):
     if key[0] == "moe.decode":
         # The recorded programs use unshared input and monolithic NVFP4 execution.
         values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False)
+    if key[0] == "gemm.blockscaled_precision":
+        values["tile_m"] = 16 if values["mode"] == "a16" else None
     assignment = FrozenMapping(values)
     contract.parameter_space(query, IDENTITY).validate(assignment)
     contract.lower(query, IDENTITY, assignment)
@@ -624,12 +626,42 @@ def test_a16_wide_tile_needs_more_than_one_n_tile():
         out_features=48,
     )
     space = TUNING.parameter_space(narrow, IDENTITY)
-    assignment = dict(mode="a16", tile_n=64, tile_k=64, split_k=1)
+    assignment = dict(mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1)
     space.validate(assignment)
     with pytest.raises(ValueError, match="predicates"):
         space.validate({**assignment, "tile_n": 128})
     wide = TUNING.parameter_space(replace(narrow, out_features=128), IDENTITY)
     wide.validate({**assignment, "tile_n": 128})
+
+
+def test_iq2_transposed_tiles_are_raced_without_split_k():
+    from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledConfig, BlockscaledQuery
+
+    query = BlockscaledQuery(recipe="iq2_xs", num_tokens=8, in_features=768,
+                             padded_in_features=768, out_features=136)
+    assignment = dict(mode="a16", tile_m=8, tile_n=128, tile_k=256, split_k=1)
+    TUNING.parameter_space(query, IDENTITY).validate(assignment)
+    TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
+    with pytest.raises(ValueError, match="split-K"):
+        TUNING.validate_config(query, BlockscaledConfig(**{**assignment, "split_k": 2}), IDENTITY)
+    for recipe in ("nvfp4", "mxfp8"):
+        with pytest.raises(ValueError, match="predicates"):
+            TUNING.parameter_space(replace(query, recipe=recipe), IDENTITY).validate(
+                {**assignment, "tile_k": 128})
+
+
+def test_nvfp4_a16_races_k256_tiles():
+    from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledConfig, BlockscaledQuery
+
+    query = BlockscaledQuery(recipe="nvfp4", num_tokens=64, in_features=800,
+                             padded_in_features=800, out_features=136, activation_mode="a16")
+    for tile_m in (16, 32, 64):
+        assignment = dict(mode="a16", tile_m=tile_m, tile_n=128, tile_k=256, split_k=4)
+        TUNING.parameter_space(query, IDENTITY).validate(assignment)
+        TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
+    with pytest.raises(ValueError, match="predicates"):
+        TUNING.parameter_space(replace(query, recipe="mxfp8", global_scale_kind="none"), IDENTITY).validate(
+            {**assignment, "tile_m": 16})
 
 
 def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
@@ -642,3 +674,22 @@ def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
     space = TUNING.parameter_space(query, IDENTITY)
     blocks = {assignment["pointwise_block"] for assignment in space.configurations()}
     assert blocks == {32, 64, 128, 256, 512, 1024, 2048, 4096}
+
+
+@pytest.mark.parametrize("sms,capability", [(48, (12, 1)), (188, (12, 0))])
+def test_nvfp4_partial_resident_grids_share_the_compiled_kernel(sms, capability):
+    from b12x.moe.fused_moe import _tuning as component
+
+    _, query = _contract_and_query("moe.decode", DECLARED[("moe.decode", "nvfp4 rows40")])
+    device = DeviceIdentity("nvidia", capability, sms, "Blackwell")
+    eligible = component.TUNING.eligible_plan(query, device)
+    configs = [config for _, config in eligible.candidates
+               if config.route_planner == "triton"]
+    grids = {config.max_active_clusters for config in configs}
+    expected = ({None, 1, 2, 4, 8, 16, 24, 32, 36, 48} if sms == 48 else
+                {None, 1, 2, 4, 8, 16, 32, 64, 94, 126})
+    assert grids == expected
+    assert len({eligible.space.compile_assignment(config.to_dict()) for config in configs}) == 1
+    with pytest.raises(ValueError, match="resident SM count"):
+        component.TUNING.configure(query, device=device,
+            override=replace(configs[0], max_active_clusters=sms + 1))

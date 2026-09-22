@@ -160,7 +160,8 @@ class PreparedW4A16MoeWeights:
     native codebook tiles and persistent full-rotation tables, sharing the
     W4A16 host ABI and retaining the tile configuration used at preparation.
     The trellis annex lives in one :class:`TrellisWeightState`; the accessor
-    properties expose its members under the host-ABI names.
+    properties expose its members under the host-ABI names. IQ2_XS keeps
+    descriptor words plus FP16 bases and packed subscales, with no trellis annex.
     """
 
     w13: torch.Tensor

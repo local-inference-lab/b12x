@@ -40,6 +40,7 @@ from .planning import (
 from .source import PackedSource, PackedSourceFormat, W13Layout, WeightSource
 from .weights import (
     PackedWeights,
+    IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
     ScaleEncoding,
@@ -68,7 +69,7 @@ def plan_weights(
 
 
 def prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights
+    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
     return _prepare_weights(plan=plan, weights=weights)
@@ -201,6 +202,7 @@ __all__ = [
     "PackedSource",
     "PackedSourceFormat",
     "PackedWeights",
+    "IQ2XSWeights",
     "PreparedExperts",
     "PreparedWeightFormat",
     "RoutingSpec",

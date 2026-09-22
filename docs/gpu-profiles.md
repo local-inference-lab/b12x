@@ -193,6 +193,21 @@ performance bound on omitted configurations; selection quality requires
 measured comparisons. Changing a space bumps the family's
 `candidate_contract_version`, which invalidates its cached selections.
 
+For NVFP4 SiLU decode with Triton routing, the runtime `max_active_clusters`
+ladder includes powers of two, half and three-quarter SM-count grids, and the
+SM/task clamp. These choices share a compiled kernel. The default remains a
+candidate, and explicit grids cannot exceed the resident SM count.
+
+The swapped M16 FC1 uses a compact N16 token permutation and direct scale loads.
+It retains accumulators only for its sixteen routed rows; the generic N32
+permutation would double those accumulators and the associated epilogue state.
+
+For uniform immutable NVFP4 input scales, `nvfp4_share_input` races one
+quantization per token against per-route quantization. M16 shares each token
+between two producer warps, splitting route metadata and quantization blocks;
+the unused tail warp stays outside the per-token barrier. Packed activations
+are still written to each routed expert row.
+
 Dense GEMM, mHC, KDA/GDN prefill, dense MLA, the DSA indexer, contiguous attention and paged GQA
 separate correctness constraints from efficiency predicates. `B12X_AUTOTUNE_EXHAUSTIVE=1`, set
 before declaration, bypasses the efficiency group while retaining TMA alignment,

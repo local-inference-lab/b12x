@@ -746,6 +746,11 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--evidence", type=pathlib.Path, help="JSONL evidence output for A16 comparisons.")
+    parser.add_argument("--model-path", type=pathlib.Path, help="Safetensors checkpoint for checkpoint-a16.")
+    parser.add_argument("--checkpoint-recipe", choices=("iq2_xs", "nvfp4"),
+                        help="Restrict checkpoint-a16 to one stored weight recipe.")
+    parser.add_argument("--profile-graphs", action="store_true",
+                        help="Expose one cold-L2 replay per checkpoint case to CUDA profiling.")
     parser.add_argument("--tune-a16", action="store_true", help="Race the 16 A16 tile/split configurations.")
     parser.add_argument(
         "--batch-sizes",
@@ -755,7 +760,7 @@ def main():
         help=(
             "M values to benchmark. Defaults to 2/4/8 for FP4, "
             "1/2/4/8/4096 for MXFP8, and a decode-to-prefill sweep for "
-            "regular block FP8."
+            "regular block FP8; checkpoint-a16 uses 1/2/4/8/16/512."
         ),
     )
     parser.add_argument("--n", type=int, default=None, help="Override output width N.")
@@ -767,11 +772,12 @@ def main():
     )
     parser.add_argument(
         "--dtype",
-        choices=("fp4", "fp8", "fp8-block", "fp8-e2e", "fp4-a16", "fp8-a16", "all"),
+        choices=("fp4", "fp8", "fp8-block", "fp8-e2e", "fp4-a16", "fp8-a16", "checkpoint-a16", "all"),
         default="fp4",
         help=(
             "Benchmark NVFP4, prequantized MXFP8, regular K128 block FP8, "
-            "end-to-end MXFP8 including BF16 input quantization, or all modes."
+            "end-to-end MXFP8 including BF16 input quantization, actual "
+            "IQ2_XS/NVFP4 checkpoint weights with BF16 inputs, or all synthetic modes."
         ),
     )
     parser.add_argument(
@@ -801,6 +807,14 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.dtype == "checkpoint-a16":
+        from benchmarks.checkpoint_dense import run
+        run(args)
+        return
+    if args.model_path is not None:
+        parser.error("--model-path requires --dtype checkpoint-a16")
+    if args.checkpoint_recipe is not None or args.profile_graphs:
+        parser.error("--checkpoint-recipe and --profile-graphs require checkpoint-a16")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if (args.n is None) != (args.k is None):

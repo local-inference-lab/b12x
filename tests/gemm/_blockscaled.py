@@ -21,11 +21,10 @@ def prepared(source, weight, *, freeze=True, override=None, **options):
                 options.get("workspace"), getattr(torch, query.output_dtype), None,
             )
         elif isinstance(query, blockscaled.BlockscaledQuery):
-            fp4 = query.recipe == "nvfp4"
+            from b12x.gemm.blockscaled._a16 import _weight_parts
+            packed_values, scales, gain, _ = _weight_parts(weight)
             run = lambda: state.run(
-                source, weight.values if fp4 else weight.weight.values,
-                weight.scale_mma if fp4 else weight.weight.scale_mma,
-                weight.global_scale if fp4 else None,
+                source, packed_values, scales, gain,
                 activation_scale=options.get("activation_global_scale"),
                 out=options.get("out"), workspace=options.get("workspace"),
             )
