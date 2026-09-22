@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from b12x.attention.qsa import _contract as contract
 from b12x.attention.qsa._contract import Caps
 from b12x.attention.qsa._dcp import (
     global_to_local,
@@ -76,7 +78,96 @@ def test_qsa_dcp_handles_partial_final_round() -> None:
     ] == [6, 4, 4, 4]
 
 
-def test_qsa_dcp4_shards_and_lse_merge_match_global_attention() -> None:
+@pytest.mark.parametrize("rank", [1, 2, 3])
+def test_qsa_dcp_rejects_plan_without_local_compressed_capacity(rank: int) -> None:
+    # Live empty ranks are valid; this checks a plan that can never score a
+    # complete local group, for which the score workspace has no chunk width.
+    with pytest.raises(ValueError, match="at least one local compressed group"):
+        caps = Caps(
+            device="cuda:0", max_batch=1, max_raw_state_slots=1, max_q_rows=1,
+            max_seq_len=4, num_main_cache_pages=1, num_compressed_cache_pages=1,
+            main_page_size=64, compressed_page_size=16,
+            dcp_size=4, dcp_rank=rank, cp_kv_cache_interleave_size=4,
+        )
+        contract._scratch_layout(caps)
+
+
+def _boundary_binding(dcp_size: int) -> contract.Binding:
+    """CPU metadata fixture whose native launch must be rejected by the API."""
+    caps = SimpleNamespace(
+        device=torch.device("cpu"), dcp_size=dcp_size, max_q_rows=2,
+        max_batch=2, q_heads=24, head_dim=256, group_budget=512,
+        dcp_rank=0, cp_kv_cache_interleave_size=4,
+        max_speculative_tokens=3,
+    )
+    programs = object.__new__(contract.QsaPrograms)
+    for field in fields(contract.QsaPrograms):
+        object.__setattr__(programs, field.name, None if field.name == "score" else {})
+    values = {field.name: None for field in fields(contract.Binding)}
+    values.update(
+        state=SimpleNamespace(
+            caps=caps, programs=programs,
+            _layout=SimpleNamespace(draft_positions_offset_bytes=0),
+        ),
+        plan=object.__new__(contract.Plan),
+        output=torch.empty(2, 24, 256, dtype=torch.bfloat16),
+        output_lse=torch.full((2, 24), torch.nan),
+        scratch=torch.empty(0, dtype=torch.uint8),
+        selected_positions=torch.empty(2, 2051, dtype=torch.int32),
+        draft_selection=SimpleNamespace(
+            _storage=torch.empty(0, dtype=torch.uint8),
+            plan=SimpleNamespace(max_source_rows=2, selection_width=2051),
+        ),
+    )
+    return contract.Binding(**values)
+
+
+@pytest.mark.parametrize("position_rows", [0, 2, 3])
+def test_qsa_dcp_attend_rejects_position_rows_before_expansion(
+    monkeypatch: pytest.MonkeyPatch, position_rows: int,
+) -> None:
+    from b12x.attention.qsa import _kernels
+
+    def unexpected_launch(**kwargs):
+        pytest.fail("invalid query positions reached global selection expansion")
+
+    monkeypatch.setattr(_kernels, "launch_expand_global_selected_groups", unexpected_launch)
+    binding = _boundary_binding(dcp_size=2)
+    selection = contract.LocalSelection(
+        group_ids=torch.zeros(1, 512, dtype=torch.int32),
+        scores=torch.empty(1, 512),
+    )
+    with pytest.raises(ValueError, match="query_positions must have shape"):
+        contract.attend(
+            binding, query=torch.empty(1, 24, 256, dtype=torch.bfloat16),
+            request_ids=torch.zeros(1, dtype=torch.int32),
+            query_positions=torch.zeros(position_rows, dtype=torch.int64),
+            selection=selection,
+        )
+
+
+def test_qsa_dcp_attend_reuse_rejects_unsharded_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x.attention.qsa import _draft_selection
+
+    monkeypatch.setattr(_draft_selection, "validate_buffers", lambda *args: None)
+    monkeypatch.setattr(_draft_selection, "prepare_selection", lambda *args: None)
+    monkeypatch.setattr(contract, "_run_attention", lambda binding, **kwargs: binding.output[:1])
+    with pytest.raises(ValueError, match="context-parallel QSA"):
+        contract.attend_reuse(
+            _boundary_binding(dcp_size=1),
+            query=torch.empty(1, 24, 256, dtype=torch.bfloat16),
+            request_ids=torch.zeros(1, dtype=torch.int32),
+            query_positions=torch.zeros(1, dtype=torch.int64),
+            reuse=contract.DraftSelectionReuse(torch.zeros(2, dtype=torch.int32)),
+        )
+
+
+@pytest.mark.parametrize("global_tokens", [4, 64])
+def test_qsa_dcp4_shards_and_lse_merge_match_global_attention(
+    global_tokens: int,
+) -> None:
     from b12x.attention.qsa._kernels import launch_expand_global_selected_groups
     from b12x.attention.qsa._sparse_gqa import launch_sparse_paged_gqa
 
@@ -84,7 +175,6 @@ def test_qsa_dcp4_shards_and_lse_merge_match_global_attention() -> None:
     torch.manual_seed(20260919)
     dcp_size = 4
     interleave = 4
-    global_tokens = 64
     q_heads = 24
     kv_heads = 2
     head_dim = 256
@@ -163,7 +253,7 @@ def test_qsa_dcp4_shards_and_lse_merge_match_global_attention() -> None:
         )
         local_keys = torch.empty(
             1,
-            local_tokens,
+            max(local_tokens, 4),
             kv_heads,
             head_dim,
             dtype=global_keys.dtype,

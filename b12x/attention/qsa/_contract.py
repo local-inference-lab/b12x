@@ -261,6 +261,11 @@ class Caps:
             raise ValueError("max_q_rows must be at least max_batch")
         if int(self.max_seq_len) < int(self.compress_ratio):
             raise ValueError("max_seq_len must be at least compress_ratio")
+        if self.max_local_groups == 0:
+            raise ValueError(
+                "max_seq_len must provide at least one local compressed group "
+                "on this DCP rank"
+            )
         if int(self.max_seq_len) > torch.iinfo(torch.int32).max:
             raise ValueError("max_seq_len must fit in positive int32 positions")
         max_page_count = torch.iinfo(torch.int32).max + 1
@@ -3797,6 +3802,16 @@ def attend(
     if not isinstance(selection, LocalSelection):
         raise TypeError("selection must be a qsa.LocalSelection")
     rows = int(query.shape[0])
+    if not 0 < rows <= min(caps.max_q_rows, binding.selected_positions.shape[0]):
+        raise ValueError("query rows exceed the bound QSA selection capacity")
+    _check_tensor(
+        query_positions,
+        name="query_positions",
+        device=caps.device,
+        shape=(rows,),
+        dtype=torch.int64,
+        contiguous=True,
+    )
     _check_tensor(
         selection.group_ids,
         name="selection.group_ids",
@@ -3838,10 +3853,12 @@ def attend_reuse(
     """Attend with a previously recorded rank-local draft selection."""
     if not isinstance(binding, Binding) or not isinstance(binding.plan, Plan):
         raise TypeError("QSA draft reuse requires a prepared binding")
+    caps = binding.state.caps
+    if caps.dcp_size <= 1:
+        raise ValueError("attend_reuse() is reserved for context-parallel QSA")
     state = binding.draft_selection
     if state is None or not isinstance(reuse, DraftSelectionReuse):
         raise ValueError("QSA draft reuse requires bound draft state and mapping")
-    caps = binding.state.caps
     rows = int(query.shape[0])
     if not 0 < rows <= min(caps.max_batch, binding.output.shape[0]):
         raise ValueError("draft selection reuse requires one row per request")
