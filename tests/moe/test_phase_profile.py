@@ -1,6 +1,7 @@
 """Balanced placement preserves raw observations and rejects undeclared weights."""
 
 from copy import deepcopy
+import json
 
 import pytest
 
@@ -67,6 +68,18 @@ def test_artifact_is_receipt_bound_and_objective_hashed():
     assert result["identity"] == profile["identity"]
     assert len(result["placements"]["layer"]["hbm_expert_ids"]) == 2
     validate(result)
+    # Serving reads JSON lists; construction retains typed tuples.
+    serialized = json.loads(json.dumps(result))
+    validate(serialized)
+    assert digest({k: v for k, v in serialized.items() if k != "hash"}) == result["hash"]
+    corrupted = deepcopy(serialized)
+    corrupted["placements"]["layer"]["selection_counts"][0] += 1
+    with pytest.raises(ValueError, match="hash mismatch"):
+        validate(corrupted)
+    changed_evidence = deepcopy(serialized)
+    changed_evidence["phase_counts"][0]["counts"][0] += 1
+    with pytest.raises(ValueError, match="differs"):
+        validate(changed_evidence)
     result["placement_objective"]["prefill_weight"] = [3, 4]
     with pytest.raises(ValueError, match="objective"):
         validate(result)

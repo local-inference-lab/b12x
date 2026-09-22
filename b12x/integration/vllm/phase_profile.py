@@ -42,5 +42,9 @@ def validate(profile):
     """A combined-phase placement is admitted only with its declared objective."""
     if profile.get("placement_objective") != OBJECTIVE:
         raise ValueError("unsupported phase placement objective")
-    if placements(profile) != profile["placements"]:
+    expected = {name: ExpertResidencyPlan.from_dict(value)
+                for name, value in placements(profile).items()}
+    actual = {name: ExpertResidencyPlan.from_dict(value)
+              for name, value in profile["placements"].items()}
+    if expected != actual:
         raise ValueError("phase placement differs from retained observations")
