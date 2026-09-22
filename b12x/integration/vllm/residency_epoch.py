@@ -90,12 +90,17 @@ class ResidencyLayerBinding:
     pointers: Callable
     validate: Callable
     timings: Callable | None = None
+    stage: Callable | None = None
+    publish: Callable | None = None
+    rollback: Callable | None = None
+    finish: Callable | None = None
 
 
 class ResidencyEpochRuntime:
     """Worker-side transaction participant; registration is explicit and opt-in."""
     def __init__(self, *, rank, owner_rank, bindings, snapshot_counters,
-                 checkpoint_id, initial_profile_id, memory: ResidencyServingMemory, anchor=None):
+                 checkpoint_id, initial_profile_id, memory: ResidencyServingMemory, anchor=None,
+                 verify_rank_counters=False):
         _integer("rank", rank)
         _integer("owner_rank", owner_rank)
         _text("checkpoint_id", checkpoint_id)
@@ -114,6 +119,7 @@ class ResidencyEpochRuntime:
             _integer("prepared exchange capacity", binding.max_pairs, 1)
         self.rank, self.owner_rank = rank, owner_rank
         self.snapshot_counters = snapshot_counters
+        self.verify_rank_counters = verify_rank_counters
         self.checkpoint_id, self.initial_profile_id, self.memory = checkpoint_id, initial_profile_id, memory
         if anchor is not None:
             from b12x.moe.residency.anchor import ResidencyAnchor
@@ -160,7 +166,7 @@ class ResidencyEpochRuntime:
         for name, slots in before.items():
             updated_slot_map(slots, (), backing_mode=self.bindings[name].exchange.backing_mode)
         start = perf_counter_ns()
-        snapshot = self.snapshot_counters(quiescent=True) if self.rank == self.owner_rank else None
+        snapshot = self.snapshot_counters(quiescent=True) if self.rank == self.owner_rank or self.verify_rank_counters else None
         snapshot_ns = perf_counter_ns() - start
         self._before = before
         return {"rank": self.rank, "checkpoint_id": self.checkpoint_id,
@@ -186,6 +192,49 @@ class ResidencyEpochRuntime:
         self._command = {name: tuple(tuple(pair) for pair in item["pairs"]) for name, item in command.items()}
         self._stage = "prepared"
         return {"rank": self.rank, "ready": True}
+
+    def stage(self, token):
+        self._require(token, "prepared")
+        self._stage = "staging"
+        for name, binding in sorted(self.bindings.items()):
+            if not all((binding.stage, binding.publish, binding.rollback, binding.finish)):
+                raise RuntimeError("backend lacks reversible distributed payload staging")
+            if self._command[name]:
+                binding.stage(self._command[name], expected=self._before[name], quiescent=True)
+            if binding.snapshot() != self._before[name]:
+                raise RuntimeError("staging published a generation before all ranks were ready")
+        self._stage = "staged"
+        return {"rank": self.rank, "staged": True}
+
+    def rollback(self, token):
+        if token != self._token or self._stage not in ("observed", "prepared", "staging", "staged"):
+            self._failed = True
+            raise RuntimeError("cannot roll back uncertain publication")
+        try:
+            for name, binding in sorted(self.bindings.items()):
+                if binding.rollback is not None:
+                    binding.rollback()
+                if binding.snapshot() != self._before[name]:
+                    raise RuntimeError("rollback did not restore the complete generation")
+        except BaseException:
+            self._failed = True
+            raise
+        self._stage, self._token, self._command, self._before = "idle", None, None, None
+        return {"rank": self.rank, "rolled_back": True}
+
+    def publish(self, token):
+        self._require(token, "staged")
+        self._stage = "publishing"
+        try:
+            for name, binding in sorted(self.bindings.items()):
+                if self._command[name]:
+                    binding.publish()
+            self._stage = "applied"
+            return {"rank": self.rank, "layers": {
+                n: asdict(b.snapshot()) for n, b in self.bindings.items()}}
+        except BaseException:
+            self._failed = True
+            raise
 
     def apply(self, token):
         self._require(token, "prepared")
@@ -213,7 +262,7 @@ class ResidencyEpochRuntime:
         return {"rank": self.rank, "layers": {n: asdict(s) for n, s in after.items()},
                 "transaction_ns": timings}
 
-    def acknowledge(self, token):
+    def acknowledge(self, token, *, staged=False):
         self._require(token, "applied")
         # No backend may mutate after apply and before the distributed success gate.
         for name, binding in self.bindings.items():
@@ -223,8 +272,19 @@ class ResidencyEpochRuntime:
                 expert_map=updated_slot_map(before, pairs, backing_mode=binding.exchange.backing_mode))
             if binding.snapshot() != expected:
                 raise RuntimeError("layer changed before distributed acknowledgement")
+        if staged:
+            self._stage = "acknowledged"
+            return {"rank": self.rank, "acknowledged": True}
         self._stage, self._token, self._command, self._before = "idle", None, None, None
         return {"rank": self.rank, "acknowledged": True}
+
+    def finish(self, token):
+        self._require(token, "acknowledged")
+        for name, binding in self.bindings.items():
+            if self._command[name]:
+                binding.finish()
+        self._stage, self._token, self._command, self._before = "idle", None, None, None
+        return {"rank": self.rank, "finished": True}
 
 
 class ResidencyEpochWorkerExtension:
@@ -240,6 +300,21 @@ class ResidencyEpochWorkerExtension:
         if not isinstance(runtime, ResidencyEpochRuntime):
             raise RuntimeError("model has no prepared residency runtime; CPU-source loader/backend integration is required")
         return runtime
+
+    def b12x_phase_timing_start(self, capacity=4096):
+        from b12x.testing.phase_timing import PhaseTiming
+        if getattr(self.model_runner, "b12x_phase_timing", None) is not None:
+            raise RuntimeError("phase timing is already active")
+        self.model_runner.b12x_phase_timing = PhaseTiming(capacity)
+        return {"capacity": capacity}
+
+    def b12x_phase_timing_finish(self):
+        timing = getattr(self.model_runner, "b12x_phase_timing", None)
+        if timing is None:
+            raise RuntimeError("phase timing was not started")
+        result = timing.finish()
+        self.model_runner.b12x_phase_timing = None
+        return result
 
     def b12x_residency_maintenance(self, config):
         """Only the engine's completed single-rank drain may invoke this method."""
@@ -290,6 +365,9 @@ class ResidencyEpochWorkerExtension:
             raise ValueError("history recording is a boolean start-only option")
         import torch
         cache = getattr(self.model_runner, "b12x_expert_cache", None)
+        if cache is not None and cache.tp_rank != 0:
+            self._b12x_health_generation()
+            return {"rank": cache.tp_rank, "observer_only": True}
         health = getattr(getattr(cache, "_counters", None), "health", None)
         if health is None:
             raise RuntimeError("cache health probes were not prepared")
@@ -337,6 +415,26 @@ class ResidencyEpochWorkerExtension:
     def b12x_residency_acknowledge(self, token):
         return self._b12x_epoch_runtime().acknowledge(token)
 
+    def b12x_residency_stage(self, token):
+        return self._b12x_epoch_runtime().stage(token)
+
+    def b12x_residency_rollback(self, token):
+        return self._b12x_epoch_runtime().rollback(token)
+
+    def b12x_residency_publish(self, token):
+        return self._b12x_epoch_runtime().publish(token)
+
+    def b12x_residency_acknowledge_staged(self, token):
+        return self._b12x_epoch_runtime().acknowledge(token, staged=True)
+
+    def b12x_residency_finish(self, token):
+        result = self._b12x_epoch_runtime().finish(token)
+        cache = getattr(self.model_runner, "b12x_expert_cache", None)
+        health = getattr(getattr(cache, "_counters", None), "health", None)
+        if health is not None:
+            health.rebase(self._b12x_health_generation())
+        return result
+
     def b12x_lifecycle_resources(self, stage):
         """Explicit diagnostic; no allocation or observation node enters replay."""
         import os
@@ -354,12 +452,14 @@ class ResidencyEpochWorkerExtension:
             raise RuntimeError("model has no prepared canonical expert cache")
         manager = getattr(self.model_runner, "cudagraph_manager", None)
         graphs = getattr(manager, "graphs", {})
-        return {"mode": model.config.mode, "checkpoint": model.checkpoint_id,
+        return {"mode": model.config.mode, "rank": model.tp_rank, "world_size": model.tp_size,
+            "checkpoint": model.checkpoint_id,
             "profile": model.profile_id, "memory": asdict(model.memory),
             "load_device_peak_bytes": model.load_device_peak_bytes,
             "graphs": {str(descriptor): id(graph) for descriptor, graph in graphs.items()},
             "layers": {name: {"resident": plan.query.resident, "experts": plan.query.experts,
                 "max_pairs": plan.query.max_pairs,
+                "storage": asdict(model.sources[name].storage),
                 "pointers": plan.prepared.state.pointers(),
                 "generation": plan.prepared.state.updates.snapshot().generation if plan.prepared.state.updates else 0}
                 for name,plan in model.plans.items()}}
@@ -401,6 +501,8 @@ def bind_sm120_epoch_layer(plan, observations):
             payload_copy_bytes_per_pair=payload, map_copy_bytes_per_transaction=2*plan.query.experts*8,
             backing_mode="canonical"), max_pairs=plan.query.max_pairs,
         snapshot=state.updates.snapshot, apply=state.updates.apply,
+        stage=state.updates.stage, publish=state.updates.publish_staged,
+        rollback=state.updates.rollback_staged, finish=state.updates.finish_staged,
         pointers=state.pointers, validate=validate,
         timings=lambda: dict(getattr(state.updates, "last_timings_ns", {})))
 
@@ -493,7 +595,10 @@ class VllmResidencyEpochs:
                 raise ValueError("ranks disagree on checkpoint or initial static profile")
             if set(value["layers"]) != set(owner["layers"]):
                 raise ValueError("ranks disagree on participating MoE layers")
-            if rank != self.owner_rank and value["snapshot"] is not None:
+            if getattr(self, "verify_rank_counters", False):
+                if value["snapshot"] is None or {**value["snapshot"], "rank": self.owner_rank} != owner["snapshot"]:
+                    raise ValueError("TP ranks disagree on canonical routing observations")
+            elif rank != self.owner_rank and value["snapshot"] is not None:
                 raise ValueError("replicated TP observations must be counted on one owner")
             for name, layer in value["layers"].items():
                 reference = owner["layers"][name]

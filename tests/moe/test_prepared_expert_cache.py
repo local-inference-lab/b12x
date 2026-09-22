@@ -262,7 +262,7 @@ def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count):
         pair_count = min(2, hot_count, e - hot_count)
         forward = ((hot_count, 0), (e - 1, 1))[:pair_count]
         backward = tuple((b, a) for a, b in forward)
-        for pairs in (forward, backward, forward[:1]):
+        for iteration, pairs in enumerate((forward, backward, forward[:1])):
             ids.random_(0, e)
             ids[0, 0] = min(hot_count, e - 1)
             ids[0, 1] = min(hot_count, e - 1)
@@ -275,9 +275,16 @@ def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count):
                 original_outputs.append(binding.output.clone())
             torch.cuda.synchronize()
             if pairs:
-                state.updates.apply(
-                    pairs, expected=state.updates.snapshot(), quiescent=True
-                )
+                expected = state.updates.snapshot()
+                if iteration == 1:
+                    state.updates.stage(pairs, expected=expected, quiescent=True)
+                    assert state.updates.snapshot() == expected
+                    state.updates.rollback_staged()
+                    state.updates.stage(pairs, expected=expected, quiescent=True)
+                    state.updates.publish_staged()
+                    state.updates.finish_staged()
+                else:
+                    state.updates.apply(pairs, expected=expected, quiescent=True)
             for (graph, binding, ref), original_output in zip(
                 graphs, original_outputs, strict=True
             ):

@@ -65,6 +65,7 @@ from .routing_profile import (
 )
 from ._residency_tuning import ResidencyConfig, ResidencyQuery
 from .cache_source import ExpertWeightSource
+from b12x.moe.residency.storage import ExpertStorageSource
 from ._cache_tuning import ExpertCacheConfig, ExpertCacheQuery
 from .weights import (
     BtxWeights,
@@ -105,7 +106,7 @@ def prepare_weights(
 
 def plan_execution(
     *,
-    experts: PreparedExperts | WeightPlan | ExpertWeightSource,
+    experts: PreparedExperts | WeightPlan | ExpertStorageSource,
     capacity: ExecutionCapacity,
     weights: PackedWeights | None = None,
     placement: ExpertResidencyPlan | None = None,
@@ -117,7 +118,7 @@ def plan_execution(
 ):
     """Declare capacity variants; preparation publishes executable states."""
     if placement is not None:
-        if isinstance(experts, ExpertWeightSource):
+        if isinstance(experts, ExpertStorageSource):
             from ._cache_preparation import plan as cache_plan
             if weights is not None or invocation or routing not in (None, RoutingSpec()):
                 raise ValueError("canonical cache consumes source-owned weights and unchanged preselected routes")

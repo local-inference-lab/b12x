@@ -24,6 +24,8 @@ HOST = [
         f"tests/moe/test_{name}.py"
         for name in (
             "shared_residency",
+            "expert_storage",
+            "tp_residency",
             "residency_cache",
             "residency_epoch",
             "vllm_residency_epoch",

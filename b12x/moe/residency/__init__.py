@@ -19,8 +19,13 @@ from .epoch import (
 )
 from .health import RoutingHealthThresholds, RoutingAnchorThresholds
 from .anchor import ResidencyAnchor, compare_anchor
+from .storage import (
+    BackingMode, ExpertRepresentation, ExpertShard, ExpertStorageContract,
+    ExpertStorageSource,
+)
 
 __all__ = [
+    "BackingMode", "ExpertRepresentation", "ExpertShard", "ExpertStorageContract", "ExpertStorageSource",
     "ResidencyAnchor", "RoutingAnchorThresholds", "compare_anchor", "ExpertPlacement", "LayerRoutingCounts", "ResidencyExchangeSpec",
     "ResidencySlotSnapshot", "ResidencyUpdateCapacity", "ResidencyUpdateError",
     "RoutingObservationSpec", "RoutingSnapshot", "ResidencyCacheConfig",

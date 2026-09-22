@@ -221,7 +221,7 @@ def test_worker_health_reads_leave_policy_and_generation_untouched(monkeypatch):
 
     health = Health()
     worker.model_runner.b12x_expert_cache = SimpleNamespace(
-        _counters=SimpleNamespace(health=health)
+        _counters=SimpleNamespace(health=health), tp_rank=0,
     )
     worker.model_runner.main_stream = None
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())

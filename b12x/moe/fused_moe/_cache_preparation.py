@@ -221,6 +221,8 @@ class ExpertCacheBinding:
         import cuda.bindings.driver as cuda
 
         self.state.validate()
+        if self.state.updates is not None:
+            self.state.updates.require_executable()
         stream = cuda.CUstream(torch.cuda.current_stream(self.a.device).cuda_stream)
         self.state.programs["remap_" + self.suffix](*self.remap_args, stream)
         for binding in self.tiers:
@@ -460,15 +462,20 @@ class ExpertCacheState:
 
 
 def plan(*, source, capacity, placement, memory_budget, updates=None, override=None):
-    from .cache_source import ExpertWeightSource
+    from .cache_source import NVFP4_CACHE_ADAPTER, NVFP4_CACHE_RECIPE
+    from b12x.moe.residency.storage import ExpertStorageSource
     from .residency import ExpertResidencyPlan, ExpertMemoryBudget
 
-    if not isinstance(source, ExpertWeightSource) or not isinstance(
+    if not isinstance(source, ExpertStorageSource) or not isinstance(
         placement, ExpertResidencyPlan
     ):
         raise TypeError(
-            "expert cache requires CPU ExpertWeightSource and ExpertResidencyPlan"
+            "expert cache requires an ExpertStorageSource and ExpertResidencyPlan"
         )
+    contract = source.storage
+    contract.require_cold_execution()
+    if contract.adapter != NVFP4_CACHE_ADAPTER or contract.recipe != NVFP4_CACHE_RECIPE:
+        raise NotImplementedError("no prepared cache execution backend for this storage adapter/recipe")
     if not isinstance(memory_budget, ExpertMemoryBudget):
         raise TypeError("expert cache requires an admitted memory budget")
     if not isinstance(

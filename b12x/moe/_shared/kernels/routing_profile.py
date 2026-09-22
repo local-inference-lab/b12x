@@ -76,3 +76,55 @@ class SetTokenLimit:
     @cute.kernel
     def kernel(self, enabled: cute.Pointer, tokens: Int32):
         enabled[1] = tokens
+
+
+class SetPhaseRange:
+    """Set engine-declared row labels on the producer stream, outside replay."""
+    @cute.jit
+    def __call__(self, labels: cute.Pointer, begin: Int32, end: Int32, phase: Int32, stream: cuda.CUstream):
+        self.kernel(labels, begin, end, phase).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, labels: cute.Pointer, begin: Int32, end: Int32, phase: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        for row in cutlass.range(begin + tid, end, 128):
+            labels[Int64(row)] = phase
+
+
+class CountPhasedRoutes:
+    """One route addition into either decode or prefill; zero labels are padding."""
+    def __init__(self, experts):
+        self.experts = experts
+        self.stride = (experts + 6) // 2 * 2
+
+    @cute.jit
+    def __call__(self, ids: cute.Pointer, counts: cute.Pointer, enabled: cute.Pointer,
+                 tokens: Int32, top_k: Int32, stream: cuda.CUstream):
+        self.kernel(ids, counts, enabled, tokens, top_k).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, ids: cute.Pointer, counts: cute.Pointer, enabled: cute.Pointer,
+               tokens: Int32, top_k: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        if enabled[0] != 0:
+            if tid == 0:
+                decode, prefill = Int64(0), Int64(0)
+                for row in cutlass.range(tokens):
+                    label = enabled[4 + Int64(row)]
+                    decode += Int64(label == 1)
+                    prefill += Int64(label == 2)
+                for phase in cutlass.range_constexpr(2):
+                    amount = decode if phase == 0 else prefill
+                    target = counts + Int64(phase * self.stride)
+                    if amount > 0:
+                        overflow = target + self.experts + 4
+                        increment(target + self.experts, overflow, Int64(1))
+                        increment(target + self.experts + 1, overflow, Int64(1))
+                        increment(target + self.experts + 2, overflow, amount)
+                        increment(target + self.experts + 3, overflow, amount)
+            for offset in cutlass.range(tid, tokens * top_k, 128):
+                label = enabled[4 + Int64(offset // top_k)]
+                expert = Int64(ids[Int64(offset)])
+                if (label >= 1) & (label <= 2) & (expert >= 0) & (expert < self.experts):
+                    target = counts + Int64(label - 1) * Int64(self.stride)
+                    increment(target + expert, target + self.experts + 4, Int64(1))

@@ -7,6 +7,13 @@ import torch
 
 from .planning import WeightPlan
 from .weights import PackedWeights
+from b12x.moe.residency.storage import (
+    BackingMode, ExpertRepresentation, ExpertShard, ExpertStorageContract,
+)
+
+
+NVFP4_CACHE_ADAPTER = "modelopt_nvfp4_canonical_w4a16"
+NVFP4_CACHE_RECIPE = "nvfp4_w4a16_whole_k_weighted_bf16_ordered_sum"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -22,6 +29,7 @@ class ExpertWeightSource:
     plan: WeightPlan
     weights: PackedWeights
     owners: tuple = ()
+    shard: ExpertShard | None = None
 
     def __post_init__(self):
         from .planning import ActivationMode
@@ -53,6 +61,12 @@ class ExpertWeightSource:
         )
         if h % 128 or i % 128:
             raise ValueError("canonical cache requires H and local I divisible by 128")
+        shard = self.shard or ExpertShard(
+            experts=e, hidden=h, intermediate=i, global_intermediate=i
+        )
+        if not isinstance(shard, ExpertShard) or (shard.experts, shard.hidden, shard.intermediate) != (e, h, i):
+            raise ValueError("storage shard differs from the weight plan geometry")
+        object.__setattr__(self, "shard", shard)
         for name, shape, dtype in (
             ("w13", (e, 2 * i, h // 2), torch.uint8),
             ("w2", (e, h, i // 2), torch.uint8),
@@ -84,6 +98,29 @@ class ExpertWeightSource:
             )
 
     @property
+    def storage(self):
+        g = self.shard
+        matrices = 3 * g.hidden * g.intermediate
+        payload = matrices // 2 + matrices // 16 + 8
+        canonical = ExpertRepresentation(
+            encoding="modelopt_nvfp4_swizzled_k16", bytes_per_expert=payload,
+            alignment=256,
+        )
+        return ExpertStorageContract(
+            adapter=NVFP4_CACHE_ADAPTER,
+            checkpoint=self.weights.checkpoint_fingerprint,
+            layer=self.weights.layer_name,
+            recipe=NVFP4_CACHE_RECIPE,
+            shard=g,
+            source=ExpertRepresentation(
+                encoding="modelopt_nvfp4", bytes_per_expert=self.source_bytes // g.experts,
+                shared_bytes=self.source_bytes % g.experts,
+            ),
+            backing=canonical, resident=canonical, mode=BackingMode.PREPARED,
+            direct_cold_execution=True, source_transform="swizzle_k16_scales",
+        )
+
+    @property
     def source_bytes(self):
         storages = {
             v.untyped_storage().data_ptr(): v.untyped_storage().nbytes()
@@ -107,6 +144,8 @@ class ExpertWeightSource:
     def row(self, expert):
         from ._residency_storage import _swizzle_scale
 
+        if type(expert) is not int or not 0 <= expert < self.shard.experts:
+            raise ValueError("expert ID is outside canonical layer geometry")
         w = self.weights
         return dict(
             w13=w.w13[expert],

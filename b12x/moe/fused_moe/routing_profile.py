@@ -19,10 +19,15 @@ def _compile(query, *, target, offline_dir=None):
     import cuda.bindings.driver as cuda
     from b12x._lib.compiler import KernelCompileSpec, compile as compile_kernel
     from b12x.moe._shared.kernels.sm103.launch import pointer
-    from b12x.moe._shared.kernels.routing_profile import CountRoutes
+    from b12x.moe._shared.kernels.routing_profile import CountRoutes, CountPhasedRoutes, SetPhaseRange
     programs = {}
-    if query.rank != query.owner_rank:
+    if query.rank != query.owner_rank and not query.observe_all_ranks:
         return programs
+    if query.runtime_phase_ranges:
+        args = (pointer(cutlass.Int32), cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(1), cuda.CUstream(0))
+        programs["set_phase_range"] = compile_kernel(SetPhaseRange(), *args,
+            options=f"--gpu-arch={target}", compile_spec=KernelCompileSpec.from_facts(
+                "moe.routing_profile.set_phase_range", 1, ("target", target)))
     if query.runtime_token_limit:
         from b12x.moe._shared.kernels.routing_profile import SetTokenLimit
         args = (pointer(cutlass.Int32), cutlass.Int32(1), cuda.CUstream(0))
@@ -53,7 +58,7 @@ def _compile(query, *, target, offline_dir=None):
             key = f"count_{experts}_{suffix}"
             args = [pointer(dtype), pointer(cutlass.Uint64), pointer(cutlass.Int32),
                     cutlass.Int32(1), cutlass.Int32(1), cuda.CUstream(0)]
-            kernel = CountRoutes(experts, query.sample_every, query.runtime_token_limit)
+            kernel = CountPhasedRoutes(experts) if query.runtime_phase_ranges else CountRoutes(experts, query.sample_every, query.runtime_token_limit)
             options = f"--gpu-arch={target}"
             if offline_dir is not None:
                 path = Path(offline_dir)/key
@@ -64,6 +69,7 @@ def _compile(query, *, target, offline_dir=None):
                 spec = KernelCompileSpec.from_facts("moe.routing_profile", 1, ("experts", experts),
                     ("sample_every", query.sample_every), ("ids_dtype", suffix),
                     ("runtime_token_limit", query.runtime_token_limit),
+                    ("runtime_phase_ranges", query.runtime_phase_ranges),
                     ("max_tokens", query.max_tokens), ("max_top_k", query.max_top_k), ("target", target))
                 program = compile_kernel(kernel, *args, options=options, compile_spec=spec)
             programs[key] = program
@@ -101,8 +107,8 @@ class _CounterState:
         self.rows = {}
         self.storage = torch.zeros(query.storage_bytes, device=device, dtype=torch.uint8) if query.storage_bytes else None
         if self.storage is not None:
-            self.enabled = self.storage[:16].view(torch.int32)
-            offset = 16
+            offset = 16 + (8 * ((query.max_tokens + 1) // 2) if query.runtime_phase_ranges else 0)
+            self.enabled = self.storage[:offset].view(torch.int32)
             for layer, experts in query.layers:
                 size = (experts+6)//2*2*8
                 for phase in query.phases:
@@ -123,6 +129,10 @@ class _CounterState:
         import cutlass
         from b12x.moe._shared.kernels.sm103.launch import pointer
         q = self.query
+        if q.runtime_phase_ranges:
+            if phase is not None:
+                raise ValueError("phase-range observer binds all declared phases together")
+            phase = "decode"
         experts = dict(q.layers).get(layer)
         if experts is None or phase not in q.phases:
             raise ValueError("layer/phase not declared for routing profiling")
@@ -140,6 +150,24 @@ class _CounterState:
                 pointer(cutlass.Uint64, self.rows[layer, phase]), pointer(cutlass.Int32, self.enabled),
                 cutlass.Int32(topk_ids.shape[0]), cutlass.Int32(topk_ids.shape[1]))
         return RoutingProfileBinding(self, self.programs[f"count_{experts}_{suffix}"], args, topk_ids)
+
+    def set_phase_ranges(self, ranges):
+        """Each tuple is (row begin, row end, decode=1/prefill=2); gaps are padding."""
+        if not self.query.runtime_phase_ranges:
+            raise ValueError("phase ranges were not prepared")
+        previous = 0
+        for begin, end, phase in ranges:
+            if any(type(v) is not int for v in (begin, end, phase)) or not previous <= begin < end <= self.query.max_tokens or phase not in (1, 2):
+                raise ValueError("phase ranges must be ordered, disjoint and within capacity")
+            previous = end
+        if self.storage is not None:
+            import cutlass
+            import cuda.bindings.driver as cuda
+            from b12x.moe._shared.kernels.sm103.launch import pointer
+            stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
+            labels = pointer(cutlass.Int32, self.enabled[4:])
+            for begin, end, phase in ((0, self.query.max_tokens, 0), *ranges):
+                self.programs["set_phase_range"](labels, cutlass.Int32(begin), cutlass.Int32(end), cutlass.Int32(phase), stream)
 
     def _quiesce(self, quiescent):
         if not quiescent:

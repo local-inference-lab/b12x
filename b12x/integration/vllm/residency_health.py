@@ -21,15 +21,23 @@ class VllmResidencyHealth:
                 raise RuntimeError("health outcome is uncertain; reload the lane")
 
             async def read():
+                def owner(replies):
+                    observers = [v for v in replies if isinstance(v, dict) and v.get("observer_only") is True]
+                    authoritative = [v for v in replies if v not in observers]
+                    if len(authoritative) != 1 or {v["rank"] for v in observers} != set(range(1, len(replies))):
+                        raise RuntimeError("health probe TP rank ownership changed")
+                    return authoritative[0]
+
                 start = perf_counter_ns()
                 replies = await self.engine.collective_rpc(
                     "b12x_residency_health",
                     args=("start", True) if self.record_history else ("start",),
                 )
-                if len(replies) != 1 or replies[0].get("submitted") is not True:
+                submitted_result = owner(replies)
+                if submitted_result is None or submitted_result.get("submitted") is not True:
                     raise RuntimeError("health probe requires one serialized worker")
-                worker_submit_ns = replies[0].get("worker_wall_ns")
-                history = replies[0].get("history")
+                worker_submit_ns = submitted_result.get("worker_wall_ns")
+                history = submitted_result.get("history")
                 submitted = perf_counter_ns()
                 polls = 0
                 while True:
@@ -38,11 +46,10 @@ class VllmResidencyHealth:
                         "b12x_residency_health", args=("poll",)
                     )
                     polls += 1
-                    if len(replies) != 1:
-                        raise RuntimeError("health probe rank ownership changed")
-                    if replies[0] is not None:
+                    summary = owner(replies)
+                    if summary is not None:
                         return dict(
-                            summary=replies[0],
+                            summary=summary,
                             worker_submit_ns=worker_submit_ns,
                             submit_rpc_ns=submitted - start,
                             total_wall_ns=perf_counter_ns() - start,

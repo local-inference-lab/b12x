@@ -20,6 +20,8 @@ class RoutingProfileQuery:
     health_summary: bool = False
     history_depth: int = 0
     anchor_summary: bool = False
+    observe_all_ranks: bool = False
+    runtime_phase_ranges: bool = False
 
     def __post_init__(self):
         from ..residency.contracts import PHASES
@@ -47,6 +49,12 @@ class RoutingProfileQuery:
             raise ValueError("expert-parallel profiling requires global-ID semantics and is unsupported")
         if type(self.runtime_token_limit) is not bool:
             raise TypeError("runtime_token_limit must be boolean")
+        if type(self.observe_all_ranks) is not bool:
+            raise TypeError("observe_all_ranks must be boolean")
+        if type(self.runtime_phase_ranges) is not bool:
+            raise TypeError("runtime_phase_ranges must be boolean")
+        if self.runtime_phase_ranges and (self.phases != ("decode", "prefill") or self.sample_every != 1 or self.runtime_token_limit):
+            raise ValueError("phase ranges require decode/prefill, unsampled counts and no token-limit observer")
 
         if type(self.health_summary) is not bool:
             raise TypeError("health_summary must be boolean")
@@ -76,7 +84,8 @@ class RoutingProfileQuery:
     @property
     def storage_bytes(self):
         return (sum(((experts+6)//2*2)*8 for _, experts in self.layers)*len(self.phases) + 16
-                if self.rank == self.owner_rank else 0)
+                + (8 * ((self.max_tokens + 1) // 2) if self.runtime_phase_ranges else 0)
+                if self.rank == self.owner_rank or self.observe_all_ranks else 0)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -97,7 +106,7 @@ def _validate(query, config, device):
         raise ValueError("unsupported routing counter configuration")
 
 
-TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=5,
+TUNING = TuningContract(component_id="moe.routing_profile", query_schema_version=6,
     config_schema_version=1, query_fields=frozenset(RoutingProfileQuery.__dataclass_fields__),
     config_fields=frozenset(RoutingProfileConfig.__dataclass_fields__), encode_query=asdict,
     encode_config=asdict, decode_config=lambda p: RoutingProfileConfig(**dict(p)),

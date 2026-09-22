@@ -18,8 +18,10 @@ def prepare(query):
     ids = torch.zeros((query.max_tokens, query.max_top_k), dtype=torch.int64, device="cuda")
     def prime(state):
         calls = [state.bind(layer=layer, phase=phase, topk_ids=ids)
-                 for layer, _ in query.layers for phase in query.phases]
+                 for layer, _ in query.layers for phase in ((None,) if query.runtime_phase_ranges else query.phases)]
         def run():
+            if query.runtime_phase_ranges:
+                state.set_phase_ranges(((0, query.max_tokens, 1),))
             if query.runtime_token_limit:
                 state.set_token_limit(query.max_tokens)
             for binding in calls:
@@ -37,6 +39,43 @@ def prepare(query):
     result = session.prepare((plan.request(name="counter", prepare_call=prime),))
     session.freeze()
     return plan, session, result
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_phase_counts_share_one_route_update_and_replay_allocates_nothing(rank):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    query = RoutingProfileQuery(layers=(("layer", 4),), max_tokens=4, max_top_k=2,
+        phases=("decode", "prefill"), runtime_phase_ranges=True, rank=rank,
+        tp_size=2, observe_all_ranks=True)
+    plan, session, result = prepare(query)
+    graph = None
+    try:
+        state = routing_profile_state(plan)
+        ids = torch.tensor([[0, 0], [1, 2], [3, -1], [4, 2]], device="cuda", dtype=torch.int64)
+        binding = state.bind(layer="layer", phase=None, topk_ids=ids)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            binding.run()
+        state.reset(quiescent=True)
+        pointer = state.storage.data_ptr()
+        for ranges in (((0, 1, 2), (1, 3, 1)), ((0, 2, 1), (2, 4, 2)), ()):
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            with kernel_resolution_guard("phase observer replay"):
+                state.set_phase_ranges(ranges)
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        snapshot = state.snapshot(quiescent=True)
+        rows = {r.phase: r for r in snapshot.layers}
+        assert rows["decode"].counts == (2, 2, 2, 1)
+        assert rows["prefill"].counts == (2, 0, 1, 1)
+        assert rows["decode"].tokens == 4 and rows["prefill"].tokens == 3
+        assert snapshot.rank == rank and state.storage.data_ptr() == pointer
+    finally:
+        if graph is not None:
+            graph.reset()
+        result.close()
+        session.close()
 
 
 def test_engine_phase_limit_changes_under_same_graph_without_host_reads():

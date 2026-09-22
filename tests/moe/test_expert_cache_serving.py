@@ -17,6 +17,18 @@ from b12x.moe.fused_moe.residency import profile_from_counts
 from tests.moe.test_prepared_expert_cache import source
 
 
+def test_phase_timing_preserves_mixed_work_and_partial_prompt_chunks():
+    from b12x.testing.phase_timing import classify_iteration, observation_ranges
+    row = classify_iteration([1, 16, 4], [40, 0, 9], [40, 64, 11])
+    assert row == {"phase": "mixed", "prompt_tokens": 18, "decode_tokens": 3,
+                   "prompt_chunks": [0, 16, 2]}
+    assert observation_ranges([1, 16, 4], [40, 0, 9], [40, 64, 11]) == (
+        (0, 1, 1), (1, 17, 2), (17, 19, 2), (19, 21, 1))
+    assert classify_iteration([1], [0], [1])["phase"] == "prefill"
+    with pytest.raises(ValueError, match="nonnegative"):
+        classify_iteration([1], [-1], [3])
+
+
 def test_checkpoint_receipt_reuses_hash_and_rejects_same_size_mutation(tmp_path, monkeypatch):
     from b12x.integration.vllm.checkpoint_identity import checkpoint_identity
 

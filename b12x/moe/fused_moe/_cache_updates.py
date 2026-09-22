@@ -39,6 +39,7 @@ class CanonicalSlotUpdates:
         self._map = tuple(tuple(row) for row in expert_map)
         self._identity, self._generation, self._healthy = uuid4().hex, 0, True
         self._lock = Lock()
+        self._pending = None
         updated_slot_map(self._snapshot(), (), backing_mode="canonical")
         self._resident = tuple(
             {n: v[r] for n, v in resident.items()}
@@ -77,6 +78,94 @@ class CanonicalSlotUpdates:
         if not self._healthy:
             raise RuntimeError("expert cache is unavailable; reload the lane")
 
+    def require_executable(self):
+        self.require_healthy()
+        if self._pending is not None:
+            raise RuntimeError("expert payload transaction is pending; keep readers paused")
+
+    def stage(self, pairs, *, expected, quiescent=False):
+        """Fill local shards without publishing; canonical victims remain recoverable."""
+        if quiescent is not True or self.transfer.capturing():
+            raise ValueError("staging requires drained readers outside graph capture")
+        pairs = tuple(pairs)
+        with self._lock:
+            self.require_executable()
+            if expected != self._snapshot() or not 0 < len(pairs) <= self.max_pairs:
+                raise ValueError("stale generation or invalid staged pair capacity")
+            next_map = updated_slot_map(expected, pairs, backing_mode="canonical")
+            self.transfer.synchronize()
+            self.transfer.copy(self.before, self.mapping)
+            self.transfer.synchronize()
+            if tuple(map(tuple, self.before.tolist())) != self._map:
+                self._healthy = False
+                raise RuntimeError("device map differs from authoritative generation")
+            self.after.copy_(torch.tensor(next_map, dtype=torch.int32))
+            overwritten = []
+            self._pending = (expected, next_map, overwritten, "staging")
+            try:
+                for candidate, victim in pairs:
+                    slot = self._map[victim][1]
+                    overwritten.append((slot, victim))
+                    for name, value in self._canonical[candidate].items():
+                        self.transfer.copy(self._resident[slot][name], value)
+                self.transfer.synchronize()
+                self._pending = (expected, next_map, overwritten, "staged")
+            except BaseException as error:
+                self._restore_staged()
+                raise ResidencyUpdateError("staged fill failed; victims restored", resumable=True) from error
+            return self._snapshot()
+
+    def _restore_staged(self):
+        try:
+            self.transfer.synchronize()
+            for slot, victim in self._pending[2]:
+                for name, value in self._canonical[victim].items():
+                    self.transfer.copy(self._resident[slot][name], value)
+            self.transfer.synchronize()
+        except BaseException as error:
+            self._healthy = False
+            raise ResidencyUpdateError("staged recovery failed; reload every rank", resumable=False) from error
+        self._pending = None
+
+    def rollback_staged(self):
+        """Undo only unpublished payload work; publication uncertainty is fatal."""
+        with self._lock:
+            self.require_healthy()
+            if self._pending is None:
+                return self._snapshot()
+            if self._pending[3] not in ("staging", "staged"):
+                self._healthy = False
+                raise ResidencyUpdateError("publication began; reload every rank", resumable=False)
+            self._restore_staged()
+            return self._snapshot()
+
+    def publish_staged(self):
+        """Called only after every participating rank has completed staging."""
+        with self._lock:
+            self.require_healthy()
+            if self._pending is None or self._pending[3] != "staged":
+                raise RuntimeError("no staged generation to publish")
+            expected, next_map, overwritten, _ = self._pending
+            self._pending = (expected, next_map, overwritten, "publishing")
+            try:
+                self.transfer.copy(self.mapping, self.after)
+                self.transfer.synchronize()
+            except BaseException as error:
+                self._healthy = False
+                raise ResidencyUpdateError("publication uncertain; reload every rank", resumable=False) from error
+            self._map, self._generation = next_map, expected.generation + 1
+            self._pending = (expected, next_map, overwritten, "published")
+            return self._snapshot()
+
+    def finish_staged(self):
+        """Retire recovery ownership after all ranks acknowledge publication."""
+        with self._lock:
+            self.require_healthy()
+            if self._pending is None or self._pending[3] != "published":
+                raise RuntimeError("no published generation to acknowledge")
+            self._pending = None
+            return self._snapshot()
+
     def apply(self, pairs, *, expected, quiescent=False):
         if quiescent is not True:
             raise ValueError("canonical fill requires paused graph producers")
@@ -84,7 +173,7 @@ class CanonicalSlotUpdates:
             raise RuntimeError("canonical fill cannot execute during graph capture")
         pairs = tuple(pairs)
         with self._lock:
-            self.require_healthy()
+            self.require_executable()
             if expected != self._snapshot():
                 raise ValueError("stale canonical cache preparation or generation")
             if not 0 < len(pairs) <= self.max_pairs:

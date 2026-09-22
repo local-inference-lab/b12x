@@ -48,9 +48,11 @@ async def run(args):
         health_probes=args.control == "health",
         history_depth=args.history_depth,
         anchor_health=args.anchor_health or args.anchor_advantage is not None,
+        phase_observations=args.phase_observations,
     )
     engine_args = AsyncEngineArgs(
         model=args.model,
+        tensor_parallel_size=args.tp_size,
         generation_config='vllm',
         model_loader_extra_config=({"tensor_coverage_path": str(args.loader_coverage)}
                                    if args.loader_coverage else {}),
@@ -130,16 +132,13 @@ async def run(args):
     completed = False
     try:
         engine = AsyncLLM.from_engine_args(engine_args)
-        status = (
-            (await engine.collective_rpc("b12x_expert_cache_status"))[0]
-            if args.mode != "native"
-            else None
-        )
+        statuses = await engine.collective_rpc("b12x_expert_cache_status") if args.mode != "native" else []
+        status = statuses[0] if statuses else None
         if status is not None and not args.eager and not status["graphs"]:
             raise AssertionError(
                 "graph-enabled serving did not retain a captured graph"
             )
-        record("prepared", status=status)
+        record("prepared", status=status, ranks=statuses)
         if args.resources:
             record("resources", result=await engine.collective_rpc(
                 "b12x_lifecycle_resources", args=("graphs_ready",)))
@@ -201,6 +200,8 @@ async def run(args):
         ]
         if not prompts:
             raise ValueError("real serving benchmark requires a nonempty prompt corpus")
+        if args.phase_timing:
+            record("phase_timing_start", result=await engine.collective_rpc("b12x_phase_timing_start"))
         if args.execution_trace:
             record(
                 "trace_begin",
@@ -411,6 +412,8 @@ async def run(args):
         if epoch_task is not None:
             await epoch_task
         elapsed = time.perf_counter_ns() - begin
+        if args.phase_timing:
+            record("phase_timing", result=await engine.collective_rpc("b12x_phase_timing_finish"))
         if args.routing_diagnostics:
             await engine.pause_generation(mode="keep", clear_cache=False)
             record("routing_boundary", next_request=len(prompts),
@@ -458,11 +461,16 @@ async def run(args):
                 pause_ns=time.perf_counter_ns() - start,
             )
             await engine.resume_generation()
-        after = (
-            (await engine.collective_rpc("b12x_expert_cache_status"))[0]
-            if args.mode != "native"
-            else None
-        )
+        after_ranks = await engine.collective_rpc("b12x_expert_cache_status") if args.mode != "native" else []
+        after = after_ranks[0] if after_ranks else None
+        if len(after_ranks) != len(statuses):
+            raise AssertionError("serving TP participant count changed")
+        for before_rank, after_rank in zip(statuses, after_ranks, strict=True):
+            if before_rank["rank"] != after_rank["rank"] or before_rank["graphs"] != after_rank["graphs"]:
+                raise AssertionError("serving rank or graph identity changed")
+            for name, before_layer in before_rank["layers"].items():
+                if before_layer["pointers"] != after_rank["layers"][name]["pointers"]:
+                    raise AssertionError("serving rank-local cache pointer changed")
         if status is not None and status["graphs"] != after["graphs"]:
             raise AssertionError("serving recaptured or replaced a CUDA graph")
         for name, before in status["layers"].items() if status else ():
@@ -493,7 +501,7 @@ async def run(args):
                 for name, before in status["layers"].items()
             ):
                 raise AssertionError("shutdown diagnostic changed captured storage")
-        record("serving_complete", status=after)
+        record("serving_complete", status=after, ranks=after_ranks)
         completed = True
     except BaseException as error:
         record(
@@ -597,6 +605,11 @@ def main():
         help="Opt-in retained counter cuts; zero allocates no history",
     )
     p.add_argument("--eager", action="store_true")
+    p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--phase-timing", action="store_true",
+                   help="Opt-in bounded model CUDA timing, separately from client TTFT")
+    p.add_argument("--phase-observations", action="store_true",
+                   help="Calibration/counters-only prefill and decode route observations")
     p.add_argument(
         "--execution-trace",
         type=Path,

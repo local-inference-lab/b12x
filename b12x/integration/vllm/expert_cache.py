@@ -50,6 +50,7 @@ class ExpertCacheServingConfig:
     health_probes: bool = False
     history_depth: int = 0
     anchor_health: bool = False
+    phase_observations: bool = False
 
     def __post_init__(self):
         if (
@@ -84,6 +85,8 @@ class ExpertCacheServingConfig:
             raise ValueError("routing history requires explicitly adaptive serving")
         if self.mode == "adaptive" and not self.max_pairs_per_layer:
             raise ValueError("adaptive cache requires positive prepared fill capacity")
+        if type(self.phase_observations) is not bool or self.phase_observations and (self.mode == "static" or self.health_probes or self.history_depth):
+            raise ValueError("phase observations require explicit calibration/counters without health or history")
 
 
 def digest(value):
@@ -97,13 +100,18 @@ def digest(value):
 class ExpertCacheModel:
     """One serialized execution lane, owned alongside its PreparationSession."""
 
-    def __init__(self, config, checkpoint_id, device):
+    def __init__(self, config, checkpoint_id, device, *, tp_rank=0, tp_size=1):
         self.config, self.checkpoint_id, self.device = (
             config,
             checkpoint_id,
             torch.device(device),
         )
         self.sources, self.plans, self.placements = {}, {}, {}
+        if type(tp_size) is not int or tp_size < 1 or type(tp_rank) is not int or not 0 <= tp_rank < tp_size:
+            raise ValueError("cache rank must belong to the TP group")
+        if tp_size > 1 and (config.history_depth or config.anchor_health):
+            raise ValueError("TP cache qualification excludes routing history and anchor recovery")
+        self.tp_rank, self.tp_size = tp_rank, tp_size
         self.counter = self.memory = self.runtime = None
         self.anchor = None
         self.capacity = None
@@ -142,6 +150,8 @@ class ExpertCacheModel:
         self._profile_started = False
 
     def add_source(self, source):
+        if (source.storage.shard.rank, source.storage.shard.world_size) != (self.tp_rank, self.tp_size):
+            raise ValueError("source shard differs from the serving TP group")
         name = source.weights.layer_name
         if (
             self.plans
@@ -154,6 +164,7 @@ class ExpertCacheModel:
     def _identity(self):
         return {
             "version": 1,
+            **({"tp_size": self.tp_size, "source_encoding": "modelopt_nvfp4"} if self.tp_size > 1 else {}),
             "checkpoint": self.checkpoint_id,
             "top_k": None if self.capacity is None else self.capacity.top_k,
             "recipe": "nvfp4_w4a16_whole_k_weighted_bf16_ordered_sum",
@@ -161,6 +172,8 @@ class ExpertCacheModel:
             "layers": {
                 name: {
                     **asdict(s.plan.geometry),
+                    **({"global_intermediate_size": s.storage.shard.global_intermediate}
+                       if self.tp_size > 1 else {}),
                     "w13_layout": s.plan.source.w13_layout.value,
                 }
                 for name, s in sorted(self.sources.items())
@@ -218,6 +231,8 @@ class ExpertCacheModel:
                 layers=tuple((name, q.experts) for name, q in queries.items()),
                 max_tokens=capacity.max_tokens,
                 max_top_k=capacity.top_k,
+                phases=("decode", "prefill") if c.phase_observations else ("decode",),
+                runtime_phase_ranges=c.phase_observations,
             ).storage_bytes
             # Fair cold start; learned profiles may later allocate unevenly.
             while True:
@@ -318,10 +333,14 @@ class ExpertCacheModel:
                     ),
                     max_tokens=capacity.max_tokens,
                     max_top_k=capacity.top_k,
-                    runtime_token_limit=True,
-                    health_summary=c.health_probes,
+                    runtime_token_limit=not c.phase_observations,
+                    runtime_phase_ranges=c.phase_observations,
+                    phases=("decode", "prefill") if c.phase_observations else ("decode",),
+                    health_summary=c.health_probes and self.tp_rank == 0,
                     history_depth=c.history_depth,
                     anchor_summary=c.anchor_health,
+                    rank=self.tp_rank, tp_size=self.tp_size,
+                    observe_all_ranks=self.tp_size > 1,
                 )
             )
         if c.anchor_health:
@@ -345,7 +364,7 @@ class ExpertCacheModel:
         allocated = torch.cuda.memory_allocated(self.device)
         host_free = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         host_new = sum(m.backing_bytes + m.update_host_bytes for m in memories.values()) + health_host_bytes
-        if host_new + c.host_safety_bytes > host_free:
+        if (host_new + c.host_safety_bytes) * self.tp_size > host_free:
             raise ValueError(
                 "canonical mapped backing exceeds available physical host memory"
             )
@@ -407,12 +426,15 @@ class ExpertCacheModel:
                     (1, self.capacity.top_k), device=self.device, dtype=torch.int32
                 )
                 bindings = [
-                    state.bind(layer=name, phase="decode", topk_ids=ids)
+                    state.bind(layer=name, phase=None if self.config.phase_observations else "decode", topk_ids=ids)
                     for name in self.observed_layers
                 ]
 
                 def run():
-                    state.set_token_limit(self.capacity.max_tokens)
+                    if self.config.phase_observations:
+                        state.set_phase_ranges(((0, 1, 1),))
+                    else:
+                        state.set_token_limit(self.capacity.max_tokens)
                     for binding in bindings:
                         binding.run()
                     if state.health is not None:
@@ -438,7 +460,10 @@ class ExpertCacheModel:
         counters = moe.routing_profile_state(self.counter)
         self._counters = counters
         counters.reset(quiescent=True)
-        counters.set_token_limit(0)
+        if self.config.phase_observations:
+            counters.set_phase_ranges(())
+        else:
+            counters.set_token_limit(0)
         if counters.history is not None:
             # Preparation's copy/event priming precedes producer ownership.
             counters.history.epoch = counters.history.stream = None
@@ -456,13 +481,14 @@ class ExpertCacheModel:
                         experts=plan.query.experts,
                         phase="decode",
                         max_top_k=plan.query.top_k,
+                        rank=self.tp_rank,
                     ),
                 )
                 for name, plan in self.plans.items()
                 if plan.query.max_pairs
             }
             self.runtime = ResidencyEpochRuntime(
-                rank=0,
+                rank=self.tp_rank,
                 owner_rank=0,
                 bindings=bindings,
                 snapshot_counters=counters.snapshot,
@@ -470,17 +496,21 @@ class ExpertCacheModel:
                 initial_profile_id=self.profile_id,
                 memory=self.memory,
                 anchor=self.anchor,
+                verify_rank_counters=self.tp_size > 1,
             )
 
-    def prepare_observation(self, decode_tokens):
+    def prepare_observation(self, decode_tokens, *, phase_ranges=()):
         """Publish phase-qualified live rows with one prepared metadata launch."""
         if self._counters is not None:
-            self._counters.set_token_limit(decode_tokens)
+            if self.config.phase_observations:
+                self._counters.set_phase_ranges(phase_ranges)
+            else:
+                self._counters.set_token_limit(decode_tokens)
 
     def observe(self, name, ids):
         if name in self.observed_layers:
             moe.bind_routing_profile(
-                self.counter, layer=name, phase="decode", topk_ids=ids
+                self.counter, layer=name, phase=None if self.config.phase_observations else "decode", topk_ids=ids
             ).run()
 
     def start_profile(self, *, quiescent=False):
@@ -493,7 +523,10 @@ class ExpertCacheModel:
             raise RuntimeError("calibration has already started")
         before = self._counters.snapshot(quiescent=True)
         self._counters.reset(quiescent=True)
-        self._counters.set_token_limit(0)
+        if self.config.phase_observations:
+            self._counters.set_phase_ranges(())
+        else:
+            self._counters.set_token_limit(0)
         self._profile_started = True
         return {"discarded_startup_observations": asdict(before)}
 
@@ -503,7 +536,7 @@ class ExpertCacheModel:
         if not self._profile_started:
             raise ValueError("calibration must start after engine warmup before saving")
         snapshot = moe.routing_profile_state(self.counter).snapshot(quiescent=quiescent)
-        rows = {row.layer: row for row in snapshot.layers}
+        rows = {row.layer: row for row in snapshot.layers if row.phase == "decode"}
         if any(not sum(row.counts) for row in rows.values()):
             raise ValueError("every layer needs real decode observations before saving")
         placements = {
@@ -523,8 +556,11 @@ class ExpertCacheModel:
             "placements": placements,
             "termination": "explicit_calibration_boundary",
             "converged": False,
+            **({"phase_counts": [asdict(row) for row in snapshot.layers]} if self.config.phase_observations else {}),
         }
         payload["hash"] = digest(payload)
+        if self.tp_rank != 0:
+            return {"path": None, "hash": payload["hash"], "snapshot": asdict(snapshot)}
         path = Path(self.config.profile_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
