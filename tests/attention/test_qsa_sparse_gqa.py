@@ -31,6 +31,7 @@ def test_split_merge_matches_softmax_with_empty_heads_and_changed_graph_inputs(
     lse[:, 1::3] = -torch.inf
     lse[0, :, 0] = -torch.inf
     output = torch.empty(16, heads, 256, dtype=torch.bfloat16, device=device)
+    output_lse = torch.empty(16, heads, dtype=torch.float32, device=device)
 
     for rows in (1, 4, 16):
 
@@ -39,6 +40,7 @@ def test_split_merge_matches_softmax_with_empty_heads_and_changed_graph_inputs(
                 partial_output=partials[:rows],
                 partial_lse=lse[:rows],
                 output=output[:rows],
+                output_lse=output_lse[:rows],
                 rows=rows,
                 splits=splits,
             )
@@ -58,6 +60,12 @@ def test_split_merge_matches_softmax_with_empty_heads_and_changed_graph_inputs(
                 expected,
                 rtol=4e-3,
                 atol=3e-5,
+            )
+            torch.testing.assert_close(
+                output_lse[:rows].double(),
+                torch.logsumexp(lse[:rows].double(), dim=1),
+                rtol=1e-5,
+                atol=1e-5,
             )
             assert torch.count_nonzero(output[0, 0]) == 0
             assert torch.count_nonzero(output[:rows, -1]) > 0
@@ -82,6 +90,7 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
             torch.randn(rows, splits, heads, 256, device=device),
             torch.randn(rows, splits, heads, device=device) * 8,
             torch.empty(rows, heads, 256, device=device, dtype=torch.bfloat16),
+            torch.empty(rows, heads, device=device, dtype=torch.float32),
         )
         for rows, splits in geometries
     }
@@ -94,11 +103,12 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
             implementation.clear_caches()
 
             def launch(rows, splits):
-                partials, lse, output = buffers[rows, splits]
+                partials, lse, output, output_lse = buffers[rows, splits]
                 implementation.launch_sparse_gqa_merge(
                     partial_output=partials,
                     partial_lse=lse,
                     output=output,
+                    output_lse=output_lse,
                     rows=rows,
                     splits=splits,
                 )
@@ -113,13 +123,15 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
                     graphs[label, rows, splits] = graph
                 assert tuple(implementation._MERGE_CACHE.items()) == warmed
         for rows, splits in geometries:
-            partials, lse, output = buffers[rows, splits]
+            partials, lse, output, output_lse = buffers[rows, splits]
             for _ in range(3):
                 partials.normal_()
                 lse.normal_()
                 lse[:, 1::3] = -torch.inf
                 lse[0, :, 0] = -torch.inf
-                pointers = tuple(t.data_ptr() for t in (partials, lse, output))
+                pointers = tuple(
+                    t.data_ptr() for t in (partials, lse, output, output_lse)
+                )
 
                 def replay(label):
                     output.fill_(float("nan"))
@@ -130,12 +142,16 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
                     after = torch.cuda.memory_stats()
                     for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
                         assert after[key] == before[key]
-                    assert tuple(t.data_ptr() for t in (partials, lse, output)) == pointers
+                    assert tuple(
+                        t.data_ptr() for t in (partials, lse, output, output_lse)
+                    ) == pointers
 
                 replay("serial")
                 expected = output.clone()
+                expected_lse = output_lse.clone()
                 replay("cooperative")
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                torch.testing.assert_close(output_lse, expected_lse, rtol=0, atol=0)
                 assert torch.count_nonzero(output[0, 0]) == 0
                 assert torch.count_nonzero(output[:rows, -1]) > 0
     finally:
@@ -237,8 +253,9 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
     output = torch.empty_like(query)
     partials = torch.empty((capacity, splits, heads, 256), device=device)
     lse = torch.empty((capacity, splits, heads), device=device)
+    output_lse = torch.empty((capacity, heads), device=device)
     descale = torch.ones(1, device=device) if kv_dtype == torch.float8_e4m3fn else None
-    buffers = (query, cache, selected, output, partials, lse)
+    buffers = (query, cache, selected, output, output_lse, partials, lse)
     pointers = tuple(t.data_ptr() for t in buffers)
 
     def launch(rows):
@@ -247,6 +264,7 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
             k_descale=descale, v_descale=descale, block_table=block_table,
             request_ids=request_ids[:rows], selected_positions=selected[:rows],
             query_positions=positions[:rows], output=output[:rows],
+            output_lse=output_lse[:rows],
             partial_output=partials[:rows], partial_lse=lse[:rows],
             softmax_scale=1 / 16, block_n=16, splits=splits,
         )
@@ -626,6 +644,7 @@ def test_qwen_geometry_rejects_invalid_cute_contract_instead_of_fallback(
             selected_positions=selected_positions,
             query_positions=query_positions,
             output=output,
+            output_lse=torch.empty((rows, q_heads), dtype=torch.float32, device="meta"),
             partial_output=partial_output,
             partial_lse=partial_lse,
             softmax_scale=1.0 / 16.0,
@@ -661,6 +680,9 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
             selected_positions=selected_positions,
             query_positions=torch.empty((rows,), dtype=torch.int64, device="meta"),
             output=torch.empty_like(query),
+            output_lse=torch.empty(
+                (rows, q_heads), dtype=torch.float32, device="meta"
+            ),
             partial_output=torch.empty(
                 (rows, 4, q_heads, head_dim), dtype=torch.float32, device="meta"
             ),
@@ -697,6 +719,9 @@ def test_large_prefill_rejects_layouts_not_supported_by_selected_abi() -> None:
         "request_ids": request_ids,
         "selected_positions": selected_positions,
         "query_positions": query_positions,
+        "output_lse": torch.empty(
+            (rows, q_heads), dtype=torch.float32, device=device
+        ),
         "partial_output": None,
         "partial_lse": None,
         "softmax_scale": 1.0 / math.sqrt(head_dim),
@@ -820,6 +845,9 @@ def test_sparse_gqa_matches_gathered_dense_reference(
         dtype=torch.bfloat16,
         device=device,
     )
+    output_lse = torch.empty(
+        (rows + 2, q_heads), dtype=torch.float32, device=device
+    )
     partial_output = (
         torch.empty(
             (rows, splits, q_heads, head_dim),
@@ -844,6 +872,7 @@ def test_sparse_gqa_matches_gathered_dense_reference(
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=softmax_scale,
@@ -890,6 +919,7 @@ def test_large_prefill_sparse_gqa_addresses_paged_cache(
     selected_positions[:, 0] = 0
     query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
     output = torch.full_like(query, float("nan"))
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     k_descale = None
     v_descale = None
     value_scale = 1.0
@@ -909,6 +939,7 @@ def test_large_prefill_sparse_gqa_addresses_paged_cache(
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=None,
         partial_lse=None,
         softmax_scale=1.0 / math.sqrt(head_dim),
@@ -988,6 +1019,8 @@ def test_large_prefill_selected_paged_gqa_matches_split_for_full_selection(
     ).to(device)
     direct_output = torch.empty_like(query)
     cute_output = torch.empty_like(query)
+    direct_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
+    cute_lse = torch.empty_like(direct_lse)
     split_output = torch.empty(
         (rows, 16, q_heads, head_dim), dtype=torch.float32, device=device
     )
@@ -1005,6 +1038,7 @@ def test_large_prefill_selected_paged_gqa_matches_split_for_full_selection(
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=direct_output,
+        output_lse=direct_lse,
         softmax_scale=scale,
         kv_warps=direct_kv_warps,
     )
@@ -1027,10 +1061,12 @@ def test_large_prefill_selected_paged_gqa_matches_split_for_full_selection(
         partial_output=split_output,
         partial_lse=split_lse,
         output=cute_output,
+        output_lse=cute_lse,
         rows=rows,
         splits=16,
     )
     torch.testing.assert_close(direct_output, cute_output, rtol=0.0, atol=3e-2)
+    torch.testing.assert_close(direct_lse, cute_lse, rtol=0.0, atol=2e-3)
 
 
 def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
@@ -1075,6 +1111,7 @@ def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
         device=device,
     )
     output = torch.empty_like(query)
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     partial_output = torch.empty(
         (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
     )
@@ -1091,6 +1128,7 @@ def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=softmax_scale,
@@ -1157,6 +1195,7 @@ def test_sparse_gqa_fp8_3008_page_matches_reference_and_graph_replay() -> None:
         device=device,
     )
     output = torch.empty_like(query)
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     partial_output = torch.empty(
         (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
     )
@@ -1177,6 +1216,7 @@ def test_sparse_gqa_fp8_3008_page_matches_reference_and_graph_replay() -> None:
             selected_positions=selected_positions,
             query_positions=query_positions,
             output=output,
+            output_lse=output_lse,
             partial_output=partial_output,
             partial_lse=partial_lse,
             softmax_scale=softmax_scale,
@@ -1231,6 +1271,7 @@ def test_sparse_gqa_zeroes_padded_request_and_all_masked_rows() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     partial_output = torch.empty(
         (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
     )
@@ -1246,6 +1287,7 @@ def test_sparse_gqa_zeroes_padded_request_and_all_masked_rows() -> None:
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=1.0 / math.sqrt(head_dim),
@@ -1276,6 +1318,7 @@ def test_sparse_gqa_split_path_is_cuda_graph_replay_safe() -> None:
         96, dtype=torch.int64, device=device
     ).to(torch.int32)
     output = torch.empty_like(query)
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     partial_output = torch.empty(
         (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
     )
@@ -1293,6 +1336,7 @@ def test_sparse_gqa_split_path_is_cuda_graph_replay_safe() -> None:
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=scale,
@@ -1310,6 +1354,7 @@ def test_sparse_gqa_split_path_is_cuda_graph_replay_safe() -> None:
             selected_positions=selected_positions,
             query_positions=query_positions,
             output=output,
+            output_lse=output_lse,
             partial_output=partial_output,
             partial_lse=partial_lse,
             softmax_scale=scale,
@@ -1354,6 +1399,7 @@ def test_selected_paged_gqa_direct_path_is_cuda_graph_replay_safe(
     selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
     selected_positions[:, 0] = 0
     output = torch.empty_like(query)
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     scale = 1.0 / math.sqrt(head_dim)
 
     launch_sparse_paged_gqa(
@@ -1365,6 +1411,7 @@ def test_selected_paged_gqa_direct_path_is_cuda_graph_replay_safe(
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=None,
         partial_lse=None,
         softmax_scale=scale,
@@ -1383,6 +1430,7 @@ def test_selected_paged_gqa_direct_path_is_cuda_graph_replay_safe(
             selected_positions=selected_positions,
             query_positions=query_positions,
             output=output,
+            output_lse=output_lse,
             partial_output=None,
             partial_lse=None,
             softmax_scale=scale,
@@ -1438,6 +1486,7 @@ def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
         )
         query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
         output = torch.empty_like(query)
+        output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
         return launch_sparse_paged_gqa(
             query=query,
             key_cache=key_cache,
@@ -1447,6 +1496,7 @@ def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
             selected_positions=selected_positions,
             query_positions=query_positions,
             output=output,
+            output_lse=output_lse,
             partial_output=None,
             partial_lse=None,
             softmax_scale=1.0 / math.sqrt(head_dim),
@@ -1487,6 +1537,7 @@ def test_large_prefill_direct_path_does_not_touch_split_scratch() -> None:
     selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
     selected_positions[:, 0] = 0
     output = torch.empty_like(query)
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     partial_output = torch.full(
         (rows, 64, q_heads, head_dim),
         float("nan"),
@@ -1511,6 +1562,7 @@ def test_large_prefill_direct_path_does_not_touch_split_scratch() -> None:
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=1.0 / math.sqrt(head_dim),
@@ -1591,6 +1643,7 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
     selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
     selected_positions[:, 0] = 0
     output = torch.empty_like(query)
+    output_lse = torch.empty((rows, q_heads), dtype=torch.float32, device=device)
     actual = launch_sparse_paged_gqa(
         query=query,
         key_cache=cache,
@@ -1602,6 +1655,7 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
+        output_lse=output_lse,
         partial_output=None,
         partial_lse=None,
         softmax_scale=1.0 / math.sqrt(head_dim),

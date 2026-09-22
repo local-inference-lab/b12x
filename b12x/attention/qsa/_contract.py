@@ -213,6 +213,9 @@ class Caps:
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
     kv_dtype: torch.dtype = torch.bfloat16
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    cp_kv_cache_interleave_size: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -242,6 +245,14 @@ class Caps:
                 raise ValueError(f"{name} must be positive")
         if int(self.max_speculative_tokens) < 0:
             raise ValueError("max_speculative_tokens must be nonnegative")
+        from ._dcp import validate_geometry
+
+        validate_geometry(
+            size=int(self.dcp_size),
+            rank=int(self.dcp_rank),
+            token_interleave=int(self.cp_kv_cache_interleave_size),
+            compress_ratio=int(self.compress_ratio),
+        )
         if not math.isfinite(float(self.rms_norm_eps)) or float(self.rms_norm_eps) <= 0:
             raise ValueError("rms_norm_eps must be finite and positive")
         if int(self.max_raw_state_slots) < int(self.max_batch):
@@ -309,7 +320,7 @@ class Caps:
         if int(self.main_page_size) % int(self.raw_ring_capacity):
             raise ValueError("raw_ring_capacity must divide main_page_size")
         if int(self.num_main_cache_pages) * int(self.main_page_size) < int(
-            self.max_seq_len
+            self.max_local_seq_len
         ):
             raise ValueError("main cache capacity cannot cover max_seq_len")
         if (
@@ -377,11 +388,40 @@ class Caps:
 
     @property
     def max_groups(self) -> int:
+        return self.max_local_groups
+
+    @property
+    def max_global_groups(self) -> int:
         return int(self.max_seq_len) // int(self.compress_ratio)
 
     @property
+    def max_local_seq_len(self) -> int:
+        from ._dcp import local_length
+
+        return local_length(
+            int(self.max_seq_len),
+            size=int(self.dcp_size),
+            rank=int(self.dcp_rank),
+            interleave=int(self.cp_kv_cache_interleave_size),
+        )
+
+    @property
+    def max_local_groups(self) -> int:
+        if int(self.dcp_size) == 1:
+            return self.max_global_groups
+        from ._dcp import local_length
+
+        return local_length(
+            self.max_global_groups,
+            size=int(self.dcp_size),
+            rank=int(self.dcp_rank),
+            interleave=int(self.cp_kv_cache_interleave_size)
+            // int(self.compress_ratio),
+        )
+
+    @property
     def main_table_width(self) -> int:
-        return math.ceil(int(self.max_seq_len) / int(self.main_page_size))
+        return math.ceil(self.max_local_seq_len / int(self.main_page_size))
 
     @property
     def compressed_table_width(self) -> int:
@@ -412,6 +452,8 @@ class _ScratchLayout:
     partial_output_nbytes: int
     partial_lse_offset_bytes: int
     partial_lse_nbytes: int
+    output_lse_offset_bytes: int
+    output_lse_nbytes: int
     draft_positions_offset_bytes: int
     total_nbytes: int
 
@@ -428,11 +470,13 @@ class QsaPrograms:
     support: Mapping[str, object]
     score: object
     sparse: Mapping[str, object]
+    sparse_draft: Mapping[str, object]
     draft: Mapping[str, object]
 
     def __post_init__(self) -> None:
         objects = (
             *self.support.values(), self.score, *self.sparse.values(),
+            *self.sparse_draft.values(),
             *self.draft.values(),
         )
         if any(item is None for item in objects):
@@ -660,11 +704,20 @@ class Binding:
     topk_group_ids_b: torch.Tensor
     partial_output: torch.Tensor
     partial_lse: torch.Tensor
+    output_lse: torch.Tensor
     selection_stream: torch.cuda.Stream | None = None
     _selection_done: torch.cuda.Event | None = None
     draft_selection: DraftSelectionState | None = None
     _draft_work_positions: torch.Tensor | None = None
     _record_draft_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class LocalSelection:
+    """Rank-local QSA group candidates for an exact DCP merge."""
+
+    group_ids: torch.Tensor
+    scores: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -688,6 +741,9 @@ class _KernelCaps:
     rms_norm_eps: float
     raw_ring_capacity: int
     max_speculative_tokens: int
+    dcp_size: int
+    dcp_rank: int
+    cp_kv_cache_interleave_size: int
 
     @property
     def group_budget(self) -> int:
@@ -699,7 +755,17 @@ class _KernelCaps:
 
     @property
     def max_groups(self) -> int:
-        return int(self.max_seq_len) // int(self.compress_ratio)
+        global_groups = int(self.max_seq_len) // int(self.compress_ratio)
+        if int(self.dcp_size) == 1:
+            return global_groups
+        interleave = int(self.cp_kv_cache_interleave_size) // int(
+            self.compress_ratio
+        )
+        round_width = int(self.dcp_size) * interleave
+        full_rounds, remainder = divmod(global_groups, round_width)
+        return full_rounds * interleave + min(
+            max(remainder - int(self.dcp_rank) * interleave, 0), interleave
+        )
 
 
 def _qwen_row_splits(rows: int) -> int:
@@ -778,6 +844,9 @@ def _scratch_layout(
     partial_lse_nbytes = (
         max_split_row_product * int(caps.q_heads) * torch.float32.itemsize
     )
+    output_lse_nbytes = (
+        int(caps.max_q_rows) * int(caps.q_heads) * torch.float32.itemsize
+    )
     eligible_counts_nbytes = workspace_q_rows * torch.int32.itemsize
     merge_lengths_nbytes = workspace_q_rows * torch.int32.itemsize
     topk_values_nbytes = (
@@ -821,6 +890,8 @@ def _scratch_layout(
     offset = partial_output_offset + partial_output_nbytes
     partial_lse_offset = _align_up(offset)
     offset = partial_lse_offset + partial_lse_nbytes
+    output_lse_offset = _align_up(offset)
+    offset = output_lse_offset + output_lse_nbytes
     draft_positions_offset = _align_up(offset)
     if caps.max_speculative_tokens > 0:
         offset = (
@@ -854,6 +925,8 @@ def _scratch_layout(
             partial_output_nbytes=partial_output_nbytes,
             partial_lse_offset_bytes=partial_lse_offset,
             partial_lse_nbytes=partial_lse_nbytes,
+            output_lse_offset_bytes=output_lse_offset,
+            output_lse_nbytes=output_lse_nbytes,
             draft_positions_offset_bytes=draft_positions_offset,
             total_nbytes=total_nbytes,
         ),
@@ -1076,6 +1149,9 @@ def _query_from_caps(caps: Caps, invocation: FrozenMapping) -> QsaQuery:
         compressed_page_size=caps.compressed_page_size,
         mrope_sections=caps.mrope_sections,
         rms_norm_eps=caps.rms_norm_eps,
+        dcp_size=caps.dcp_size,
+        dcp_rank=caps.dcp_rank,
+        cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
         abi=abi,
     )
 def _materialize(caps: Caps, abi: FrozenMapping, config: QsaConfig) -> _MaterializedPlan:
@@ -1124,6 +1200,9 @@ def _caps_from_query(query: QsaQuery, *, ordinal: int) -> Caps:
         rms_norm_eps=query.rms_norm_eps,
         dtype=getattr(torch, query.q_dtype),
         kv_dtype=getattr(torch, query.kv_dtype),
+        dcp_size=query.dcp_size,
+        dcp_rank=query.dcp_rank,
+        cp_kv_cache_interleave_size=query.cp_kv_cache_interleave_size,
     )
 
 
@@ -1260,6 +1339,9 @@ def compile_qsa(
             mrope_interleaved=caps.mrope_interleaved, rms_norm_eps=caps.rms_norm_eps,
             raw_ring_capacity=caps.raw_ring_capacity,
             max_speculative_tokens=caps.max_speculative_tokens,
+            dcp_size=caps.dcp_size,
+            dcp_rank=caps.dcp_rank,
+            cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
         )
         score = compile_score_representatives(
             prepared_query=prepared, query_positions=positions, request_ids=request_ids,
@@ -1270,7 +1352,24 @@ def compile_qsa(
         sparse = compile_sparse_paged_gqa(
             query=q, key_cache=main_k, value_cache=main_v, request_ids=request_ids,
             selected_positions=selected[:rows], direct_kv_warps=config.sparse_gqa_direct_kv_warps,
+            return_lse=caps.dcp_size > 1,
         )
+        if caps.max_speculative_tokens:
+            draft_selected = empty(
+                (rows, caps.selection_width + caps.max_speculative_tokens),
+                torch.int32,
+            )
+            sparse_draft = compile_sparse_paged_gqa(
+                query=q,
+                key_cache=main_k,
+                value_cache=main_v,
+                request_ids=request_ids,
+                selected_positions=draft_selected,
+                direct_kv_warps=config.sparse_gqa_direct_kv_warps,
+                return_lse=caps.dcp_size > 1,
+            )
+        else:
+            sparse_draft = sparse
         draft = {}
         # One complete transaction under the compile context compiles every
         # support program the runtime launches, with the runtime ABI.
@@ -1295,6 +1394,10 @@ def compile_qsa(
                 layout.topk_values_b_offset_bytes, layout.topk_indices_b_offset_bytes,
                 layout.topk_offset_bytes, layout.partial_output_offset_bytes,
                 layout.partial_lse_offset_bytes,
+                layout.output_lse_offset_bytes,
+                dcp_size=caps.dcp_size,
+                dcp_rank=caps.dcp_rank,
+                cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
                 programs=SimpleNamespace(support=support, score=score, sparse=sparse),
             )
         if not support:
@@ -1317,12 +1420,20 @@ def compile_qsa(
                 draft_state.num_source_rows, empty((rows,), torch.int32), positions,
                 selected, rows, caps.max_q_rows, caps.max_batch,
                 WIDTH=caps.selection_width, TAIL=caps.max_speculative_tokens,
+                DCP_SIZE=caps.dcp_size, DCP_RANK=caps.dcp_rank,
+                CP_INTERLEAVE=caps.cp_kv_cache_interleave_size,
                 BLOCK=triton.next_power_of_2(caps.selection_width + caps.max_speculative_tokens),
                 num_warps=4,
             )
         else:
             draft["disabled"] = score
-    return QsaPrograms(support=support, score=score, sparse=sparse, draft=draft)
+    return QsaPrograms(
+        support=support,
+        score=score,
+        sparse=sparse,
+        sparse_draft=sparse_draft,
+        draft=draft,
+    )
 
 
 def plan(
@@ -1950,6 +2061,12 @@ def _bind_materialized(
         shape=(int(state.max_split_row_product), int(caps.q_heads)),
         dtype=torch.float32,
     )
+    output_lse = _scratch_view(
+        scratch_storage,
+        offset_bytes=layout.output_lse_offset_bytes,
+        shape=(int(caps.max_q_rows), int(caps.q_heads)),
+        dtype=torch.float32,
+    )
     if draft_selection is not None:
         if not isinstance(draft_selection, DraftSelectionState):
             raise TypeError("draft_selection must be a qsa.DraftSelectionState")
@@ -2081,6 +2198,7 @@ def _bind_materialized(
         topk_group_ids_b=topk_group_ids_b,
         partial_output=partial_output,
         partial_lse=partial_lse,
+        output_lse=output_lse,
     )
 
 
@@ -2152,7 +2270,11 @@ def _qsa_decode_impl(
     topk_offset_bytes: int,
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
+    output_lse_offset_bytes: int,
     *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
     programs: QsaPrograms | None = None,
 ) -> None:
     """Launch selector state updates, optionally followed by sparse attention."""
@@ -2185,6 +2307,9 @@ def _qsa_decode_impl(
         rms_norm_eps=float(rms_norm_eps),
         raw_ring_capacity=int(raw_k_ring.shape[1]),
         max_speculative_tokens=int(max_speculative_tokens),
+        dcp_size=int(dcp_size),
+        dcp_rank=int(dcp_rank),
+        cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
     )
 
     max_q_rows = int(selected_positions.shape[0])
@@ -2296,8 +2421,15 @@ def _qsa_decode_impl(
         shape=(int(max_split_row_product), q_heads),
         dtype=torch.float32,
     )
+    output_lse_storage = _scratch_view(
+        scratch,
+        offset_bytes=int(output_lse_offset_bytes),
+        shape=(max_q_rows, q_heads),
+        dtype=torch.float32,
+    )
     from ._kernels import (
         launch_compress_completed_groups,
+        launch_expand_global_selected_groups,
         launch_expand_selected_groups,
         launch_prepare_index_query,
         launch_stabilize_topk,
@@ -2442,20 +2574,27 @@ def _qsa_decode_impl(
             final_ids = output_ids
 
         selected = selected_positions[row_slice]
-        launch_expand_selected_groups(
-            topk_group_ids=final_ids,
-            eligible_counts=chunk_eligible,
-            query_positions=chunk_positions,
-            selected_positions=selected,
-            caps=caps,
-            _prepared=None if programs is None else programs.support,
-        )
+        if int(caps.dcp_size) == 1:
+            launch_expand_selected_groups(
+                topk_group_ids=final_ids,
+                eligible_counts=chunk_eligible,
+                query_positions=chunk_positions,
+                selected_positions=selected,
+                caps=caps,
+                _prepared=None if programs is None else programs.support,
+            )
 
-        # Selection has no dependency on main Q/K/V contents. Its selected
-        # positions remain live until the attention stage consumes them.
         if query is None:
             continue
 
+        if int(caps.dcp_size) > 1:
+            launch_expand_global_selected_groups(
+                topk_group_ids=final_ids,
+                query_positions=chunk_positions,
+                selected_positions=selected,
+                caps=caps,
+                _prepared=None if programs is None else programs.support,
+            )
         block_n, splits = _target_splits(caps, chunk_rows)
         split_output = None
         split_lse = None
@@ -2478,6 +2617,11 @@ def _qsa_decode_impl(
             selected_positions=selected,
             query_positions=chunk_positions,
             output=active_output,
+            output_lse=(
+                output_lse_storage[row_slice]
+                if int(caps.dcp_size) > 1
+                else None
+            ),
             partial_output=split_output,
             partial_lse=split_lse,
             softmax_scale=1.0 / math.sqrt(head_dim),
@@ -2562,6 +2706,7 @@ def _qsa_decode_op(
     topk_offset_bytes: int,
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
+    output_lse_offset_bytes: int,
     selection_only: bool,
 ) -> None:
     state = require_prepared(plan_from_handle(plan_handle), "attention.qsa", query.device)
@@ -2669,6 +2814,10 @@ def _qsa_decode_op(
         topk_offset_bytes,
         partial_output_offset_bytes,
         partial_lse_offset_bytes,
+        output_lse_offset_bytes,
+        dcp_size=state.caps.dcp_size,
+        dcp_rank=state.caps.dcp_rank,
+        cp_kv_cache_interleave_size=state.caps.cp_kv_cache_interleave_size,
         programs=state.programs,
     )
 
@@ -2732,6 +2881,7 @@ def _qsa_decode_fake(
     topk_offset_bytes: int,
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
+    output_lse_offset_bytes: int,
     selection_only: bool,
 ) -> None:
     return None
@@ -2861,6 +3011,7 @@ def _qsa_decode_shared_op(
     topk_offset_bytes: int,
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
+    output_lse_offset_bytes: int,
     selection_only: bool,
 ) -> None:
     state = require_prepared(plan_from_handle(plan_handle), "attention.qsa", query.device)
@@ -2976,6 +3127,10 @@ def _qsa_decode_shared_op(
         topk_offset_bytes,
         partial_output_offset_bytes,
         partial_lse_offset_bytes,
+        output_lse_offset_bytes,
+        dcp_size=state.caps.dcp_size,
+        dcp_rank=state.caps.dcp_rank,
+        cp_kv_cache_interleave_size=state.caps.cp_kv_cache_interleave_size,
         programs=state.programs,
     )
 
@@ -3037,6 +3192,7 @@ def _qsa_decode_shared_fake(
     topk_offset_bytes: int,
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
+    output_lse_offset_bytes: int,
     selection_only: bool,
 ) -> None:
     return None
@@ -3221,6 +3377,10 @@ def _run(
             int(binding.state._layout.topk_offset_bytes),
             int(binding.state._layout.partial_output_offset_bytes),
             int(binding.state._layout.partial_lse_offset_bytes),
+            int(binding.state._layout.output_lse_offset_bytes),
+            dcp_size=caps.dcp_size,
+            dcp_rank=caps.dcp_rank,
+            cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
             programs=programs,
         )
         return binding.output[:rows]
@@ -3284,6 +3444,7 @@ def _run(
             int(layout.topk_offset_bytes),
             int(layout.partial_output_offset_bytes),
             int(layout.partial_lse_offset_bytes),
+            int(layout.output_lse_offset_bytes),
             selection_only,
         )
         return binding.output[:rows]
@@ -3345,6 +3506,7 @@ def _run(
         int(layout.topk_offset_bytes),
         int(layout.partial_output_offset_bytes),
         int(layout.partial_lse_offset_bytes),
+        int(layout.output_lse_offset_bytes),
         selection_only,
     )
     return binding.output[:rows]
@@ -3426,6 +3588,8 @@ def run(
         raise TypeError("binding must be a qsa.Binding")
     if not isinstance(binding.plan, Plan):
         raise TypeError("QSA binding requires a prepared plan")
+    if binding.state.caps.dcp_size > 1:
+        raise ValueError("DCP QSA requires select() followed by attend()")
     if reuse is not None:
         if not isinstance(reuse, DraftSelectionReuse):
             raise TypeError("reuse must be a qsa.DraftSelectionReuse")
@@ -3495,6 +3659,9 @@ def run(
             binding.state._layout.draft_positions_offset_bytes,
             caps.max_batch,
             caps.max_speculative_tokens,
+            caps.dcp_size,
+            caps.dcp_rank,
+            caps.cp_kv_cache_interleave_size,
         )
         return _run_attention(
             binding,
@@ -3570,6 +3737,164 @@ def run(
         return result
 
 
+def select(
+    binding: Binding,
+    *,
+    query: torch.Tensor,
+    index_query: torch.Tensor,
+    raw_index_key: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    rope_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
+) -> LocalSelection:
+    """Update selector state and return rank-local group IDs and scores."""
+    if not isinstance(binding, Binding) or not isinstance(binding.plan, Plan):
+        raise TypeError("QSA selection requires a prepared binding")
+    if binding.state.caps.dcp_size <= 1:
+        raise ValueError("select() is reserved for context-parallel QSA")
+    if binding.selection_stream is not None:
+        raise ValueError("DCP QSA selection currently requires the calling stream")
+    _run(
+        binding,
+        query=query,
+        index_query=index_query,
+        raw_index_key=raw_index_key,
+        request_ids=request_ids,
+        query_positions=query_positions,
+        rope_positions=rope_positions,
+        sequence_lengths=sequence_lengths,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        is_prefilling=is_prefilling,
+        selection_only=True,
+    )
+    if binding.state.num_score_chunks % 2:
+        group_ids, scores = binding.topk_group_ids, binding.topk_values
+    else:
+        group_ids, scores = binding.topk_group_ids_b, binding.topk_values_b
+    rows = int(query.shape[0])
+    return LocalSelection(group_ids=group_ids[:rows], scores=scores[:rows])
+
+
+def attend(
+    binding: Binding,
+    *,
+    query: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    selection: LocalSelection,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand globally merged groups and return rank-local output and LSE."""
+    if not isinstance(binding, Binding) or not isinstance(binding.plan, Plan):
+        raise TypeError("QSA attention requires a prepared binding")
+    caps = binding.state.caps
+    if caps.dcp_size <= 1:
+        raise ValueError("attend() is reserved for context-parallel QSA")
+    if not isinstance(selection, LocalSelection):
+        raise TypeError("selection must be a qsa.LocalSelection")
+    rows = int(query.shape[0])
+    _check_tensor(
+        selection.group_ids,
+        name="selection.group_ids",
+        device=caps.device,
+        shape=(rows, caps.group_budget),
+        dtype=torch.int32,
+        contiguous=True,
+    )
+    from ._kernels import launch_expand_global_selected_groups
+
+    programs = binding.state.programs
+    if not isinstance(programs, QsaPrograms):
+        raise RuntimeError("QSA attention requires retained native programs")
+    launch_expand_global_selected_groups(
+        topk_group_ids=selection.group_ids,
+        query_positions=query_positions,
+        selected_positions=binding.selected_positions[:rows],
+        caps=caps,
+        _prepared=programs.support,
+    )
+    output = _run_attention(
+        binding,
+        query=query,
+        request_ids=request_ids,
+        query_positions=query_positions,
+    )
+    _record_draft_anchors(binding, query_positions)
+    return output, binding.output_lse[:rows]
+
+
+def attend_reuse(
+    binding: Binding,
+    *,
+    query: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    reuse: DraftSelectionReuse,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attend with a previously recorded rank-local draft selection."""
+    if not isinstance(binding, Binding) or not isinstance(binding.plan, Plan):
+        raise TypeError("QSA draft reuse requires a prepared binding")
+    state = binding.draft_selection
+    if state is None or not isinstance(reuse, DraftSelectionReuse):
+        raise ValueError("QSA draft reuse requires bound draft state and mapping")
+    caps = binding.state.caps
+    rows = int(query.shape[0])
+    if not 0 < rows <= min(caps.max_batch, binding.output.shape[0]):
+        raise ValueError("draft selection reuse requires one row per request")
+    for tensor, name, shape, dtype in (
+        (query, "query", (rows, caps.q_heads, caps.head_dim), torch.bfloat16),
+        (request_ids, "request_ids", (rows,), (torch.int32, torch.int64)),
+        (query_positions, "query_positions", (rows,), torch.int64),
+        (
+            reuse.source_rows,
+            "source_rows",
+            (caps.max_batch,),
+            (torch.int32, torch.int64),
+        ),
+    ):
+        _check_tensor(
+            tensor,
+            name=name,
+            device=caps.device,
+            shape=shape,
+            dtype=dtype,
+            contiguous=True,
+        )
+    from ._draft_selection import prepare_selection, validate_buffers
+
+    validate_buffers(
+        [binding.scratch, binding.output],
+        [query, request_ids, query_positions, reuse.source_rows],
+    )
+    prepare_selection(
+        state._storage,
+        state.plan.max_source_rows,
+        state.plan.selection_width,
+        reuse.source_rows,
+        request_ids,
+        query_positions,
+        binding.scratch,
+        binding.state._layout.draft_positions_offset_bytes,
+        caps.max_batch,
+        caps.max_speculative_tokens,
+        caps.dcp_size,
+        caps.dcp_rank,
+        caps.cp_kv_cache_interleave_size,
+    )
+    output = _run_attention(
+        binding,
+        query=query,
+        request_ids=request_ids,
+        query_positions=query_positions,
+        reuse=True,
+    )
+    return output, binding.output_lse[:rows]
+
+
 def _record_draft_anchors(binding: Binding, positions: torch.Tensor) -> None:
     if binding.draft_selection is not None:
         from ._draft_selection import record_anchors
@@ -3603,6 +3928,7 @@ def _qsa_attention_op(
     max_split_row_product: int,
     partial_output_offset: int,
     partial_lse_offset: int,
+    output_lse_offset: int,
     direct_kv_warps: int,
     draft_positions_offset: int,
     draft_width: int,
@@ -3629,7 +3955,8 @@ def _qsa_attention_op(
         ),
     )
     rows, q_heads, head_dim = map(int, query.shape)
-    if selected_positions is None:
+    draft_reuse = selected_positions is None
+    if draft_reuse:
         selected_positions = _scratch_view(
             scratch,
             offset_bytes=draft_positions_offset,
@@ -3648,6 +3975,12 @@ def _qsa_attention_op(
         shape=(max_split_row_product, q_heads),
         dtype=torch.float32,
     )
+    output_lse = _scratch_view(
+        scratch,
+        offset_bytes=output_lse_offset,
+        shape=(state.caps.max_q_rows, q_heads),
+        dtype=torch.float32,
+    )
     # Use the same row-chunk and native CuTe split policy as the combined call.
     for start in range(0, rows, work_rows):
         count = min(work_rows, rows - start)
@@ -3664,6 +3997,11 @@ def _qsa_attention_op(
             selected_positions=selected_positions[row_slice],
             query_positions=query_positions[row_slice],
             output=output[row_slice],
+            output_lse=(
+                output_lse[row_slice]
+                if int(state.caps.dcp_size) > 1
+                else None
+            ),
             partial_output=(
                 partial_output[: count * splits].view(count, splits, q_heads, head_dim)
                 if splits > 1
@@ -3678,7 +4016,11 @@ def _qsa_attention_op(
             block_n=BLOCK_N,
             splits=splits,
             direct_kv_warps=direct_kv_warps,
-            _prepared=state.programs.sparse,
+            _prepared=(
+                state.programs.sparse_draft
+                if draft_reuse
+                else state.programs.sparse
+            ),
         )
 
 
@@ -3700,6 +4042,7 @@ def _qsa_attention_fake(
     max_split_row_product: int,
     partial_output_offset: int,
     partial_lse_offset: int,
+    output_lse_offset: int,
     direct_kv_warps: int,
     draft_positions_offset: int,
     draft_width: int,
@@ -3757,6 +4100,7 @@ def _run_attention(
         binding.state.max_split_row_product,
         layout.partial_output_offset_bytes,
         layout.partial_lse_offset_bytes,
+        layout.output_lse_offset_bytes,
         binding.state.config.sparse_gqa_direct_kv_warps,
         layout.draft_positions_offset_bytes if reuse else -1,
         caps.selection_width + caps.max_speculative_tokens,
@@ -3833,8 +4177,7 @@ def _prime(binding: Binding, *, rows: int | None = None) -> None:
             )
             if ready is not None:
                 ready.record(torch.cuda.current_stream(device))
-            run(
-                binding,
+            inputs = dict(
                 query=query,
                 index_query=index_query,
                 raw_index_key=raw_index_key,
@@ -3845,21 +4188,41 @@ def _prime(binding: Binding, *, rows: int | None = None) -> None:
                 query_start_loc=query_start_loc,
                 num_accepted_tokens=num_accepted_tokens,
                 is_prefilling=is_prefilling,
-                index_ready=ready,
             )
+            if caps.dcp_size > 1:
+                local = select(binding, **inputs)
+                attend(
+                    binding,
+                    query=query,
+                    request_ids=request_ids,
+                    query_positions=query_positions,
+                    selection=local,
+                )
+            else:
+                run(binding, **inputs, index_ready=ready)
             if binding.draft_selection is not None:
                 draft_rows = min(warm_row_count, int(caps.max_batch))
                 for source_rows in (
                     sequence_lengths,
                     binding.draft_selection.logical_positions[: caps.max_batch],
                 ):
-                    run(
-                        binding,
-                        query=query[:draft_rows],
-                        request_ids=request_ids[:draft_rows],
-                        query_positions=query_positions[:draft_rows],
-                        reuse=DraftSelectionReuse(source_rows),
-                    )
+                    reuse = DraftSelectionReuse(source_rows)
+                    if caps.dcp_size > 1:
+                        attend_reuse(
+                            binding,
+                            query=query[:draft_rows],
+                            request_ids=request_ids[:draft_rows],
+                            query_positions=query_positions[:draft_rows],
+                            reuse=reuse,
+                        )
+                    else:
+                        run(
+                            binding,
+                            query=query[:draft_rows],
+                            request_ids=request_ids[:draft_rows],
+                            query_positions=query_positions[:draft_rows],
+                            reuse=reuse,
+                        )
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:
@@ -3876,6 +4239,7 @@ __all__ = [
     "DraftSelectionState",
     "DraftSelectionPlan",
     "DraftSelectionReuse",
+    "LocalSelection",
     "CacheRequirements",
     "QsaPrograms",
     "cache_requirements",
@@ -3883,5 +4247,8 @@ __all__ = [
     "plan",
     "bind",
     "run",
+    "select",
+    "attend",
+    "attend_reuse",
     "is_supported",
 ]
