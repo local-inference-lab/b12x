@@ -22,6 +22,42 @@ def maintenance_check_interval(current, *, minimum, maximum, health):
     return min(maximum, current * 2) if health == "healthy" else minimum
 
 
+def verify_storage_identities(before_ranks, after_ranks):
+    """Check every participant after serving or a cancelled control request."""
+    world = len(before_ranks)
+    if len(after_ranks) != world:
+        raise AssertionError("serving TP participant count changed")
+    if not world:
+        return
+
+    def participants(reports):
+        ranks = [r["rank"] for r in reports]
+        if (any(type(rank) is not int for rank in ranks)
+                or sorted(ranks) != list(range(world))
+                or any(r["world_size"] != world for r in reports)):
+            raise AssertionError("serving TP identity is incomplete or inconsistent")
+        return {r["rank"]: r for r in reports}
+
+    before, after = participants(before_ranks), participants(after_ranks)
+    reference = after[0]
+    for rank, initial in before.items():
+        current = after[rank]
+        for field in ("checkpoint", "profile", "mode"):
+            if current[field] != initial[field] or current[field] != reference[field]:
+                raise AssertionError("serving checkpoint, profile or mode changed")
+        if initial["graphs"] != current["graphs"]:
+            raise AssertionError("serving recaptured or replaced a CUDA graph")
+        if set(initial["layers"]) != set(current["layers"]) or set(current["layers"]) != set(reference["layers"]):
+            raise AssertionError("serving TP layer inventory changed")
+        for name, layer in current["layers"].items():
+            previous = initial["layers"][name]
+            if previous["pointers"] != layer["pointers"]:
+                raise AssertionError("serving rank-local cache pointer changed")
+            if (layer["generation"] < previous["generation"]
+                    or layer["generation"] != reference["layers"][name]["generation"]):
+                raise AssertionError("serving TP generations disagree or moved backward")
+
+
 async def run(args):
     import torch
     from vllm import AsyncEngineArgs, SamplingParams
@@ -471,19 +507,7 @@ async def run(args):
             await engine.resume_generation()
         after_ranks = await engine.collective_rpc("b12x_expert_cache_status") if args.mode != "native" else []
         after = after_ranks[0] if after_ranks else None
-        if len(after_ranks) != len(statuses):
-            raise AssertionError("serving TP participant count changed")
-        for before_rank, after_rank in zip(statuses, after_ranks, strict=True):
-            if before_rank["rank"] != after_rank["rank"] or before_rank["graphs"] != after_rank["graphs"]:
-                raise AssertionError("serving rank or graph identity changed")
-            for name, before_layer in before_rank["layers"].items():
-                if before_layer["pointers"] != after_rank["layers"][name]["pointers"]:
-                    raise AssertionError("serving rank-local cache pointer changed")
-        if status is not None and status["graphs"] != after["graphs"]:
-            raise AssertionError("serving recaptured or replaced a CUDA graph")
-        for name, before in status["layers"].items() if status else ():
-            if before["pointers"] != after["layers"][name]["pointers"]:
-                raise AssertionError("serving cache changed a captured pointer")
+        verify_storage_identities(statuses, after_ranks)
         if args.resources:
             record("resources", result=await engine.collective_rpc(
                 "b12x_lifecycle_resources", args=("serving_finished",)))
@@ -503,12 +527,9 @@ async def run(args):
                        result=result)
             except asyncio.CancelledError:
                 record("shutdown_case", case=args.shutdown_case, cancellation_observed=True)
-            after = (await engine.collective_rpc("b12x_expert_cache_status"))[0]
-            if status["graphs"] != after["graphs"] or any(
-                before["pointers"] != after["layers"][name]["pointers"]
-                for name, before in status["layers"].items()
-            ):
-                raise AssertionError("shutdown diagnostic changed captured storage")
+            after_ranks = await engine.collective_rpc("b12x_expert_cache_status")
+            verify_storage_identities(statuses, after_ranks)
+            after = after_ranks[0]
         record("serving_complete", status=after, ranks=after_ranks)
         completed = True
     except BaseException as error:

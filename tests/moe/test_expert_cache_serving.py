@@ -17,6 +17,47 @@ from b12x.moe.fused_moe.residency import profile_from_counts
 from tests.moe.test_prepared_expert_cache import source
 
 
+@pytest.mark.parametrize("world", [1, 2, 3, 4])
+def test_serving_storage_check_covers_every_rank_and_reordered_replies(world):
+    from copy import deepcopy
+    from benchmarks.moe.expert_cache_serving import verify_storage_identities
+
+    before = [dict(rank=rank, world_size=world, checkpoint="checkpoint",
+                   profile="profile", mode="adaptive", graphs={"4": rank + 10},
+                   layers={"moe": dict(pointers=[rank + 100], generation=0)})
+              for rank in range(world)]
+    after = deepcopy(before)
+    for row in after:
+        row["layers"]["moe"]["generation"] = 1
+    verify_storage_identities(before, list(reversed(after)))
+    for fault in ("pointers", "graphs", "profile", "generation", "layers", "rank", "world_size"):
+        changed = deepcopy(after)
+        row = changed[world // 2]
+        if fault == "pointers":
+            row["layers"]["moe"]["pointers"] = [-1]
+        elif fault == "generation":
+            row["layers"]["moe"]["generation"] = -1
+        elif fault == "graphs":
+            row["graphs"] = {"4": -1}
+        elif fault == "layers":
+            row["layers"] = {}
+        elif fault == "profile":
+            row["profile"] = "foreign"
+        elif fault == "rank":
+            row["rank"] = world
+        else:
+            row["world_size"] = world + 1
+        with pytest.raises(AssertionError):
+            verify_storage_identities(before, changed)
+    with pytest.raises(AssertionError, match="participant count"):
+        verify_storage_identities(before, after[:-1])
+    if world > 1:
+        after[-1]["layers"]["moe"]["generation"] = 2
+        with pytest.raises(AssertionError, match="generations disagree"):
+            verify_storage_identities(before, after)
+    verify_storage_identities([], [])
+
+
 def test_phase_timing_preserves_mixed_work_and_partial_prompt_chunks():
     from b12x.testing.phase_timing import classify_iteration, observation_ranges
     row = classify_iteration([1, 16, 4], [40, 0, 9], [40, 64, 11])
