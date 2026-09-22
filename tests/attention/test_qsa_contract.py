@@ -281,8 +281,8 @@ def test_qsa_bind_accepts_a_runtime_pool_smaller_than_planned_capacity() -> None
         compressed_k_cache=binding.compressed_k_cache[:1],
     )
 
-    assert rebound.plan.caps.main_table_width == 2
-    assert rebound.plan.caps.compressed_table_width == 2
+    assert rebound.state.caps.main_table_width == 2
+    assert rebound.state.caps.compressed_table_width == 2
     assert rebound.main_k_cache.shape[0] == 1
     assert rebound.compressed_k_cache.shape[0] == 1
 
@@ -3780,11 +3780,11 @@ def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
             ),
         )
     source_rows = torch.zeros(
-        binding.plan.caps.max_batch, dtype=torch.int64, device=device
+        binding.state.caps.max_batch, dtype=torch.int64, device=device
     )
     with pytest.raises(ValueError, match="does not accept selector inputs"):
         qsa.run(binding, **dynamic, reuse=qsa.DraftSelectionReuse(source_rows))
-    aliased_rows = binding.scratch[: 8 * binding.plan.caps.max_batch].view(torch.int64)
+    aliased_rows = binding.scratch[: 8 * binding.state.caps.max_batch].view(torch.int64)
     with pytest.raises(ValueError, match="overlap"):
         qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
     assert state.num_source_rows.item() == 0
