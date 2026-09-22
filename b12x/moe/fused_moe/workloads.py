@@ -8,7 +8,7 @@ import random
 import torch
 
 
-TUNING_WORKLOAD_VERSION = "shared_40_v1"
+TUNING_WORKLOAD_VERSION = "shared_0_20_40_60_80_v1"
 
 
 def make_routing_ids(
@@ -38,8 +38,25 @@ def make_routing_ids(
         )
     if workload != "shared_40":
         raise ValueError(f"unknown routing workload: {workload!r}")
+    return _make_shared_routing_ids(
+        tokens, top_k, num_experts, sharing_percent=40, seed=seed, device=device
+    )
 
-    unique = min(num_experts, max(top_k, (3 * tokens * top_k + 2) // 5))
+
+def _make_shared_routing_ids(
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    *,
+    sharing_percent: int,
+    seed: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    if tokens < 1 or not 1 <= top_k <= num_experts:
+        raise ValueError("require positive tokens and 1 <= top_k <= num_experts")
+    unique = min(num_experts, max(
+        top_k, (tokens * top_k * (100 - sharing_percent) + 50) // 100
+    ))
     rng = random.Random(seed)
     expert_ids = rng.sample(range(num_experts), unique)
     counts: Counter[int] = Counter()
@@ -66,11 +83,19 @@ def make_routing_ids(
 def make_tuning_routes(
     tokens: int, top_k: int, num_experts: int, *, device: torch.device | str
 ) -> torch.Tensor:
-    """Use four sharing realizations for small verification batches."""
+    """Cover route-sharing variation in small verification batches.
+
+    Five equally weighted sharing levels retain a nominal 40% mean while
+    avoiding selection against a single distinct-expert count. Token and
+    expert-pool constraints can clamp the realizable sharing levels.
+    """
     if 2 <= tokens <= 8:
         return torch.stack([
-            make_routing_ids(tokens, top_k, num_experts, seed=seed, device=device)
-            for seed in range(42, 46)
+            _make_shared_routing_ids(
+                tokens, top_k, num_experts, sharing_percent=sharing,
+                seed=42 + index, device=device,
+            )
+            for index, sharing in enumerate((0, 20, 40, 60, 80))
         ])
     return make_routing_ids(
         tokens, top_k, num_experts, workload="disjoint", device=device

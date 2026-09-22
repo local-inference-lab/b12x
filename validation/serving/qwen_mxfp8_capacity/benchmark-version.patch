@@ -1,0 +1,11 @@
+--- a/llm_decode_bench.py
++++ b/llm_decode_bench.py
+@@ -63,7 +63,7 @@
+ # Constants
+ # ---------------------------------------------------------------------------
+ 
+-VERSION = "0.6.1"
++VERSION = "0.6.2"
+ 
+ # Bumped whenever the answer extraction / scoring rules change in a way that can
+ # move a pass/fail verdict. Recorded in result metadata so old and new reports

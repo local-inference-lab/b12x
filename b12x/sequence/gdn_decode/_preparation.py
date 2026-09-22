@@ -73,6 +73,7 @@ def _query_from_caps(caps, invocation):
         max_seqs=caps.max_seqs, max_tokens=caps.max_tokens,
         state_index_columns=caps.state_index_columns, max_state_slots=caps.max_state_slots,
         null_state_index=caps.null_state_index, **dict(invocation),
+        recover_speculative_state=caps.recover_speculative_state,
     )
 
 
@@ -84,6 +85,7 @@ def _caps(query, ordinal):
         state_index_columns=query.state_index_columns,
         state_dtype=getattr(torch, query.state_dtype), gate_activation=query.gate_activation,
         qk_l2norm=query.qk_l2norm, null_state_index=query.null_state_index,
+        recover_speculative_state=query.recover_speculative_state,
     )
 
 
@@ -155,7 +157,11 @@ def compile_decode(query_payload, config_payload, ordinal):
     caps = layout.caps
     kda = caps.key_heads == caps.value_heads
     with torch.cuda.device(ordinal):
-        if kda:
+        commit = None
+        if query.recover_speculative_state:
+            from ._recovery import compile_recovery
+            recurrent, commit = compile_recovery(query, config)
+        elif kda:
             n, columns = b.state_indices.shape
             recurrent = kernels._packed_sequential_kda_decode_kernel.warmup(
                 b.mixed_qkv, b.raw_g, b.raw_beta, b.A_log, b.dt_bias, b.recurrent_state,
@@ -187,7 +193,7 @@ def compile_decode(query_payload, config_payload, ordinal):
             num_warps=layout.norm_num_warps, num_stages=1,
             grid=(b.output.shape[0] * caps.value_heads,),
         )
-        return {"recurrent": recurrent, "norm": norm}
+        return {"recurrent": recurrent, "norm": norm, "commit": commit}
 
 
 def _binding_tensors(binding):
@@ -207,6 +213,7 @@ class _GdnState:
     layout: object
     recurrent: object
     norm: object
+    commit: object = None
     _kda: bool = field(init=False)
     _has_null: bool = field(init=False)
     _null: int = field(init=False)
@@ -250,12 +257,12 @@ class _GdnState:
 
     def _check(self, tensors):
         q = self.query
-        for name, tensor, alignment in zip(_OPERANDS, tensors, self._alignments):
+        for name, tensor, alignment in zip(_OPERANDS, tensors, self._alignments, strict=True):
             if tensor.device != self.layout.caps.device:
                 raise ValueError(
                     f"GDN {name} device {tensor.device} differs from the prepared {self.layout.caps.device}"
                 )
-            if alignment is not None and _alignment(tensor) != alignment:
+            if alignment is not None and not (q.recover_speculative_state and name == "b") and _alignment(tensor) != alignment:
                 raise ValueError(
                     f"GDN {name} pointer alignment {_alignment(tensor)} differs from the prepared {alignment}"
                 )
@@ -268,12 +275,16 @@ class _GdnState:
             strides = _kda_strides(
                 tensors[0], tensors[1], tensors[2], tensors[5], tensors[7], tensors[13],
             )
-            if strides != q.kda_strides:
+            actual, expected = strides, q.kda_strides
+            if q.recover_speculative_state:
+                actual = (*strides[:3], *strides[5:])
+                expected = (*q.kda_strides[:3], *q.kda_strides[5:])
+            if actual != expected:
                 raise ValueError(
                     f"KDA compile-time strides {strides} differ from the prepared {q.kda_strides}"
                 )
 
-    def run(self, binding, *, eps=1e-6, scale=None, lower_bound=-5.0):
+    def run(self, binding, *, eps=1e-6, scale=None, lower_bound=-5.0, apply_output_norm=True):
         if binding._state != self.layout:
             raise ValueError("binding belongs to another GDN layout")
         eps, scale = float(eps), float(128**-0.5 if scale is None else scale)
@@ -281,6 +292,12 @@ class _GdnState:
             raise ValueError("GDN epsilon and scale must be finite and positive")
         if self._kda and (not math.isfinite(lower_bound) or lower_bound >= 0):
             raise ValueError("KDA lower bound must be finite and negative")
+        if self.query.recover_speculative_state:
+            self._check(_binding_tensors(binding))
+            self.recurrent(binding, scale=scale, lower_bound=float(lower_bound))
+            if apply_output_norm:
+                self._run_norm(binding.output, binding.z, binding.norm_weight, binding.num_tokens, eps)
+            return binding.output
         self.run_tensors(*_binding_tensors(binding), eps=eps, scale=scale, lower_bound=float(lower_bound))
         return binding.output
 
@@ -289,11 +306,12 @@ class _GdnState:
         query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
         output, *, eps, scale, lower_bound,
     ):
+        if self.query.recover_speculative_state:
+            raise ValueError("KDA recovery requires a binding with record buffers")
         self._check((mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
                      query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
                      output))
         q, layout = self.query, self.layout
-        m = int(output.shape[0])
         n, columns = map(int, state_indices.shape)
         stride_r, stride_c = state_indices.stride()
         kda = self._kda
@@ -311,6 +329,10 @@ class _GdnState:
                 mixed_qkv, a, b, A_log, dt_bias, recurrent_state, query_start_loc,
                 num_accepted_tokens, state_indices, num_seqs, output, float(scale),
             )
+        self._run_norm(output, z, norm_weight, num_tokens, eps)
+
+    def _run_norm(self, output, z, norm_weight, num_tokens, eps):
+        q, m, kda = self.query, output.shape[0], self._kda
         self.norm[(m * q.value_heads, 1, 1)](
             output, z, norm_weight, num_tokens, float(eps), m,
             int(output.stride(0)), int(output.stride(1)), int(z.stride(0)), int(z.stride(1)),

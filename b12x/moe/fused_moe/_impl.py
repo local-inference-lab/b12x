@@ -10658,6 +10658,7 @@ def _get_dynamic_kernel(
     trellis_bits: int = 0,
     trellis_coupled: bool = False,
     planned_tile_m: int | None = None,
+    planned_num_tokens: int | None = None,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
@@ -10696,11 +10697,14 @@ def _get_dynamic_kernel(
         activation=activation_spec.activation,
         planned_tile_m=planned_tile_m,
     )
+    # A capacity plan must retain its FC1/FC2 representation when the live
+    # count shrinks to one; otherwise replay asks for an unprepared kernel.
+    specialization_tokens = m if planned_num_tokens is None else planned_num_tokens
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
         activation=activation_spec.activation,
-        num_tokens=m,
-        routed_rows=m * num_topk,
+        num_tokens=specialization_tokens,
+        routed_rows=specialization_tokens * num_topk,
         num_experts=E,
         k=k,
         n=n,
@@ -11173,6 +11177,7 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
     planned_tile_m: int,
     planned_direct_routing: bool,
+    planned_num_tokens: int,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     # Output rows follow the reduction contract, never an independent caller
@@ -11217,7 +11222,7 @@ def _launch_dynamic_flat(
         and _w4a8_dynamic_decode_candidate(
             quant_mode=quant_mode,
             activation=activation,
-            routed_rows=routed_rows,
+            routed_rows=planned_num_tokens * num_topk,
             num_experts=E,
             n=n,
             deterministic_output=deterministic_output,
@@ -11251,8 +11256,8 @@ def _launch_dynamic_flat(
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
         activation=activation,
-        num_tokens=m,
-        routed_rows=routed_rows,
+        num_tokens=planned_num_tokens,
+        routed_rows=planned_num_tokens * num_topk,
         num_experts=E,
         k=k,
         n=n,
@@ -11335,9 +11340,11 @@ def _launch_dynamic_flat(
             )
         effective_mac = min(effective_mac, direct_task_count)
     if (
-        (external_route_plan or w4a8_n64_repacked)
+        (external_route_plan or w4a8_n64_repacked
+         or (w4a8_repacked and n % 128 == 0 and selected_tile_m <= 32))
         and policy_max_active_clusters > 0
         and _first_env(
+            f"B12X_{mac_backend.upper()}_MAX_ACTIVE_CLUSTERS",
             "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
             "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
         )
@@ -11374,6 +11381,7 @@ def _launch_dynamic_flat(
         trellis_bits=trellis_bits,
         trellis_coupled=trellis_coupled,
         planned_tile_m=planned_tile_m,
+        planned_num_tokens=planned_num_tokens,
     )
     if volatile_launch_state:
         barrier_count.zero_()
@@ -11638,6 +11646,7 @@ def _tp_moe_dynamic_launch_op(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
+    planned_num_tokens: int,
 ) -> None:
     (
         volatile_launch_state,
@@ -11718,6 +11727,7 @@ def _tp_moe_dynamic_launch_op(
         volatile_launch_state=volatile_launch_state,
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
+        planned_num_tokens=planned_num_tokens,
     )
 
 
@@ -11786,6 +11796,7 @@ def _tp_moe_dynamic_launch_fake(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
+    planned_num_tokens: int,
 ) -> None:
     del launch_policy
     return None
@@ -11823,6 +11834,7 @@ def _launch_dynamic(
     policy_max_active_clusters: int = -1,
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
+    planned_num_tokens: int | None = None,
 ) -> None:
     del stream
     if dynamic_route_mode not in {"direct", "grouped"}:
@@ -11936,6 +11948,7 @@ def _launch_dynamic(
         float(swiglu_alpha),
         float(swiglu_beta),
         launch_policy,
+        m if planned_num_tokens is None else planned_num_tokens,
     )
 
 
@@ -13206,6 +13219,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 else decode_config.max_active_clusters
             ),
             planned_tile_m=planned_tile_m,
+            planned_num_tokens=plan.routed_rows // plan.num_topk,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
                 (

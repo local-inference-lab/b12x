@@ -36,10 +36,21 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
         name = torch.cuda.get_device_name(device_ordinal).strip()
         if not name:
             raise RuntimeError("CUDA device name is unavailable")
+        properties = torch.cuda.get_device_properties(device_ordinal)
+        # Key on the silicon, not the product label. One part ships under
+        # several names (for example RTX PRO 6000 Blackwell "Workstation
+        # Edition" and "Max-Q Workstation Edition"), so a tensor-parallel group
+        # that mixes those labels would otherwise fail reconcile() across ranks
+        # even though every rank can reuse the same decisions. Reported total
+        # memory is excluded for the same reason: those two labels report it
+        # several MiB apart. The name is still read above so an unusable device
+        # fails closed.
         return {
             "schema_version": 5, "tuning_cache_version": version,
             "measurement": "stream_gated_events_v1",
-            "namespace": dict(namespace), "device_name": name,
+            "namespace": dict(namespace),
+            "compute_capability": [int(properties.major), int(properties.minor)],
+            "sm_count": int(properties.multi_processor_count),
         }
 
 

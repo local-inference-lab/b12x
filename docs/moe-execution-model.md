@@ -333,14 +333,18 @@ Single-token batches cannot share, and a small expert pool can force more reuse.
 The deterministic generator spreads IDs across the expert pool and favors
 already popular experts when reusing them.
 
-The vLLM preparation adapter uses four seeded realizations for 2–8 token
-batches. Every candidate sees the same inputs and is scored over the complete
-mix before elimination. Other batch sizes retain cyclic, maximally spread
-routing. `shared_40_v1` versions selection-cache inputs; compiled kernels do not
-change when the tuning workload changes. This is a simple assumed workload,
-not a claim that all models or every layer have the same routing distribution.
+The vLLM preparation adapter uses five equally weighted sharing levels for
+2–8 token batches: 0%, 20%, 40%, 60%, and 80%. The nominal mean remains 40%,
+but candidate timing covers variation in expert reuse instead of repeating
+one distinct-expert count. Per-token uniqueness and the available expert pool
+can clamp those levels. Every candidate sees the same deterministic inputs
+and is scored over the complete mix before elimination. Other batch sizes
+retain cyclic, maximally spread routing. `shared_0_20_40_60_80_v1` versions
+selection-cache inputs; compiled kernels do not change when the tuning
+workload changes. These are coverage points, not a claim that every model
+or layer follows a uniform distribution of sharing levels.
 
-The assumption is informed by DSV4.1 TP4 serving observations on GB10: 179,600
+The 40% mean is informed by DSV4.1 TP4 serving observations on GB10: 179,600
 target-layer calls from short/medium-context reasoning and code requests showed
 36–42% reuse at observed 5/7/8-row verification sizes. The separate drafter was
 more concentrated (about 62% reuse). Raw traces are diagnostic artifacts, not

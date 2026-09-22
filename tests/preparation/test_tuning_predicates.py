@@ -571,6 +571,51 @@ def test_compact_w4a8_races_runtime_grids_for_both_backends():
     assert len(candidates) == 20
 
 
+@pytest.mark.parametrize("sms", (48, 188))
+def test_repacked_w4a8_decode_races_physical_resident_grids(sms):
+    from b12x.moe.fused_moe import _tuning as component
+
+    _, original = _contract_and_query(
+        "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
+    )
+    query = replace(
+        original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32", num_experts=256, hidden_size=4096,
+        intermediate_size=1024, top_k=6, num_tokens=6, routed_rows=36,
+        route_num_experts=None, route_logits_dtype=None,
+        w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
+    )
+    device = DeviceIdentity("nvidia", (12, 0), sms, "Synthetic SM120")
+    configuration = component.TUNING.configure(query, device=device)
+    candidates = [config for _, config in component.TUNING.iterate(configuration)]
+    for tile in (16, 32):
+        configs = [config for config in candidates
+                   if config.backend == "dynamic" and config.dynamic_tile_m == tile
+                   and config.dynamic_route_mode == "grouped"]
+        grids = {config.max_active_clusters for config in configs}
+        assert {None, 1, sms, 2 * sms} <= grids
+        assert all(grid is None or 0 < grid <= 2 * sms for grid in grids)
+        if sms == 188:
+            assert 128 in grids
+        assignments = [component.TUNING.encode_config(config) for config in configs]
+        assert len({configuration.space.compile_assignment(a) for a in assignments}) == 1
+        with pytest.raises(ValueError, match="two-CTA-per-SM"):
+            component.TUNING.configure(
+                query, device=device,
+                override=replace(configs[0], max_active_clusters=2 * sms + 1),
+            )
+    for config in candidates:
+        if config.backend != "dynamic" or config.dynamic_tile_m not in (16, 32):
+            assert config.max_active_clusters is None
+    for outside in (
+        replace(query, num_tokens=11, routed_rows=66),
+        replace(query, deterministic_output=True),
+        replace(query, source_format="trellis"),
+        replace(query, controls=FrozenMapping({"dynamic_work_source": "ready_queue"})),
+    ):
+        assert not component._repacked_w4a8_decode_query(outside)
+
+
 def test_a16_wide_tile_needs_more_than_one_n_tile():
     from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledQuery
 

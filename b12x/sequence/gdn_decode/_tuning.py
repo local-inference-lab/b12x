@@ -54,6 +54,7 @@ class GdnQuery:
     state_indices_dtype: str = "int32"
     kda_strides: tuple[int, ...] | None = None
     pointer_alignments: FrozenMapping | None = None
+    recover_speculative_state: bool = False
 
     def __post_init__(self):
         kda = self.key_heads == self.value_heads
@@ -110,7 +111,7 @@ def _default_config(
     query: GdnQuery,
     _device: DeviceIdentity | None,
 ) -> GdnConfig:
-    backend = "triton" if query.key_heads == query.value_heads else "cutedsl"
+    backend = _backend(query)
     return GdnConfig(
         backend=backend,
         recurrent_block_v=32,
@@ -128,6 +129,12 @@ def _validate_query(query: GdnQuery, _device: DeviceIdentity | None) -> None:
     if query.state_index_columns > 8 or query.max_tokens > query.max_seqs * query.state_index_columns:
         raise ValueError("GDN token capacity must fit at most eight state columns per sequence")
     kda = query.key_heads == query.value_heads
+    if type(query.recover_speculative_state) is not bool:
+        raise TypeError("recover_speculative_state must be boolean")
+    if query.recover_speculative_state and (
+        not kda or query.state_dtype != "float32" or not query.qk_l2norm
+    ):
+        raise ValueError("KDA recovery requires equal heads, FP32 state and Q/K normalization")
     if not kda and query.value_heads != 3 * query.key_heads:
         raise ValueError("Qwen GDN requires three value heads per key head")
     if query.gate_activation not in ("silu", "sigmoid") or (kda and query.gate_activation != "sigmoid"):
@@ -165,7 +172,7 @@ def _validate_config(
 ) -> None:
     if not isinstance(config, GdnConfig):
         raise TypeError("config must be GdnConfig")
-    expected_backend = "triton" if query.key_heads == query.value_heads else "cutedsl"
+    expected_backend = _backend(query)
     if config.backend != expected_backend:
         raise ValueError(f"GDN recipe requires the {expected_backend} backend")
     if not isinstance(config.recurrent_block_v, int) or isinstance(
@@ -180,10 +187,14 @@ def _validate_config(
         raise ValueError("Qwen GDN requires recurrent_block_v=32")
 
 
+def _backend(query: GdnQuery) -> str:
+    return "triton" if query.key_heads == query.value_heads and not query.recover_speculative_state else "cutedsl"
+
+
 def _tuning_parameters(query: GdnQuery, device):
     del device
     # Production dispatch is fixed by the equal-head KDA / grouped-head GDN recipe.
-    return {"backend": ("triton" if query.key_heads == query.value_heads else "cutedsl",)}
+    return {"backend": (_backend(query),)}
 
 
 # The state slot count sizes the caller's pool; it does not change which
@@ -197,7 +208,7 @@ def _encode_query(query: GdnQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="attention.gdn",
-    query_schema_version=4,
+    query_schema_version=5,
     config_schema_version=4,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "recurrent_block_v"}),
@@ -211,7 +222,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="recurrent_block_v", values=(16, 32), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     parameters=_tuning_parameters,
 )
 

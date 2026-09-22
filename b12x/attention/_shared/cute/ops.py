@@ -5,7 +5,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, const_expr
-from cutlass._mlir.dialects import llvm, nvvm
+from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
@@ -13,7 +13,7 @@ LOG2_E = math.log2(math.e)
 
 
 def compute_softmax_scale_log2(softmax_scale):
-    return softmax_scale * LOG2_E, None
+    return softmax_scale * LOG2_E, softmax_scale
 
 
 def make_tiled_copy_A(
