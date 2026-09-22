@@ -130,7 +130,7 @@ with set_current_vllm_config(config), torch.inference_mode():
         global_w = full.weights
         i = 512 // world
         s = rank * i
-        torch.testing.assert_close(
+        oracle.assert_checkpoint_close(
             local.w13,
             torch.cat(
                 [global_w.w13[:, s : s + i], global_w.w13[:, 512 + s : 512 + s + i]], 1
@@ -138,7 +138,7 @@ with set_current_vllm_config(config), torch.inference_mode():
             atol=0,
             rtol=0,
         )
-        torch.testing.assert_close(
+        oracle.assert_checkpoint_close(
             local.w2, global_w.w2[:, :, s // 2 : (s + i) // 2], atol=0, rtol=0
         )
         torch.manual_seed(131 + args.layer)
@@ -222,35 +222,42 @@ with set_current_vllm_config(config), torch.inference_mode():
                         before == torch.cuda.memory_stats()["allocation.all.allocated"]
                     )
                     assert pointers == state.pointers()
-                    assert torch.isfinite(binding.output).all() and torch.count_nonzero(
-                        binding.output
-                    )
+                    assert torch.isfinite(
+                        binding.output.cpu()
+                    ).all() and torch.count_nonzero(binding.output.cpu())
                     expected_local = oracle.routed_oracle(source, x, ids, weights)
-                    torch.testing.assert_close(
+                    oracle.assert_checkpoint_close(
                         binding.output, expected_local, atol=0.001, rtol=0.03
                     )
                     reduced = tensor_model_parallel_all_reduce(binding.output.clone())
                     expected = oracle.routed_oracle(full, x, ids, weights)
-                    torch.testing.assert_close(reduced, expected, atol=0.003, rtol=0.06)
+                    oracle.assert_checkpoint_close(
+                        reduced, expected, atol=0.003, rtol=0.06
+                    )
                     arithmetic.append(
                         dict(
                             routes=case,
                             local_max_abs=float(
-                                (binding.output.float() - expected_local.float())
+                                (
+                                    binding.output.cpu().float()
+                                    - expected_local.cpu().float()
+                                )
                                 .abs()
                                 .max()
                             ),
                             reduced_max_abs=float(
-                                (reduced.float() - expected.float()).abs().max()
+                                (reduced.cpu().float() - expected.cpu().float())
+                                .abs()
+                                .max()
                             ),
                             reduced_relative_l2=float(
-                                (reduced.float() - expected.float()).norm()
-                                / expected.float().norm()
+                                (reduced.cpu().float() - expected.cpu().float()).norm()
+                                / expected.cpu().float().norm()
                             ),
                             reduced_cosine=float(
                                 torch.nn.functional.cosine_similarity(
-                                    reduced.float().flatten(),
-                                    expected.float().flatten(),
+                                    reduced.cpu().float().flatten(),
+                                    expected.cpu().float().flatten(),
                                     dim=0,
                                 )
                             ),
@@ -260,7 +267,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                         if placement_reference is None:
                             placement_reference = reduced.clone()
                         else:
-                            torch.testing.assert_close(
+                            oracle.assert_checkpoint_close(
                                 reduced, placement_reference, atol=0, rtol=0
                             )
                     progress(f"layer-{args.layer}:resident-{resident}:case-{case}")
@@ -276,7 +283,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                     combined_expected = tensor_model_parallel_all_reduce(
                         shared + binding.output
                     )
-                    torch.testing.assert_close(
+                    oracle.assert_checkpoint_close(
                         combined, combined_expected, atol=0, rtol=0
                     )
                     whole_graph = torch.cuda.CUDAGraph()
@@ -292,7 +299,7 @@ with set_current_vllm_config(config), torch.inference_mode():
                 whole_graph.replay()
                 torch.cuda.synchronize()
                 assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
-                torch.testing.assert_close(combined_graph, combined, atol=0, rtol=0)
+                oracle.assert_checkpoint_close(combined_graph, combined, atol=0, rtol=0)
                 if resident < 512:
                     slots = state.updates.snapshot()
                     pairs = ((resident, 0),)
@@ -309,7 +316,9 @@ with set_current_vllm_config(config), torch.inference_mode():
                         before == torch.cuda.memory_stats()["allocation.all.allocated"]
                     )
                     assert pointers == state.pointers()
-                    torch.testing.assert_close(combined_graph, combined, atol=0, rtol=0)
+                    oracle.assert_checkpoint_close(
+                        combined_graph, combined, atol=0, rtol=0
+                    )
                     assert state.updates.snapshot().generation == 1
                 reports.append(
                     dict(

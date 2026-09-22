@@ -162,7 +162,7 @@ def load_layer(checkpoint, layer):
         )
 
     globals13 = field(("gate_proj", "up_proj"), "weight_scale_2")
-    torch.testing.assert_close(globals13[:, 0], globals13[:, 1], atol=0, rtol=0)
+    assert_checkpoint_close(globals13[:, 0], globals13[:, 1], atol=0, rtol=0)
     plan = moe.plan_weights(
         source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w31"),
         activation=moe.ActivationSpec(
@@ -190,6 +190,11 @@ def load_layer(checkpoint, layer):
         source,
         {n: v for n, v in values.items() if not n.startswith("experts.")},
     )
+
+
+def assert_checkpoint_close(actual, expected, **kwargs):
+    """Compare copied outputs on the host; validation launches no CUDA kernels."""
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), **kwargs)
 
 
 def checkpoint_progress(location):
@@ -262,7 +267,7 @@ def test_real_next80_cpu_oracle_matches_device():
         host = routed_oracle(source, x, route_ids, weights, device="cpu")
         device = routed_oracle(source, x, route_ids, weights, device="cuda")
         assert torch.isfinite(host).all() and torch.count_nonzero(host)
-        torch.testing.assert_close(host, device, atol=1e-4, rtol=0.01)
+        assert_checkpoint_close(host, device, atol=1e-4, rtol=0.01)
 
 
 @pytest.mark.parametrize("layer", [0, 24, 47])
@@ -432,7 +437,7 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
         shared_expected = shared.down_proj(intermediate)[0] * torch.sigmoid(
             torch.nn.functional.linear(x, ordinary["shared_expert_gate.weight"].cuda())
         )
-        torch.testing.assert_close(shared(x), shared_expected, atol=0, rtol=0)
+        assert_checkpoint_close(shared(x), shared_expected, atol=0, rtol=0)
         graph_shared = torch.cuda.CUDAGraph()
         before_calls = len(calls)
         torch.cuda.synchronize()
@@ -454,17 +459,17 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                 assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
                 assert pointers == plan.prepared.state.pointers()
                 results.append(binding.output.clone())
-                torch.testing.assert_close(binding.output, oracle, atol=1e-3, rtol=0.03)
-                assert torch.isfinite(binding.output).all() and torch.count_nonzero(
-                    binding.output
+                assert_checkpoint_close(binding.output, oracle, atol=1e-3, rtol=0.03)
+                assert torch.isfinite(results[-1].cpu()).all() and torch.count_nonzero(
+                    results[-1].cpu()
                 )
             for output in results[1:]:
-                torch.testing.assert_close(output, results[0], atol=0, rtol=0)
+                assert_checkpoint_close(output, results[0], atol=0, rtol=0)
             before = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph_shared.replay()
             torch.cuda.synchronize()
             assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
-            torch.testing.assert_close(
+            assert_checkpoint_close(
                 combined, shared_expected + results[1], atol=0, rtol=0
             )
             if case == 0:
@@ -479,10 +484,10 @@ def test_real_next80_routes_graph_and_independent_arithmetic(
                     graph.replay()
                 torch.cuda.synchronize()
                 for (_, binding, _), expected in zip(graphs, results, strict=True):
-                    torch.testing.assert_close(binding.output, expected, atol=0, rtol=0)
+                    assert_checkpoint_close(binding.output, expected, atol=0, rtol=0)
                 graph_shared.replay()
                 torch.cuda.synchronize()
-                torch.testing.assert_close(
+                assert_checkpoint_close(
                     combined, shared_expected + results[1], atol=0, rtol=0
                 )
             checkpoint_progress(f"layer-{layer}:case-{case}-passed")
