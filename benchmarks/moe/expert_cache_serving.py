@@ -97,6 +97,7 @@ async def run(args):
         max_model_len=args.context,
         max_num_seqs=args.concurrency,
         max_num_batched_tokens=args.capacity,
+        long_prefill_token_threshold=args.prefill_chunk_tokens,
         kv_cache_memory_bytes=args.kv_gib << 30,
         offload_backend='uva' if args.expert_offload_gib else 'auto',
         cpu_offload_gb=args.expert_offload_gib,
@@ -586,6 +587,8 @@ def main():
     p.add_argument("--kv-gib", type=int, default=2)
     p.add_argument("--context", type=int, default=2048)
     p.add_argument("--capacity", type=int, default=64)
+    p.add_argument("--prefill-chunk-tokens", type=int, default=0,
+                   help="Explicit engine per-request prefill chunk limit; 0 preserves the engine default")
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--tokens", type=int, default=64)
     p.add_argument("--epoch-tokens", type=int, default=32)
@@ -681,6 +684,8 @@ def main():
         help="Also enable vLLM Inductor compilation; requires matching engine extensions",
     )
     args = p.parse_args()
+    if not 0 <= args.prefill_chunk_tokens <= args.capacity:
+        p.error("prefill chunk limit must be zero or within prepared token capacity")
     if args.expert_offload_gib < 0 or (args.expert_offload_gib and args.mode != 'native'):
         p.error('selective UVA offload requires native mode and a nonnegative envelope')
     if args.repeat_lifecycle < 1:
