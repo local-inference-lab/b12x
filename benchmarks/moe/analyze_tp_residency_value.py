@@ -189,6 +189,12 @@ def analyze(records):
                 )
             )
         worker, receipt = epoch["worker"], epoch["receipt"]
+
+        def observed_sum(field):
+            if not any(v["observed_windows"] for v in lifetimes):
+                return None
+            return sum(v[field] for v in lifetimes)
+
         transactions.append(
             dict(
                 epoch=index,
@@ -199,11 +205,9 @@ def analyze(records):
                 per_rank_copy_bytes=worker["per_rank_copy_bytes"],
                 engine_wall_ns=receipt["engine_wall_ns"],
                 engine_stages_ns=receipt["engine_stages_ns"],
-                promoted_hits=sum(v["promoted_hits"] for v in lifetimes),
-                evicted_expert_demand=sum(
-                    v["evicted_expert_demand"] for v in lifetimes
-                ),
-                net_avoided_cold=sum(v["net_avoided_cold"] for v in lifetimes),
+                promoted_hits=observed_sum("promoted_hits"),
+                evicted_expert_demand=observed_sum("evicted_expert_demand"),
+                net_avoided_cold=observed_sum("net_avoided_cold"),
                 unobserved_pairs=sum(not v["observed_windows"] for v in lifetimes),
                 zero_hit_observed_pairs=sum(
                     v["observed_windows"] > 0 and not v["promoted_hits"]

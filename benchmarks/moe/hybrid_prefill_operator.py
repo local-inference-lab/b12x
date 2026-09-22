@@ -31,6 +31,11 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 16, 64, 128, 256])
     parser.add_argument("--samples", type=int, default=6)
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument(
+        "--diagnostic-only",
+        action="store_true",
+        help="Replay each tier inside an NVTX range for an external profiler; no timing claim",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
@@ -66,6 +71,9 @@ def main():
         torch=torch.__version__,
         cuda=torch.version.cuda,
         gpu_before=subprocess.check_output(["nvidia-smi", "-q"], text=True),
+        measurement_scope="external profiler"
+        if args.diagnostic_only
+        else "CUDA event timing; separate profiler traces",
         rows=[],
     )
     for rows in args.rows:
@@ -150,7 +158,7 @@ def main():
                 resident[: len(expected)], expected.cpu(), atol=0.001, rtol=0.03
             )
             samples = {mode: [] for mode in graphs}
-            for sample in range(args.samples):
+            for sample in range(0 if args.diagnostic_only else args.samples):
                 for mode in (
                     ("resident", "mapped")
                     if sample % 2 == 0
@@ -176,17 +184,22 @@ def main():
                     assert pointers[mode] == plans[mode].prepared.state.pointers()
                     samples[mode].append(start.elapsed_time(stop) * 1000 / args.replays)
             for mode, graph in graphs.items():
-                with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ]
-                ) as profiler:
-                    graph.replay()
-                    torch.cuda.synchronize()
-                profiler.export_chrome_trace(
-                    str(args.output / f"rows-{rows}-{mode}.json")
-                )
+                if args.diagnostic_only:
+                    with torch.cuda.nvtx.range(f"w4a16_{mode}_m{rows}"):
+                        graph.replay()
+                        torch.cuda.synchronize()
+                else:
+                    with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ]
+                    ) as profiler:
+                        graph.replay()
+                        torch.cuda.synchronize()
+                    profiler.export_chrome_trace(
+                        str(args.output / f"rows-{rows}-{mode}.json")
+                    )
                 graph.reset()
             report["rows"].append(
                 dict(

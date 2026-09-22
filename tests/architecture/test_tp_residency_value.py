@@ -85,7 +85,8 @@ def test_final_transaction_has_no_invented_future_hits():
     last = result["transactions"][-1]
     assert last["unobserved_pairs"] == 1
     assert last["zero_hit_observed_pairs"] == 0
-    assert last["promoted_hits"] == 0
+    assert last["promoted_hits"] is None
+    assert last["net_avoided_cold"] is None
     assert last["pairs"][0]["right_censored"]
 
 
