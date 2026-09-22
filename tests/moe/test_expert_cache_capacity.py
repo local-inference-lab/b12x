@@ -124,7 +124,12 @@ def test_capacity_projection_keeps_counts_and_noncache_reservations(monkeypatch)
         module,
         "memory_for",
         lambda q, d, s: ExpertCacheMemory(
-            q.resident * 10000, q.experts * 10000, s, 1000, 64, 32 if q.max_pairs else 0
+            q.resident * 10000,
+            q.experts * 10000,
+            s,
+            q.max_tokens * 250,
+            64,
+            32 if q.max_pairs else 0,
         ),
     )
     baseline = dict(
@@ -156,6 +161,14 @@ def test_capacity_projection_keeps_counts_and_noncache_reservations(monkeypatch)
         "other_device",
     ):
         assert row["memory"][key] == baseline[key]
+    wider, wider_placements = plan(
+        profile, counts, baseline, 100000, device="cpu", capacity=256
+    )
+    assert wider["counts"]["layer"] < row["counts"]["layer"]
+    assert wider["memory"]["workspace"] > row["memory"]["workspace"]
+    assert wider["memory"]["kv"] == row["memory"]["kv"]
+    assert wider["memory"]["device_safety"] == row["memory"]["device_safety"]
+    assert tuple(wider_placements["layer"]["selection_counts"]) == counts["layer"]
     with pytest.raises(ValueError, match="reservations exceed"):
         plan(
             profile,

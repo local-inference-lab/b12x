@@ -228,7 +228,14 @@ def main():
     )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--capacity",
+        type=int,
+        help="Prepared token capacity; defaults to the reference receipt's capacity",
+    )
     args = p.parse_args()
+    if args.capacity is not None and args.capacity < 1:
+        p.error("capacity must be positive")
     import torch
 
     if torch.cuda.get_device_capability(args.device) != (12, 0):
@@ -246,6 +253,9 @@ def main():
         raise ValueError("reference must complete before using its reservations")
     status = next(r["status"] for r in reference if r["kind"] == "prepared")
     config = next(r for r in reference if r["kind"] == "configuration")
+    prepared_capacity = (
+        args.capacity if args.capacity is not None else config["arguments"]["capacity"]
+    )
     if status["checkpoint"] != profile["identity"]["checkpoint"]:
         raise ValueError("reference checkpoint differs from calibration")
     baseline, accounting = runtime_reservations(status["memory"], reference)
@@ -258,6 +268,7 @@ def main():
         canonical_counts_sha256=digest(counts),
         calibration_arguments=calibration[0]["arguments"],
         reference_arguments=config["arguments"],
+        prepared_capacity=prepared_capacity,
         reference_memory_accounting=accounting,
     )
     results = []
@@ -275,7 +286,7 @@ def main():
                 baseline,
                 envelope,
                 device=args.device,
-                capacity=config["arguments"]["capacity"],
+                capacity=prepared_capacity,
                 layer_pairs=config["arguments"]["layer_pairs"],
             )
             artifact = dict(
