@@ -75,6 +75,12 @@ class BlockscaledGemm:
         self.b_gmem_dtype = cutlass.Uint8 if self.pack_b_smem else self.b_dtype
         self.a_smem_dtype = cutlass.Uint8 if self.a_dtype.width == 6 else self.a_dtype
         self.b_smem_dtype = cutlass.Uint8 if self.b_dtype.width == 6 else self.b_dtype
+        # kind::mxf8f6f4 reads E2M1 with byte addressing: each sixteen codes
+        # occupy their own sixteen-byte slot (eight code bytes, eight ignored).
+        # TMA stages packed checkpoint rows; the MMA warp expands them.
+        self.unpack_b_fp4 = recipe == "w4a8_mx"
+        if self.unpack_b_fp4:
+            self.b_smem_dtype = cutlass.Uint8
         self.sf_dtype = cutlass.Float8E4M3FN if recipe == "nvfp4" else cutlass.Float8E8M0FNU
         self.sf_vec_size = 16 if recipe == "nvfp4" else 32
         self.c_dtype = c_dtype
@@ -226,15 +232,36 @@ class BlockscaledGemm:
             internal_type=self.a_smem_dtype if cutlass.const_expr(self.a_dtype.width == 6) else None,
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
-            b_tensor,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=self.b_smem_dtype if cutlass.const_expr(self.b_dtype.width == 6) else None,
-        )
+        if cutlass.const_expr(self.unpack_b_fp4):
+            packed_row_bytes = self.mma_tiler[2] // 2
+            self.b_packed_smem_layout_staged = cute.make_layout(
+                (self.mma_tiler[1], packed_row_bytes, self.num_ab_stage),
+                stride=(packed_row_bytes, 1, self.mma_tiler[1] * packed_row_bytes),
+            )
+            b_bytes = cute.make_tensor(
+                cute.recast_ptr(b_ptr, dtype=cutlass.Uint8),
+                cute.make_layout(
+                    (n, cute.assume(k // 2, 16), self.experts),
+                    stride=(cute.assume(k // 2, 16), 1, cutlass.Int64(n) * (k // 2)),
+                ),
+            )
+            tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                b_bytes,
+                cute.slice_(self.b_packed_smem_layout_staged, (None, None, 0)),
+                (self.mma_tiler[1], packed_row_bytes),
+            )
+        else:
+            self.b_packed_smem_layout_staged = None
+            tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+                b_tensor,
+                b_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=self.b_smem_dtype if cutlass.const_expr(self.b_dtype.width == 6) else None,
+            )
 
         sfa_smem_layout = cute.slice_(
             self.sfa_smem_layout_staged, (None, None, None, 0)
@@ -385,6 +412,16 @@ class BlockscaledGemm:
                 byte_alignment=128,
                 swizzle=b_smem_layout_staged.inner,
             )
+            if cutlass.const_expr(self.unpack_b_fp4):
+                packed_row_bytes = self.mma_tiler[2] // 2
+                sBp = smem.allocate_tensor(
+                    element_type=cutlass.Uint8,
+                    layout=cute.make_layout(
+                        (self.mma_tiler[1], packed_row_bytes, self.num_ab_stage),
+                        stride=(packed_row_bytes, 1, self.mma_tiler[1] * packed_row_bytes),
+                    ),
+                    byte_alignment=128,
+                )
             sSFA = smem.allocate_tensor(
                 element_type=self.sf_dtype,
                 layout=sfa_smem_layout_staged,
@@ -418,9 +455,14 @@ class BlockscaledGemm:
             gA_mkl = cute.local_tile(
                 mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
             )
-            gB_nkl = cute.local_tile(
-                mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-            )
+            if cutlass.const_expr(self.unpack_b_fp4):
+                gB_nkl = cute.local_tile(
+                    mB_nkl, (self.mma_tiler[1], self.mma_tiler[2] // 2), (None, None, None)
+                )
+            else:
+                gB_nkl = cute.local_tile(
+                    mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+                )
             gSFA_mkl = cute.local_tile(
                 mSFA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
             )
@@ -434,7 +476,6 @@ class BlockscaledGemm:
 
             thr_mma = tiled_mma.get_slice(0)
             tCgA = thr_mma.partition_A(gA_mkl)
-            tCgB = thr_mma.partition_B(gB_nkl)
             tCgSFA = thr_mma.partition_A(gSFA_mkl)
             tCgSFB = thr_mma.partition_B(gSFB_nkl)
             tCgC = thr_mma.partition_C(gC_mnl)
@@ -446,13 +487,22 @@ class BlockscaledGemm:
                 cute.group_modes(sA, 0, 3),
                 cute.group_modes(tCgA, 0, 3),
             )
-            tBsB, tBgB = cpasync.tma_partition(
-                tma_atom_b,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sB, 0, 3),
-                cute.group_modes(tCgB, 0, 3),
-            )
+            if cutlass.const_expr(self.unpack_b_fp4):
+                tBsB, tBgB = cpasync.tma_partition(
+                    tma_atom_b,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sBp, 0, 2),
+                    cute.group_modes(gB_nkl, 0, 2),
+                )
+            else:
+                tBsB, tBgB = cpasync.tma_partition(
+                    tma_atom_b,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sB, 0, 3),
+                    cute.group_modes(thr_mma.partition_B(gB_nkl), 0, 3),
+                )
 
             tAsSFA, tAgSFA = cpasync.tma_partition(
                 tma_atom_sfa,
@@ -588,6 +638,13 @@ class BlockscaledGemm:
                     if cutlass.const_expr(self.pack_a_smem or self.pack_b_smem):
                         cute.arch.sync_warp()
                         cute.arch.fence_proxy("async.shared", space="cta")
+                    if cutlass.const_expr(self.unpack_b_fp4):
+                        self._unpack_fp4_smem(
+                            sBp[(None, None, ab_full.index)],
+                            sB[(None, None, None, ab_full.index)],
+                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.sync_warp()
 
                     s2t_stage_coord = (None, None, None, None, ab_full.index)
                     tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
@@ -671,6 +728,25 @@ class BlockscaledGemm:
 
             cute.arch.barrier()
             tmem.free(acc_tmem_ptr)
+
+    @cute.jit
+    def _unpack_fp4_smem(self, packed: cute.Tensor, tile: cute.Tensor):
+        """Copy each packed group of sixteen E2M1 codes into its UMMA slot.
+
+        ``packed`` holds checkpoint-native rows, two codes per byte. ``tile`` is
+        the swizzled byte-addressed operand; code k of a row starts slot k // 16,
+        whose trailing eight bytes the MMA ignores. A warp owns disjoint groups.
+        """
+        lane = cute.arch.lane_idx()
+        groups = self.mma_tiler[2] // 16
+        for item in cutlass.range(lane, self.mma_tiler[1] * groups, 32):
+            row = item // groups
+            group = item % groups
+            for j in cutlass.range_constexpr(8):
+                k = group * 16 + j
+                tile[((row, k % self.mma_inst_shape_k), 0, k // self.mma_inst_shape_k)] = (
+                    packed[row, group * 8 + j]
+                )
 
     @cute.jit
     def _pack_fp6_smem(self, tile: cute.Tensor, byte_count: cutlass.Constexpr):
