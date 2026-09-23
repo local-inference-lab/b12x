@@ -9,6 +9,13 @@ from __future__ import annotations
 import pytest
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "device_trap: executes a kernel that must trap; sanitizers report the intended fault",
+    )
+
+
 def require_b12x():
     """Skip unless running on a consumer-Blackwell (SM120/SM121) GPU."""
     torch = pytest.importorskip("torch")
