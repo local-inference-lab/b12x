@@ -98,7 +98,7 @@ def prepare_collapse(session, source, mix, output):
 
 import pytest
 from b12x.preparation import PreparationSession
-from ..conftest import require_b12x
+from ..conftest import require_sm103_or_sm12x as require_b12x
 
 
 @pytest.fixture

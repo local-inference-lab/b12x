@@ -154,11 +154,14 @@ def test_current_mix_reuses_capacity_and_mutable_graph_inputs(
                 assert bool(torch.isfinite(got).all()) and bool(
                     torch.count_nonzero(got)
                 )
-                torch.testing.assert_close(
-                    got,
-                    expected,
-                    rtol=2e-5,
-                    atol=0.016 if got.dtype == torch.bfloat16 else 4e-5,
-                )
+                if got.dtype == torch.bfloat16:
+                    # FP32 reduction order may round across one BF16 boundary;
+                    # 0.016 is below one ULP for magnitudes of four and above.
+                    reference = expected.float()
+                    ulp = torch.ldexp(torch.ones_like(reference), torch.frexp(reference).exponent - 8)
+                    bound = torch.maximum(ulp, torch.full_like(reference, 0.016))
+                    assert bool(((got.float() - reference).abs() <= bound).all())
+                else:
+                    torch.testing.assert_close(got, expected, rtol=2e-5, atol=4e-5)
         for buffer in (output, y, post, comb):
             assert bool(torch.isnan(buffer[live:]).all())

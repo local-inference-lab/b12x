@@ -8,7 +8,7 @@ from b12x.norm.mhc import _impl
 from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall, require_prepared
 from b12x.testing.mhc import make_inputs, post_reference, pre_reference
 
-from ..conftest import require_b12x
+from ..conftest import require_sm103_or_sm12x as require_b12x
 
 
 def _invocation(*, norm: bool, rms_eps: float = 1e-6) -> FrozenMapping:
@@ -69,26 +69,33 @@ def test_mhc_prepared_norm_matches_native_oracle(tokens: int, rms_eps: float) ->
 
 def test_mhc_prepared_projection_splits_share_projection_and_keep_finalizers_distinct() -> None:
     device, hidden = require_b12x(), 4096
+    # SM103 admits TF32 projection only with its explicit high/low FP32 split.
+    split_fp32 = torch.cuda.get_device_capability(device) == (10, 3)
     requests = []
     for rows in (1, 128):
         residual, x, fn, scale, bias = make_inputs(tokens=rows, hidden_size=hidden, seed=17, device=device)
         _, previous_post, previous_comb = pre_reference(residual, fn, scale, bias, rms_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20)
         norm = torch.ones(hidden, device=device, dtype=torch.bfloat16)
         for splits in (1, 16):
-            config = mhc.MhcConfig(backend="tf32_tma", projection_tile_m=16, projection_tile_n=8, projection_tile_k=256, projection_num_stages=1, projection_num_m_warps=1, projection_num_n_warps=1, projection_k_splits=splits)
+            config = mhc.MhcConfig(backend="tf32_tma", projection_tile_m=16, projection_tile_n=8, projection_tile_k=256, projection_num_stages=1, projection_num_m_warps=1, projection_num_n_warps=1, projection_k_splits=splits, projection_split_fp32=split_fp32)
             declaration = mhc.plan(mhc.Caps(device=device, max_tokens=rows, hidden_size=hidden, split_k=64), invocation=_invocation(norm=True), override=config)
             name = f"m{rows}-s{splits}"
             requests.append(declaration.request(name=name, prepare_call=lambda state, values=(x, residual, previous_post, previous_comb, fn, scale, bias, norm): _bound_call(state, x=values[0], residual=values[1], previous_post=values[2], previous_comb=values[3], fn=values[4], scale=values[5], bias=values[6], norm=values[7], rms_eps=1e-6)))
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         result = session.prepare(requests)
-        projection, finalizers = set(), set()
-        for plan in result.plans.values():
+        projection, finalizers = {}, set()
+        for name, plan in result.plans.items():
+            splits = name.rsplit("-s", 1)[1]
             for program in require_prepared(plan, "norm.mhc").launchers["partial"].__b12x_programs__:
                 if "mhc_prefill_tf32_project_tma_" in program.name:
-                    projection.add(program)
+                    projection.setdefault(splits, set()).add(program)
                 if "mhc_finalize_gram_" in program.name:
                     finalizers.add(program)
-        assert len(projection) == 1
+        # The TF32 projection specializes on its configured K-split count; each
+        # count shares one projection across both planned capacities.
+        assert sorted(projection) == ["1", "16"]
+        assert all(len(programs) == 1 for programs in projection.values())
+        assert projection["1"].isdisjoint(projection["16"])
         assert len(finalizers) == 2
 
 

@@ -6,7 +6,7 @@ from typing import TypeVar
 import pytest
 import torch
 
-from benchmarks.common import require_sm120
+from ..conftest import require_sm103_or_sm12x
 from b12x.norm import mhc
 
 from .test_mhc_lagged import _lagged_reference
@@ -67,7 +67,7 @@ def _nonuniform_mix(rows: int, device: torch.device) -> torch.Tensor:
 
 def test_mhc_lagged_parallel_rejects_y_output_alias(mhc_session) -> None:
     """The producer writes y before consumers finish reading the residual."""
-    device = require_blackwell()
+    device = require_sm103_or_sm12x()
     hidden = 5120
     residual, _, fn, scale, bias = _make_inputs(
         tokens=1, hidden_size=hidden, seed=923_100, device=device
@@ -98,7 +98,7 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
     mhc_session,
 ) -> None:
     """Unbound prepared pre keeps its producer/finalizer mode across live rows."""
-    device = require_blackwell()
+    device = require_sm103_or_sm12x()
     hidden, capacity = 5120, 128
     residual, _, fn, scale, bias = _make_inputs(
         tokens=capacity, hidden_size=hidden, seed=923_102, device=device
@@ -164,7 +164,7 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
 ) -> None:
     """Lagged decode consumes freshly produced BF16 collapse statistics on replay."""
     monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
-    device = require_sm120()
+    device = require_sm103_or_sm12x()
     hidden, capacity = 5120, 16
     live_counts = (1, 2, 4, 6, 8, 16)
     residual, x, fn, scale, bias = _make_inputs(
@@ -265,7 +265,7 @@ def test_mhc_lagged_post_pre_static_split_reuses_frozen_capacity(
     """A planned split producer and finalizer agree below the planned capacity."""
     from b12x.norm.mhc._preparation import _lower_native
 
-    device = require_sm120()
+    device = require_sm103_or_sm12x()
     hidden, capacity = 4096, 8
     residual, x, fn, scale, bias = _make_inputs(
         tokens=capacity, hidden_size=hidden, seed=923_102, device=device
