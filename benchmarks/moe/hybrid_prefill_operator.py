@@ -193,8 +193,17 @@ def main():
                 assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
                 assert pointers[mode] == plans[mode].prepared.state.pointers()
             resident = bindings["resident"].output.cpu()
+            launch_metadata = {}
+            for mode, p in plans.items():
+                launch = p.prepared.state.states[1].w4a16_launches.select(
+                    tokens=rows, route_ids_dtype=torch.int32, has_route_map=True, activation_amax=None
+                )[0]
+                launch_metadata[mode] = {key: getattr(launch, key) for key in (
+                    "fc1_tile_k", "fc1_tile_n", "fc2_tile_k", "fc2_tile_n", "blocks_per_sm", "moe_block_size"
+                )}
+            (args.output / f"rows-{rows}-launches.json").write_text(json.dumps(launch_metadata, indent=2))
             for mode in bindings:
-                torch.testing.assert_close(resident, bindings[mode].output.cpu(), atol=0, rtol=0)
+                torch.testing.assert_close(resident, bindings[mode].output.cpu(), atol=0, rtol=0, msg=mode)
             assert torch.isfinite(resident).all() and torch.count_nonzero(resident)
             expected = oracle.routed_oracle(
                 source,
