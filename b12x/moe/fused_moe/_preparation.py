@@ -407,13 +407,14 @@ def _w4a16_primary_launches(scratch, caps, *, cold_prefill="fused") -> _W4A16Pri
         packed_mapped = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
         )
-        if cold_prefill not in ("fused", "two_cta"):
+        if cold_prefill not in ("fused", "two_cta", "two_cta_pipeline3"):
             raise ValueError("unsupported cold-prefill variant")
         cold_launch = None
-        if cold_prefill == "two_cta":
+        if cold_prefill != "fused":
             cold_launch = compile_w4a16_fused_moe(
                 **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
-                cold_prefill_two_cta=True,
+                cold_prefill_two_cta=cold_prefill == "two_cta",
+                cold_prefill_pipeline3=cold_prefill == "two_cta_pipeline3",
             )
         direct = direct_mapped = None
         if weight_layout == "packed":

@@ -241,7 +241,7 @@ def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count, override=None)
         state = plan.prepared.state
         pointers = state.pointers()
         graphs = []
-        for m in dict.fromkeys((1, 4, 2, capacity)):
+        for m in dict.fromkeys((1, 4, 2, min(16, capacity), max(1, capacity - 1), capacity)):
             binding = moe.bind(
                 plan, a=a[:m], topk_ids=ids[:m], topk_weights=weights[:m]
             )

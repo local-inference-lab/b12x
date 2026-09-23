@@ -69,7 +69,7 @@ def validate_config(query, config, device):
     validate(query, device)
     if not isinstance(config, ExpertCacheConfig) or config.backend != ExpertCacheConfig().backend:
         raise ValueError("unsupported canonical cache backend")
-    if config.cold_prefill not in ("fused", "two_cta"):
+    if config.cold_prefill not in ("fused", "two_cta", "two_cta_pipeline3"):
         raise ValueError("unsupported cold-prefill variant")
     if config.cold_prefill != "fused" and query.max_tokens < 16:
         raise ValueError("cold-prefill variants require capacity of at least 16 tokens")
@@ -97,7 +97,7 @@ TUNING = TuningContract(
         # the qualified fused implementation.
         Knob(name="cold_prefill", values=("fused",), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     parameters=lambda query, device: ParameterSpace.create(TUNING.knobs),
     materialize=lambda query, device, choice: ExpertCacheConfig(**dict(choice)),
 )

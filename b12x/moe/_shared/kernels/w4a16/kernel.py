@@ -935,7 +935,11 @@ class W4A16GemmKernel:
         schedule_whole_tiles: bool = False,
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
+        pipeline_stages: int = 4,
     ):
+        if pipeline_stages not in (3, 4):
+            raise ValueError("W4A16 pipeline requires three or four stages")
+        self.pipeline_stages = pipeline_stages
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if weight_layout not in _WEIGHT_LAYOUTS:
@@ -1294,7 +1298,7 @@ class W4A16GemmKernel:
         # B region size in int4 (16-byte) units, rounded up to a 16-byte
         # multiple so the following SMEM regions keep their 16-byte alignment
         # (exact for all supported tiles since b_sh_stage is a multiple of 4).
-        sh_b_size = _covering_count(_STAGES * self.b_sh_stage_bytes, 16)
+        sh_b_size = _covering_count(self.pipeline_stages * self.b_sh_stage_bytes, 16)
         sh_size_min = min(sh_red_size, sh_b_size)
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
@@ -1302,8 +1306,8 @@ class W4A16GemmKernel:
         self.sh_b_off = self.sh_valid_count_off
         self.sh_red_off = self.sh_valid_count_off
         self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
-        self.sh_a_off = self.sh_s_off + _STAGES * self.s_sh_stage
-        self.shared_int4 = self.sh_a_off + _STAGES * self.a_sh_stage
+        self.sh_a_off = self.sh_s_off + self.pipeline_stages * self.s_sh_stage
+        self.shared_int4 = self.sh_a_off + self.pipeline_stages * self.a_sh_stage
         self.shared_words = self.shared_int4 * 4
         if self.shared_words * 4 > int(max_shared_mem):
             raise ValueError(
@@ -1354,6 +1358,7 @@ class W4A16GemmKernel:
             # planned for different residency targets out of the same cache
             # entry even when their arithmetic geometry otherwise matches.
             self.blocks_per_sm,
+            self.pipeline_stages,
             self.schedule_whole_tiles,
             self.schedule_route_block_factor,
             self.sqg_xor_cheb_t12_smem,
@@ -2675,7 +2680,7 @@ class W4A16GemmKernel:
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
-            for pipe in cutlass.range_constexpr(_STAGES):
+            for pipe in cutlass.range_constexpr(self.pipeline_stages):
                 if tile_idx < k_tiles:
                     for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
                         self._load_next_fragment_bundle(
@@ -3598,7 +3603,7 @@ class W4A16GemmKernel:
                     tid,
                     b_sh_rd,
                     s_sh_rd,
-                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 1) % self.pipeline_stages),
                     Int32(0),
                     reduce_k_tile + next_tile,
                     dynamic_pair_override,
@@ -3607,7 +3612,7 @@ class W4A16GemmKernel:
                     a_regs_next,
                     smem_base,
                     a_sh_rd,
-                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 1) % self.pipeline_stages),
                     Int32(0),
                     uses_m_block_8,
                 )
@@ -4780,7 +4785,7 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
-        for pipe in cutlass.range_constexpr(_STAGES - 1):
+        for pipe in cutlass.range_constexpr(self.pipeline_stages - 1):
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
                     a_bf16_flat,
@@ -4807,7 +4812,7 @@ class W4A16GemmKernel:
                 )
             else:
                 cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.cp_async_wait_group(self.pipeline_stages - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -4837,7 +4842,7 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
-        fetch_tile = tile_idx + Int32(_STAGES - 1)
+        fetch_tile = tile_idx + Int32(self.pipeline_stages - 1)
         if fetch_tile < k_tiles:
             self._stage_k_tile_async(
                 a_bf16_flat,
@@ -4846,7 +4851,7 @@ class W4A16GemmKernel:
                 scales_i32_flat,
                 smem_base,
                 tid,
-                Int32((pipe + _STAGES - 1) % _STAGES),
+                Int32((pipe + self.pipeline_stages - 1) % self.pipeline_stages),
                 reduce_k_tile + fetch_tile,
                 block_valid_rows,
                 a_gl_stride,
@@ -4864,7 +4869,7 @@ class W4A16GemmKernel:
             )
         else:
             cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.cp_async_wait_group(self.pipeline_stages - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -5764,6 +5769,7 @@ class W4A16FusedMoeKernel:
         coupled_hadamard: bool = False,
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
+        pipeline_stages: int = 4,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6009,6 +6015,7 @@ class W4A16FusedMoeKernel:
             dual_a=self.dual_a,
             route_major_a=self.full_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
+            pipeline_stages=pipeline_stages,
             dynamic_num_experts=self.dynamic_num_experts,
         )
         self.fc2 = W4A16GemmKernel(
@@ -6041,6 +6048,7 @@ class W4A16FusedMoeKernel:
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),
             schedule_whole_tiles=self.schedule_whole_tiles,
+            pipeline_stages=pipeline_stages,
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
         )
@@ -9143,6 +9151,7 @@ def compile_w4a16_fused_moe(
     schedule_whole_tiles: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     cold_prefill_two_cta: bool = False,
+    cold_prefill_pipeline3: bool = False,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     coupled_hadamard: bool = False,
@@ -9456,7 +9465,9 @@ def compile_w4a16_fused_moe(
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
             fc2_cta_threads = 256
-    if cold_prefill_two_cta:
+    if cold_prefill_two_cta and cold_prefill_pipeline3:
+        raise ValueError("select one cold-prefill experiment")
+    if cold_prefill_two_cta or cold_prefill_pipeline3:
         if not (
             weight_layout == "modelopt" and scale_format == "e4m3_k16"
             and element_dtype == "bf16" and activation == "silu"
@@ -9470,7 +9481,8 @@ def compile_w4a16_fused_moe(
             raise ValueError("two-CTA cold prefill requires whole-K mapped ModelOpt BF16 SiLU")
         # Preserve the qualified K traversal and reduction boundary. Halving K
         # changes BF16 rounding on real checkpoint activations.
-        force_tile_config = (fc1_tile_k, fc1_tile_n // 2, fc2_tile_k, fc2_tile_n // 2)
+        if cold_prefill_two_cta:
+            force_tile_config = (fc1_tile_k, fc1_tile_n // 2, fc2_tile_k, fc2_tile_n // 2)
     if force_tile_config is not None:
         # Some weight layouts are packed for a specific CTA N-tile. An explicit
         # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple therefore pins
@@ -9547,8 +9559,9 @@ def compile_w4a16_fused_moe(
         coupled_hadamard=coupled_hadamard,
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
+        pipeline_stages=3 if cold_prefill_pipeline3 else 4,
     )
-    if cold_prefill_two_cta:
+    if cold_prefill_two_cta or cold_prefill_pipeline3:
         # Whole-K tiles do not use split-K lock rows. The shared global barrier
         # needs every CTA resident; compilation enforces the register bound and
         # admission checks the physical SM shared-memory capacity.

@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 16, 64, 128, 256])
     parser.add_argument("--samples", type=int, default=6)
     parser.add_argument("--replays", type=int, default=20)
-    parser.add_argument("--cold-prefill", choices=("two_cta",))
+    parser.add_argument("--cold-prefill", choices=("two_cta", "two_cta_pipeline3"))
     parser.add_argument(
         "--diagnostic-only",
         action="store_true",
