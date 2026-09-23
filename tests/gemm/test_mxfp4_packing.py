@@ -6,7 +6,7 @@ import torch
 
 import b12x
 from b12x.gemm import blockscaled
-from tests._reference.helpers import require_b12x
+from tests.conftest import require_sm103_or_sm12x
 
 
 def test_mxfp4_packing_exports_output_mutations():
@@ -24,7 +24,7 @@ def test_mxfp4_packing_exports_output_mutations():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("k", [32, 160, 1024])
 def test_mxfp4_packing_rounding_padding_and_graph(dtype, k):
-    require_b12x()
+    require_sm103_or_sm12x()
     m = 129
     pattern = torch.tensor([
         0., -0., .25, -.25, .5, -.5, .75, -.75,
@@ -88,7 +88,7 @@ def test_mxfp4_packing_rounding_padding_and_graph(dtype, k):
 
 
 def test_mxfp4_packing_rejects_invalid_buffers_and_accepts_zero_rows():
-    require_b12x()
+    require_sm103_or_sm12x()
     source = torch.empty(3, 160, device="cuda", dtype=torch.bfloat16)
     values = torch.empty(3, 80, device="cuda", dtype=torch.uint8)
     scales = torch.empty(1024, device="cuda", dtype=torch.uint8)
