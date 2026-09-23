@@ -123,7 +123,10 @@ class BlockscaledGemm:
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
         n, k = self.n, self.k
 
-        mma_inst_tile_k = 4
+        # Never tile K beyond the whole reduction: a 256-wide FP4 tile over K=128
+        # gives MXFP4 a single scale-factor K atom smaller than its TMA box,
+        # which faults with an illegal instruction on SM103.
+        mma_inst_tile_k = max(1, min(4, k // self.mma_inst_shape_k))
         self.mma_tiler = (
             self.mma_tiler_mn[0],
             self.mma_tiler_mn[1],
