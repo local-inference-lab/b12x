@@ -112,6 +112,7 @@ def test_high_row_offset_is_widened_before_multiplication(id_dtype):
         graph.reset()
 
 
+@pytest.mark.device_trap
 @pytest.mark.parametrize("bad_id", [-1, 3, 2**32])
 def test_invalid_ids_raise_device_error_instead_of_zero_or_oob(bad_id):
     # trap poisons the CUDA context, so each invalid replay owns a subprocess.

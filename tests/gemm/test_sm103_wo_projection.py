@@ -272,6 +272,7 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
             torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
+@pytest.mark.device_trap
 @pytest.mark.parametrize("position", [-1, 2, 2**31])
 def test_invalid_cosine_position_raises_device_error(position):
     # Invalid positions poison their own CUDA context, so isolate each launch.

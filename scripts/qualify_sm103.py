@@ -41,7 +41,10 @@ SUITES = {
     "gdn_decode": ["tests/sequence/test_gdn_decode.py"],
     "kda_prefill": ["tests/sequence/test_kda_prefill.py"],
     "gdn_prefill": ["tests/preparation/test_delta_prefill.py"],
-    "mtp_feedback": ["tests/sequence/test_mtp_feedback.py", "-k", "not standalone_cute_norm"],
+    # The optional vLLM native-quantization comparison needs an installed vLLM
+    # extension, which this operator suite excludes from its scope.
+    "mtp_feedback": ["tests/sequence/test_mtp_feedback.py", "-k",
+                     "not standalone_cute_norm and not optional_vllm_native_quantization"],
     "mla_compress": ["tests/attention/test_mla_compress.py"],
     "embedding": ["tests/sequence/test_embedding.py"],
     "engram": ["tests/sequence/test_engram.py"],
@@ -65,7 +68,9 @@ SUITES = {
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
     "vocabulary_projection": [
         "tests/gemm/test_bf16_vocab_projection.py", "-k",
-        "not planned_projection_matches_reference_and_replays_graph and not triton",
+        # The Triton-pinned prepared test was renamed from planned_*; SM103
+        # rejects that backend, and the CuTe cases above cover this target.
+        "not projection_matches_reference_and_replays_graph and not triton",
     ],
     "blockscaled": ["tests/gemm/test_sm103_blockscaled.py", "tests/gemm/test_mxfp4_packing.py"],
     "fp8": ["tests/gemm/test_sm103_fp8.py"],
@@ -125,6 +130,10 @@ def main(argv=None):
         "--sanitizer-tool",
         choices=("memcheck", "synccheck", "racecheck"),
         default="memcheck",
+    )
+    parser.add_argument(
+        "--sanitizer-exclude-kernel", action="append", default=[], metavar="SUBSTRING",
+        help="leave kernels whose names contain SUBSTRING uninstrumented (recorded in the receipt)",
     )
     args = parser.parse_args(argv)
     if args.execute and not args.device_uuid:
@@ -189,6 +198,7 @@ def main(argv=None):
                 [str(args.sanitizer.resolve()), "--version"], text=True
             ),
             "tool": args.sanitizer_tool,
+            "excluded_kernels": args.sanitizer_exclude_kernel,
         }
     for component in components:
         command = [
@@ -201,12 +211,16 @@ def main(argv=None):
             f"--junitxml={out / (component + '.xml')}",
         ]
         if args.sanitizer:
+            # Device-trap tests fault by design in child processes; the
+            # uninstrumented suite runs them, and sanitizers report the trap.
+            command += ["-m", "not device_trap"]
             command = [
                 str(args.sanitizer.resolve()),
                 "--tool",
                 args.sanitizer_tool,
                 "--error-exitcode",
                 "99",
+                *(f"--kernel-name-exclude=kns={name}" for name in args.sanitizer_exclude_kernel),
                 *command,
             ]
         receipt["results"].append(
