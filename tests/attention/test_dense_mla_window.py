@@ -8,7 +8,7 @@ import torch
 from b12x.attention import dense_mla
 
 from .test_dense_mla import _bind, _prepared_scope
-from ..conftest import require_b12x
+from ..conftest import require_sm103_or_sm12x as require_b12x
 
 FP8 = torch.float8_e4m3fn
 WINDOW_SIZE = 513

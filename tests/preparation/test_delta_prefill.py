@@ -18,8 +18,8 @@ from b12x.testing.delta_prefill_cases import (
 
 
 def _gpu():
-    from ..conftest import require_b12x
-    return require_b12x()
+    from ..conftest import require_sm103_or_sm12x
+    return require_sm103_or_sm12x()
 
 
 @pytest.mark.parametrize("recipe", ("gdn", "kda"))

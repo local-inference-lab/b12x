@@ -8,7 +8,7 @@ from b12x.preparation import PreparedCall, PreparationSession
 from b12x.sequence import engram
 from b12x.sequence.engram.reference import hash_reference
 from b12x.sequence.engram import _impl
-from tests._reference.helpers import require_b12x
+from tests.conftest import require_sm103_or_sm12x
 
 
 @pytest.mark.parametrize("resident_scales", [False, True])
@@ -152,7 +152,7 @@ def _prepared_hash(device, *, tokens=7):
 
 
 def test_prepared_hash_replay_matches_signed_reference_and_preserves_history():
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     session, result, plan, inputs = _prepared_hash(device)
     try:
         binding = engram.bind(plan, **inputs)
@@ -184,7 +184,7 @@ def test_prepared_hash_replay_matches_signed_reference_and_preserves_history():
 
 
 def test_prepared_lookup_accepts_e8m0_bytes_and_exact_row_shards():
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     declaration = _declaration(device, tokens=2, rank=1, tp=3, invocation={"operation": "lookup", "compact_rows": False})
     weight = torch.empty(((declaration.query.table_rows + 2) // 3, 256), dtype=torch.float8_e4m3fn, device=device)
     scales = torch.empty((weight.shape[0], 8), dtype=torch.uint8, device=device)
@@ -218,7 +218,7 @@ def test_disk_lookup_matches_varied_rows_with_graph_replay_and_stream_reuse(
     from contextlib import ExitStack
     from b12x._lib.runtime_control import kernel_resolution_guard
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     plan = _declaration(device, tokens=3, rank=1, tp=3,
                         invocation={"operation": "lookup", "compact_rows": True,
                                     "resident_scales": resident_scales})

@@ -8,11 +8,11 @@ from b12x.attention import mla_compress as op
 from b12x.attention.mla_compress import _impl
 from b12x.attention.mla_compress.reference import streaming_reference
 from b12x.preparation import PreparedCall, PreparationSession
-from tests._reference.helpers import require_b12x
+from tests.conftest import require_sm103_or_sm12x
 
 
 def _device():
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     pytest.importorskip("cutlass")
     pytest.importorskip("cuda.bindings.driver")
     return device
