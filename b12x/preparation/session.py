@@ -8,6 +8,7 @@ later batch so each candidate is compared head to head with it.
 from __future__ import annotations
 
 import logging
+import gc
 import os
 import threading
 import time
@@ -34,6 +35,25 @@ from .types import (
 )
 
 logger = logging.getLogger("b12x.preparation")
+_CAPTURE_GC_LOCK = threading.RLock()
+
+
+@contextmanager
+def _capture_gc_guard():
+    """Retire cyclic compiler owners outside the CUDA capture window."""
+    # CuTe JitModule finalizers call cuLibraryUnload. Python argument-descriptor
+    # allocation can trigger cyclic collection inside a captured launch, which
+    # invalidates the graph even when every live program is retained. Serialize
+    # these scopes because cyclic-GC enablement is process-wide.
+    with _CAPTURE_GC_LOCK:
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if enabled:
+                gc.enable()
+                gc.collect()
 
 
 @dataclass
@@ -503,11 +523,15 @@ class PreparationSession:
 
     @contextmanager
     def capture(self):
-        """Refuse kernel resolution for the duration of a CUDA graph capture."""
+        """Enclose CUDA capture with resolution and compiler-finalizer guards.
+
+        Enter before ``torch.cuda.graph`` and exit after that graph ends capture.
+        The scope does not cover replay and adds no replay-time host work.
+        """
         self._check_thread()
         if self._job is not None or self._pool is not None:
             raise RuntimeError("capture requires drained preparation")
-        with kernel_resolution_guard("prepared CUDA graph capture"):
+        with _capture_gc_guard(), kernel_resolution_guard("prepared CUDA graph capture"):
             yield
 
     def freeze(self):
