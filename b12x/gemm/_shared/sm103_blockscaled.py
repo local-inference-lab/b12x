@@ -233,11 +233,8 @@ class BlockscaledGemm:
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         if cutlass.const_expr(self.unpack_b_fp4):
+            self._check_unpacked_b_layout()
             packed_row_bytes = self.mma_tiler[2] // 2
-            self.b_packed_smem_layout_staged = cute.make_layout(
-                (self.mma_tiler[1], packed_row_bytes, self.num_ab_stage),
-                stride=(packed_row_bytes, 1, self.mma_tiler[1] * packed_row_bytes),
-            )
             b_bytes = cute.make_tensor(
                 cute.recast_ptr(b_ptr, dtype=cutlass.Uint8),
                 cute.make_layout(
@@ -248,11 +245,10 @@ class BlockscaledGemm:
             tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileG2SOp(),
                 b_bytes,
-                cute.slice_(self.b_packed_smem_layout_staged, (None, None, 0)),
+                cute.make_layout((self.mma_tiler[1], packed_row_bytes), stride=(packed_row_bytes, 1)),
                 (self.mma_tiler[1], packed_row_bytes),
             )
         else:
-            self.b_packed_smem_layout_staged = None
             tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
                 cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
                 b_tensor,
@@ -409,7 +405,7 @@ class BlockscaledGemm:
             sB = smem.allocate_tensor(
                 element_type=self.b_smem_dtype,
                 layout=b_smem_layout_staged.outer,
-                byte_alignment=128,
+                byte_alignment=1024 if self.unpack_b_fp4 else 128,
                 swizzle=b_smem_layout_staged.inner,
             )
             if cutlass.const_expr(self.unpack_b_fp4):
@@ -729,24 +725,48 @@ class BlockscaledGemm:
             cute.arch.barrier()
             tmem.free(acc_tmem_ptr)
 
+    def _check_unpacked_b_layout(self):
+        """Pin the byte-addressed operand geometry that ``_unpack_fp4_smem`` writes.
+
+        Each row holds one 128-byte SW128 atom row: code k of row r lives at byte
+        r*128 + k before the swizzle, stages are 16 KiB apart, and the swizzle
+        permutes sixteen-byte slots by r % 8.
+        """
+        outer, inner = self.b_smem_layout_staged.outer, self.b_smem_layout_staged.inner
+        rows, k_tile, inst_k = self.mma_tiler[1], self.mma_tiler[2], self.mma_inst_shape_k
+        if k_tile != 128 or str(inner) != "S<3,4,3>":
+            raise ValueError(f"unexpected E2M1 operand layout {inner} o {outer}")
+        for row, k, stage in ((0, 0, 0), (1, 17, 0), (5, 70, 1), (rows - 1, k_tile - 1, 1)):
+            if outer(((row, k % inst_k), 0, k // inst_k, stage)) != stage * rows * k_tile + row * k_tile + k:
+                raise ValueError(f"unexpected E2M1 operand layout {inner} o {outer}")
+
     @cute.jit
     def _unpack_fp4_smem(self, packed: cute.Tensor, tile: cute.Tensor):
         """Copy each packed group of sixteen E2M1 codes into its UMMA slot.
 
-        ``packed`` holds checkpoint-native rows, two codes per byte. ``tile`` is
-        the swizzled byte-addressed operand; code k of a row starts slot k // 16,
-        whose trailing eight bytes the MMA ignores. A warp owns disjoint groups.
+        ``packed`` holds one stage of checkpoint-native rows, two codes per byte.
+        ``tile`` is the matching stage of the byte-addressed SW128 operand: group g
+        of row r occupies sixteen-byte slot g ^ (r % 8) of the row's 128 bytes,
+        and the MMA ignores the slot's trailing eight bytes. The buffer is
+        1024-byte aligned, so the swizzle is relative to the stage. Each lane moves
+        whole eight-byte groups; a warp owns disjoint groups.
         """
         lane = cute.arch.lane_idx()
-        groups = self.mma_tiler[2] // 16
-        for item in cutlass.range(lane, self.mma_tiler[1] * groups, 32):
+        rows, groups = self.mma_tiler[1], self.mma_tiler[2] // 16
+        source = cute.make_tensor(
+            cute.recast_ptr(packed.iterator, dtype=cutlass.Uint64), cute.make_layout(rows * groups)
+        )
+        target = cute.make_tensor(
+            cute.recast_ptr(tile.iterator, dtype=cutlass.Uint64), cute.make_layout(rows * groups * 2)
+        )
+        values = cute.make_rmem_tensor(rows * groups // 32, cutlass.Uint64)
+        for i in cutlass.range_constexpr(rows * groups // 32):
+            values[i] = source[lane + 32 * i]
+        for i in cutlass.range_constexpr(rows * groups // 32):
+            item = lane + 32 * i
             row = item // groups
-            group = item % groups
-            for j in cutlass.range_constexpr(8):
-                k = group * 16 + j
-                tile[((row, k % self.mma_inst_shape_k), 0, k // self.mma_inst_shape_k)] = (
-                    packed[row, group * 8 + j]
-                )
+            slot = (item % groups) ^ (row % 8)
+            target[row * groups * 2 + slot * 2] = values[i]
 
     @cute.jit
     def _pack_fp6_smem(self, tile: cute.Tensor, byte_count: cutlass.Constexpr):
