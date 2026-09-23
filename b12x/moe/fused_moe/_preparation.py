@@ -774,7 +774,19 @@ class _FusedMoeCapacityState:
         activations = kwargs.get("a")
         if not isinstance(activations, torch.Tensor) or activations.ndim != 2:
             raise TypeError("fused MoE binding requires a rank-two activation tensor")
-        return variant_for(self.variants, activations.shape[0]).bind(**kwargs)
+        tokens, capacity = activations.shape[0], max(self.variants, default=0)
+        output = kwargs.get("output")
+        # Callers size outputs for the declared plan capacity. An exact smaller
+        # variant has its own capacity, so it receives only the live rows.
+        if (
+            isinstance(output, torch.Tensor)
+            and tokens in self.variants
+            and tokens < capacity
+            and output.ndim == 2
+            and output.shape[0] == capacity
+        ):
+            kwargs["output"] = output[:tokens]
+        return variant_for(self.variants, tokens).bind(**kwargs)
 
     def run(self, binding):
         return binding.run()
