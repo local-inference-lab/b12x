@@ -56,7 +56,7 @@ class MoeRecipe:
             raise ValueError("compatible_activations must be non-empty and unique")
         if any(not activation for activation in self.compatible_activations):
             raise ValueError("compatible_activations must contain non-empty strings")
-        is_trellis = self.source_format in {"btx", "b12x_trellis"}
+        is_trellis = self.source_format in {"exl3", "b12x_trellis"}
         if is_trellis and not self.trellis_variant:
             raise ValueError("Trellis recipes require a trellis_variant")
         if not is_trellis and self.trellis_variant is not None:
@@ -262,13 +262,13 @@ MOE_RECIPES = (
     ),
     MoeRecipe(
         recipe_id="trellis-k3-w4a16",
-        family_id="trellis-k3-sqg",
+        family_id="trellis-k3-lut",
         quant_mode="w4a16",
         source_format="b12x_trellis",
         intermediate_alignment=256,
         minimum_intermediate_size=256,
         compatible_activations=("situ",),
-        trellis_variant="k3-sqg-uniform-coupled",
+        trellis_variant="k3-lut-uniform-hadamard",
     ),
 )
 
@@ -455,7 +455,7 @@ COMMON_MOE_MODELS = (
         num_experts=896,
         native_top_k=16,
         activation="situ",
-        recipe_families=("trellis-k3-sqg",),
+        recipe_families=("trellis-k3-lut",),
         source="Kimi-K3 TP12 production geometry",
     ),
 )

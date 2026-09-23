@@ -383,7 +383,7 @@ def make_w4a16_packed_buffers(
     )
     rotation_a_up = (
         rotation_a_gate
-        if full_rotation and bool(getattr(prepared, "coupled_hadamard", False))
+        if full_rotation and bool(getattr(prepared, "intermediate_hadamard", False))
         else torch.empty(
             (plan.routed_rows, int(prepared.hidden_size)),
             dtype=torch.float16,

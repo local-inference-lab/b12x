@@ -280,6 +280,7 @@ def test_mhc_predicates_remove_inactive_work_without_rejecting_useful_tails():
     choice = dict(
         backend="tf32_tma",
         lagged_prepare=False,
+        partials_per_cta=4,
         projection_tile_n=8,
         projection_tile_k=64,
         projection_num_stages=2,
@@ -347,7 +348,7 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
         rms_eps=1e-20, smem_limit=100 << 10,
     )
     choice = dict(
-        backend="tf32_tma", lagged_prepare=False, projection_tile_n=8,
+        backend="tf32_tma", lagged_prepare=False, partials_per_cta=4, projection_tile_n=8,
         projection_tile_k=tile_k, projection_num_stages=3,
         projection_num_m_warps=1, projection_num_n_warps=1,
         projection_k_splits=2,
@@ -365,6 +366,80 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
             k_splits=2, split_fp32_fn=True,
         )
     space.validate({**choice, "projection_tile_k": 32})
+
+
+@pytest.mark.parametrize("partials", [None, "13", "25", "0"])
+def test_mhc_prepared_post_pre_honors_partial_group_control(partials):
+    """The fused lagged producer must not silently ignore its grouping control."""
+    from types import SimpleNamespace
+
+    from b12x.norm.mhc import _preparation, _tuning
+
+    query = _tuning.MhcQuery(
+        dtype="bfloat16", max_tokens=8, hidden_size=5120, split_k=80,
+        operation="post_pre", has_norm_weight=True, lagged_mix=True,
+        rms_eps=1e-20, norm_eps=1e-20,
+        controls=FrozenMapping({} if partials is None else {
+            "B12X_MHC_PARTIALS_PER_CTA": partials,
+        }),
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        "nvidia", (12, 1), 48, "NVIDIA GB10",
+    ))
+    if partials == "0":
+        with pytest.raises(ValueError, match="partials_per_cta"):
+            _tuning.TUNING.configure(query, device=device.identity, search=False)
+    else:
+        config = _tuning.TUNING.configure(query, device=device.identity, search=False).default
+        assert config.lagged_prepare
+        launch = _preparation._lower_native(query, config, device)
+        assert launch.partials_per_cta == (4 if partials is None else int(partials))
+
+
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+def test_mhc_races_grouping_only_for_fused_lagged_producers(operation):
+    """Grouping changes the producer geometry without duplicating inactive routes."""
+    from types import SimpleNamespace
+
+    from b12x.norm.mhc import _preparation, _tuning
+
+    query = _tuning.MhcQuery(
+        dtype="bfloat16", max_tokens=8, hidden_size=5120, split_k=80,
+        operation=operation, has_norm_weight=True, lagged_mix=True,
+        expanded_residual=operation == "pre", rms_eps=1e-20, norm_eps=1e-20,
+        controls=FrozenMapping({"B12X_MHC_PREFILL_TF32_MMA": "0"}),
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    choices = list(_tuning.TUNING.parameter_space(query, device).configurations())
+    assert {(p["lagged_prepare"], p["partials_per_cta"]) for p in choices} == {
+        (False, 4), (True, 4), (True, 9), (True, 13), (True, 25),
+    }
+    assert len(choices) == 5
+    for choice in choices:
+        config = _tuning.TUNING.lower(query, device, choice)
+        launch = _preparation._lower_native(query, config, SimpleNamespace(identity=device))
+        assert launch.partials_per_cta == choice["partials_per_cta"]
+    pinned = replace(query, controls=FrozenMapping({
+        **query.controls, "B12X_MHC_PARTIALS_PER_CTA": "13",
+    }))
+    choices = list(_tuning.TUNING.parameter_space(pinned, device).configurations())
+    assert {(p["lagged_prepare"], p["partials_per_cta"]) for p in choices} == {
+        (False, 4), (True, 13),
+    }
+
+
+@pytest.mark.parametrize("tokens,partials", [(2, 4), (4, 9), (8, 25)])
+def test_mhc_grouping_preserves_spark_pre_defaults(tokens, partials):
+    from b12x.norm.mhc import _tuning
+
+    query = _tuning.MhcQuery(
+        dtype="bfloat16", max_tokens=tokens, hidden_size=4096, split_k=64,
+        operation="pre", lagged_mix=True, expanded_residual=True,
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    config = _tuning.TUNING.configure(query, device=device, search=False).default
+    assert config.lagged_prepare
+    assert config.partials_per_cta == partials
 
 
 def _thawed(value):
@@ -565,12 +640,23 @@ def test_compact_w4a8_races_runtime_grids_for_both_backends():
             None, 1, 2, 4, 8, 16, 24, 32, 36, 48,
         }
         assignments = [component.TUNING.encode_config(config) for config in configs]
-        assert len({configuration.space.compile_assignment(a) for a in assignments}) == 1
+        assert len({configuration.space.compile_assignment(a) for a in assignments}) == (
+            2 if backend == "dynamic" else 1
+        )
         with pytest.raises(ValueError, match="resident SM count"):
             component.TUNING.configure(
                 query, device=device, override=replace(configs[0], max_active_clusters=49)
             )
-    assert len(candidates) == 20
+    assert len(candidates) == 30
+    external = next(config for _, config in candidates if config.route_planner == "triton")
+    for outside in (
+        replace(query, num_tokens=43, routed_rows=258),
+        replace(query, deterministic_output=True),
+        replace(query, intermediate_size=640),
+        replace(query, controls=FrozenMapping({"dynamic_work_source": "ready_queue"})),
+    ):
+        with pytest.raises(ValueError, match="Triton route planner"):
+            component.TUNING.configure(outside, device=device, override=external)
 
 
 @pytest.mark.parametrize("sms", (48, 188))

@@ -6415,7 +6415,7 @@ def packed_decode_trellis_mul1_e4m3_to_e4m3x8(
     decoder, this primitive never widens the reconstructed values after the
     encoder-defined E4M3 rounding step.
 
-    ``bits`` is a trace-time specialization. QSRT uses only K2/K3/K4,
+    ``bits`` is a trace-time specialization. ``lut_e4m3`` uses only K2/K3/K4,
     whose four-window spans fit in each supplied 32-bit funnel window.
     """
     bits = int(bits)
@@ -6492,32 +6492,32 @@ def packed_decode_trellis_mul1_e4m3_to_e4m3x8(
 
 
 @dsl_user_op
-def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+def packed_decode_lut_e4m3_to_e4m3x8(
     win_a,
     win_b,
-    t12_lut_addr,
+    value_table_addr,
     bits: int = 3,
-    t12_in_shared: bool = False,
+    value_table_in_shared: bool = False,
     *,
     loc=None,
     ip=None,
 ):
-    """Decode eight SQG-XOR windows through the modal Cheb-T12 staircase.
+    """Decode eight ``lut_e4m3`` windows to E4M3 bytes.
 
-    The graph is a two-xorshift, one-IMAD bijection over the retained L16
-    history. Its product high bits choose the branch stratum and its low bits
-    choose the ordered phase. The 4 KiB T12 table maps ``rank >> 4`` directly
-    to the frozen profile-5 E4M3 staircase.
+    A two-xorshift, one-IMAD permutation of each window's history bits gives
+    its rank: the product's high bits, combined with the bit-reversed branch,
+    select the upper rank bits and its low bits give the lower rank bits. The
+    4 KiB value table maps ``rank >> 4`` to an E4M3 byte.
     """
 
     bits = int(bits)
-    t12_in_shared = bool(t12_in_shared)
+    value_table_in_shared = bool(value_table_in_shared)
     if bits not in (2, 3, 4):
         raise ValueError(
-            f"unsupported SQG-XOR-Cheb-T12 bitrate {bits}; expected 2, 3, or 4"
+            f"unsupported lut_e4m3 bit width {bits}; expected 2, 3, or 4"
         )
     width = 16 - bits
-    phase_table_mask = (1 << (width - 4)) - 1
+    low_index_mask = (1 << (width - 4)) - 1
     decode_blocks: list[str] = []
     for pair in range(4):
         indices = (2 * pair, 2 * pair + 1)
@@ -6554,12 +6554,12 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
                 f"""
                     {reverse}
                     shr.u32 w{slot}, p{slot}, 4;
-                    and.b32 w{slot}, w{slot}, {phase_table_mask:#x};
+                    and.b32 w{slot}, w{slot}, {low_index_mask:#x};
                     shl.b32 t{slot}, t{slot}, {width - 4};
                     or.b32 t{slot}, t{slot}, w{slot};
                 """
             )
-            if t12_in_shared:
+            if value_table_in_shared:
                 load_lines.append(
                     f"""
                         add.u32 addr{slot}, t{slot}, $4;
@@ -6593,7 +6593,7 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
 
     address_reg = (
         ".reg .b32 addr0,addr1;"
-        if t12_in_shared
+        if value_table_in_shared
         else ".reg .b64 addr0,addr1;"
     )
     asm = (
@@ -6615,9 +6615,9 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
         + "\n}"
     )
     address_value = (
-        Int32(t12_lut_addr).ir_value(loc=loc, ip=ip)
-        if t12_in_shared
-        else Int64(t12_lut_addr).ir_value(loc=loc, ip=ip)
+        Int32(value_table_addr).ir_value(loc=loc, ip=ip)
+        if value_table_in_shared
+        else Int64(value_table_addr).ir_value(loc=loc, ip=ip)
     )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -6627,7 +6627,7 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
             address_value,
         ],
         asm,
-        "=r,=r,r,r," + ("r" if t12_in_shared else "l"),
+        "=r,=r,r,r," + ("r" if value_table_in_shared else "l"),
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -6640,7 +6640,7 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
 
 
 @dsl_user_op
-def packed_decode_sqg_fp16_d3l_to_half2x4(
+def packed_decode_lut_fp16_to_half2x4(
     win_a,
     win_b,
     descriptor_addr,
@@ -6649,16 +6649,16 @@ def packed_decode_sqg_fp16_d3l_to_half2x4(
     loc=None,
     ip=None,
 ):
-    """Decode eight K5/K6 SQG windows through the frozen FP16-D3L law.
+    """Decode eight 5- or 6-bit ``lut_fp16`` windows to FP16.
 
-    The carry-mixed graph produces a global 16-bit rank.  Its sign-symmetric
-    magnitude is mapped to one of 104 dyadic segments, followed by one native
-    FP16 FMA using the interleaved ``(base, slope)`` descriptor pair.
+    The permutation produces a 16-bit rank. Its sign-symmetric magnitude
+    selects one of 104 segments, followed by one native FP16 FMA using the
+    interleaved ``(base, slope)`` segment pair.
     """
 
     bits = int(bits)
     if bits not in (5, 6):
-        raise ValueError(f"SQG FP16-D3L supports only K5/K6, got K{bits}")
+        raise ValueError(f"lut_fp16 supports only K5/K6, got K{bits}")
     width = 16 - bits
     history_mask = (1 << width) - 1
     decode_blocks: list[str] = []
@@ -6796,585 +6796,7 @@ def packed_decode_sqg_fp16_d3l_to_half2x4(
 
 
 @dsl_user_op
-def packed_decode_trellis_sqg_cheb_normal_e4m3_rank_lut_to_e4m3x8(
-    win_a,
-    win_b,
-    rank_lut_addr,
-    bits: int = 3,
-    k2_q8h4: bool = False,
-    global_lut: bool = True,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Decode eight SQG-Cheb windows through one packed PTX block.
-
-    Keeping the eight graph evaluations in one block lets ptxas reuse the
-    extraction and scratch registers instead of materializing eight DSL call
-    frames.  The descriptor remains one immutable 2 KiB global table; the
-    benchmark decides whether CTA staging is worth its copy and occupancy cost.
-    """
-
-    bits = int(bits)
-    k2_q8h4 = bool(k2_q8h4)
-    global_lut = bool(global_lut)
-    if bits not in (2, 3, 4):
-        raise ValueError(
-            f"unsupported SQG-Cheb trellis bitrate {bits}; expected 2, 3, or 4"
-        )
-    if k2_q8h4 and bits != 2:
-        raise ValueError("the virtual-octile graph is valid only for K2")
-    if not global_lut:
-        # The packed form uses a 64-bit global pointer.  Keep the scalar shared
-        # implementation available for the later staging experiment rather
-        # than mixing generic and shared address spaces in one PTX template.
-        mask = Uint32(0xFFFF)
-        source_a = Uint32(win_a)
-        source_b = Uint32(win_b)
-        windows = [
-            (source_b >> Uint32(3 * bits)) & mask,
-            (source_b >> Uint32(2 * bits)) & mask,
-            (source_b >> Uint32(bits)) & mask,
-            source_b & mask,
-            (source_a >> Uint32(3 * bits)) & mask,
-            (source_a >> Uint32(2 * bits)) & mask,
-            (source_a >> Uint32(bits)) & mask,
-            source_a & mask,
-        ]
-        decoded = [
-            decode_trellis_sqg_cheb_normal_e4m3_rank_lut(
-                window,
-                rank_lut_addr,
-                bits,
-                k2_q8h4=k2_q8h4,
-                global_lut=False,
-                loc=loc,
-                ip=ip,
-            )
-            for window in windows
-        ]
-        lo = decoded[0]
-        hi = decoded[4]
-        for index in range(1, 4):
-            lo = lo | (decoded[index] << Uint32(8 * index))
-            hi = hi | (decoded[index + 4] << Uint32(8 * index))
-        return Uint32(lo), Uint32(hi)
-
-    graph_bits = 3 if k2_q8h4 else bits
-    width = 16 - graph_bits
-    width_mask = (1 << width) - 1
-    branch_mask = (1 << graph_bits) - 1
-    decode_blocks: list[str] = []
-    for index in range(8):
-        source = "$3" if index < 4 else "$2"
-        shift = (3 - (index & 3)) * bits
-        target = "$0" if index < 4 else "$1"
-        byte_shift = 8 * (index & 3)
-        extract = f"mov.b32 w, {source};"
-        if shift:
-            extract += f" shr.u32 w, w, {shift};"
-        q8_swap = ""
-        if k2_q8h4:
-            q8_swap = """
-                shr.u32 tmp, w, 2;
-                shr.u32 tmp2, w, 4;
-                xor.b32 tmp, tmp, tmp2;
-                and.b32 tmp, tmp, 1;
-                shl.b32 tmp2, tmp, 2;
-                xor.b32 w, w, tmp2;
-                shl.b32 tmp2, tmp, 4;
-                xor.b32 w, w, tmp2;
-            """
-        pack = f"shl.b32 code, code, {byte_shift};" if byte_shift else ""
-        decode_blocks.append(
-            f"""
-                {extract}
-                and.b32 w, w, 0xffff;
-                {q8_swap}
-                shr.u32 h, w, {graph_bits};
-                and.b32 b, w, {branch_mask:#010x};
-
-                mov.b32 phase, h;
-                shr.u32 tmp, phase, 6;
-                xor.b32 phase, phase, tmp;
-                mul.lo.u32 phase, phase, 0x000065af;
-                and.b32 phase, phase, {width_mask:#010x};
-                shr.u32 tmp, phase, 4;
-                xor.b32 phase, phase, tmp;
-                mul.lo.u32 phase, phase, 0x000016bf;
-                and.b32 phase, phase, {width_mask:#010x};
-                shr.u32 tmp, phase, 5;
-                xor.b32 phase, phase, tmp;
-                and.b32 phase, phase, {width_mask:#010x};
-
-                xor.b32 syndrome, h, 0x00005105;
-                and.b32 syndrome, syndrome, {width_mask:#010x};
-                shr.u32 tmp, syndrome, 2;
-                xor.b32 syndrome, syndrome, tmp;
-                mul.lo.u32 syndrome, syndrome, 0x00008693;
-                and.b32 syndrome, syndrome, {width_mask:#010x};
-                shr.u32 tmp, syndrome, 4;
-                xor.b32 syndrome, syndrome, tmp;
-                mul.lo.u32 syndrome, syndrome, 0x00002a21;
-                and.b32 syndrome, syndrome, {width_mask:#010x};
-                shr.u32 tmp, syndrome, 4;
-                xor.b32 syndrome, syndrome, tmp;
-                and.b32 syn, syndrome, {branch_mask:#010x};
-
-                brev.b32 rev, b;
-                shr.u32 rev, rev, {32 - graph_bits};
-                xor.b32 stratum, rev, syn;
-                mul.lo.u32 stratum, stratum, 7;
-                and.b32 stratum, stratum, {branch_mask:#010x};
-                shl.b32 rank, stratum, {width};
-                or.b32 rank, rank, phase;
-
-                setp.lt.u32 pneg, rank, 0x00008000;
-                and.b32 mag, rank, 0x00007fff;
-                xor.b32 tmp, mag, 0x00007fff;
-                selp.b32 mag, tmp, mag, pneg;
-                shr.u32 tmp, mag, 5;
-                cvt.u64.u32 addr, tmp;
-                shl.b64 addr, addr, 1;
-                add.u64 addr, addr, $4;
-                ld.global.u16 entry16, [addr];
-                cvt.u32.u16 entry, entry16;
-                and.b32 local, mag, 31;
-                shr.u32 cut, entry, 8;
-                setp.ge.u32 ptest, local, cut;
-                selp.u32 tmp, 1, 0, ptest;
-                and.b32 code, entry, 255;
-                add.u32 code, code, tmp;
-                setp.ge.u32 ptest, mag, 32764;
-                selp.u32 tmp, 1, 0, ptest;
-                add.u32 code, code, tmp;
-                setp.ge.u32 ptest, mag, 32767;
-                selp.u32 tmp, 1, 0, ptest;
-                add.u32 code, code, tmp;
-                setp.ne.u32 pnz, code, 0;
-                and.pred ptest, pneg, pnz;
-                selp.u32 sign, 128, 0, ptest;
-                or.b32 code, code, sign;
-                {pack}
-                or.b32 {target}, {target}, code;
-            """
-        )
-
-    asm = """
-        {
-            .reg .b16 entry16;
-            .reg .b32 w,h,b,phase,syndrome,syn,rev,stratum,rank;
-            .reg .b32 tmp,tmp2,mag,entry,local,cut,code,sign;
-            .reg .b64 addr;
-            .reg .pred pneg,pnz,ptest;
-            mov.b32 $0, 0;
-            mov.b32 $1, 0;
-    """ + "\n".join(decode_blocks) + "\n}"
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [
-            Uint32(win_a).ir_value(loc=loc, ip=ip),
-            Uint32(win_b).ir_value(loc=loc, ip=ip),
-            Int64(rank_lut_addr).ir_value(loc=loc, ip=ip),
-        ],
-        asm,
-        "=r,=r,r,r,l",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    return Uint32(lo), Uint32(hi)
-
-
-# Shared-memory staging layout for the profile-5 state-table decoder.  The
-# region is phase-invariant so dynamic pair kernels can mix K3, K2, and K4
-# arms without re-staging: K3 states (also serving K2-Q8H4 after its codeword
-# swap) and the 2 KiB rank descriptor live in shared memory, while the
-# plain-K2 and K4 arms read their state tables from the global blob through a
-# base pointer parked at the end of the region.  Keeping the region at
-# 18 KiB holds the fused kernel's total shared footprint under the 64 KiB
-# carveout, preserving a 64 KiB L1 in which the 40 KiB of global K2/K4 state
-# stays resident (payload staging bypasses L1).  Offsets are relative to the
-# staged region base inside dynamic shared memory.
-SQG_STATE_SMEM_K3_OFF = 0
-SQG_STATE_SMEM_DESC_OFF = 16384
-SQG_STATE_SMEM_BLOB_PTR_OFF = 18432
-SQG_STATE_SMEM_REGION_BYTES = 18448
-
-# Byte offsets of each segment inside the packed 58 KiB global state blob
-# produced by ``sqg_cheb_normal_e4m3_state_lut``.
-SQG_STATE_BLOB_K2_OFF = 0
-SQG_STATE_BLOB_K3_OFF = 2 * (1 << 14)
-SQG_STATE_BLOB_K4_OFF = 2 * ((1 << 14) + (1 << 13))
-SQG_STATE_BLOB_DESC_OFF = 2 * ((1 << 14) + (1 << 13) + (1 << 12))
-
-
-@dsl_user_op
-def packed_decode_trellis_sqg_state_global_to_e4m3x8(
-    win_a,
-    win_b,
-    state_blob_addr,
-    bits: int = 3,
-    k2_q8h4: bool = False,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Decode eight profile-5 windows via the global 58 KiB state blob.
-
-    Same phase-batched structure as the shared-memory variant, but every
-    graph-state and descriptor lookup reads the packed
-    ``sqg_cheb_normal_e4m3_state_lut`` blob through the read-only global
-    cache.  The 26 KiB touched per rate pair stays L1-resident, unlike the
-    per-rate 64 KiB direct tables this replaces in the W4A8 route kernels.
-    Byte-for-byte identical to the direct tables across all transitions.
-    """
-
-    bits = int(bits)
-    k2_q8h4 = bool(k2_q8h4)
-    if bits not in (2, 3, 4):
-        raise ValueError(
-            f"unsupported SQG-Cheb trellis bitrate {bits}; expected 2, 3, or 4"
-        )
-    if k2_q8h4 and bits != 2:
-        raise ValueError("the virtual-octile graph is valid only for K2")
-
-    graph_bits = 3 if k2_q8h4 else bits
-    width = 16 - graph_bits
-    branch_mask = (1 << graph_bits) - 1
-    stratum_mask = (branch_mask << width) & 0xFFFF
-    stratum_mult = (7 << width) & 0xFFFF
-    state_blob_off = {
-        2: SQG_STATE_BLOB_K2_OFF,
-        3: SQG_STATE_BLOB_K3_OFF,
-        4: SQG_STATE_BLOB_K4_OFF,
-    }[graph_bits]
-    if graph_bits == 2:
-        rev_lo, rev_hi = 0x03010200, 0x03010200
-    else:
-        rev_lo, rev_hi = 0x06020400, 0x07030501
-
-    extract_blocks: list[str] = []
-    rank_blocks: list[str] = []
-    finish_blocks: list[str] = []
-    for index in range(8):
-        source = "$3" if index < 4 else "$2"
-        shift = (3 - (index & 3)) * bits
-        target = "$0" if index < 4 else "$1"
-        byte_shift = 8 * (index & 3)
-        extract = f"mov.b32 w{index}, {source};"
-        if shift:
-            extract += f" shr.u32 w{index}, w{index}, {shift};"
-        q8_swap = ""
-        if k2_q8h4:
-            q8_swap = f"""
-                shr.u32 t, w{index}, 2;
-                shr.u32 u, w{index}, 4;
-                lop3.b32 t, t, u, 0x1, 0x28;
-                mul.lo.u32 t, t, 20;
-                xor.b32 w{index}, w{index}, t;
-            """
-        extract_blocks.append(
-            f"""
-                {extract}
-                and.b32 w{index}, w{index}, 0xffff;
-                {q8_swap}
-                shr.u32 t, w{index}, {graph_bits};
-                mad.wide.u32 ga, t, 2, gb;
-                ld.global.nc.u16 s{index}, [ga];
-            """
-        )
-        if graph_bits == 4:
-            reverse = f"""
-                and.b32 t, w{index}, {branch_mask:#x};
-                brev.b32 t, t;
-                shr.u32 t, t, 28;
-            """
-        else:
-            reverse = f"""
-                and.b32 t, w{index}, {branch_mask:#x};
-                prmt.b32 t, rl, rh, t;
-            """
-        rank_blocks.append(
-            f"""
-                {reverse}
-                shr.u32 u, s{index}, {width};
-                xor.b32 t, t, u;
-                mul.lo.u32 t, t, {stratum_mult:#x};
-                lop3.b32 u, t, s{index}, {stratum_mask:#x}, 0xE4;
-                shr.u32 k{index}, u, 15;
-                add.s32 k{index}, k{index}, -1;
-                lop3.b32 m{index}, u, k{index}, 0x7fff, 0x28;
-                shr.u32 t, m{index}, 4;
-                and.b32 t, t, 0x0ffe;
-                mad.wide.u32 ga, t, 1, gd;
-                ld.global.nc.u16 e{index}, [ga];
-            """
-        )
-        pack = f"shl.b32 t, t, {byte_shift};" if byte_shift else ""
-        finish_blocks.append(
-            f"""
-                and.b32 t, m{index}, 31;
-                shr.u32 u, e{index}, 8;
-                setp.ge.u32 p, t, u;
-                and.b32 t, e{index}, 255;
-                @p add.u32 t, t, 1;
-                setp.ge.u32 p, m{index}, 32764;
-                @p add.u32 t, t, 1;
-                setp.ge.u32 p, m{index}, 32767;
-                @p add.u32 t, t, 1;
-                setp.ne.u32 p, t, 0;
-                and.b32 u, k{index}, 128;
-                @p or.b32 t, t, u;
-                {pack}
-                or.b32 {target}, {target}, t;
-            """
-        )
-
-    asm = (
-        """
-        {
-            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
-            .reg .b32 s0,s1,s2,s3,s4,s5,s6,s7;
-            .reg .b32 m0,m1,m2,m3,m4,m5,m6,m7;
-            .reg .b32 e0,e1,e2,e3,e4,e5,e6,e7;
-            .reg .b32 k0,k1,k2,k3,k4,k5,k6,k7;
-            .reg .b32 t,u,rl,rh;
-            .reg .b64 ga,gb,gd;
-            .reg .pred p;
-            mov.b32 $0, 0;
-            mov.b32 $1, 0;
-    """
-        + f"""
-            add.u64 gb, $4, {state_blob_off};
-            add.u64 gd, $4, {SQG_STATE_BLOB_DESC_OFF};
-            mov.b32 rl, {rev_lo:#010x};
-            mov.b32 rh, {rev_hi:#010x};
-    """
-        + "\n".join(extract_blocks)
-        + "\n".join(rank_blocks)
-        + "\n".join(finish_blocks)
-        + "\n}"
-    )
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [
-            Uint32(win_a).ir_value(loc=loc, ip=ip),
-            Uint32(win_b).ir_value(loc=loc, ip=ip),
-            Int64(state_blob_addr).ir_value(loc=loc, ip=ip),
-        ],
-        asm,
-        "=r,=r,r,r,l",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    return Uint32(lo), Uint32(hi)
-
-
-@dsl_user_op
-def packed_decode_trellis_sqg_state_smem_to_e4m3x8(
-    win_a,
-    win_b,
-    table_smem_off,
-    bits: int = 3,
-    k2_q8h4: bool = False,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Decode eight profile-5 windows via shared-memory state tables.
-
-    ``table_smem_off`` is the 32-bit byte offset of the staged table region
-    inside the CTA's dynamic shared memory (layout per the
-    ``SQG_STATE_SMEM_*`` constants).  K3, K2-Q8H4, and K4 windows resolve
-    their graph state from shared memory; plain-K2 windows read the global
-    58 KiB blob through the pointer parked at the end of the staged region.
-
-    The instruction stream is phase-batched: all eight history lookups issue
-    before any rank arithmetic, and all eight descriptor lookups issue before
-    any staircase resolution, keeping eight table transactions in flight
-    instead of one serial mixer chain per window.  Byte-for-byte identical to
-    the global-descriptor path across all 65,536 transitions per rate.
-    """
-
-    bits = int(bits)
-    k2_q8h4 = bool(k2_q8h4)
-    if bits not in (2, 3, 4):
-        raise ValueError(
-            f"unsupported SQG-Cheb trellis bitrate {bits}; expected 2, 3, or 4"
-        )
-    if k2_q8h4 and bits != 2:
-        raise ValueError("the virtual-octile graph is valid only for K2")
-
-    graph_bits = 3 if k2_q8h4 else bits
-    width = 16 - graph_bits
-    branch_mask = (1 << graph_bits) - 1
-    stratum_mask = (branch_mask << width) & 0xFFFF
-    stratum_mult = (7 << width) & 0xFFFF
-    state_global = graph_bits != 3
-    state_blob_off = (
-        SQG_STATE_BLOB_K4_OFF if graph_bits == 4 else SQG_STATE_BLOB_K2_OFF
-    )
-    # PRMT byte tables giving the bit-reversed branch for selector values 0-7.
-    # K4 falls back to BREV because PRMT indexes at most eight byte slots.
-    if graph_bits == 2:
-        rev_lo, rev_hi = 0x03010200, 0x03010200
-    else:
-        rev_lo, rev_hi = 0x06020400, 0x07030501
-
-    extract_blocks: list[str] = []
-    rank_blocks: list[str] = []
-    finish_blocks: list[str] = []
-    for index in range(8):
-        source = "$3" if index < 4 else "$2"
-        shift = (3 - (index & 3)) * bits
-        target = "$0" if index < 4 else "$1"
-        byte_shift = 8 * (index & 3)
-        extract = f"mov.b32 w{index}, {source};"
-        if shift:
-            extract += f" shr.u32 w{index}, w{index}, {shift};"
-        q8_swap = ""
-        if k2_q8h4:
-            q8_swap = f"""
-                shr.u32 t, w{index}, 2;
-                shr.u32 u, w{index}, 4;
-                lop3.b32 t, t, u, 0x1, 0x28;
-                mul.lo.u32 t, t, 20;
-                xor.b32 w{index}, w{index}, t;
-            """
-        if state_global:
-            state_load = f"""
-                shr.u32 t, w{index}, {graph_bits};
-                mad.wide.u32 ga, t, 2, gb;
-                ld.global.nc.u16 s{index}, [ga];
-            """
-        else:
-            state_load = f"""
-                shr.u32 t, w{index}, {graph_bits};
-                mad.lo.u32 t, t, 2, bs;
-                ld.shared.u16 s{index}, [t];
-            """
-        extract_blocks.append(
-            f"""
-                {extract}
-                and.b32 w{index}, w{index}, 0xffff;
-                {q8_swap}
-                {state_load}
-            """
-        )
-        if graph_bits == 4:
-            reverse = f"""
-                and.b32 t, w{index}, {branch_mask:#x};
-                brev.b32 t, t;
-                shr.u32 t, t, 28;
-            """
-        else:
-            reverse = f"""
-                and.b32 t, w{index}, {branch_mask:#x};
-                prmt.b32 t, rl, rh, t;
-            """
-        rank_blocks.append(
-            f"""
-                {reverse}
-                shr.u32 u, s{index}, {width};
-                xor.b32 t, t, u;
-                mul.lo.u32 t, t, {stratum_mult:#x};
-                lop3.b32 u, t, s{index}, {stratum_mask:#x}, 0xE4;
-                shr.u32 k{index}, u, 15;
-                add.s32 k{index}, k{index}, -1;
-                lop3.b32 m{index}, u, k{index}, 0x7fff, 0x28;
-                shr.u32 t, m{index}, 4;
-                and.b32 t, t, 0x0ffe;
-                add.u32 t, t, bd;
-                ld.shared.u16 e{index}, [t];
-            """
-        )
-        pack = f"shl.b32 t, t, {byte_shift};" if byte_shift else ""
-        finish_blocks.append(
-            f"""
-                and.b32 t, m{index}, 31;
-                shr.u32 u, e{index}, 8;
-                setp.ge.u32 p, t, u;
-                and.b32 t, e{index}, 255;
-                @p add.u32 t, t, 1;
-                setp.ge.u32 p, m{index}, 32764;
-                @p add.u32 t, t, 1;
-                setp.ge.u32 p, m{index}, 32767;
-                @p add.u32 t, t, 1;
-                setp.ne.u32 p, t, 0;
-                and.b32 u, k{index}, 128;
-                @p or.b32 t, t, u;
-                {pack}
-                or.b32 {target}, {target}, t;
-            """
-        )
-
-    if state_global:
-        state_base = f"""
-            add.u32 t, $4, {SQG_STATE_SMEM_BLOB_PTR_OFF};
-            ld.shared.u64 gb, [t];
-            add.u64 gb, gb, {state_blob_off};
-        """
-    else:
-        state_base = f"""
-            add.u32 bs, $4, {SQG_STATE_SMEM_K3_OFF};
-        """
-    asm = (
-        """
-        {
-            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
-            .reg .b32 s0,s1,s2,s3,s4,s5,s6,s7;
-            .reg .b32 m0,m1,m2,m3,m4,m5,m6,m7;
-            .reg .b32 e0,e1,e2,e3,e4,e5,e6,e7;
-            .reg .b32 k0,k1,k2,k3,k4,k5,k6,k7;
-            .reg .b32 t,u,bs,bd,rl,rh;
-            .reg .b64 ga,gb;
-            .reg .pred p;
-            mov.b32 $0, 0;
-            mov.b32 $1, 0;
-    """
-        + state_base
-        + f"""
-            add.u32 bd, $4, {SQG_STATE_SMEM_DESC_OFF};
-            mov.b32 rl, {rev_lo:#010x};
-            mov.b32 rh, {rev_hi:#010x};
-    """
-        + "\n".join(extract_blocks)
-        + "\n".join(rank_blocks)
-        + "\n".join(finish_blocks)
-        + "\n}"
-    )
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [
-            Uint32(win_a).ir_value(loc=loc, ip=ip),
-            Uint32(win_b).ir_value(loc=loc, ip=ip),
-            Int32(table_smem_off).ir_value(loc=loc, ip=ip),
-        ],
-        asm,
-        "=r,=r,r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    return Uint32(lo), Uint32(hi)
-
-
-@dsl_user_op
-def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+def packed_decode_lut_e4m3_direct_to_e4m3x8(
     win_a,
     win_b,
     direct_lut_addr,
@@ -7384,7 +6806,7 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     loc=None,
     ip=None,
 ):
-    """Decode eight L16 windows through a K-specific direct E4M3 table.
+    """Decode eight 16-bit windows through a rate-specific direct E4M3 table.
 
     This is the lookup lower-bound primitive: one byte load per reconstructed
     weight. Every slot owns its own address/code registers so all eight
@@ -7395,7 +6817,7 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     bits = int(bits)
     if bits not in (2, 3, 4):
         raise ValueError(
-            f"unsupported SQG-normal trellis bitrate {bits}; expected 2, 3, or 4"
+            f"unsupported lut_e4m3 bit width {bits}; expected 2, 3, or 4"
         )
     table_offset = ((bits - 2) << 16) if rate_indexed else 0
     extract_lines: list[str] = []
@@ -7924,12 +7346,12 @@ def packed_decode_iq2_xs_to_bfloat2x4(
 
 
 @dsl_user_op
-def packed_decode_sqg_fp16_d3l_to_bfloat2x4(
+def packed_decode_lut_fp16_to_bfloat2x4(
     win_a, win_b, descriptor_addr, bits: int, *, loc=None, ip=None
 ):
-    """Decode K5/K6 FP16-D3L values and convert them to BF16 pairs."""
+    """Decode 5- or 6-bit ``lut_fp16`` values and convert them to BF16 pairs."""
 
-    h0, h1, h2, h3 = packed_decode_sqg_fp16_d3l_to_half2x4(
+    h0, h1, h2, h3 = packed_decode_lut_fp16_to_half2x4(
         win_a,
         win_b,
         descriptor_addr,

@@ -97,14 +97,17 @@ def _lower_native(query, config, device):
         bf16x2 = (raw != "0" if raw is not None else tokens == 16 and hidden == 4096 and source_splits > 0)
         bf16x2 = bf16x2 and query.bf16x2_eligible
     threads, groups = 0, 1
-    if route in ("pre", "decode"):
+    if route in ("pre", "decode", "post_pre"):
         raw = controls.get("B12X_MHC_PARTIALS_PER_CTA")
-        if raw is not None and raw != "":
+        if config.lagged_prepare:
+            partials = config.partials_per_cta
+        elif raw is not None and raw != "":
             partials = int(raw)
-        elif capability == (12, 1) and hidden == 4096:
+        elif route != "post_pre" and capability == (12, 1) and hidden == 4096:
             partials = 25 if tokens >= 8 else 9 if tokens >= 4 else 4
         from ._kernels import _validate_post_pre_partials_per_cta
         partials = _validate_post_pre_partials_per_cta(partials)
+    if route in ("pre", "decode"):
         raw = controls.get("B12X_MHC_DECODE_FINALIZE_THREADS")
         if raw is not None and raw != "":
             threads = int(raw)

@@ -274,10 +274,9 @@ def validate_moe_decode_config(
     if (
         query.quant_mode == "w4a8_mx" and query.source_format == "fp4_e8m0_k32"
         and query.intermediate_size % 128 == 64 and config.backend == "dynamic"
-        and (config.dynamic_tile_m != 16 or config.dynamic_route_mode != "grouped"
-             or config.route_planner != "internal")
+        and (config.dynamic_tile_m != 16 or config.dynamic_route_mode != "grouped")
     ):
-        raise ValueError("compact N64 W4A8 dynamic execution requires grouped internal M16 routing")
+        raise ValueError("compact N64 W4A8 dynamic execution requires grouped M16 routing")
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
     if query.quant_mode == "w4a16":
@@ -306,9 +305,13 @@ def validate_moe_decode_config(
     if config.route_planner == "triton" and config.dynamic_tile_m != 16:
         raise ValueError("the Triton route planner requires dynamic_tile_m=16")
     if config.route_planner == "triton" and not (
-        query.quant_mode == "nvfp4" and query.activation == "silu" and 0 < query.routed_rows <= 256
+        (query.quant_mode == "nvfp4" or (
+            _compact_w4a8_query(query) and not query.deterministic_output
+            and query.controls.get("dynamic_work_source", "materialized_queue")
+            in {"materialized_queue", "persistent_grid"}
+        )) and query.activation == "silu" and 0 < query.routed_rows <= 256
     ):
-        raise ValueError("the Triton route planner only supports small NVFP4 SiLU workloads")
+        raise ValueError("the Triton route planner requires small NVFP4 or compact W4A8 SiLU workloads")
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
     if config.max_active_clusters is not None:
@@ -556,7 +559,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=13,
+    candidate_contract_version=14,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),

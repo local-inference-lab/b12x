@@ -1,19 +1,18 @@
 # Checkpoint loader
 
-Status: implemented. The `--load-format b12x` vLLM adapter loads selected
-safetensors ranges into persistent CUDA weight allocations. It selects the
-allocation and transport from device capabilities:
+The `--load-format b12x` adapter loads selected safetensors ranges into ordinary
+PyTorch CUDA tensors. It never installs an allocator or requires model weight
+factories. `read_mode` selects transport only:
 
-| Device capability | Final weight allocation | Checkpoint payload transport |
-| --- | --- | --- |
-| Pageable memory access using GPU host page tables, including GB10 | `cudaMallocManaged`, locked against paging | CPU `O_DIRECT` reads into coherent managed storage |
-| Devices without those capabilities | `cudaMalloc` | Shared cuFile reads with CUDA IPC scatter across host-local TP ranks; GDS with CPU compatibility fallback |
+| Setting | Checkpoint payload transport |
+| --- | --- |
+| `auto` (default) | Bounce on GPU host-page-table devices such as GB10; GDS elsewhere |
+| `bounce` | O_DIRECT → 16 MiB io_uring host ring → asynchronous CUDA copies |
+| `gds` | Shared cuFile reads and CUDA IPC scatter across host-local TP ranks |
 
-Allocation and CPU/GDS transport are selected from device capabilities. Device
-weight storage always uses coordinated shared reads; no loader option is needed
-to enable them. The disk embedding setting
-`B12X_DISK_BACKEND` controls Engram/PLE row fetching and does not select the
-checkpoint transport. The managed path does not load cuFile.
+GDS registers ordinary CUDA allocations. Both paths retain tensor owners through
+completion, and both leave allocation to PyTorch. `B12X_DISK_BACKEND` separately
+controls Engram/PLE row fetching. Bounce mode does not load cuFile.
 
 ## Integration and ownership
 
@@ -24,13 +23,10 @@ the loader plugin:
 VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 ```
 
-The loader supplies its allocator through `weight_transfer`; vLLM's
-`allocate_weights(factory, ...)` marks weight creation. The default CUDA allocator
-continues to own runtime outputs, workspaces and mutable state. Preparation may
-reuse loaded weights in place or produce ordinary CUDA allocations. A final audit
-rejects non-persistent runtime buffers allocated in the weight pool. The audit's
-`shared_parameter_bytes` field counts loader-owned parameters for both allocation
-types; `allocation` identifies `managed` or `device` storage.
+`weight_transfer` scopes checkpoint writes and completion fences only. Weights,
+outputs and workspaces all use their normal allocation paths, including MTP and
+draft modules. Numerical preparation can reuse weights in place or allocate new
+tensors without consulting the loader.
 
 The adapter preserves index, prefix, expert and file-backed-weight filtering,
 including draft-model loading. File-backed embedding tables retain their separate
@@ -57,15 +53,12 @@ divides physical bytes read by the shared readers across all TP ranks by that
 shared read-and-scatter interval, using decimal GB/s. It includes GPU scatter and
 excludes header reads and rank-local numerical dependency reads.
 Detailed per-rank I/O and
-allocation counters are logged at debug level and retained on the model.
+transfer counters are logged at debug level and retained on the model.
 
-Weights are ordinary Torch tensors using its suballocator and stream bookkeeping.
-The pool is scoped around explicit weight factories, and live tensors retain their
-storage after the loader closes. Graph inputs must retain their tensor owners.
-Allocator backends remain process-owned because Torch retains their native
-function pointers. PyTorch's native CUDA allocator is required; vLLM sleep mode is
-unsupported. The pool temporarily disables expandable segments while active and
-restores the caller's setting at scope exit.
+Loaded tensors remain valid after the session closes. The loader retains queued
+source/destination tensors until I/O and CUDA copies finish; callers retain graph
+inputs for replay. No custom MemPool, allocator lifetime registry, or temporary
+allocator-setting changes are used.
 
 ## Routing and completion
 
@@ -82,13 +75,13 @@ Each queued transfer has eight unsigned 64-bit fields:
 
 Strides are bytes. Operations are unchanged-byte reads, BF16-to-FP32 expansion,
 and owned CPU control-metadata copies. The metadata operation uses `offset` as a
-source address. Native validation checks file bounds, destination ownership,
+source address. Native validation checks file bounds, CUDA allocation bounds,
 device identity and disjoint destination extents before issuing reads. File,
 row, stride and pointer arithmetic uses 64-bit values. Source files must remain
 immutable until the session closes.
 
 The executor sorts jobs by file position, divides large transfers into 64 MiB jobs,
-and distributes them across persistent pthread workers. `io_threads` defaults to
+and executes them through the selected native transport. `io_threads` defaults to
 8 and accepts 1–16 through vLLM's model-loader extra configuration. Python retains
 source descriptors and destination owners until completion; no Python callback
 runs per read.
@@ -115,18 +108,38 @@ fails before reaching that boundary. Reported setup time includes only work and
 waits remaining at completion; initialization overlapped with routing is not added
 again to the wall-time breakdown.
 
-## Managed-memory transport
+## Asynchronous bounce reads
 
-`b12x/loader/_batch.c` reads through the CPU alias of locked managed storage.
-Aligned file/address ranges enter final storage directly. Large misaligned ranges
-can read within the destination allocation and realign in place with `memmove`.
-Small edges and coalesced TP rows use each worker's fixed 8 MiB locked scratch.
-BF16 expansion reads into the first half of the final FP32 allocation and expands
-backwards in place, preserving every BF16 bit pattern.
+On Spark the default transport uses sixteen 1 MiB host slots registered with
+io_uring and CUDA (16 MiB per rank). It issues `READ_FIXED` requests against
+`O_DIRECT` descriptors. `io_threads` sets maximum outstanding reads, from 1 to 16,
+defaulting to 8:
 
-This path requires coherent GPU host-page-table access. Locking failures fail
-allocation. Mapped, registered and pinned allocation variants remain available to
-internal allocation-qualification tools.
+```sh
+VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x \
+  --model-loader-extra-config '{"read_mode":"bounce","io_threads":8}'
+```
+
+A native copy thread submits `cudaMemcpy2DAsync` into the final CUDA tensors while
+other reads remain outstanding. A slot is recycled only after its copy stream
+completes. The caller's loading stream is synchronized before the batch; `flush()`
+waits for all submitted reads and CUDA writes. No CPU writes target model weights.
+
+Headers and control metadata use a separate 64 KiB direct-read buffer. BF16-to-FP32
+expansion compacts and widens backwards within a ring slot, preserving every bit
+pattern before the CUDA copy. Other contiguous casts can use an additional bounded
+8 MiB GPU input buffer. TP slices preserve destination padding. There is no Python
+callback per read, page-cache fallback, or tensor-sized host staging allocation.
+
+This transport requires liburing development headers and pkg-config when building
+the native helper, sufficient locked-memory allowance, and permission to use
+io_uring in the host/container policy. Missing support fails explicitly. Both
+normal and expandable PyTorch CUDA allocations are accepted. I/O failure drains
+outstanding work; CUDA or ring submission failures retire the executor. All ring
+resources are released when the loading session closes.
+
+The audit records `read_mode`, `bounce_buffer_bytes`, `bounced_bytes`,
+`io_uring_submits`, and `max_inflight_reads`.
 
 ## GPUDirect Storage transport
 
@@ -135,7 +148,7 @@ consumers still require immediate completion; `b12x/loader/_gds_checkpoint.c`
 serves those dependency boundaries with synchronous `cuFileRead` calls from native
 worker threads. Payloads enter GPU memory without a CPU payload buffer. Each
 worker owns an 8 MiB registered device scratch buffer, up to 64 KiB of allocation
-alignment padding, and a CUDA stream. Header reads use a separate 8 MiB CPU
+alignment padding, and a CUDA stream. Header reads use a separate 64 KiB CPU
 `O_DIRECT` reader. At the default eight workers, reserved native GPU scratch is
 64.5 MiB if a rank-local consumer needs this executor. It is allocated lazily and
 released at session close. Ordinary bulk completion uses the shared reader's
@@ -197,8 +210,8 @@ is retained when metadata is opened and checked before completion and after
 execution. File descriptors and virtual addresses are never
 used as cross-process identities.
 
-Each allocation is exported only after validating its complete CUDA extent against
-the b12x weight pool. Peers import handles on the GPU that launches the scatter.
+Each allocation is exported only after validating its complete CUDA extent and
+device identity. Peers import handles on the GPU that launches the scatter.
 All ranks finish descriptor, file-handle and mapping validation before shared
 payload writes start. Earlier rank-local metadata copies and eager transformations
 are already complete and are not rolled back on failure. The native executor in
@@ -243,7 +256,7 @@ fail explicitly.
 
 Logs separate physical input bytes, selected payload bytes, direct destination
 bytes, alignment/strided copies, BF16 expansion, other casts, metadata copies,
-reserved scratch and final parameter ownership. `gds_physical_bytes` excludes CPU
+reserved scratch and final parameter bytes. `gds_physical_bytes` excludes CPU
 header/metadata reads; `physical_bytes` includes both. `gds_version` records the
 runtime cuFile version. Optional cuFile statistics expose NVFS, P2P, POSIX and
 error counters for transport qualification.
@@ -254,16 +267,12 @@ counters do not establish a bound on aggregate transform memory. A shared
 target/draft transform budget is unsupported. Disk I/O and blocking waits belong
 to startup, outside CUDA graph capture and replay.
 
-`b12x.loader.read_tensor` remains an allocation-qualification primitive with a
-buffered raw-file reader. It is separate from checkpoint loading and does not
-support the device/GDS allocation route.
-
 ## Qualification
 
 `tests/loader/test_gds_checkpoint.py` exercises exact bytes, all BF16 bit patterns,
 strided TP rows and destination padding, aligned final reads, unaligned EOF,
 file and device-storage offsets beyond 4 GiB, bounded casts, metadata copies,
-invalid destination ownership, overlaps, truncation, transport counters, and graph
+invalid CUDA allocation bounds, overlaps, truncation, transport counters, and graph
 replay after session close. Run it on a GDS filesystem with the assigned GPU:
 
 ```sh
@@ -293,9 +302,9 @@ reader initialization, collective planning, IPC mapping, reading, scattering and
 cleanup. Destination allocation, source routing, process setup and the byte oracle
 are outside that interval; the command records source and native-library hashes.
 
-`tests/loader/test_vllm.py` qualifies model routing using the same automatic
-allocation selection. `tests/loader/test_direct.py` covers the coherent-memory
-transport on a device with GPU host page tables. Full serving qualification must
+`tests/loader/test_vllm.py` qualifies model routing using ordinary PyTorch
+allocations. `tests/loader/test_direct.py` covers the asynchronous ring
+transport and normal CUDA tensor lifetime. Full serving qualification must
 also exercise the selected model's actual launch script, preparation, CUDA graph
 capture/replay, repeated requests and cache hits. Transport unit tests alone do
 not qualify a model for serving or establish startup performance.

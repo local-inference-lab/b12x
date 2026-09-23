@@ -10,7 +10,7 @@ from __future__ import annotations
 import importlib
 import sys
 import subprocess
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,7 +43,10 @@ def _import_vllm(checkout: Path) -> Any:
     existing = sys.modules.get("vllm")
     if existing is None:
         sys.path.insert(0, str(checkout))
-        existing = importlib.import_module("vllm")
+        try:
+            existing = importlib.import_module("vllm")
+        finally:
+            sys.path.remove(str(checkout))
 
     origin = getattr(existing, "__file__", None)
     if origin is None:
@@ -108,6 +111,9 @@ class VllmMHCRunner:
     norm_eps: float
     capture_sizes: tuple[int, ...]
     _lock_workspace: Any
+    _preparation_stack: ExitStack
+    _preparation_session: Any = None
+    _layer: Any = None
 
     @property
     def integration_files(self) -> tuple[Path, ...]:
@@ -119,6 +125,15 @@ class VllmMHCRunner:
 
     @property
     def provenance(self) -> dict[str, Any]:
+        selections = {}
+        if self._preparation_session is not None:
+            for rows in self.capture_sizes:
+                selected = self.adapter._plan_for("post_pre", rows).selection
+                selections[str(rows)] = {
+                    "source": selected.source,
+                    "query": selected.query.to_dict(),
+                    "config": selected.config.to_dict(),
+                }
         return {
             "checkout": str(self.vllm_path),
             "commit": subprocess.check_output(
@@ -126,12 +141,59 @@ class VllmMHCRunner:
             ).strip(),
             "adapter": f"{type(self.adapter).__module__}.{type(self.adapter).__name__}",
             "capture_sizes": self.capture_sizes,
+            "selections": selections,
             "scope": "Production attention-post/FFN-pre adapter, one rank; no model forward or collective",
         }
 
     def lock_workspace(self) -> None:
         """Forbid workspace growth after the caller's warmup sequence."""
+        if self._preparation_session is not None:
+            self._preparation_session.freeze()
         self._lock_workspace()
+
+    def prepare_weights(self, tensors: dict[str, Any]) -> None:
+        """Prepare the V4.1 adapter through its serving preparation provider."""
+        if self.profile_name != _V41_PROFILE:
+            return
+        if self._layer is not None:
+            raise RuntimeError("mHC benchmark weights have already been prepared")
+        import torch
+        from b12x.preparation import PreparationSession
+        from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+
+        layer = torch.nn.Module()
+        layer._b12x_mhc = self.adapter
+        for target, source in (
+            ("hc_attn_fn", "prev_fn"), ("hc_attn_scale", "prev_scale"),
+            ("hc_attn_base", "prev_bias"), ("hc_ffn_fn", "fn"),
+            ("hc_ffn_scale", "scale"), ("hc_ffn_base", "bias"),
+        ):
+            setattr(layer, target, tensors[source])
+        layer.hc_attn_fn_broadcast = None
+        for name in ("attn_norm", "ffn_norm"):
+            norm = torch.nn.Module()
+            norm.weight = tensors["norm_weight"]
+            setattr(layer, name, norm)
+        prefix = f"benchmark.mhc#{id(layer):x}"
+        register_b12x_layer(prefix, layer)
+        self.adapter.bind_layer_name(prefix)
+        self._layer = layer
+        workload = B12xWorkload(
+            stage="weights", token_counts=self.capture_sizes,
+            fixed_token_counts=self.capture_sizes[:-1],
+            output_dtype=torch.bfloat16, max_tokens=max(self.capture_sizes),
+            max_seqs=1, max_model_len=max(self.capture_sizes),
+        )
+        units = self.adapter.get_b12x_preparation_units(layer, workload)
+        requests = tuple(request for unit in units for request in unit.requests
+                         if ".post_pre." in request.name)
+        if not requests:
+            raise RuntimeError("mHC provider did not declare the benchmark operation")
+        session = self._preparation_stack.enter_context(PreparationSession(
+            device=tensors["fn"].device, autotune=True, compile_workers=2,
+        ))
+        self._preparation_stack.enter_context(session.prepare(requests))
+        self._preparation_session = session
 
     def run(
         self,
@@ -246,7 +308,7 @@ def vllm_mhc_runner(
     reset_workspace_manager()
     init_workspace_manager(device)
     try:
-        with set_current_vllm_config(vllm_config), collect_cuda_graph_capture_resources() as resources:
+        with set_current_vllm_config(vllm_config), collect_cuda_graph_capture_resources() as resources, ExitStack() as preparation_stack:
             if profile_name == _V4_PROFILE:
                 adapter_module = importlib.import_module("vllm.models.deepseek_v4.nvidia.b12x")
                 adapter = adapter_module.B12xMHCResidual(
@@ -272,6 +334,7 @@ def vllm_mhc_runner(
                 norm_eps=hf_config.rms_norm_eps,
                 capture_sizes=capture_sizes,
                 _lock_workspace=lock_workspace,
+                _preparation_stack=preparation_stack,
             )
             yield runner
     finally:

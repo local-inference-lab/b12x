@@ -9,6 +9,7 @@ import torch
 
 
 TUNING_WORKLOAD_VERSION = "shared_0_20_40_60_80_v1"
+ROUTING_WORKLOADS = ("disjoint", *(f"shared_{p}" for p in (0, 20, 40, 60, 80, 100)))
 
 
 def make_routing_ids(
@@ -22,7 +23,7 @@ def make_routing_ids(
 ) -> torch.Tensor:
     """Build routes with distinct experts per token.
 
-    ``shared_40`` reuses 40% of the batch's token/expert assignments, rounded
+    ``shared_N`` reuses N% of the batch's token/expert assignments, rounded
     to the nearest realizable expert count. Reuse favors already popular
     experts, rather than giving every expert exactly one or two tokens.
     One-token batches cannot share; a small expert pool may force more reuse.
@@ -36,10 +37,11 @@ def make_routing_ids(
             .reshape(tokens, top_k)
             .remainder_(num_experts)
         )
-    if workload != "shared_40":
+    if workload not in ROUTING_WORKLOADS:
         raise ValueError(f"unknown routing workload: {workload!r}")
     return _make_shared_routing_ids(
-        tokens, top_k, num_experts, sharing_percent=40, seed=seed, device=device
+        tokens, top_k, num_experts, sharing_percent=int(workload.removeprefix("shared_")),
+        seed=seed, device=device,
     )
 
 

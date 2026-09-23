@@ -21,7 +21,7 @@ _OPERANDS = (
 _QWEN_ALIGNED_OPERANDS = frozenset((
     "query_start_loc", "num_accepted_tokens", "num_seqs", "num_tokens", "norm_weight",
 ))
-_KDA_ALIGNED_OPERANDS = frozenset(_OPERANDS) - {"z"}
+_KDA_ALIGNED_OPERANDS = frozenset(_OPERANDS) - {"z", "state_indices"}
 
 
 def aligned_operands(kda):
@@ -208,7 +208,7 @@ def _encode_query(query: GdnQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="attention.gdn",
-    query_schema_version=5,
+    query_schema_version=6,
     config_schema_version=4,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "recurrent_block_v"}),

@@ -486,7 +486,9 @@ class _FixedExecutionState:
         if source.ndim != 2 or source.device != self.device or source.dtype != getattr(torch, q.input_dtype):
             raise ValueError("fixed source layout/dtype/device differs from preparation")
         expected_k = q.in_features // 2 if serialized and q.recipe in ("nvfp4", "mxfp4") else q.in_features
-        if source.shape[1] != expected_k or source.shape[0] not in (0, q.max_rows):
+        if source.shape[1] != expected_k or source.shape[0] > q.max_rows:
+            raise ValueError("fixed execution exceeds its planned M capacity or logical K")
+        if q.expected_m is not None and source.shape[0] not in (0, q.max_rows):
             raise ValueError("fixed execution requires its exact planned nonempty M and logical K")
         weight_k = q.padded_in_features // 2 if serialized and q.recipe in ("nvfp4", "mxfp4") else q.padded_in_features
         if weight.device != self.device or weight.shape != (q.out_features, weight_k):

@@ -32,7 +32,7 @@ from enum import Enum
 from .trellis_codebooks import (
     CODEBOOKS as _TRELLIS_CODEBOOKS,
     MCG as _TRELLIS_MCG,
-    SQG_E4M3 as _TRELLIS_SQG_E4M3,
+    LUT_E4M3 as _TRELLIS_LUT_E4M3,
     validate_codebook_bits as _validate_trellis_codebook_bits,
 )
 
@@ -167,13 +167,13 @@ _SOURCE_FORMATS = {
     "mxfp6_e2m3",
     "b12x_trellis",
     "iq2_xs",
-    "btx",
+    "exl3",
 }
-_TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "btx"})
+_TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "exl3"})
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
-    "w4a8_mx": frozenset({"fp4_e8m0_k32", "btx"}),
+    "w4a8_mx": frozenset({"fp4_e8m0_k32", "exl3"}),
     # The packed MX-FP6 source is exclusive to the w6a8_mx recipe.
     "w4a16": frozenset(
         {
@@ -182,7 +182,7 @@ _SOURCES_BY_QUANT_MODE = {
             "compressed_tensors",
             "b12x_trellis",
             "iq2_xs",
-            "btx",
+            "exl3",
         }
     ),
     "w6a8_mx": frozenset({"mxfp6_e2m3"}),
@@ -287,12 +287,12 @@ class MoEWeightPreparationPlan:
     storage_policy: WeightStoragePolicy
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
-    coupled_hadamard: bool = False
+    intermediate_hadamard: bool = False
     # Trellis declarations used by preparation and private kernel planning.
     trellis_codebook: str | None = None
     trellis_rate_granularity: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
-    coupled_hadamard_blocks: tuple[int, int] | None = None
+    intermediate_hadamard_blocks: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -320,7 +320,7 @@ class MoEWeightPreparationPlan:
         object.__setattr__(
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
-        object.__setattr__(self, "coupled_hadamard", bool(self.coupled_hadamard))
+        object.__setattr__(self, "intermediate_hadamard", bool(self.intermediate_hadamard))
         if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
             codebook = (
@@ -366,9 +366,9 @@ class MoEWeightPreparationPlan:
                         f"{granularity} trellis rates declare no pair kinds"
                     )
             elif granularity == "per_expert_pair":
-                if self.coupled_hadamard:
+                if self.intermediate_hadamard:
                     raise ValueError(
-                        "coupled-Hadamard Trellis execution is qualified "
+                        "intermediate-Hadamard trellis execution is qualified "
                         "only for uniform rate granularity"
                     )
                 if bits != 3:
@@ -397,9 +397,9 @@ class MoEWeightPreparationPlan:
                         f"or {{P33,P43}}; got {sorted(pair_kinds)}"
                     )
             elif granularity == "per_expert_projection":
-                if self.coupled_hadamard:
+                if self.intermediate_hadamard:
                     raise ValueError(
-                        "coupled-Hadamard trellis execution requires uniform rates"
+                        "intermediate-Hadamard trellis execution requires uniform rates"
                     )
                 if self.trellis_codebook != _TRELLIS_MCG:
                     raise ValueError(
@@ -418,41 +418,41 @@ class MoEWeightPreparationPlan:
                 )
             blocks = (
                 None
-                if self.coupled_hadamard_blocks is None
+                if self.intermediate_hadamard_blocks is None
                 else tuple(
-                    int(value) for value in self.coupled_hadamard_blocks
+                    int(value) for value in self.intermediate_hadamard_blocks
                 )
             )
-            if self.coupled_hadamard:
-                if self.trellis_codebook != _TRELLIS_SQG_E4M3:
+            if self.intermediate_hadamard:
+                if self.trellis_codebook != _TRELLIS_LUT_E4M3:
                     raise ValueError(
-                        "coupled-Hadamard Trellis execution is qualified only"
-                        " for the sqg_e4m3 codebook"
+                        "intermediate-Hadamard trellis execution is qualified only"
+                        " for the lut_e4m3 codebook"
                     )
                 if blocks is None:
                     blocks = (512, 128)
                 if blocks != (512, 128):
                     raise ValueError(
-                        "coupled-Hadamard Trellis execution implements "
+                        "intermediate-Hadamard trellis execution implements "
                         f"blocks (512, 128); got {blocks}"
                     )
             elif blocks is not None:
                 raise ValueError(
-                    "coupled_hadamard_blocks require coupled_hadamard"
+                    "intermediate_hadamard_blocks require intermediate_hadamard"
                 )
             object.__setattr__(
                 self, "trellis_rate_granularity", granularity
             )
             object.__setattr__(self, "trellis_pair_kinds", pair_kinds)
-            object.__setattr__(self, "coupled_hadamard_blocks", blocks)
+            object.__setattr__(self, "intermediate_hadamard_blocks", blocks)
         elif (
             self.trellis_bits is not None
             or self.trellis_tile_config is not None
-            or self.coupled_hadamard
+            or self.intermediate_hadamard
             or self.trellis_codebook is not None
             or self.trellis_rate_granularity is not None
             or self.trellis_pair_kinds is not None
-            or self.coupled_hadamard_blocks is not None
+            or self.intermediate_hadamard_blocks is not None
         ):
             raise ValueError(
                 "trellis storage settings require a trellis source format"
@@ -756,11 +756,11 @@ def plan_moe_weight_preparation(
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
-    coupled_hadamard: bool | None = None,
+    intermediate_hadamard: bool | None = None,
     trellis_codebook: str | None = None,
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Iterable[str] | None = None,
-    coupled_hadamard_blocks: tuple[int, int] | None = None,
+    intermediate_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -846,10 +846,10 @@ def plan_moe_weight_preparation(
                 # the 128-wide activation boundary per intermediate chunk.
                 if (
                     trellis_codebook is not None
-                    and str(trellis_codebook).lower() != "sqg_e4m3"
+                    and str(trellis_codebook).lower() != "lut_e4m3"
                 ):
                     raise ValueError(
-                        "W4A8-MX Trellis execution requires the sqg_e4m3 codebook"
+                        "W4A8-MX Trellis execution requires the lut_e4m3 codebook"
                     )
                 if (
                     trellis_rate_granularity is not None
@@ -860,7 +860,7 @@ def plan_moe_weight_preparation(
                     # W4A16-only.
                     raise ValueError(
                         "W4A8-MX trellis execution supports only "
-                        "uniform-rate profiles; mixed-rate atom profiles "
+                        "uniform-rate profiles; mixed-rate profiles "
                         "require quant_mode='w4a16'"
                     )
                 if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
@@ -1012,8 +1012,8 @@ def plan_moe_weight_preparation(
     else:
         storage_policy = WeightStoragePolicy.KEEP_SOURCE
 
-    if coupled_hadamard is None:
-        coupled_hadamard = False
+    if intermediate_hadamard is None:
+        intermediate_hadamard = False
     return MoEWeightPreparationPlan(
         specs=normalized_specs,
         num_experts=num_experts,
@@ -1025,7 +1025,7 @@ def plan_moe_weight_preparation(
         storage_policy=storage_policy,
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
-        coupled_hadamard=coupled_hadamard,
+        intermediate_hadamard=intermediate_hadamard,
         trellis_codebook=trellis_codebook,
         trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=(
@@ -1033,7 +1033,7 @@ def plan_moe_weight_preparation(
             if trellis_pair_kinds is None
             else frozenset(str(kind) for kind in trellis_pair_kinds)
         ),
-        coupled_hadamard_blocks=coupled_hadamard_blocks,
+        intermediate_hadamard_blocks=intermediate_hadamard_blocks,
     )
 
 

@@ -53,6 +53,7 @@ def _make_case(
     tensor_tokens: int | None = None,
     tensor_columns: int | None = None,
     state_dtype: torch.dtype = torch.float32,
+    state_indices_dtype: torch.dtype = torch.int64,
     null_state_index: int | None = None,
     noncontiguous_beta: bool = False,
     recurrent_block_v: int | None = None,
@@ -89,7 +90,7 @@ def _make_case(
             [min(2, length, column_capacity) for length in query_lengths], dtype=torch.int32, device=device,
         ),
         "state_indices": torch.arange(
-            max_seqs * column_capacity, dtype=torch.int64, device=device
+            max_seqs * column_capacity, dtype=state_indices_dtype, device=device
         ).view(max_seqs, column_capacity),
         "num_seqs": torch.tensor([max_seqs], dtype=torch.int32, device=device),
         "num_tokens": torch.tensor([live_tokens], dtype=torch.int32, device=device),
@@ -667,7 +668,12 @@ def test_kda_binding_rejects_invalid_live_contract() -> None:
         )
 
 
-def test_live_kda_cuda_graph_replays_bound_capacity() -> None:
+@pytest.mark.parametrize("state_indices_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("index_offset", [0, 1, 2])
+def test_live_kda_cuda_graph_replays_bound_capacity(
+    state_indices_dtype: torch.dtype, index_offset: int,
+) -> None:
+    """Sliced metadata must reuse the prepared kernel and remain graph-safe."""
     device = require_sm120()
     binding = _make_case(
         device=device,
@@ -676,7 +682,16 @@ def test_live_kda_cuda_graph_replays_bound_capacity() -> None:
         max_tokens=6,
         tensor_tokens=2,
         tensor_columns=1,
+        state_indices_dtype=state_indices_dtype,
     )
+    storage = torch.empty(
+        binding.state_indices.numel() + index_offset,
+        dtype=state_indices_dtype, device=device,
+    )
+    indices = storage[index_offset:].view_as(binding.state_indices)
+    indices.copy_(binding.state_indices)
+    with kernel_resolution_guard("KDA sliced state indices"):
+        binding = _rebind(binding, state_indices=indices)
 
     def launch() -> torch.Tensor:
         return gdn.run_kda(_rebind(binding))

@@ -1,9 +1,10 @@
-"""Canonical high-rate SQG FP16-D3L reconstruction data and references.
+"""Lookup tables for the ``lut_fp16`` trellis codebook.
 
-``sqg_fp16_d3l`` is defined only at uniform K5/K6.  Its graph is the same
-carry-mixed L16 permutation used by SQG-XOR-Cheb-T12 at K2/K3/K4; its scalar
-law is a frozen 104-entry dyadic-linear descriptor evaluated with one FP16
-FMA.  The interleaved ``(base, slope)`` table is 416 bytes.
+``lut_fp16`` serves 5- and 6-bit trellis weights. An integer permutation maps
+each 16-bit decode window to a rank in ``[0, 65536)``, and a sign-symmetric
+value law maps the rank to FP16 through a frozen 104-entry piecewise-linear
+segment table evaluated with one FP16 FMA. The interleaved ``(base, slope)``
+table is 416 bytes.
 """
 
 from __future__ import annotations
@@ -14,17 +15,16 @@ import hashlib
 import torch
 
 
-SQG_FP16_D3L = "sqg_fp16_d3l"
-SQG_FP16_D3L_SUBDIVISION_BITS = 3
-SQG_FP16_D3L_DESCRIPTOR_COUNT = 104
-SQG_FP16_D3L_DESCRIPTOR_BYTES = 416
-SQG_FP16_D3L_DESCRIPTOR_SHA256 = (
+LUT_FP16_SUBDIVISION_BITS = 3
+LUT_FP16_SEGMENT_COUNT = 104
+LUT_FP16_SEGMENT_TABLE_BYTES = 416
+LUT_FP16_SEGMENT_TABLE_SHA256 = (
     "17cf4ca9ef1e3a07c3354c12f7ac887b4e081b1668bea61eb37d8f2b410bb968"
 )
 
 # 104 interleaved little-endian FP16 (base, slope) pairs. This is checkpoint-
-# independent execution data and is byte-identical to kquant's canonical law.
-_DESCRIPTOR_HEX = (
+# independent execution data.
+_SEGMENT_TABLE_HEX = (
     "7d4600001d460000ef450000d0450000b8450000a54500009545000087450000"
     "7b45000070450000664500005d450000544500004c450000454500003e450000"
     "32450026274500251c450025134500250a45002502450024fb440024f4440022"
@@ -42,62 +42,59 @@ _DESCRIPTOR_HEX = (
 
 
 @functools.cache
-def sqg_fp16_d3l_descriptors_cpu() -> torch.Tensor:
-    """Return the frozen descriptor payload as contiguous uint8 storage."""
-
-    raw = bytes.fromhex(_DESCRIPTOR_HEX)
-    if len(raw) != SQG_FP16_D3L_DESCRIPTOR_BYTES:
-        raise AssertionError("SQG FP16-D3L descriptor byte count changed")
-    if hashlib.sha256(raw).hexdigest() != SQG_FP16_D3L_DESCRIPTOR_SHA256:
-        raise AssertionError("SQG FP16-D3L descriptor identity changed")
+def lut_fp16_segment_table_cpu() -> torch.Tensor:
+    """Return the frozen segment table as contiguous uint8 storage."""
+    raw = bytes.fromhex(_SEGMENT_TABLE_HEX)
+    if len(raw) != LUT_FP16_SEGMENT_TABLE_BYTES:
+        raise AssertionError("lut_fp16 segment table byte count changed")
+    if hashlib.sha256(raw).hexdigest() != LUT_FP16_SEGMENT_TABLE_SHA256:
+        raise AssertionError("lut_fp16 segment table identity changed")
     return torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone().contiguous()
 
 
-_SQG_FP16_D3L_DESCRIPTORS_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
+_LUT_FP16_SEGMENT_TABLE_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
-def _sqg_fp16_d3l_descriptors_device(
+def _lut_fp16_segment_table_device(
     device_type: str,
     device_index: int | None,
 ) -> torch.Tensor:
     key = (device_type, device_index)
-    cached = _SQG_FP16_D3L_DESCRIPTORS_DEVICE.get(key)
+    cached = _LUT_FP16_SEGMENT_TABLE_DEVICE.get(key)
     if cached is None:
-        cached = sqg_fp16_d3l_descriptors_cpu().to(
+        cached = lut_fp16_segment_table_cpu().to(
             device=torch.device(device_type, device_index)
         ).contiguous()
-        _SQG_FP16_D3L_DESCRIPTORS_DEVICE[key] = cached
+        _LUT_FP16_SEGMENT_TABLE_DEVICE[key] = cached
     return cached
 
 
-def sqg_fp16_d3l_descriptors(device: torch.device | str) -> torch.Tensor:
-    """Return the process-lifetime descriptor payload for ``device``."""
-
+def lut_fp16_segment_table(device: torch.device | str) -> torch.Tensor:
+    """Return the process-lifetime segment table for ``device``."""
     resolved = torch.device(device)
     index = resolved.index
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
-    return _sqg_fp16_d3l_descriptors_device(resolved.type, index)
+    return _lut_fp16_segment_table_device(resolved.type, index)
 
 
-def sqg_fp16_d3l_descriptors_resident(
+def lut_fp16_segment_table_resident(
     device: torch.device | str,
 ) -> torch.Tensor | None:
-    """Return the resident device descriptors without allocating them."""
+    """Return the resident device segment table without allocating it."""
     resolved = torch.device(device)
     index = resolved.index
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
-    return _SQG_FP16_D3L_DESCRIPTORS_DEVICE.get((resolved.type, index))
+    return _LUT_FP16_SEGMENT_TABLE_DEVICE.get((resolved.type, index))
 
 
-def sqg_xor_high_rate_rank_for_codewords(
+def lut_fp16_permutation(
     codewords: torch.Tensor, bits: int
 ) -> torch.Tensor:
-    """Apply the canonical carry-mixed SQG graph at K5 or K6."""
-
+    """Map 5- or 6-bit decode windows to value-law ranks."""
     if bits not in (5, 6):
-        raise ValueError(f"SQG FP16-D3L supports only K5/K6, got K{bits}")
+        raise ValueError(f"lut_fp16 supports only K5/K6, got K{bits}")
     width = 16 - bits
     history_mask = (1 << width) - 1
     branch_mask = (1 << bits) - 1
@@ -107,15 +104,15 @@ def sqg_xor_high_rate_rank_for_codewords(
     mixed = history ^ (history >> 11)
     mixed ^= (mixed << 11) & history_mask
     product = (0x3FA7D929 * mixed + 0xC928FD8E) & 0xFFFFFFFF
-    phase = product & history_mask
-    syndrome = product >> (32 - bits)
+    low = product & history_mask
+    branch_key = product >> (32 - bits)
     reversed_branch = torch.zeros_like(branch)
     for index in range(bits):
         reversed_branch |= ((branch >> index) & 1) << (bits - 1 - index)
-    return ((reversed_branch ^ syndrome) << width) | phase
+    return ((reversed_branch ^ branch_key) << width) | low
 
 
-def decode_sqg_fp16_d3l_ranks_torch(ranks: torch.Tensor) -> torch.Tensor:
+def lut_fp16_decode_ranks_torch(ranks: torch.Tensor) -> torch.Tensor:
     """Decode ranks with the exact integer coordinates and FP16-FMA law."""
 
     rank = ranks.to(torch.int64) & 0xFFFF
@@ -124,47 +121,46 @@ def decode_sqg_fp16_d3l_ranks_torch(ranks: torch.Tensor) -> torch.Tensor:
     magnitude = torch.where(negative, magnitude ^ 0x7FFF, magnitude)
     odd_tail = 65535 - 2 * magnitude
     exponent = torch.floor(torch.log2(odd_tail.to(torch.float64))).to(torch.int64)
-    shift = torch.clamp(exponent - SQG_FP16_D3L_SUBDIVISION_BITS, min=0)
+    shift = torch.clamp(exponent - LUT_FP16_SUBDIVISION_BITS, min=0)
     power = 1 << exponent
     delta = odd_tail - power
     subdivision = delta >> shift
-    fitted_descriptor = (shift << SQG_FP16_D3L_SUBDIVISION_BITS) + subdivision
+    fitted_segment = (shift << LUT_FP16_SUBDIVISION_BITS) + subdivision
     maximum_odd = power + (subdivision << shift) + (1 << shift) - 1
     fitted_local = (maximum_odd - odd_tail) >> 1
-    exact_descriptor = (1 << torch.clamp(exponent - 1, min=0)) + ((delta - 1) >> 1)
-    exact = exponent <= SQG_FP16_D3L_SUBDIVISION_BITS
-    descriptor = torch.where(exact, exact_descriptor, fitted_descriptor)
+    exact_segment = (1 << torch.clamp(exponent - 1, min=0)) + ((delta - 1) >> 1)
+    exact = exponent <= LUT_FP16_SUBDIVISION_BITS
+    segment = torch.where(exact, exact_segment, fitted_segment)
     local = torch.where(exact, torch.zeros_like(fitted_local), fitted_local)
 
-    table = sqg_fp16_d3l_descriptors_cpu().view(torch.float16).reshape(-1, 2)
+    table = lut_fp16_segment_table_cpu().view(torch.float16).reshape(-1, 2)
     table = table.to(device=rank.device)
     local_f32 = local.to(torch.float16).to(torch.float32)
     magnitude_value = (
-        table[:, 1].index_select(0, descriptor).float() * local_f32
-        + table[:, 0].index_select(0, descriptor).float()
+        table[:, 1].index_select(0, segment).float() * local_f32
+        + table[:, 0].index_select(0, segment).float()
     ).to(torch.float16)
     return torch.where(negative, -magnitude_value, magnitude_value).contiguous()
 
 
 @functools.cache
-def sqg_fp16_d3l_direct_lut_cpu(bits: int) -> torch.Tensor:
-    """Return the canonical 65,536-entry FP16 codeword oracle for tests."""
+def lut_fp16_direct_table_cpu(bits: int) -> torch.Tensor:
+    """Return the 65,536-entry FP16 codeword oracle for tests."""
 
     codewords = torch.arange(1 << 16, dtype=torch.int64)
-    ranks = sqg_xor_high_rate_rank_for_codewords(codewords, bits)
-    return decode_sqg_fp16_d3l_ranks_torch(ranks)
+    ranks = lut_fp16_permutation(codewords, bits)
+    return lut_fp16_decode_ranks_torch(ranks)
 
 
 __all__ = [
-    "SQG_FP16_D3L",
-    "SQG_FP16_D3L_DESCRIPTOR_BYTES",
-    "SQG_FP16_D3L_DESCRIPTOR_COUNT",
-    "SQG_FP16_D3L_DESCRIPTOR_SHA256",
-    "SQG_FP16_D3L_SUBDIVISION_BITS",
-    "decode_sqg_fp16_d3l_ranks_torch",
-    "sqg_fp16_d3l_descriptors",
-    "sqg_fp16_d3l_descriptors_cpu",
-    "sqg_fp16_d3l_descriptors_resident",
-    "sqg_fp16_d3l_direct_lut_cpu",
-    "sqg_xor_high_rate_rank_for_codewords",
+    "LUT_FP16_SEGMENT_COUNT",
+    "LUT_FP16_SEGMENT_TABLE_BYTES",
+    "LUT_FP16_SEGMENT_TABLE_SHA256",
+    "LUT_FP16_SUBDIVISION_BITS",
+    "lut_fp16_decode_ranks_torch",
+    "lut_fp16_direct_table_cpu",
+    "lut_fp16_permutation",
+    "lut_fp16_segment_table",
+    "lut_fp16_segment_table_cpu",
+    "lut_fp16_segment_table_resident",
 ]

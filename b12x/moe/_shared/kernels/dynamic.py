@@ -814,7 +814,7 @@ class MoEDynamicKernelBackend:
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
         trellis_bits: int | None = None,
-        trellis_coupled: bool = False,
+        trellis_intermediate_hadamard: bool = False,
         trellis_direct_lut: bool = False,
     ):
         activation = normalize_moe_activation(activation)
@@ -908,7 +908,7 @@ class MoEDynamicKernelBackend:
         self.mxfp6_fmt_b = mxfp6_fmt_b
         self.is_w4a8 = quant_recipe in ("w4a8_mx", "w4a8_nvfp4", "w4a8_trellis")
         self.w4a8_residual = quant_recipe == "w4a8_nvfp4"
-        # w4a8_trellis: QSRT SQG-XOR-Cheb-T12 trellis payload decoded to
+        # w4a8_trellis: ``lut_e4m3`` trellis payload decoded to
         # fully-scaled E4M3 in the MMA warps (identity UE8M0 SFB). It rides
         # the repacked W4A8 pipeline shape: producer-staged B windows, named
         # pipeline, no B TMA; only the B staging, expansion, and MMA operand
@@ -942,9 +942,9 @@ class MoEDynamicKernelBackend:
         elif trellis_bits is not None:
             raise ValueError("trellis_bits is only valid for w4a8_trellis")
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
-        if trellis_coupled and not self.w4a8_trellis:
-            raise ValueError("trellis_coupled requires quant_recipe='w4a8_trellis'")
-        self.trellis_coupled = bool(trellis_coupled)
+        if trellis_intermediate_hadamard and not self.w4a8_trellis:
+            raise ValueError("trellis_intermediate_hadamard requires quant_recipe='w4a8_trellis'")
+        self.trellis_intermediate_hadamard = bool(trellis_intermediate_hadamard)
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         self.w4a8_repacked = bool(w4a8_repacked)
         self.w4a8_n64_repacked = bool(w4a8_n64_repacked)
@@ -1055,8 +1055,8 @@ class MoEDynamicKernelBackend:
                     if self.w4a8_trellis and self.w4a8_split_materialized
                     else None
                 ),
-                trellis_coupled=(
-                    self.trellis_coupled and self.w4a8_split_materialized
+                trellis_intermediate_hadamard=(
+                    self.trellis_intermediate_hadamard and self.w4a8_split_materialized
                 ),
                 trellis_direct_lut=(
                     self.trellis_direct_lut and self.w4a8_split_materialized
@@ -1170,13 +1170,14 @@ class MoEDynamicKernelBackend:
                 "W4A8 MX (materialized execution is M16-only)"
             )
         if self.external_route_plan and not (
-            quant_recipe == "nvfp4"
+            (quant_recipe == "nvfp4"
+             or (quant_recipe == "w4a8_mx" and self.w4a8_n64_repacked))
             and not self.direct_routing
             and work_source
             in {_WORK_SOURCE_MATERIALIZED_QUEUE, _WORK_SOURCE_PERSISTENT_GRID}
         ):
             raise ValueError(
-                "external route planning requires grouped NVFP4 with the "
+                "external route planning requires grouped NVFP4 or compact W4A8 with the "
                 "materialized or persistent work source"
             )
         if self.is_w4a8 and swap_ab:
@@ -2502,7 +2503,7 @@ class MoEDynamicKernelBackend:
         w13_sfb_rp: cute.Tensor | None = None,  # flat repacked u32 SFB
         down_rp: cute.Tensor | None = None,  # flat repacked u32 B
         down_sfb_rp: cute.Tensor | None = None,  # flat repacked u32 SFB
-        trellis_lut: cute.Tensor | None = None,  # 4 KiB T12 staircase (u8)
+        trellis_lut: cute.Tensor | None = None,  # 4 KiB lut_e4m3 value table (u8)
         trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
     ):
         self.a_dtype = packed_a.element_type
@@ -2729,7 +2730,7 @@ class MoEDynamicKernelBackend:
                 and trellis_lut is not None
             ), (
                 "w4a8_trellis requires the flat trellis payload tensors "
-                "(via w13_rp/down_rp) and the T12 staircase table"
+                "(via w13_rp/down_rp) and the lut_e4m3 value table"
             )
         elif cutlass.const_expr(self.w4a8_repacked):
             assert (
@@ -3243,7 +3244,7 @@ class MoEDynamicKernelBackend:
         sfa_base_addr = ctrl_base_addr + Int32(Storage._offsets["sSFA"])
         reduce_scratch_addr = ctrl_base_addr + Int32(Storage._offsets["reduce_scratch"])
         if cutlass.const_expr(self.w4a8_trellis):
-            # Stage the 4 KiB T12 staircase once; every later decode gathers
+            # Stage the 4 KiB value table once; every later decode gathers
             # from shared memory. The phase-0 grid barrier orders the copy
             # ahead of any consumer decode.
             trellis_lut_smem_base = ctrl_base_addr + Int32(
@@ -3464,7 +3465,7 @@ class MoEDynamicKernelBackend:
 
         # General grouped execution compacts routes by expert.  Tiny direct-
         # routing decode instead gives every routed pair its own physical M tile:
-        # this removes the histogram, serial expert prefix, and two resident-
+        # this removes the histogram, expert prefix, and two resident-
         # grid barriers while retaining the exact same compute/task body.
         # The external route-plan specialization gets the grouped histogram and
         # prefix from an ordered Triton launch and skips the same control phase.
@@ -3490,17 +3491,31 @@ class MoEDynamicKernelBackend:
                 is_cta_leader,
             )
 
-            if flat_tid == Int32(0):
+            # Scan coalesced chunks in one warp, preserving expert order.
+            if Int32(bidz) == Int32(0) and warp_idx == Int32(0):
+                prefix_lane = Int32(tidx) & Int32(31)
                 tile_acc = Int32(0)
-                expert_idx = Int32(0)
-                while expert_idx < num_experts:
-                    expert_tile_base[expert_idx] = tile_acc
-                    rows = row_counts[expert_idx]
-                    tile_acc += (
-                        rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
-                    ) // Int32(self.tile_shape_mnk[0])
-                    expert_idx += Int32(1)
-                expert_tile_base[num_experts] = tile_acc
+                expert_chunk = Int32(0)
+                while expert_chunk < num_experts:
+                    expert_idx = expert_chunk + prefix_lane
+                    tiles = Int32(0)
+                    if expert_idx < num_experts:
+                        tiles = (
+                            row_counts[expert_idx]
+                            + Int32(self.tile_shape_mnk[0]) - Int32(1)
+                        ) // Int32(self.tile_shape_mnk[0])
+                    prefix = tiles
+                    for shift in cutlass.range_constexpr(5):
+                        offset = Int32(1 << shift)
+                        preceding = cute.arch.shuffle_sync(prefix, prefix_lane - offset)
+                        if prefix_lane >= offset:
+                            prefix += preceding
+                    if expert_idx < num_experts:
+                        expert_tile_base[expert_idx] = tile_acc + prefix - tiles
+                    tile_acc += cute.arch.shuffle_sync(prefix, Int32(31))
+                    expert_chunk += Int32(32)
+                if prefix_lane == Int32(0):
+                    expert_tile_base[num_experts] = tile_acc
 
             self._resident_grid_barrier(
                 barrier_count,
@@ -4992,7 +5007,7 @@ class MoEDynamicKernelBackend:
             w4a8_resb = ctrl_base_addr + Int32(Storage._offsets["sSFB_up"])
             if cutlass.const_expr(self.w4a8_trellis):
                 # t256 ring geometry depends only on lane and bitrate; the
-                # 4 KiB T12 staircase is read through its global address.
+                # 4 KiB value table is read through its global address.
                 tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
                     Int32(tidx) & Int32(31), self.trellis_bits
                 )
@@ -6305,7 +6320,7 @@ class MoEDynamicKernelBackend:
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
                             if cutlass.const_expr(
-                                self.w4a8_trellis and not self.trellis_coupled
+                                self.w4a8_trellis and not self.trellis_intermediate_hadamard
                             ):
                                 # Trellis activation boundary through sC:
                                 # ig = rot_g * H128(g); then restage up,
@@ -6473,9 +6488,9 @@ class MoEDynamicKernelBackend:
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                             if cutlass.const_expr(
-                                self.w4a8_trellis and self.trellis_coupled
+                                self.w4a8_trellis and self.trellis_intermediate_hadamard
                             ):
-                                # Coupled activation boundary: the slice's raw
+                                # Intermediate-Hadamard activation boundary: the slice's raw
                                 # gate sits in sC[epi_buffer]; restage raw up
                                 # into the next epilogue buffer, then per row
                                 # run the interleaved signed-Hadamard sandwich,
@@ -8645,7 +8660,7 @@ class MoEDynamicKernelBackend:
                                     if cutlass.const_expr(self.w4a8_trellis):
                                         # Trellis payload is projection-major
                                         # [proj][E][K16][N16] window blocks
-                                        # (the prepared QSRT layout); stage
+                                        # (the prepared trellis layout); stage
                                         # the slice's gate tile (and the up
                                         # tile when fused; the second pass of
                                         # the non-fused gated shape stages up

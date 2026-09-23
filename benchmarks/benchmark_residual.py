@@ -155,14 +155,26 @@ def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, f
     return float(diff.abs().max().item()), float(torch.sqrt(torch.mean(diff * diff)).item())
 
 
-def _bench_graph(fn, *, warmup: int, iters: int, l2_flush, samples_out=None, check=None) -> tuple[float, float]:
+def _bench_graph(fn, *, warmup: int, iters: int, l2_flush, samples_out=None, check=None, cupti=False) -> tuple[float, float]:
     graph = capture_cuda_graph(fn, warmup=warmup)
     try:
         graph.replay()
         if check is not None:
             check()
-        stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
-        samples = stats["replay_us"]
+        if cupti:
+            from importlib.metadata import version
+            from cupti import cupti as _cupti  # noqa: F401
+            from flashinfer.testing import bench_gpu_time_with_cupti
+
+            if int(version("cupti-python").split(".")[0]) < 13:
+                raise RuntimeError("CUPTI timing requires cupti-python >= 13")
+            samples = [ms * 1000 for ms in bench_gpu_time_with_cupti(
+                graph.replay, dry_run_iters=warmup, repeat_iters=iters,
+                use_cuda_graph=False, cold_l2_cache=l2_flush is not None,
+            )]
+        else:
+            stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
+            samples = stats["replay_us"]
         if check is not None:
             check()
         if samples_out is not None:
@@ -234,6 +246,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--cupti", action="store_true", help="Time graph replay with CUPTI; --l2-flush uses FlashInfer's write eviction instead of the default read sweep.")
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
@@ -251,6 +264,8 @@ def main() -> None:
     parser.add_argument("--vllm-path", type=pathlib.Path, help="Checkout for the production adapters or TileLang comparison.")
     parser.add_argument("--output", type=pathlib.Path, help="Write raw timing, correctness and source provenance JSON.")
     args = parser.parse_args()
+    if args.cupti and (args.eager or args.l2_flush_bytes):
+        parser.error("--cupti requires graph mode and the default L2 flush size")
     with ExitStack() as stack:
         _run_benchmark(args, stack)
 
@@ -345,6 +360,7 @@ def _run_benchmark(args, stack: ExitStack) -> None:
             args.vllm_path, profile_name=args.model_profile, model_config=cfg,
             capture_sizes=capture_sizes,
         ))
+        runner.prepare_weights(tensors)
         # The integration owns the split and capture-capacity decisions.
         required_split = 4 * args.hidden_size // args.block_k
         if args.split_k is not None and args.split_k != required_split:
@@ -473,11 +489,13 @@ def _run_benchmark(args, stack: ExitStack) -> None:
     fused_median, fused_min = bench(
         run_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush,
         samples_out=samples, check=check,
+        **({"cupti": args.cupti} if not args.eager else {}),
     )
     vllm_median = vllm_min = None
     if args.compare_vllm:
         vllm_median, vllm_min = bench(
             run_vllm_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush,
+            **({"cupti": args.cupti} if not args.eager else {}),
         )
     mode = "eager" if args.eager else "graph"
     print(
@@ -509,6 +527,10 @@ def _run_benchmark(args, stack: ExitStack) -> None:
             "rms_eps": args.rms_eps, "norm_eps": args.norm_eps, "hc_eps": args.hc_eps,
             "sinkhorn_iters": args.sinkhorn_iters, "split_k": args.split_k,
             "timing_mode": mode, "l2_flush": args.l2_flush, "warmup": args.warmup,
+            "timing_backend": "cupti" if args.cupti else "cuda_events",
+            "l2_eviction": (
+                "flashinfer_zero_write" if args.cupti else "read_sweep"
+            ) if args.l2_flush else "none",
             "samples_us": samples, "median_us": fused_median, "min_us": fused_min,
             "correctness": (
                 "unchecked" if args.skip_check else

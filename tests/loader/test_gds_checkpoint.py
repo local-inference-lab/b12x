@@ -7,18 +7,19 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from b12x.loader import capabilities
 from b12x.loader._checkpoint import DirectWeightSession
-from b12x.loader._pool import owns_storage, weight_allocation, weight_pool
+
 
 
 @pytest.fixture
 def session():
-    if weight_allocation() != "device":
+    if capabilities()["host_page_tables"]:
         pytest.skip("discrete-GPU checkpoint transport required")
     with (
-        weight_pool(allocation="device") as allocator,
-        DirectWeightSession(io_threads=2, allocation_scope=allocator) as session,
-        allocator(),
+
+        DirectWeightSession(io_threads=2, read_mode="gds") as session,
+
     ):
         yield session
 
@@ -46,7 +47,7 @@ def test_tp_bytes_and_bf16_bits_preserve_destination_padding(
     stats = session.stats()
     assert stats["gds_enabled"] == 1
     assert stats["gpu_scratch_bytes"] == 2 * ((8 << 20) + 65536)
-    assert stats["transform_scratch_bytes"] == stats["inplace_transform_bytes"] == 0
+    assert stats["transform_scratch_bytes"] == stats["bf16_expansion_bytes"] == 0
     for rank, (backing, target) in enumerate(targets):
         expected = bits[:, rank * 128 : (rank + 1) * 128]
         actual = target.cpu().view(torch.int32 if expanded else torch.int16)
@@ -93,7 +94,6 @@ def test_file_and_device_offsets_with_partial_eof_and_graph_lifetime(
     target = backing[prefix:-1]
     backing[prefix - 1 : prefix].fill_(199)
     backing[-1:].fill_(199)
-    assert owns_storage(target)
     session(target, source)
     stats = session.stats()
     if offset == 4096:
@@ -147,7 +147,7 @@ def test_invalid_destinations_and_truncation_fail_before_writes(tmp_path, sessio
         session.flush()
     assert torch.count_nonzero(target) == 0
     entry = session.sources[source.untyped_storage()._cdata][1]
-    with pytest.raises(RuntimeError, match="owned device weight storage"):
+    with pytest.raises(RuntimeError, match="CUDA device allocation"):
         session._execute(array("Q", (entry.fd, entry.offset, 4, 1, 0, 1, 0, 0)))
     session(target, source)
     with path.open("r+b") as file:

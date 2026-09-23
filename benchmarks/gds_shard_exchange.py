@@ -28,7 +28,7 @@ import time
 import torch
 
 from b12x.loader._checkpoint import DirectWeightSession
-from b12x.loader._pool import weight_pool
+
 
 
 @dataclass(frozen=True)
@@ -152,14 +152,14 @@ def main():
         "sources": {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in [Path(__file__), Path(__file__).with_name("_gds_shard_reads.c"),
                                  *sorted((repo / "b12x/loader").glob("_gds*")),
-                                 repo / "b12x/loader/_checkpoint.py", repo / "b12x/loader/_pool.py"] if path.is_file()},
+                                 repo / "b12x/loader/_checkpoint.py", repo / "b12x/loader/_cuda_range.h"] if path.is_file()},
         "topology": subprocess.check_output(["nvidia-smi", "topo", "-m"], text=True),
         "gpu_before_setup": gpu_snapshot(devices),
     }
     results = []
     disabled = set()
     with ExitStack() as stack:
-        pools, sessions, targets, full, owner_storage = [], [], [], [], []
+        sessions, targets, full, owner_storage = [], [], [], []
         owner_capacity = max(sum(((cases[j].offset % 4096 + cases[j].nbytes + 4095) // 4096) * 4096
                                  for j in (i, i + 1)) for i in range(0, len(cases), 2))
         owner_capacity = (owner_capacity + 65535) // 65536 * 65536
@@ -170,16 +170,13 @@ def main():
             stack.callback(os.close, fd)
         for device in devices:
             torch.cuda.set_device(device)
-            pool = stack.enter_context(weight_pool(allocation="device", device=device))
-            pools.append(pool)
-            session = stack.enter_context(DirectWeightSession(device, args.io_threads, allocation_scope=pool))
+            session = stack.enter_context(DirectWeightSession(device, args.io_threads, read_mode="gds"))
             sessions.append(session)
-            with pool():
-                targets.append([torch.empty((c.rows, c.width // tp), dtype=torch.uint8, device=device) for c in cases])
-                backing = torch.empty(owner_capacity + 65536, dtype=torch.uint8, device=device)
-                alignment = (-backing.data_ptr()) % 65536
-                owner_storage.append(backing[alignment:alignment + owner_capacity])
-                full.append({})
+            targets.append([torch.empty((c.rows, c.width // tp), dtype=torch.uint8, device=device) for c in cases])
+            backing = torch.empty(owner_capacity + 65536, dtype=torch.uint8, device=device)
+            alignment = (-backing.data_ptr()) % 65536
+            owner_storage.append(backing[alignment:alignment + owner_capacity])
+            full.append({})
             session._execute(array("Q"))
         gds = sessions[0]._gds
         gds.start_stats(3)

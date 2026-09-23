@@ -108,7 +108,7 @@ propagation and complete-world completion. Incomplete races are not cached.
 `cache_only=True` refuses search and compilation. A complete cached restart
 loads and primes process-local state without starting compiler workers.
 
-The decision cache uses schema 5 and an explicit positive integer version,
+The decision cache uses schema 6 and an explicit positive integer version,
 `B12X_TUNING_CACHE_VERSION`, which defaults to `1`. Set the same version on
 every rank. Increment it before launch to discard prior tuning decisions:
 
@@ -124,7 +124,9 @@ keys; the tuning-cache version is excluded from the compiler environment key.
 A cached decision still validates its assignment and configuration, then
 compiles any missing artifacts for that selected configuration. Increment the
 decision version when implementation or toolchain changes warrant retuning.
-Schema-4 files are left intact and are not read by schema 5.
+Schema-4 and schema-5 files are left intact and are not read by schema 6.
+The schema bump invalidates prior decisions even when the environment version
+is explicitly set, so kernels are retuned for ordinary CUDA weight storage.
 
 A selection key digests the component, the contract versions, the encoded
 query, the invocation, the pin and the dependencies. GDN decode, GDN and KDA
@@ -222,6 +224,11 @@ row tiles, restricts MXFP8 decode swapping to N<=K/2, and omits wide NVFP4
 K512 prefill tiles outside short-K or narrow-output cases. MXFP8 retains
 16-row tiles through M128 and the legal BK64 row-tile exception. Explicit
 launch constraints bypass these search heuristics.
+
+Native lagged mHC races 4, 9, 13 and 25 partials per CTA when its fused
+producer is active. This compile-time parameter is inactive for other routes,
+so it does not multiply their candidate counts. `B12X_MHC_PARTIALS_PER_CTA`
+pins the grouping, while preparation without tuning retains the existing defaults.
 
 mHC prefill at M>=384 couples M warp groups, single N warps and 128–256
 buffered K elements. At M>=2048 it keeps N tiles covering all 24 projections

@@ -352,6 +352,13 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
     )
 def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k,
          causal=False, window_size=None, attention_sink_bias=None, override=None):
+    """Prepare row and segment capacities for packed varlen attention.
+
+    Bindings may use fewer packed rows or segments than the planning tensors.
+    Head dimensions, dtype, and contiguous layouts remain fixed. GPU cumulative
+    lengths must describe the bound tensors; supplied maximum lengths must not
+    exceed the prepared limits. Live shapes never select or compile a program.
+    """
     query, invocation = _varlen_invocation(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k, causal=causal, window_size=window_size,

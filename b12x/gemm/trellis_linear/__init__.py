@@ -1,7 +1,7 @@
 """Trellis-coded dense linear for SM12x.
 
 The operation consumes the checkpoint-native ``trellis_t256`` payload
-(MCG or SQG-XOR-Cheb-T12 codebooks) and
+(``mcg`` or ``lut_e4m3`` codebooks) and
 its two Hadamard sign vectors.  Preparation validates and records zero-copy
 views; execution performs input rotation, a W4A16 or direct E4M3-W4A8 GEMM,
 and output rotation.
@@ -33,8 +33,8 @@ META = OpMeta(
     dtypes=("bf16", "fp16"),
     recipes=(
         "w4a16/trellis_mcg",
-        "w4a16/trellis_sqg_e4m3",
-        "w4a8/trellis_sqg_e4m3",
+        "w4a16/trellis_lut_e4m3",
+        "w4a8/trellis_lut_e4m3",
     ),
     provenance=Provenance(
         repo="https://github.com/local-inference-lab/b12x",

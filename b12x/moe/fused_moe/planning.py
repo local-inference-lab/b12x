@@ -120,9 +120,9 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
 
 
 def _validate_trellis_runtime(source: TrellisConfig) -> None:
-    if source.codebook.value == "sqg_fp16":
+    if source.codebook.value == "lut_fp16":
         raise NotImplementedError(
-            "sqg_fp16 is defined by the checkpoint schema but is not "
+            "lut_fp16 is defined by the checkpoint schema but is not "
             "implemented by the routed fused MoE runtime"
         )
     if source.rate.group_size is not None:
@@ -137,20 +137,20 @@ def _validate_trellis_runtime(source: TrellisConfig) -> None:
             "fused MoE trellis execution requires scaled_hadamard(128)"
         )
     expert = source.transform.expert
-    if expert.kind == "coupled_hadamard" and (
-        source.codebook.value != "sqg_e4m3"
+    if expert.kind == "intermediate_hadamard" and (
+        source.codebook.value != "lut_e4m3"
         or source.rate.granularity.value != "uniform"
     ):
         raise NotImplementedError(
-            "fused MoE coupled_hadamard execution currently requires the "
-            "sqg_e4m3 codebook with uniform rates"
+            "fused MoE intermediate_hadamard execution currently requires the "
+            "lut_e4m3 codebook with uniform rates"
         )
-    if expert.kind == "coupled_hadamard" and (
+    if expert.kind == "intermediate_hadamard" and (
         expert.pre_block_size,
         expert.post_block_size,
     ) != (512, 128):
         raise NotImplementedError(
-            "fused MoE coupled_hadamard requires block sizes (512, 128)"
+            "fused MoE intermediate_hadamard requires block sizes (512, 128)"
         )
 
 
@@ -274,10 +274,10 @@ def plan_weights(
                 if source.codebook.value == "mcg"
                 else (64, 256, 64, 256)
             ),
-            coupled_hadamard=expert.kind == "coupled_hadamard",
+            intermediate_hadamard=expert.kind == "intermediate_hadamard",
             trellis_codebook=source.codebook.value,
             trellis_rate_granularity=source.rate.granularity.value,
-            coupled_hadamard_blocks=(
+            intermediate_hadamard_blocks=(
                 None
                 if expert.kind == "none"
                 else (expert.pre_block_size, expert.post_block_size)

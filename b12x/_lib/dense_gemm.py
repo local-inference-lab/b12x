@@ -500,6 +500,9 @@ def _dense_gemm_policy_for(
                 and mma_tiler_mn == (16, 128)
                 else 2
             )
+    if not _B12X_DENSE_SPLITK_TURBO:
+        # The FP32 workspace reducer consumes exactly two partials.
+        split_k_slices = min(split_k_slices, 2)
     # A declared expected_m owns compile-time tuning for its regime. Without a
     # hint, keep the unroll choice stable throughout the persistent scheduler
     # regime so one warmed kernel covers every live M in that regime.
@@ -7350,7 +7353,7 @@ def _select_mxfp8_tile_k(
         and _use_low_sm_dense_tactics(sm_count)
     ):
         return 64
-    # Keep tile M and K coupled for the short-K, wide-output prefill plan.
+    # Keep tile M and K tied for the short-K, wide-output prefill plan.
     if (
         expected_m is not None
         and expected_m >= 2048

@@ -221,6 +221,8 @@ TUNING = TuningContract(
 
 @dataclass(frozen=True, kw_only=True)
 class FixedBlockscaledQuery:
+    """Fixed kernel recipe; serialized block-FP8 accepts dynamic M with expected_m=None."""
+
     recipe: str
     call_kind: str
     max_rows: int
@@ -229,7 +231,7 @@ class FixedBlockscaledQuery:
     out_features: int
     input_dtype: str
     output_dtype: str
-    expected_m: int
+    expected_m: int | None
     alpha_mode: str | None = None
     source_scale_form: str | None = None
     codegen: FrozenMapping | None = None
@@ -250,11 +252,14 @@ def _validate_fixed_query(query, device):
         raise TypeError("query must be FixedBlockscaledQuery")
     if query.codegen != _codegen_snapshot():
         raise ValueError("fixed packed code-generation snapshot changed")
-    if (min(query.max_rows, query.in_features, query.out_features, query.expected_m) <= 0
+    if (min(query.max_rows, query.in_features, query.out_features) <= 0
+            or (query.expected_m is not None and query.expected_m <= 0)
             or query.padded_in_features < query.in_features
             or query.output_dtype not in ("bfloat16", "float16")
             or query.alpha_mode not in ("unit", "tensor")):
         raise ValueError("invalid fixed blockscaled metadata")
+    if query.expected_m is None and (query.call_kind, query.recipe) != ("serialized", "block_fp8"):
+        raise ValueError("dynamic fixed blockscaled rows require serialized block-FP8")
     if query.call_kind == "serialized":
         if (query.recipe not in ("nvfp4", "mxfp4", "block_fp8")
                 or query.in_features != query.padded_in_features
@@ -289,5 +294,5 @@ def _validate_fixed_query(query, device):
 
 FIXED_TUNING = replace(
     make_fixed_contract(component_id="gemm.blockscaled.fixed", query_type=FixedBlockscaledQuery, backend="cutedsl"),
-    query_schema_version=2, validate_query=_validate_fixed_query,
+    query_schema_version=3, validate_query=_validate_fixed_query,
 )

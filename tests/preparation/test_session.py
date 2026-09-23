@@ -20,7 +20,7 @@ from .test_defaults import Config, Query, contract
 
 def session(tmp_path, **kwargs):
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
-    value._cache = SelectionCache(tmp_path, {"schema_version": 5, "tuning_cache_version": 1})
+    value._cache = SelectionCache(tmp_path, {"schema_version": 6, "tuning_cache_version": 1})
     return value
 
 

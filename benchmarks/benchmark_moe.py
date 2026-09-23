@@ -331,6 +331,7 @@ class ModelProfile:
     default_swiglu_alpha: float | None = None
     default_swiglu_beta: float | None = None
     default_routing: str = "synthetic"
+    default_scale_contract: str = "shared"
     shape: ShapeSpec | None = None
 
 
@@ -524,6 +525,19 @@ MODEL_PROFILES = {
         default_validate="oracle",
         default_swiglu_limit=10.0,
         default_routing="model",
+    ),
+    "deepseek-v4-flash-0731": ModelProfile(
+        label="DeepSeek V4 Flash 0731",
+        checkpoint_family="deepseek_v4_flash",
+        default_layer_idx=3,
+        tp_size=2,
+        hf_repo_id="deepseek-ai/DeepSeek-V4-Flash-0731",
+        default_activation="silu",
+        default_quant_mode="w4a8_mx",
+        default_validate="oracle",
+        default_swiglu_limit=10.0,
+        default_routing="model",
+        default_scale_contract="per-expert",
     ),
     "deepseek-v4.1-flash": ModelProfile(
         label="DeepSeek V4.1 Flash",
@@ -1695,6 +1709,7 @@ def make_benchmark_case(
             torch.arange(spec.top_k, dtype=torch.float32, device=device) * .125,
             dim=-1,
         ).expand(m, -1).contiguous()
+        topk_weights.mul_(getattr(weights, "gate_route_scale", 1.0))
         return x, topk_ids, topk_weights, None
     if profile.default_routing == "model":
         topk_ids, topk_weights = compute_model_gate_routing(
@@ -2872,6 +2887,7 @@ def prepare_moe_execution(
         max_tokens=max(inputs),
         top_k=top_k,
         warmup_token_counts=tuple(inputs),
+        route_num_experts=0,
     )
     if route_mode != "auto":
         if override is not None:
@@ -3264,6 +3280,7 @@ def bench_multilayer_graph_mode(
 
 def bench_e2e() -> None:
     from b12x.moe.fused_moe._impl import default_moe_quant_mode
+    from b12x.moe.fused_moe.workloads import ROUTING_WORKLOADS
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
@@ -3292,8 +3309,12 @@ def bench_e2e() -> None:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--raw-samples-jsonl", type=pathlib.Path)
     parser.add_argument(
-        "--routing-workload", choices=("default", "shared_40"), default="default",
-        help="shared_40 reuses about 40%% of token/expert assignments in the batch.",
+        "--torch-trace-dir", type=pathlib.Path,
+        help="Save one untimed graph replay per case for launch/resource comparison.",
+    )
+    parser.add_argument(
+        "--routing-workload", choices=("default", *ROUTING_WORKLOADS), default="default",
+        help="shared_N reuses about N%% of token/expert assignments across the batch.",
     )
     parser.add_argument(
         "--routing-repeat-period",
@@ -3382,7 +3403,7 @@ def bench_e2e() -> None:
             "for the MXFP4xMXFP8 reference (default: 4096)."
         ),
     )
-    parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
+    parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default=None)
     parser.add_argument(
         "--w4a16-native",
         action="store_true",
@@ -3486,6 +3507,9 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
+
+    if args.torch_trace_dir is not None and (not args.graph_only or not args.cuda_graph or args.graph_mode != "single-op" or args.tp_parallel):
+        parser.error("--torch-trace-dir requires single-op, single-rank --graph-only")
     if args.profile_graphs and (
         not args.graph_only or not args.cuda_graph or args.graph_mode != "single-op"
         or args.profile_once != "none" or not args.flush_l2
@@ -3509,6 +3533,8 @@ def bench_e2e() -> None:
     args.activation = normalize_moe_activation(args.activation)
     if args.quant_mode is None:
         args.quant_mode = model_profile.default_quant_mode or quant_mode_default
+    if args.scale_contract is None:
+        args.scale_contract = model_profile.default_scale_contract
     use_w4a16 = args.quant_mode == "w4a16"
     use_w4a8 = args.quant_mode in {"w4a8_mx", "w4a8_nvfp4"}
     swiglu_limit = args.swiglu_limit if args.swiglu_limit is not None else model_profile.default_swiglu_limit
@@ -4138,6 +4164,9 @@ def bench_e2e() -> None:
         record = {
             "tokens": batch_size,
             "active_experts": active_experts,
+            "expert_row_counts": sorted(
+                topk_ids[local_routes].unique(return_counts=True)[1].cpu().tolist()
+            ),
             "logical_weight_bytes": active_experts * logical_expert_bytes(
                 spec, activation=args.activation, quant_mode=args.quant_mode,
                 source_format=weights.source_format,
@@ -4146,6 +4175,7 @@ def bench_e2e() -> None:
                 "source": exact.selection.source,
                 "config": asdict(exact.selection.config),
                 "query": exact.selection.query.to_dict(),
+                "invocation": exact.invocation.to_dict(),
             },
             "oracle": asdict(backend_metrics) if backend_metrics is not None else None,
             "graph_samples_ms": {},
@@ -4261,6 +4291,24 @@ def bench_e2e() -> None:
                     def replay(g: torch.cuda.CUDAGraph = graph) -> None:
                         g.replay()
 
+                    if name == backend_label and oracle_ref is not None:
+                        backend_output.fill_(float("nan"))
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        if not torch.isfinite(backend_output).all() or (
+                            active_experts and not torch.count_nonzero(backend_output)
+                        ):
+                            raise RuntimeError("Graph replay produced invalid MoE output")
+                        graph_metrics = compare_to_reference(backend_output, oracle_ref)
+                        failures = check_oracle_metrics(
+                            f"{backend_label} graph vs oracle", graph_metrics, batch_size,
+                            activation=args.activation, oracle_mode=args.oracle_mode,
+                            min_cosine=args.min_cosine,
+                        )
+                        if failures:
+                            raise RuntimeError("Graph oracle failed: " + "; ".join(failures))
+                        record["graph_oracle"] = asdict(graph_metrics)
+
                     # Warm graph replay separately; replay latency is the value
                     # that should drive the default summary.
                     device_before = nvidia_smi_gpu_mode_snapshot() if args.raw_samples_jsonl is not None else None
@@ -4300,6 +4348,19 @@ def bench_e2e() -> None:
                             )) + "\n")
                     graph_stats_by_name[name] = stats
                     print(f" {fmt_timing_stats(stats)}")
+                    if args.torch_trace_dir is not None:
+                        args.torch_trace_dir.mkdir(parents=True, exist_ok=True)
+                        if l2_flush is not None:
+                            l2_flush()
+                        torch.cuda.synchronize()
+                        with torch.profiler.profile(activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ]) as profiler:
+                            graph.replay()
+                            torch.cuda.synchronize()
+                        trace_path = args.torch_trace_dir / f"m{batch_size}-{name}.trace.json"
+                        profiler.export_chrome_trace(str(trace_path))
                     if args.profile_graphs:
                         if accuracy_failures:
                             raise RuntimeError("cannot profile a failed oracle check")
@@ -4473,6 +4534,7 @@ def bench_e2e() -> None:
             "geometry": asdict(spec),
             "quant_mode": args.quant_mode,
             "source_format": weights.source_format,
+            "weight_storage": "pytorch",
             "scale_contract": args.scale_contract,
             "routing_workload": args.routing_workload,
             "timing_backend": args.timing_backend,

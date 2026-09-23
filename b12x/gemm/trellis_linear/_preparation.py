@@ -121,21 +121,21 @@ def _lut_memory(query: TrellisQuery, device) -> PersistentMemory | None:
     if query.codebook == "mcg":
         return None
     resolved = torch.device("cuda", device.ordinal)
-    if query.codebook == "sqg_e4m3":
-        from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut_resident
+    if query.codebook == "lut_e4m3":
+        from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table_resident
 
-        resident = sqg_xor_cheb_t12_lut_resident(resolved)
-        key = ("sqg_xor_cheb_t12_lut", resolved.type, resolved.index)
+        resident = lut_e4m3_value_table_resident(resolved)
+        key = ("lut_e4m3_value_table", resolved.type, resolved.index)
         required = 1 << 12
     else:
-        from b12x._lib.quant.sqg_fp16_d3l import (
-            SQG_FP16_D3L_DESCRIPTOR_BYTES,
-            sqg_fp16_d3l_descriptors_resident,
+        from b12x._lib.quant.lut_fp16 import (
+            LUT_FP16_SEGMENT_TABLE_BYTES,
+            lut_fp16_segment_table_resident,
         )
 
-        resident = sqg_fp16_d3l_descriptors_resident(resolved)
-        key = ("sqg_fp16_d3l_descriptors", resolved.type, resolved.index)
-        required = SQG_FP16_D3L_DESCRIPTOR_BYTES
+        resident = lut_fp16_segment_table_resident(resolved)
+        key = ("lut_fp16_segment_table", resolved.type, resolved.index)
+        required = LUT_FP16_SEGMENT_TABLE_BYTES
     resident_nbytes = (
         resident.numel() * resident.element_size() if resident is not None else 0
     )

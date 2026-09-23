@@ -39,7 +39,7 @@ _HIDDEN = 3584
 _LOCAL_INTERMEDIATE = 256
 _PAYLOAD_BYTES = _HIDDEN * _LOCAL_INTERMEDIATE * 3 // 8
 _PAIR_BITS = {"P24": (2, 4), "P33": (3, 3)}
-_CODEBOOKS = ("mcg", "sqg_e4m3")
+_CODEBOOKS = ("mcg", "lut_e4m3")
 _RESULT_KIND = "b12x_trellis_pair_tp12_benchmark"
 _RESULT_SCHEMA_VERSION = 1
 

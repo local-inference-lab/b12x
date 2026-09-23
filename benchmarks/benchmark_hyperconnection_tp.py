@@ -24,7 +24,6 @@ from safetensors import safe_open
 
 from b12x.comm import roce
 from b12x.comm.roce import _preparation
-from b12x.loader._pool import HostWeightWriter, weight_allocation, weight_pool
 from b12x.norm.hyperconnection import _cute
 from b12x.preparation import PreparationSession, PreparedCall
 
@@ -59,10 +58,9 @@ def gpu_identity():
     }
 
 
-def load_weights(model, count, rank, world, pool):
+def load_weights(model, count, rank, world):
     index = json.loads((model / "model.safetensors.index.json").read_text())
     weight_map = index["weight_map"]
-    writer = HostWeightWriter()
     local_rank = LOWRANK // world
     local_hidden = HIDDEN // world
 
@@ -71,11 +69,7 @@ def load_weights(model, count, rank, world, pool):
             return f.get_tensor(name).clone()
 
     def upload(source):
-        source = source.contiguous()
-        with pool():
-            target = torch.empty(source.shape, dtype=source.dtype, device="cuda")
-        writer(target, source)
-        return target
+        return source.contiguous().to(device="cuda")
 
     result = []
     for i in range(count):
@@ -399,14 +393,13 @@ def main():
         device=torch.device("cuda:0"), autotune=False, compile_workers=2
     )
     session.prepare((plan.request(name="hc-tp-roce", prepare_call=prepare),))
-    allocation = weight_allocation()
     identities = [None] * world
     dist.all_gather_object(identities, gpu_identity())
     receipt = {
         "command": sys.argv,
         "identities": identities,
         "world": world,
-        "weights_allocation": allocation,
+        "weights_allocation": "pytorch",
         "mixers": args.mixers,
         "measurement": "interleaved cold-L2 CUDA graph, median of per-sample rank maxima, per mixer",
         "source_revision": os.environ.get("B12X_BENCH_GIT_REV"),
@@ -443,105 +436,104 @@ def main():
         },
         "cases": [],
     }
-    with weight_pool(allocation=allocation, device=0) as pool:
-        weights = load_weights(args.model, args.mixers, rank, world, pool)
-        if rank == 0:
-            print("Weights loaded; distributed correctness before timing", flush=True)
-        flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
-        barrier = torch.zeros(16, dtype=torch.float32, device="cuda")
-        names = list(ARMS)
-        for rows in args.rows:
-            torch.manual_seed(20260921 + rows)
-            mixers = [Mixer(w, rows, rank, world, runtime, plan) for w in weights]
+    weights = load_weights(args.model, args.mixers, rank, world)
+    if rank == 0:
+        print("Weights loaded; distributed correctness before timing", flush=True)
+    flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+    barrier = torch.zeros(16, dtype=torch.float32, device="cuda")
+    names = list(ARMS)
+    for rows in args.rows:
+        torch.manual_seed(20260921 + rows)
+        mixers = [Mixer(w, rows, rank, world, runtime, plan) for w in weights]
 
-            def run(name, mixers=mixers):
-                for mixer in mixers:
-                    mixer.run(name)
+        def run(name, mixers=mixers):
+            for mixer in mixers:
+                mixer.run(name)
 
-            correct = {}
-            for name in names:
-                if rank == 0:
-                    print(f"rows={rows}: checking {name}", flush=True)
-                run(name)
-                torch.cuda.synchronize()
-                correct[name] = [mixer.check(name) for mixer in mixers]
+        correct = {}
+        for name in names:
             if rank == 0:
-                print(f"rows={rows}: correctness passed; capturing", flush=True)
-            graphs = {name: capture(lambda name=name: run(name)) for name in names}
-            for _ in range(6):
-                for name in names:
-                    graphs[name][0].replay()
+                print(f"rows={rows}: checking {name}", flush=True)
+            run(name)
             torch.cuda.synchronize()
-            samples = {name: [] for name in names}
-            start, end = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            for sample in range(args.samples):
-                order = names if sample % 2 == 0 else names[::-1]
-                for name in order:
-                    flush.zero_()
-                    dist.all_reduce(barrier, op=dist.ReduceOp.MAX)
-                    start.record()
-                    graphs[name][0].replay()
-                    end.record()
-                    end.synchronize()
-                    samples[name].append(start.elapsed_time(end) * 1000 / args.mixers)
+            correct[name] = [mixer.check(name) for mixer in mixers]
+        if rank == 0:
+            print(f"rows={rows}: correctness passed; capturing", flush=True)
+        graphs = {name: capture(lambda name=name: run(name)) for name in names}
+        for _ in range(6):
             for name in names:
                 graphs[name][0].replay()
-                torch.cuda.synchronize()
-                for mixer in mixers:
-                    mixer.check(name)
-            if args.profile is not None and rows == 4:
-                dist.barrier()
-                with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ]
-                ) as profile:
-                    for name in names:
-                        flush.zero_()
-                        dist.all_reduce(barrier, op=dist.ReduceOp.MAX)
-                        with torch.profiler.record_function(name):
-                            graphs[name][0].replay()
-                            torch.cuda.synchronize()
-                args.profile.mkdir(parents=True, exist_ok=True)
-                profile.export_chrome_trace(
-                    str(args.profile / f"hc-rank{rank}.trace.json.gz")
-                )
-            per_rank = [None] * world
-            dist.all_gather_object(per_rank, samples)
-            maxima = {
-                name: [max(v) for v in zip(*(r[name] for r in per_rank), strict=True)]
-                for name in names
-            }
-            medians = {name: statistics.median(v) for name, v in maxima.items()}
-            case = {
-                "rows": rows,
-                "median_us": medians,
-                "raw_us_by_rank": per_rank,
-                "rank_max_samples_us": maxima,
-                "correctness_rank0": correct,
-                "baseline_over_candidate": {
-                    name: medians["replicated"] / medians[name] for name in names
-                },
-            }
-            receipt["cases"].append(case)
-            if rank == 0:
-                print(
-                    json.dumps(
-                        {
-                            k: v
-                            for k, v in case.items()
-                            if k in ("rows", "median_us", "baseline_over_candidate")
-                        }
-                    ),
-                    flush=True,
-                )
-                args.output.parent.mkdir(parents=True, exist_ok=True)
-                args.output.write_text(json.dumps(receipt, indent=2) + "\n")
-            del graphs, mixers
+        torch.cuda.synchronize()
+        samples = {name: [] for name in names}
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        for sample in range(args.samples):
+            order = names if sample % 2 == 0 else names[::-1]
+            for name in order:
+                flush.zero_()
+                dist.all_reduce(barrier, op=dist.ReduceOp.MAX)
+                start.record()
+                graphs[name][0].replay()
+                end.record()
+                end.synchronize()
+                samples[name].append(start.elapsed_time(end) * 1000 / args.mixers)
+        for name in names:
+            graphs[name][0].replay()
+            torch.cuda.synchronize()
+            for mixer in mixers:
+                mixer.check(name)
+        if args.profile is not None and rows == 4:
+            dist.barrier()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            ) as profile:
+                for name in names:
+                    flush.zero_()
+                    dist.all_reduce(barrier, op=dist.ReduceOp.MAX)
+                    with torch.profiler.record_function(name):
+                        graphs[name][0].replay()
+                        torch.cuda.synchronize()
+            args.profile.mkdir(parents=True, exist_ok=True)
+            profile.export_chrome_trace(
+                str(args.profile / f"hc-rank{rank}.trace.json.gz")
+            )
+        per_rank = [None] * world
+        dist.all_gather_object(per_rank, samples)
+        maxima = {
+            name: [max(v) for v in zip(*(r[name] for r in per_rank), strict=True)]
+            for name in names
+        }
+        medians = {name: statistics.median(v) for name, v in maxima.items()}
+        case = {
+            "rows": rows,
+            "median_us": medians,
+            "raw_us_by_rank": per_rank,
+            "rank_max_samples_us": maxima,
+            "correctness_rank0": correct,
+            "baseline_over_candidate": {
+                name: medians["replicated"] / medians[name] for name in names
+            },
+        }
+        receipt["cases"].append(case)
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in case.items()
+                        if k in ("rows", "median_us", "baseline_over_candidate")
+                    }
+                ),
+                flush=True,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(receipt, indent=2) + "\n")
+        del graphs, mixers
     torch.cuda.synchronize()
     dist.barrier()
     runtime.close()

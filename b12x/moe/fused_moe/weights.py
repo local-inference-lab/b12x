@@ -81,21 +81,21 @@ class ScaleFactors:
 class TrellisWeights:
     """Layer-local views of the canonical ``b12x_trellis`` tensors.
 
-    ``atoms`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
+    ``codes`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
     ``rate`` is a view selected from the single model-level uint8 rate tensor;
     it is never copied merely to give each layer its own rate parameter.
     """
 
-    atoms: torch.Tensor
+    codes: torch.Tensor
     rate: torch.Tensor
     input_scales: ScaleFactors
     intermediate_scales: ScaleFactors
     output_scales: ScaleFactors
-    expert_transform_draws: torch.Tensor | None = None
+    expert_sign_patterns: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.atoms, torch.Tensor):
-            raise TypeError("TrellisWeights.atoms must be a torch.Tensor")
+        if not isinstance(self.codes, torch.Tensor):
+            raise TypeError("TrellisWeights.codes must be a torch.Tensor")
         if not isinstance(self.rate, torch.Tensor):
             raise TypeError("TrellisWeights.rate must be a torch.Tensor")
         for name in (
@@ -105,11 +105,11 @@ class TrellisWeights:
         ):
             if not isinstance(getattr(self, name), ScaleFactors):
                 raise TypeError(f"TrellisWeights.{name} must be ScaleFactors")
-        if self.expert_transform_draws is not None and not isinstance(
-            self.expert_transform_draws, torch.Tensor
+        if self.expert_sign_patterns is not None and not isinstance(
+            self.expert_sign_patterns, torch.Tensor
         ):
             raise TypeError(
-                "TrellisWeights.expert_transform_draws must be a tensor or None"
+                "TrellisWeights.expert_sign_patterns must be a tensor or None"
             )
 
 

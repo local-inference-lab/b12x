@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut_cpu
+from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table_cpu
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend
@@ -29,7 +29,7 @@ def _run_micro_trellis(
     top_k: int,
     seed: int,
     mac: int = 64,
-    coupled: bool = False,
+    intermediate_hadamard: bool = False,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -53,7 +53,7 @@ def _run_micro_trellis(
     topk_weights = torch.softmax(
         torch.randn(m, top_k, device=device), dim=-1
     ).float()
-    rot_segments = 6 if coupled else 3
+    rot_segments = 6 if intermediate_hadamard else 3
     rotations = (
         torch.rand(
             (E, rot_segments * n), generator=gen, dtype=torch.float32
@@ -67,7 +67,7 @@ def _run_micro_trellis(
         rotations,
         topk_ids,
         topk_weights,
-        coupled=coupled,
+        intermediate_hadamard=intermediate_hadamard,
     )
 
     kernel = MoEMicroKernelBackend(
@@ -79,7 +79,7 @@ def _run_micro_trellis(
         scale_format="e8m0_k32",
         weight_layout="trellis_t256",
         trellis_bits=_BITS,
-        trellis_coupled=coupled,
+        trellis_intermediate_hadamard=intermediate_hadamard,
         share_input_across_experts=True,
         single_token=m == 1,
     )
@@ -98,7 +98,7 @@ def _run_micro_trellis(
         m * top_k + m * 16, dtype=torch.int32, device=device
     )
     barrier_epoch = torch.zeros_like(barrier_count)
-    t12_lut = sqg_xor_cheb_t12_lut_cpu().to(device)
+    value_table = lut_e4m3_value_table_cpu().to(device)
     rot_flat = rotations.reshape(-1).contiguous()
 
     MoEMicroKernelBackend.launch(
@@ -120,7 +120,7 @@ def _run_micro_trellis(
         barrier_epoch=from_dlpack(barrier_epoch, assumed_align=16),
         m=m,
         grid_x=kernel.grid_x,
-        trellis_lut=t12_lut,
+        trellis_lut=value_table,
         trellis_rotations=rot_flat,
     )
     torch.cuda.synchronize()
@@ -132,13 +132,13 @@ def _run_micro_trellis(
 # mac=8 pins the single-CTA FC1 path (trellis_ksplit=1); mac=64 exercises
 # the K-split global-scratch merge at the maximum split factor.
 @pytest.mark.parametrize("mac", [8, 64])
-@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize("intermediate_hadamard", [False, True])
 def test_micro_trellis_matches_reference(
-    m: int, mac: int, coupled: bool
+    m: int, mac: int, intermediate_hadamard: bool
 ) -> None:
     got, want = _run_micro_trellis(
         E=8, m=m, K=512, n=256, top_k=4, seed=20260815, mac=mac,
-        coupled=coupled,
+        intermediate_hadamard=intermediate_hadamard,
     )
     assert torch.isfinite(got).all()
     cosine = torch.nn.functional.cosine_similarity(

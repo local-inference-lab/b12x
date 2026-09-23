@@ -35,8 +35,8 @@ from .host import (
     route_pack_warmup_token_counts,
 )
 from .kernel import (
-    _SQG_XOR_CHEB_T12_LUT_ENTRIES,
-    _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+    _LUT_E4M3_VALUE_TABLE_ENTRIES,
+    _LUT_E4M3_SMEM_REGION_BYTES,
     W4A16FusedMoeKernel,
     _cutlass_element_dtype,
     _fake_m_for_specialization,
@@ -260,13 +260,13 @@ class W4A16MixedTrellisKernel:
         self.shared_words = max(
             driver.shared_words, tier0.shared_words, tier1.shared_words
         )
-        # Each bitrate has a different GEMM scratch footprint. The shared T12
+        # Each bitrate has a different GEMM scratch footprint. The shared value
         # table must follow the largest pre-LUT region, otherwise a wider tier
         # can overwrite a table placed at the driver's (K3) offset.
-        self.sqg_xor_cheb_t12_smem_off = max(
-            driver.sqg_xor_cheb_t12_smem_off,
-            tier0.sqg_xor_cheb_t12_smem_off,
-            tier1.sqg_xor_cheb_t12_smem_off,
+        self.lut_e4m3_smem_off = max(
+            driver.lut_e4m3_smem_off,
+            tier0.lut_e4m3_smem_off,
+            tier1.lut_e4m3_smem_off,
         )
 
     @property
@@ -682,7 +682,7 @@ class W4A16MixedTrellisKernel:
         trellis_lut = cute.make_tensor(
             trellis_lut_ptr,
             layout=cute.make_layout(
-                (Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
+                (Int64(_LUT_E4M3_VALUE_TABLE_ENTRIES),), stride=(1,)
             ),
         )
         rotation_input = cute.make_tensor(
@@ -702,7 +702,7 @@ class W4A16MixedTrellisKernel:
         trellis_lut = cute.make_tensor(
             trellis_lut_ptr,
             layout=cute.make_layout(
-                (cutlass.Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
+                (cutlass.Int64(_LUT_E4M3_VALUE_TABLE_ENTRIES),), stride=(1,)
             ),
         )
         self.kernel(
@@ -815,16 +815,16 @@ class W4A16MixedTrellisKernel:
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
         trellis_lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
         phase_lut_addr = trellis_lut_addr
-        if cutlass.const_expr(self.driver.sqg_xor_cheb_t12_smem):
-            self.driver._sqg_smem_copy(
+        if cutlass.const_expr(self.driver.lut_e4m3_smem):
+            self.driver._lut_smem_copy(
                 trellis_lut_addr,
-                smem_base + Int32(self.driver.sqg_xor_cheb_t12_smem_off),
-                _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+                smem_base + Int32(self.driver.lut_e4m3_smem_off),
+                _LUT_E4M3_SMEM_REGION_BYTES,
                 tid,
             )
             cute.arch.sync_threads()
             phase_lut_addr = Int64(
-                smem_base + Int32(self.driver.sqg_xor_cheb_t12_smem_off)
+                smem_base + Int32(self.driver.lut_e4m3_smem_off)
             )
         fc1_emit = partial(
             self._emit_tier_tile,
@@ -1018,8 +1018,8 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         self.sms = driver.sms
         self.blocks_per_sm = min(tier.blocks_per_sm for tier in kernels)
         self.shared_words = max(tier.shared_words for tier in kernels)
-        self.sqg_xor_cheb_t12_smem_off = max(
-            tier.sqg_xor_cheb_t12_smem_off for tier in kernels
+        self.lut_e4m3_smem_off = max(
+            tier.lut_e4m3_smem_off for tier in kernels
         )
 
     @property
@@ -1389,7 +1389,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         )
         up_suh = weight_tensor(up_suh_ptr, suh_rows * cutlass.Int64(self.hidden_size))
         trellis_lut = weight_tensor(
-            trellis_lut_ptr, Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES)
+            trellis_lut_ptr, Int64(_LUT_E4M3_VALUE_TABLE_ENTRIES)
         )
         trellis_lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
         rotation_input = weight_tensor(
@@ -1528,15 +1528,15 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
         phase_lut_addr = trellis_lut_addr
-        if cutlass.const_expr(self.driver.sqg_xor_cheb_t12_smem):
-            self.driver._sqg_smem_copy(
+        if cutlass.const_expr(self.driver.lut_e4m3_smem):
+            self.driver._lut_smem_copy(
                 trellis_lut_addr,
-                smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
-                _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+                smem_base + Int32(self.lut_e4m3_smem_off),
+                _LUT_E4M3_SMEM_REGION_BYTES,
                 tid,
             )
             cute.arch.sync_threads()
-            phase_lut_addr = Int64(smem_base + Int32(self.sqg_xor_cheb_t12_smem_off))
+            phase_lut_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
         common = (
             packed_route_indices,
             block_expert_ids,

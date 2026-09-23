@@ -55,7 +55,7 @@ from b12x._lib.intrinsics import (
 from b12x._lib.intrinsics import (
     _f16x2_dot_sum_f32acc,
     fp8x4_e4m3_to_half2x2,
-    packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
+    packed_decode_lut_e4m3_to_e4m3x8,
 )
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
@@ -406,7 +406,7 @@ class MoEMicroKernelBackend:
         w13_layout: str = "w13",
         weight_layout: str = "modelopt",
         trellis_bits: int | None = None,
-        trellis_coupled: bool = False,
+        trellis_intermediate_hadamard: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if int(compile_time_phase) not in {0, 1, 2}:
@@ -440,9 +440,9 @@ class MoEMicroKernelBackend:
                 raise ValueError(
                     "trellis_t256 micro weights require a gated activation"
                 )
-        elif trellis_bits is not None or trellis_coupled:
+        elif trellis_bits is not None or trellis_intermediate_hadamard:
             raise ValueError(
-                "trellis_bits/trellis_coupled require weight_layout 'trellis_t256'"
+                "trellis_bits/trellis_intermediate_hadamard require weight_layout 'trellis_t256'"
             )
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
@@ -475,7 +475,7 @@ class MoEMicroKernelBackend:
         self.weight_layout = weight_layout
         self.weight_layout_trellis256 = weight_layout == "trellis_t256"
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
-        self.trellis_coupled = bool(trellis_coupled)
+        self.trellis_intermediate_hadamard = bool(trellis_intermediate_hadamard)
         self.trellis_ksplit = 1
         self.trellis_scratch_u32 = 0
         self._cfg = None
@@ -500,7 +500,7 @@ class MoEMicroKernelBackend:
             self.a8_mx_mode,
             self.weight_layout,
             self.trellis_bits,
-            self.trellis_coupled,
+            self.trellis_intermediate_hadamard,
             self.trellis_ksplit,
             self.scale_format,
             self.e8m0_scale_layout,
@@ -2551,7 +2551,7 @@ class MoEMicroKernelBackend:
             trellis_red = cute.make_tensor(
                 trellis_red_ptr, cute.make_layout(2 * cfg.i_chunk)
             )
-            # T12 staircase in shared memory: every decode gathers eight
+            # Value table in shared memory: every decode gathers eight
             # bytes from it, so keep those trips off the L1/global path.
             trellis_lut_smem_ptr = cute.arch.alloc_smem(Uint32, 1024)
             trellis_lut_smem = cute.make_tensor(
@@ -2825,11 +2825,11 @@ class MoEMicroKernelBackend:
                     merged_u = (Int64(ua) << Int64(32)) | Int64(ub)
                     win_ua = Uint32(merged_u >> Int64(tr_s2))
                     win_ub = Uint32(merged_u >> Int64(tr_s2 + Int32(4 * tr_bits)))
-                    g_lo, g_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-                        win_a, win_b, tr_lut_addr, tr_bits, t12_in_shared=True
+                    g_lo, g_hi = packed_decode_lut_e4m3_to_e4m3x8(
+                        win_a, win_b, tr_lut_addr, tr_bits, value_table_in_shared=True
                     )
-                    u_lo, u_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-                        win_ua, win_ub, tr_lut_addr, tr_bits, t12_in_shared=True
+                    u_lo, u_hi = packed_decode_lut_e4m3_to_e4m3x8(
+                        win_ua, win_ub, tr_lut_addr, tr_bits, value_table_in_shared=True
                     )
                     g01, g23 = fp8x4_e4m3_to_half2x2(g_lo)
                     gh01, gh23 = fp8x4_e4m3_to_half2x2(g_hi)
@@ -2951,20 +2951,20 @@ class MoEMicroKernelBackend:
                         )
                     cute.arch.sync_threads()
                 if tr_final > Int32(0) and warp_id == Int32(0):
-                    # H128 activation boundary (ordinary or coupled), then
+                    # H128 activation boundary (ordinary or intermediate Hadamard), then
                     # per-32 a8 quantize-dequantize and the plain f16-pair
                     # intermediate store for the trellis FC2 arm.
                     tr_isz = Int32(cfg.n)
                     tr_col = i_chunk_off + lane * Int32(4)
-                    if cutlass.const_expr(self.trellis_coupled):
-                        # Coupled interleaved boundary over the six-segment
+                    if cutlass.const_expr(self.trellis_intermediate_hadamard):
+                        # Intermediate-Hadamard interleaved boundary over the six-segment
                         # per-expert rotations: each 64-neuron block forms
                         # the pre window [g[a:a+32], u[a:a+32], g[a+32:],
                         # u[a+32:]], then H128 -> U_A -> H128 -> presign ->
                         # pairwise gated activation; a warp re-gather closes
                         # the interleave and U_B -> H128 -> down scale ->
                         # H128 lands the chunk. Index formulas mirror the
-                        # dynamic-kernel coupled epilogue.
+                        # dynamic-kernel intermediate-Hadamard epilogue.
                         tr_rot6 = eid * (Int32(6) * tr_isz)
                         tr_chunk = lane >> Int32(3)
                         tr_chunk_lane = lane & Int32(7)
@@ -5677,8 +5677,8 @@ class MoEMicroKernelBackend:
                     merged = (Int64(wa) << Int64(32)) | Int64(wb)
                     win_a = Uint32(merged >> Int64(tr_s2))
                     win_b = Uint32(merged >> Int64(tr_s2 + Int32(4 * tr_bits)))
-                    d_lo, d_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-                        win_a, win_b, tr_lut_addr, tr_bits, t12_in_shared=True
+                    d_lo, d_hi = packed_decode_lut_e4m3_to_e4m3x8(
+                        win_a, win_b, tr_lut_addr, tr_bits, value_table_in_shared=True
                     )
                     d01, d23 = fp8x4_e4m3_to_half2x2(d_lo)
                     dh01, dh23 = fp8x4_e4m3_to_half2x2(d_hi)
@@ -5977,7 +5977,7 @@ class MoEMicroKernelBackend:
                 cute.make_tensor(
                     trellis_rot_ptr,
                     cute.make_layout(
-                        Int32(cfg.weight_E * (6 if self.trellis_coupled else 3) * cfg.n)
+                        Int32(cfg.weight_E * (6 if self.trellis_intermediate_hadamard else 3) * cfg.n)
                     ),
                 )
                 if cutlass.const_expr(trellis_rot_ptr is not None)

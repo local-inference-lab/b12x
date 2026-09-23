@@ -337,7 +337,7 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         trellis_codebook="mcg",
         trellis_pair_kinds=None,
         trellis_tile_config=None,
-        coupled_hadamard=False,
+        intermediate_hadamard=False,
     )
     fused_calls: list[dict[str, object]] = []
     resolved_fused = object()

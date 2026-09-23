@@ -1098,10 +1098,11 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
 
 @pytest.mark.parametrize("max_active_clusters", (None, 1, 24, 48))
 @pytest.mark.parametrize(
-    ("max_tokens", "unseen_counts", "expected_implementation"),
+    ("max_tokens", "unseen_counts", "expected_implementation", "route_planner"),
     (
-        pytest.param(8, (1, 2, 7), "micro", id="micro-capacity"),
-        pytest.param(64, (1, 2, 8, 16), "dynamic", id="dynamic-capacity"),
+        pytest.param(8, (1, 2, 7), "micro", "internal", id="micro-capacity"),
+        pytest.param(64, (1, 2, 8, 16), "dynamic", "internal", id="dynamic-capacity"),
+        pytest.param(64, (1, 2, 8, 16), "dynamic", "triton", id="dynamic-triton"),
     ),
 )
 def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
@@ -1109,6 +1110,7 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
     unseen_counts: tuple[int, ...],
     expected_implementation: str,
     max_active_clusters: int | None,
+    route_planner: str,
 ) -> None:
     _skip_if_unavailable()
     from b12x.preparation import PreparationSession, PreparedCall
@@ -1159,7 +1161,7 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
         invocation={"fast_math": False},
         override=MoeDecodeConfig(
             backend=expected_implementation,
-            route_planner="internal",
+            route_planner=route_planner,
             max_active_clusters=max_active_clusters,
             dynamic_tile_m=16 if expected_implementation == "dynamic" else None,
             dynamic_route_mode="grouped" if expected_implementation == "dynamic" else None,
@@ -1197,6 +1199,9 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
             with torch.cuda.graph(graph):
                 fused_moe.run(binding=binding)
             for _ in range(3):
+                if route_planner == "triton":
+                    for tensor in scratch:
+                        tensor.fill_(0x5A)
                 output.fill_(float("nan"))
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay()

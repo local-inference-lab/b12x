@@ -46,7 +46,7 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
         # several MiB apart. The name is still read above so an unusable device
         # fails closed.
         return {
-            "schema_version": 5, "tuning_cache_version": version,
+            "schema_version": 6, "tuning_cache_version": version,
             "measurement": "stream_gated_events_v1",
             "namespace": dict(namespace),
             "compute_capability": [int(properties.major), int(properties.minor)],
@@ -59,8 +59,8 @@ class SelectionCache:
 
     def __init__(self, root: str | Path, identity: Mapping[str, object]):
         self.identity = json.loads(_json(identity))
-        if self.identity.get("schema_version") != 5:
-            raise ValueError("preparation selection cache requires schema 5")
+        if self.identity.get("schema_version") != 6:
+            raise ValueError("preparation selection cache requires schema 6")
         version = self.identity.get("tuning_cache_version")
         if type(version) is not int or version <= 0:
             raise ValueError("selection cache requires a positive tuning_cache_version")

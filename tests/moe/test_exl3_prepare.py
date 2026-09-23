@@ -1,8 +1,8 @@
-"""BTX preparation equivalence and fail-closed reader tests.
+"""EXL3 preparation equivalence and fail-closed reader tests.
 
 Independent-assembly checks reconstruct the runtime word order with
 naive loops so the shared restore helper is never compared against
-itself; frozen-container equivalence lives in test_btx_compat.
+itself; frozen-container equivalence lives in test_exl3_compat.
 """
 
 from __future__ import annotations
@@ -12,20 +12,20 @@ import json
 import pytest
 import torch
 
-from b12x.moe._shared.btx_schema import (
-    BTX_MANIFEST_FILENAME,
-    matrix_atom_bytes,
+from b12x.moe._shared.exl3_schema import (
+    EXL3_MANIFEST_FILENAME,
+    matrix_slot_bytes,
     rate_code,
 )
-from b12x.moe._shared.kernels.w4a16.btx import (
-    prepare_btx_moe_weights,
-    read_btx_layer,
-    read_btx_manifest,
+from b12x.moe._shared.kernels.w4a16.exl3 import (
+    prepare_exl3_moe_weights,
+    read_exl3_layer,
+    read_exl3_manifest,
 )
-from b12x.moe._shared.kernels.w4a16.btx_synth import (
-    BtxSynthConfig,
+from b12x.moe._shared.kernels.w4a16.exl3_synth import (
+    Exl3SynthConfig,
     synth_layer_payloads,
-    write_btx_checkpoint,
+    write_exl3_checkpoint,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
@@ -46,7 +46,7 @@ def _plane_pair(payloads, expert: int, slot: int, matrix: int):
 
 def _naive_fc1_words(low_planes, high_planes) -> torch.Tensor:
     """FC1 runtime order via explicit loops: per K16 tile, all low-plane
-    windows atom-major, then all high-plane windows."""
+    windows slot-major, then all high-plane windows."""
 
     hidden_tiles = low_planes[0].shape[0]
     rows = []
@@ -66,10 +66,10 @@ def _naive_fc2_words(low_planes, high_planes) -> torch.Tensor:
 
 
 @requires_cuda
-def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
+def test_exl3_uniform_mcg_matches_direct_binder(tmp_path) -> None:
     hidden, global_i, experts, bits = 256, 512, 3, 3
     slots = global_i // 32
-    config = BtxSynthConfig(
+    config = Exl3SynthConfig(
         codebook="mcg",
         num_experts=experts,
         hidden_size=hidden,
@@ -80,12 +80,12 @@ def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
         extent_alignment_slots=4,
         seed=5,
     )
-    manifest = write_btx_checkpoint(tmp_path, config)
-    layer = read_btx_layer(
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    layer = read_exl3_layer(
         tmp_path, manifest, 0, first_slot=0, slot_count=slots
     )
     device = _device()
-    btx_prepared = prepare_btx_moe_weights(
+    exl3_prepared = prepare_exl3_moe_weights(
         layer, activation="silu", device=device
     )
 
@@ -136,24 +136,24 @@ def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
         tile_config=(64, 256, 64, 256),
     )
 
-    assert torch.equal(btx_prepared.w13, binder_prepared.w13)
-    assert torch.equal(btx_prepared.w2, binder_prepared.w2)
+    assert torch.equal(exl3_prepared.w13, binder_prepared.w13)
+    assert torch.equal(exl3_prepared.w2, binder_prepared.w2)
     assert torch.equal(
-        btx_prepared.intermediate_rotations,
+        exl3_prepared.intermediate_rotations,
         binder_prepared.intermediate_rotations,
     )
-    assert btx_prepared.trellis_codebook == "mcg"
-    assert btx_prepared.source_format == "btx"
+    assert exl3_prepared.trellis_codebook == "mcg"
+    assert exl3_prepared.source_format == "exl3"
 
 
-def _per_expert_config(kinds: dict[int, tuple[int, int]]) -> BtxSynthConfig:
+def _per_expert_config(kinds: dict[int, tuple[int, int]]) -> Exl3SynthConfig:
     experts = len(kinds)
     fc1 = torch.tensor(
         [[rate_code(*kinds[e]) for e in range(experts)]], dtype=torch.uint8
     )
     fc2 = torch.full_like(fc1, rate_code(3, 3))
-    return BtxSynthConfig(
-        codebook="sqg_e4m3",
+    return Exl3SynthConfig(
+        codebook="lut_e4m3",
         num_experts=experts,
         hidden_size=256,
         intermediate_size=256,
@@ -170,15 +170,15 @@ def _per_expert_config(kinds: dict[int, tuple[int, int]]) -> BtxSynthConfig:
     "high_rates, expected_kind",
     [((2, 4), "PDYNAMIC"), ((4, 3), "P33_P43")],
 )
-def test_btx_per_expert_pair_matches_naive_assembly(
+def test_exl3_per_expert_pair_matches_naive_assembly(
     tmp_path, high_rates, expected_kind
 ) -> None:
     kinds = {0: (3, 3), 1: high_rates, 2: (3, 3)}
     config = _per_expert_config(kinds)
-    manifest = write_btx_checkpoint(tmp_path, config)
-    layer = read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
     device = _device()
-    prepared = prepare_btx_moe_weights(
+    prepared = prepare_exl3_moe_weights(
         layer, activation="situ", device=device
     )
     assert prepared.fc1_trellis_pair_kind == expected_kind
@@ -210,7 +210,7 @@ def test_btx_per_expert_pair_matches_naive_assembly(
     assert torch.equal(prepared.w2.view(torch.int16), expected_w2)
 
     # Rotation rows follow the pair runtime's record-major channel order:
-    # each atom's first 16 channels belong to the low record, its last 16
+    # each slot's first 16 channels belong to the low record, its last 16
     # to the high record.
     expected_rotations = []
     for matrix in range(3):
@@ -241,9 +241,9 @@ def test_btx_per_expert_pair_matches_naive_assembly(
         ]
 
 
-def test_btx_reader_fails_closed(tmp_path) -> None:
-    config = BtxSynthConfig(
-        codebook="sqg_e4m3",
+def test_exl3_reader_fails_closed(tmp_path) -> None:
+    config = Exl3SynthConfig(
+        codebook="lut_e4m3",
         num_experts=2,
         hidden_size=128,
         intermediate_size=256,
@@ -252,26 +252,26 @@ def test_btx_reader_fails_closed(tmp_path) -> None:
         extent_alignment_slots=4,
         seed=1,
     )
-    manifest = write_btx_checkpoint(tmp_path, config)
-    read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
 
     with pytest.raises(ValueError, match="align"):
-        read_btx_layer(tmp_path, manifest, 0, first_slot=1, slot_count=4)
+        read_exl3_layer(tmp_path, manifest, 0, first_slot=1, slot_count=4)
     with pytest.raises(ValueError, match="does not declare layer"):
-        read_btx_layer(tmp_path, manifest, 7, first_slot=0, slot_count=4)
+        read_exl3_layer(tmp_path, manifest, 7, first_slot=0, slot_count=4)
 
     # Manifest/metadata disagreement: tamper the manifest codebook (the
     # tampered value must still parse) and require the metadata cross-check
     # to reject the layer.
-    data = json.loads((tmp_path / BTX_MANIFEST_FILENAME).read_text())
+    data = json.loads((tmp_path / EXL3_MANIFEST_FILENAME).read_text())
     data["codebook"] = "mcg"
     data["codebook_seed"] = 0xCBAC1FED
     data["rates"]["bits"] = 3
-    from b12x.moe._shared.btx_schema import BtxManifest
+    from b12x.moe._shared.exl3_schema import Exl3Manifest
 
-    tampered = BtxManifest.from_dict(data)
+    tampered = Exl3Manifest.from_dict(data)
     with pytest.raises(ValueError, match="metadata 'codebook'"):
-        read_btx_layer(tmp_path, tampered, 0, first_slot=0, slot_count=4)
+        read_exl3_layer(tmp_path, tampered, 0, first_slot=0, slot_count=4)
 
     # sha verification.
     ref = manifest.layers[0]
@@ -280,15 +280,15 @@ def test_btx_reader_fails_closed(tmp_path) -> None:
     blob[-1] ^= 0xFF
     path.write_bytes(bytes(blob))
     with pytest.raises(ValueError, match="sha256 mismatch"):
-        read_btx_layer(
+        read_exl3_layer(
             tmp_path, manifest, 0, first_slot=0, slot_count=4, verify_sha=True
         )
 
 
 @requires_cuda
-def test_btx_uniform_padding_must_be_zero(tmp_path) -> None:
-    config = BtxSynthConfig(
-        codebook="sqg_e4m3",
+def test_exl3_uniform_padding_must_be_zero(tmp_path) -> None:
+    config = Exl3SynthConfig(
+        codebook="lut_e4m3",
         num_experts=2,
         hidden_size=128,
         intermediate_size=256,
@@ -297,15 +297,15 @@ def test_btx_uniform_padding_must_be_zero(tmp_path) -> None:
         extent_alignment_slots=4,
         seed=2,
     )
-    manifest = write_btx_checkpoint(tmp_path, config)
-    layer = read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
-    corrupted = layer.atoms.clone()
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
+    corrupted = layer.codes.clone()
     corrupted[0, -1] = 1
     from dataclasses import replace
 
     with pytest.raises(ValueError, match="padding must be zero"):
-        prepare_btx_moe_weights(
-            replace(layer, atoms=corrupted),
+        prepare_exl3_moe_weights(
+            replace(layer, codes=corrupted),
             activation="situ",
             device=_device(),
         )

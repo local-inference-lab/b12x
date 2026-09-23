@@ -352,7 +352,7 @@ def launch_options(query, config):
 
 
 def knob_values(query):
-    """Recipe-specific host knob choices; validate_config applies coupled launch constraints."""
+    """Recipe-specific host knob choices; validate_config applies interdependent launch constraints."""
     fp4 = query.recipe in ("nvfp4", "mxfp4")
     fp8 = query.recipe in ("mxfp8", "tensor_fp8", "block_fp8")
     return dict(

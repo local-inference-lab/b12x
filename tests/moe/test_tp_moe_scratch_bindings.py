@@ -565,7 +565,7 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
+        source_format="exl3",
         trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
@@ -615,7 +615,7 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
+        source_format="exl3",
         trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
@@ -647,7 +647,7 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
+        source_format="exl3",
         trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
@@ -704,7 +704,7 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="btx",
+        source_format="exl3",
         trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,

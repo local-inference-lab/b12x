@@ -12,7 +12,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
-    _coupled_rotation_signs,
+    _intermediate_hadamard_signs,
     _finalize_prepared_trellis_weights,
     prepare_trellis256_moe_weights,
 )
@@ -27,7 +27,7 @@ from .config import (
 from .weights import ScaleFactors, TrellisWeights
 
 
-_ATOM_CHANNELS = 32
+_SLOT_CHANNELS = 32
 _PROJECTIONS = 3
 _TIERS = (3, 4, 5)
 
@@ -318,11 +318,11 @@ def _symmetric_bits(config: TrellisConfig, rates: torch.Tensor) -> torch.Tensor:
         )
     if config.codebook is TrellisCodebook.MCG:
         allowed = (3, 4, 5)
-    elif config.codebook is TrellisCodebook.SQG_E4M3:
+    elif config.codebook is TrellisCodebook.LUT_E4M3:
         allowed = (3,)
     else:
         raise NotImplementedError(
-            "sqg_fp16 is represented by the v2 format but is not implemented "
+            "lut_fp16 is represented by the v2 format but is not implemented "
             "by the config-only fused MoE planner"
         )
     if any(int(value) not in allowed for value in low.reshape(-1).tolist()):
@@ -352,7 +352,7 @@ def _bundle_offsets(bits: torch.Tensor, hidden_size: int) -> list[list[int]]:
 
 
 def _projection_native(
-    atoms: torch.Tensor,
+    codes: torch.Tensor,
     *,
     experts: list[int],
     projection: int,
@@ -361,7 +361,7 @@ def _projection_native(
     hidden_size: int,
     fc1: bool,
 ) -> torch.Tensor:
-    slots = int(atoms.shape[0])
+    slots = int(codes.shape[0])
     hidden_tiles = hidden_size // 16
     section = _matrix_section_bytes(hidden_size, bits)
     if not experts:
@@ -369,16 +369,16 @@ def _projection_native(
             return torch.zeros(
                 (1, hidden_tiles, 2 * slots, 16 * bits),
                 dtype=torch.int16,
-                device=atoms.device,
+                device=codes.device,
             )
         return torch.zeros(
             (1, 2 * slots, hidden_tiles, 16 * bits),
             dtype=torch.int16,
-            device=atoms.device,
+            device=codes.device,
         )
     sections = torch.stack(
         tuple(
-            atoms[:, offsets[expert][projection] : offsets[expert][projection] + section]
+            codes[:, offsets[expert][projection] : offsets[expert][projection] + section]
             for expert in experts
         ),
         dim=1,
@@ -395,23 +395,23 @@ def _projection_native(
     )
 
 
-def _coupled_rows(
+def _intermediate_hadamard_rows(
     values: torch.Tensor,
-    draws: torch.Tensor,
+    sign_patterns: torch.Tensor,
     *,
     intermediate_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    draws_host = draws.detach().cpu()
+    sign_patterns_host = sign_patterns.detach().cpu()
     signs = torch.empty(
         (int(values.shape[0]), 3 * intermediate_size), dtype=torch.float16
     )
-    for draw in sorted(set(int(value) for value in draws_host.tolist())):
-        if not 0 <= draw < 8:
-            raise ValueError("expert_transform_draws values must be in 0..7")
-        rows = torch.nonzero(draws_host == draw, as_tuple=False).flatten()
-        pre = _coupled_rotation_signs(2 * intermediate_size, draw=draw, axis=1)
-        post = _coupled_rotation_signs(intermediate_size, draw=draw, axis=2)
+    for sign_pattern in sorted(set(int(value) for value in sign_patterns_host.tolist())):
+        if not 0 <= sign_pattern < 8:
+            raise ValueError("expert_sign_patterns values must be in 0..7")
+        rows = torch.nonzero(sign_patterns_host == sign_pattern, as_tuple=False).flatten()
+        pre = _intermediate_hadamard_signs(2 * intermediate_size, sign_pattern=sign_pattern, axis=1)
+        post = _intermediate_hadamard_signs(intermediate_size, sign_pattern=sign_pattern, axis=2)
         signs.index_copy_(
             0,
             rows,
@@ -442,7 +442,7 @@ def _uniform_prepared(
     offsets = _bundle_offsets(bits, hidden_size)
     experts = list(range(num_experts))
     gate = _projection_native(
-        weights.atoms,
+        weights.codes,
         experts=experts,
         projection=0,
         bits=bit,
@@ -451,7 +451,7 @@ def _uniform_prepared(
         fc1=True,
     )
     up = _projection_native(
-        weights.atoms,
+        weights.codes,
         experts=experts,
         projection=1,
         bits=bit,
@@ -460,7 +460,7 @@ def _uniform_prepared(
         fc1=True,
     )
     down = _projection_native(
-        weights.atoms,
+        weights.codes,
         experts=experts,
         projection=2,
         bits=bit,
@@ -488,38 +488,38 @@ def _uniform_prepared(
         tile_config=(64, 256, 64, 256),
     )
     if config.transform.expert.kind == "none":
-        if weights.expert_transform_draws is not None:
+        if weights.expert_sign_patterns is not None:
             raise ValueError(
-                "expert_transform_draws is invalid when expert transform is 'none'"
+                "expert_sign_patterns is invalid when expert transform is 'none'"
             )
         return prepared
-    draws = weights.expert_transform_draws
-    if draws is None:
-        raise ValueError("coupled_hadamard preparation requires expert_transform_draws")
+    sign_patterns = weights.expert_sign_patterns
+    if sign_patterns is None:
+        raise ValueError("intermediate_hadamard preparation requires expert_sign_patterns")
     _require_cuda_tensor(
-        draws,
-        name="expert_transform_draws",
+        sign_patterns,
+        name="expert_sign_patterns",
         dtype=torch.uint8,
-        device=weights.atoms.device,
+        device=weights.codes.device,
     )
-    if tuple(draws.shape) != (num_experts,):
-        raise ValueError(f"expert_transform_draws must be uint8[{num_experts}]")
-    if torch.count_nonzero(draws).item():
+    if tuple(sign_patterns.shape) != (num_experts,):
+        raise ValueError(f"expert_sign_patterns must be uint8[{num_experts}]")
+    if torch.count_nonzero(sign_patterns).item():
         raise NotImplementedError(
-            "rank-local coupled_hadamard preparation currently requires "
-            "all-zero expert_transform_draws"
+            "rank-local intermediate_hadamard preparation currently requires "
+            "all-zero expert_sign_patterns"
         )
     assert prepared.trellis is not None
     return replace(
         prepared,
         trellis=replace(
             prepared.trellis,
-            coupled_hadamard=True,
-            intermediate_rotations=_coupled_rows(
+            intermediate_hadamard=True,
+            intermediate_rotations=_intermediate_hadamard_rows(
                 intermediate.reshape(num_experts, -1),
-                draws,
+                sign_patterns,
                 intermediate_size=intermediate_size,
-                device=weights.atoms.device,
+                device=weights.codes.device,
             ),
         ),
     )
@@ -543,8 +543,8 @@ def _projection_prepared(
         raise ValueError("projection-tiered trellis execution requires codebook 'mcg'")
     if config.transform.expert.kind != "none":
         raise ValueError("projection-tiered trellis execution has no expert transform")
-    if weights.expert_transform_draws is not None:
-        raise ValueError("expert_transform_draws is invalid without an expert transform")
+    if weights.expert_sign_patterns is not None:
+        raise ValueError("expert_sign_patterns is invalid without an expert transform")
 
     offsets = _bundle_offsets(bits, hidden_size)
     memberships = tuple(
@@ -558,13 +558,13 @@ def _projection_prepared(
         )
         for bit in _TIERS
     )
-    dummy_scale = torch.zeros(4, dtype=torch.uint8, device=weights.atoms.device)
+    dummy_scale = torch.zeros(4, dtype=torch.uint8, device=weights.codes.device)
     shared_workspace: torch.Tensor | None = None
     tiers: list[PreparedW4A16MoeWeights] = []
     for tier_index, bit in enumerate(_TIERS):
         gate_ids, up_ids, down_ids = memberships[tier_index]
         gate = _projection_native(
-            weights.atoms,
+            weights.codes,
             experts=gate_ids,
             projection=0,
             bits=bit,
@@ -573,7 +573,7 @@ def _projection_prepared(
             fc1=True,
         )
         up = _projection_native(
-            weights.atoms,
+            weights.codes,
             experts=up_ids,
             projection=1,
             bits=bit,
@@ -582,7 +582,7 @@ def _projection_prepared(
             fc1=True,
         )
         down = _projection_native(
-            weights.atoms,
+            weights.codes,
             experts=down_ids,
             projection=2,
             bits=bit,
@@ -602,7 +602,7 @@ def _projection_prepared(
             w13 = gate
         prepared = _finalize_prepared_trellis_weights(
             context=f"MCG K{bit} projection-tier preparation",
-            device=weights.atoms.device,
+            device=weights.codes.device,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
@@ -632,7 +632,7 @@ def _projection_prepared(
             w2_global_scale=torch.ones(
                 (max(len(down_ids), 1),),
                 dtype=torch.float32,
-                device=weights.atoms.device,
+                device=weights.codes.device,
             ),
         )
         tiers.append(prepared)
@@ -657,7 +657,7 @@ def _projection_prepared(
         up_tiers,
         down_tiers,
         tier_slots=(num_experts, num_experts, num_experts),
-        device=weights.atoms.device,
+        device=weights.codes.device,
     )
     broadcast_input = int(gate_suh.shape[0]) == 1
     broadcast_output = int(down_svh.shape[0]) == 1
@@ -718,17 +718,17 @@ def prepare_trellis_weights(
 ) -> PreparedW4A16MoeWeights | PreparedProjectionTrellisWeights:
     """Prepare one rank-local canonical Trellis MoE layer."""
 
-    atoms = weights.atoms
-    if atoms.dtype != torch.uint8:
-        raise TypeError(f"atoms must be torch.uint8, got {atoms.dtype}")
-    if atoms.device.type != "cuda":
-        raise ValueError("trellis preparation requires CUDA-resident atoms")
-    if atoms.ndim != 2 or not atoms.is_contiguous():
-        raise ValueError("atoms must be contiguous uint8 [I_local/32,row_stride]")
-    if int(atoms.shape[0]) * _ATOM_CHANNELS != intermediate_size:
+    codes = weights.codes
+    if codes.dtype != torch.uint8:
+        raise TypeError(f"codes must be torch.uint8, got {codes.dtype}")
+    if codes.device.type != "cuda":
+        raise ValueError("trellis preparation requires CUDA-resident codes")
+    if codes.ndim != 2 or not codes.is_contiguous():
+        raise ValueError("codes must be contiguous uint8 [I_local/32,row_stride]")
+    if int(codes.shape[0]) * _SLOT_CHANNELS != intermediate_size:
         raise ValueError(
-            "atoms first dimension must equal intermediate_size/32: "
-            f"got {int(atoms.shape[0])} rows for I={intermediate_size}"
+            "codes first dimension must equal intermediate_size/32: "
+            f"got {int(codes.shape[0])} rows for I={intermediate_size}"
         )
     if config.transform.projection.kind != "scaled_hadamard" or (
         config.transform.projection.block_size != 128
@@ -737,7 +737,7 @@ def prepare_trellis_weights(
             "fused MoE trellis preparation implements scaled_hadamard(128)"
         )
 
-    device = atoms.device
+    device = codes.device
     rates = _local_rate_matrix(
         config, weights.rate, num_experts=num_experts, device=device
     )
@@ -749,9 +749,9 @@ def prepare_trellis_weights(
         for expert, expert_offsets in enumerate(offsets)
         for projection, offset in enumerate(expert_offsets)
     )
-    if int(atoms.shape[1]) != required_row_bytes:
+    if int(codes.shape[1]) != required_row_bytes:
         raise ValueError(
-            f"atoms row_stride={int(atoms.shape[1])} does not match the "
+            f"codes row_stride={int(codes.shape[1])} does not match the "
             f"canonical projection payload ({required_row_bytes} bytes)"
         )
 

@@ -40,12 +40,12 @@ evaluation order is universally more accurate.
 ## Supplemental installed-model control
 
 This is a same-process **compatibility check**, not an isolated speedup claim
-for this patch. Both arms share the same QSRT, workspace and communication
+for this patch. Both arms share the same 2-bit trellis target, workspace and communication
 implementation. Only the eager prefill backend changes between FlashAttention
 2 and B12X; target decode and speculative execution are unchanged. The
 integration's separate overlap improvement is not attributed to normalization.
 
-- Target: `lukealonso/Kimi-K3-QSRT-K2@3b98114115f1d41ce7963ba346c3fca19918b0bd`.
+- Target: Kimi-K3 2-bit trellis checkpoint used by the TP9 deployment.
 - Draft: BF16 `lightseekorg/kimi-k3-dflash2@e77935fb4804e17eb55085bffd045eae1d779769`.
 - B12X: `4741d3ffab512268ef54f4501d30e2de2a0c8ed7`, worktree
   `/root/vllm/kimi/b12x-k3-prefill-numerics`. Its two normalization files
@@ -69,7 +69,7 @@ The operator-side capture command against the resident diagnostic service was:
 cd /root/vllm/kimi
 kk-integration/.venv/bin/python kk-integration/compare-prefill-coding-controls.py \
   --url http://127.0.0.1:8012 \
-  --output /mnt/luke/kimi-k3-runs/kk-integration-20260919/qsrt-prefill-numerics/installed/coding-controls
+  --output <evidence-dir>/installed/coding-controls
 ```
 
 That integration harness and image require the operator's artifacts; they
@@ -106,8 +106,7 @@ FlashAttention 2 control for these inputs. One timing pair per prompt is not
 a statistically powered performance comparison. These checks do not establish
 capability accuracy, long-context determinism or multi-request qualification.
 
-Operator receipts are sealed under
-`/mnt/luke/kimi-k3-runs/kk-integration-20260919/qsrt-prefill-numerics/`.
+Operator receipts are sealed in the operator's evidence directory.
 The 474-file `evidence-index.json` SHA256 is
 `12375f7103f83bf27c6ae2b7a00716c1346fa362bb7b887b55b596395b2fc839`.
 It includes JUnit results, failing negative controls, hidden-state identities
