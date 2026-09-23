@@ -630,7 +630,7 @@ def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
 @pytest.mark.parametrize("cache_kind", ["swa", "indexed"])
 @torch.inference_mode()
 def test_v41_writer_prepared_dynamic_rows_and_graph_replay(cache_kind: str) -> None:
-    device = require_sm120()
+    device = require_sm103_or_sm12x()
     page_size = 3
     page_bytes = compressed_sparse_mla.page_nbytes(
         page_size, cache_format="deepseek_v41", cache_kind=cache_kind
