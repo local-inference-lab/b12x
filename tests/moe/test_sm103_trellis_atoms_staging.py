@@ -16,6 +16,7 @@ from b12x.moe._shared.kernels.sm103.launch import pointer
 from b12x.moe._shared.kernels.sm103.trellis_atoms_gemm import RoutedAtomTrellisGemm
 from tests._reference.trellis_atoms import atom_fixture, btx_atom_fixture
 from tests.moe.test_sm103_trellis_mixed_staging import _require_gpu
+from tests.moe.test_sm103_trellis_atoms_moe import _btx_plan
 
 
 class InspectAtomOperands:
@@ -208,13 +209,14 @@ def _run_atom_staging(codebook, group_size, fc1, dual_input, *, btx_path=None):
         torch.testing.assert_close(payload.rates.cpu(), logical, atol=0, rtol=0)
     else:
         public, layer, matrices = btx_atom_fixture(btx_path, codebook=codebook)
+        public = _btx_plan(public, layer)
         # Only layout selection is counterfactual; the real GPU executes the
         # production operand staging below using its own compilation target.
         with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
             prepared = fused_moe.prepare_weights(
-                plan=public, btx_layer=layer, btx_device="cuda", params_dtype=torch.bfloat16,
+                plan=public, weights=fused_moe.BtxWeights(layer=layer, device="cuda"),
             )
-        payload = prepared.representation_for("w4a16")
+        payload = prepared._impl.representation_for("w4a16")
         assert payload.paired_records
     n, k = (
         (payload.intermediate_size, payload.hidden_size)
@@ -333,11 +335,12 @@ def test_atom_row_offsets_cross_int32_word_boundary(tmp_path, btx):
         pytest.skip("17 GiB of free GPU memory required for high atom row offsets")
     if btx:
         public, layer, matrices = btx_atom_fixture(tmp_path, experts=1, width=256)
+        public = _btx_plan(public, layer)
         with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
             prepared = fused_moe.prepare_weights(
-                plan=public, btx_layer=layer, btx_device="cuda", params_dtype=torch.bfloat16,
+                plan=public, weights=fused_moe.BtxWeights(layer=layer, device="cuda"),
             )
-        payload = prepared.representation_for("w4a16")
+        payload = prepared._impl.representation_for("w4a16")
     else:
         public, bundle, _, matrices = atom_fixture(experts=1, device="cuda")
         prepared = fused_moe.prepare_weights(plan=public, weights=bundle)

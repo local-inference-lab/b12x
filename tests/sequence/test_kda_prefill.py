@@ -464,10 +464,10 @@ def test_prologue_initializes_more_windows_than_threads() -> None:
     """Small tuning windows must initialize the entire table, including its tail."""
     from types import SimpleNamespace
 
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
     from b12x.sequence._shared.delta_prefill._cute_kernels import _compile_prologue
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     tiles, windows, seqs = 515, 515, 4
     caps = SimpleNamespace(max_seqs=seqs, tiles_capacity=tiles, heads=1)
     layout = SimpleNamespace(caps=caps, window_tiles=1, max_windows=windows, workspace_windows=2)
@@ -854,7 +854,7 @@ def test_op_cuda_graph_replay_is_allocation_free_with_poison() -> None:
 
 def test_op_three_window_ring_reuse_is_capture_safe() -> None:
     """Three populated windows preserve results and fixed storage on replay."""
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
     from b12x.sequence.kda_prefill import KdaPrefillConfig
 
     device = require_sm103_or_sm12x()
@@ -953,7 +953,7 @@ def test_op_read_only_inputs_are_immutable() -> None:
 
 
 def test_op_accepts_strided_views() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
     from b12x.sequence.kda_prefill import _impl as impl
 
     device = require_sm103_or_sm12x()
@@ -999,7 +999,7 @@ def test_op_accepts_strided_views() -> None:
 
 
 def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.sequence._shared.delta_prefill import _cute_kernels as kernels
 
@@ -1039,7 +1039,7 @@ def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
 
 
 def test_op_state_slot_offset_past_int32_boundary() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
     from b12x.sequence.kda_prefill import _impl as impl
 
     device = require_sm103_or_sm12x()
@@ -1099,7 +1099,7 @@ def test_op_zero_tokens_copies_states_only() -> None:
 @pytest.mark.parametrize("decode_backend", ["auto", "cutedsl"])
 def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_backend):
     from b12x._lib.runtime_control import kernel_resolution_guard
-    from b12x.policy import GDN_ATTENTION, PolicyContext
+    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
     from b12x.sequence import gdn_decode as decode, kda_prefill as prefill
     from ..conftest import require_sm103_or_sm12x
 
@@ -1116,29 +1116,17 @@ def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_
     prefix_inputs["cu_seqlens"] = torch.tensor([0, prefix_tokens], dtype=torch.int32, device=device)
     prefix_inputs["final"] = torch.tensor([tail], dtype=torch.int32, device=device)
     prefix, _ = make_binding(
-        prefix_inputs, max_tokens=33, max_seqs=1,
-        recurrent_state=pool, metadata_validation="trusted",
+        prefix_inputs, max_tokens=33, max_seqs=1, recurrent_state=pool,
     )
-    policy = PolicyContext.for_device(device)
-    if decode_backend != "auto":
-        policy = policy.with_override(
-            GDN_ATTENTION, decode.GdnConfig(backend=decode_backend, recurrent_block_v=32)
-        )
-    plan = decode.plan(
-        decode.Caps(
-            device=device, max_tokens=decode_capacity, max_seqs=1,
-            max_state_slots=pool.shape[0], key_heads=heads, value_heads=heads,
-            state_index_columns=decode_capacity, state_dtype=torch.float32,
-            gate_activation="sigmoid", null_state_index=0,
-            kda_metadata_validation="trusted",
-        ),
-        policy=policy,
+    caps = decode.Caps(
+        device=device, max_tokens=decode_capacity, max_seqs=1,
+        max_state_slots=pool.shape[0], key_heads=heads, value_heads=heads,
+        state_index_columns=decode_capacity, state_dtype=torch.float32,
+        gate_activation="sigmoid", null_state_index=0,
     )
-    scratch_spec, = plan.scratch_specs()
     z = inputs["raw_g"][prefix_tokens:].clone()
     weight = torch.linspace(0.8, 1.2, HEAD_DIM, device=device)
-    binding = decode.bind_kda(
-        plan, scratch=torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+    args = dict(
         mixed_qkv=torch.cat([
             inputs[name][prefix_tokens:].flatten(1) for name in ("q", "k", "v")
         ], dim=1),
@@ -1151,6 +1139,33 @@ def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_
         num_seqs=torch.ones(1, dtype=torch.int32, device=device),
         num_tokens=torch.tensor([decode_capacity], dtype=torch.int32, device=device),
         output=torch.empty(decode_capacity, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
+    )
+    override = (
+        None if decode_backend == "auto"
+        else decode.GdnConfig(backend=decode_backend, recurrent_block_v=32)
+    )
+    plan = decode.plan(caps, invocation=decode.invocation_from_tensors(caps, **args), override=override)
+    decode_slots = pool[tail:tail + decode_capacity]
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        primed = state.bind_kda(scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args)
+        original_slots, original_output = decode_slots.clone(), primed.output.clone()
+
+        def reset():
+            decode_slots.copy_(original_slots)
+            primed.output.copy_(original_output)
+
+        return PreparedCall(
+            run=lambda: state.run(primed, lower_bound=-5.0, eps=1e-5),
+            output=primed.output, reset=reset, restore=reset,
+        )
+
+    session = PreparationSession(device=device, autotune=False)
+    result = session.prepare((plan.request(name="kda-continuity", prepare_call=prepare_call),))
+    (spec,) = require_prepared(plan, "attention.gdn").layout.scratch_specs()
+    binding = decode.bind_kda(
+        plan, scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
     )
 
     def run():
@@ -1189,3 +1204,6 @@ def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_
                 assert_kda_close("continued state", final, pool[tail + live - 1].cpu(), ratio=5e-3)
                 assert torch.isnan(pool[0]).all()
                 assert addresses == (pool.data_ptr(), prefix.output.data_ptr(), binding.output.data_ptr())
+    graph.reset()
+    result.close()
+    session.close()

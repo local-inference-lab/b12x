@@ -1306,8 +1306,11 @@ def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes
         details = [r.getMessage() for r in caplog.records if "unprepared plan Query#" in r.getMessage()]
         assert len(details) == 21
     finally:
+        # Lazy sessions are keyed by device ordinal: None without CUDA, else the GPU.
+        from b12x.preparation.device import detect_device
+        session = _LAZY_SESSIONS[detect_device(None).ordinal]
         for plan in plans:
-            _LAZY_SESSIONS[None].release(plan)
+            session.release(plan)
         _warn_unprepared_declaration.cache_clear()
 
 

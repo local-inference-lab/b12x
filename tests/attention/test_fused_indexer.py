@@ -736,7 +736,7 @@ def test_dsa_indexer_config_and_merge_thresholds() -> None:
     )
 
     config = DsaIndexerConfig.from_config(
-        FrozenMapping({"backend": "native", "fused_merge": FUSED_MERGE_AUTO})
+        FrozenMapping({"backend": "native", "fused_merge": FUSED_MERGE_AUTO, "mxfp4_score_kind": None})
     )
     assert TUNING.encode_config(config) == config.to_dict()
     common = dict(ctas_per_group=47, num_heads=32, topk=2048)

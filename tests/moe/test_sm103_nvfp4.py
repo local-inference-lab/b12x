@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import b12x
 from b12x.moe import fused_moe
 from b12x._lib.intrinsics import swizzle_block_scale
+from b12x.preparation import PreparationSession, PreparedCall
 from tests.architecture.test_sm103 import make_experts
 from b12x.moe._shared.kernels.materialized_nvfp4_reference import reference
 
@@ -56,6 +57,22 @@ def case(
     return prepared, plan, scratch
 
 
+def prepare(session, plan, prepared, scratch, *, capacity, top_k, experts, device):
+    """Prime the production launch at its planned capacity, then freeze."""
+    a = torch.randn((capacity, 256), device=device, dtype=torch.bfloat16) * 0.1
+    ids = (torch.arange(capacity * top_k, device=device) % experts).reshape(capacity, top_k)
+    weights = torch.rand((capacity, top_k), device=device)
+
+    def call(state):
+        binding = state.bind(
+            scratch=scratch, experts=prepared, a=a, topk_ids=ids, topk_weights=weights
+        )
+        return PreparedCall(run=binding.run, owners=(binding, a, ids, weights))
+
+    session.prepare((plan.request(name="sm103-nvfp4", prepare_call=call),))
+    session.freeze()
+
+
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("mode,w13_layout", [("a4", "w13"), ("a4", "w31"), ("auto", "w13")])
 def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, mode, w13_layout):
@@ -66,50 +83,52 @@ def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, mode, w13_lay
         prepared._impl.w1_fp4.data_ptr(),
         prepared._impl.w2_fp4.data_ptr(),
     )
-    with kernel_resolution_guard("SM103 qualification"):
-        for m in (1, 4, 8, 2):
-            a = torch.randn((m, 256), device=device, dtype=torch.bfloat16) * 0.1
-            ids = torch.arange(m * 2, device=device, dtype=id_dtype).reshape(m, 2) % 4
-            ids[0, 0] = -1
-            if m == 4:
-                ids[0, 0] = 2**32 + 1 if id_dtype == torch.int64 else 4
-            weights = torch.rand((m, 2), device=device)
-            binding = fused_moe.bind(
-                plan,
-                scratch=scratch,
-                experts=prepared,
-                a=a,
-                topk_ids=ids,
-                topk_weights=weights,
-            )
-            expected = reference(a, prepared._impl, ids, weights)
-            actual = fused_moe.run(binding=binding)
-            torch.cuda.synchronize()
-            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
-            assert (
-                F.cosine_similarity(
-                    actual.float().flatten(), expected.float().flatten(), dim=0
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        prepare(session, plan, prepared, scratch, capacity=8, top_k=2, experts=4, device=device)
+        with kernel_resolution_guard("SM103 qualification"):
+            for m in (1, 4, 8, 2):
+                a = torch.randn((m, 256), device=device, dtype=torch.bfloat16) * 0.1
+                ids = torch.arange(m * 2, device=device, dtype=id_dtype).reshape(m, 2) % 4
+                ids[0, 0] = -1
+                if m == 4:
+                    ids[0, 0] = 2**32 + 1 if id_dtype == torch.int64 else 4
+                weights = torch.rand((m, 2), device=device)
+                binding = fused_moe.bind(
+                    plan,
+                    scratch=scratch,
+                    experts=prepared,
+                    a=a,
+                    topk_ids=ids,
+                    topk_weights=weights,
                 )
-                > 0.999
-            )
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                fused_moe.run(binding=binding)
-            for _ in range(3):
-                a.mul_(0.75)
-                ids.copy_((ids + 1) % 4)
                 expected = reference(a, prepared._impl, ids, weights)
-                actual.fill_(float("nan"))
-                before = torch.cuda.memory_allocated()
-                graph.replay()
+                actual = fused_moe.run(binding=binding)
                 torch.cuda.synchronize()
-                assert torch.cuda.memory_allocated() == before
                 torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
-            assert initial_ptrs == (
-                scratch.data_ptr(),
-                prepared._impl.w1_fp4.data_ptr(),
-                prepared._impl.w2_fp4.data_ptr(),
-            )
+                assert (
+                    F.cosine_similarity(
+                        actual.float().flatten(), expected.float().flatten(), dim=0
+                    )
+                    > 0.999
+                )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    fused_moe.run(binding=binding)
+                for _ in range(3):
+                    a.mul_(0.75)
+                    ids.copy_((ids + 1) % 4)
+                    expected = reference(a, prepared._impl, ids, weights)
+                    actual.fill_(float("nan"))
+                    before = torch.cuda.memory_allocated()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_allocated() == before
+                    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
+                assert initial_ptrs == (
+                    scratch.data_ptr(),
+                    prepared._impl.w1_fp4.data_ptr(),
+                    prepared._impl.w2_fp4.data_ptr(),
+                )
 
 
 def test_native_moe_prefill_crosses_route_grid_boundary_with_frozen_plan():
@@ -126,35 +145,37 @@ def test_native_moe_prefill_crosses_route_grid_boundary_with_frozen_plan():
     source_weights = torch.rand((period, top_k), device=device)
     a, ids, weights = source[rows], source_ids[rows], source_weights[rows]
     scratch_ptr = scratch.data_ptr()
-    with kernel_resolution_guard("SM103 prefill route boundary"):
-        for live in (1, 8192, capacity):
-            binding = fused_moe.bind(
-                plan,
-                scratch=scratch,
-                experts=prepared,
-                a=a[:live],
-                topk_ids=ids[:live],
-                topk_weights=weights[:live],
-            )
-            actual = fused_moe.run(binding=binding)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                fused_moe.run(binding=binding)
-            source.mul_(0.75)
-            source_weights.mul_(0.5)
-            a.copy_(source[rows])
-            weights.copy_(source_weights[rows])
-            expected = reference(
-                source, prepared._impl, source_ids, source_weights
-            )[rows[:live]]
-            actual.fill_(float("nan"))
-            allocated = torch.cuda.memory_allocated()
-            graph.replay()
-            torch.cuda.synchronize()
-            assert torch.cuda.memory_allocated() == allocated
-            assert scratch.data_ptr() == scratch_ptr
-            assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
-            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
-            assert F.cosine_similarity(
-                actual.float().flatten(), expected.float().flatten(), dim=0
-            ) > 0.999
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        prepare(session, plan, prepared, scratch, capacity=capacity, top_k=top_k, experts=8, device=device)
+        with kernel_resolution_guard("SM103 prefill route boundary"):
+            for live in (1, 8192, capacity):
+                binding = fused_moe.bind(
+                    plan,
+                    scratch=scratch,
+                    experts=prepared,
+                    a=a[:live],
+                    topk_ids=ids[:live],
+                    topk_weights=weights[:live],
+                )
+                actual = fused_moe.run(binding=binding)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    fused_moe.run(binding=binding)
+                source.mul_(0.75)
+                source_weights.mul_(0.5)
+                a.copy_(source[rows])
+                weights.copy_(source_weights[rows])
+                expected = reference(
+                    source, prepared._impl, source_ids, source_weights
+                )[rows[:live]]
+                actual.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                assert scratch.data_ptr() == scratch_ptr
+                assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+                torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
+                assert F.cosine_similarity(
+                    actual.float().flatten(), expected.float().flatten(), dim=0
+                ) > 0.999
