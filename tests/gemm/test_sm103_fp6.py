@@ -115,18 +115,21 @@ def test_native_fp6_opaque_serving_op_compile_and_capture():
     require_native()
     from b12x.quantization.mxfp6 import quantize_dense_weight_to_fp6
     from b12x.quantization.mxfp6.fp6_dense_op import fp6_dense_linear
+    from tests.gemm.test_fp6_dense_op import _op_args, _prepared_execution
     weight = quantize_dense_weight_to_fp6(torch.randn(128, 384, device="cuda", dtype=torch.bfloat16))
-    packed = weight.gemm_weight()
-    def operation(x):
-        return fp6_dense_linear(x, packed, weight.scale_storage, weight.global_scale,
-                                weight.fmt, 128, 384, weight.act_fmt)
     source = torch.randn(8, 384, device="cuda", dtype=torch.bfloat16)
-    compiled = torch.compile(operation, fullgraph=True, backend="aot_eager")
-    torch.testing.assert_close(compiled(source), operation(source), atol=0, rtol=0)
-    with kernel_resolution_guard("FP6 opaque serving op capture is prewarmed"):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            result = compiled(source)
-        source.normal_()
-        graph.replay()
-        torch.testing.assert_close(result, operation(source), atol=0, rtol=0)
+    with _prepared_execution(weight, source.shape[0]) as plan:
+        args = _op_args(weight, plan)
+
+        def operation(x):
+            return fp6_dense_linear(x, *args)
+
+        compiled = torch.compile(operation, fullgraph=True, backend="aot_eager")
+        torch.testing.assert_close(compiled(source), operation(source), atol=0, rtol=0)
+        with kernel_resolution_guard("FP6 opaque serving op capture is prewarmed"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = compiled(source)
+            source.normal_()
+            graph.replay()
+            torch.testing.assert_close(result, operation(source), atol=0, rtol=0)

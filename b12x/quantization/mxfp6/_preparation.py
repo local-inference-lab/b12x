@@ -161,6 +161,97 @@ class _Mxfp6DenseState:
         return out[:, :, 0]
 
 
+@dataclass(frozen=True)
+class _CompiledMxfp6Sm103:
+    scales: object
+    quantize: object
+    gemm: object
+
+
+def compile_mxfp6_dense_sm103(query_payload, config_payload, ordinal):
+    """Compile the native SM103 activation quantizer and FP6 GEMM for one invocation."""
+    from b12x.gemm.blockscaled._fp6 import compile_kernel
+    from . import _rows
+    query = Mxfp6DenseQuery(**dict(query_payload))
+    Mxfp6DenseConfig(**dict(config_payload))
+    k, fmt, per_row = query.in_features, query.activation_format, query.per_row_global_scale
+    packed = fmt != "e4m3"
+    with torch.cuda.device(ordinal):
+        scales = _rows.compile_scales(k, fmt, per_row, ordinal, "sm_103a")
+        quantize = _rows.compile_quantizer(k, fmt, per_row, packed, ordinal, "sm_103a")
+        gemm = compile_kernel(
+            query.out_features, k, 1, fmt, query.weight_format, not packed,
+            query.weight_storage == "expanded", "bfloat16", False, per_row, ordinal,
+        )
+    return attach_programs(_CompiledMxfp6Sm103(scales, quantize, gemm), scales, quantize, gemm)
+
+
+def _sm103_storage_nbytes(query) -> int:
+    m, k = query.max_tokens, query.in_features
+    stored_k = k if query.activation_format == "e4m3" else 3 * k // 4
+    return (
+        m * stored_k + ((m + 127) // 128) * (k // 128) * 512
+        + 4 * (m if query.per_row_global_scale else 1) + 2 * m + 4
+    )
+
+
+@dataclass(frozen=True)
+class _Mxfp6Sm103State:
+    """SM103 ``linear_with_workspace`` arithmetic through retained programs."""
+
+    query: Mxfp6DenseQuery
+    device: torch.device
+    compiled: _CompiledMxfp6Sm103
+    workspace: object
+
+    def run(self, x: torch.Tensor, weight: torch.Tensor, weight_scales: torch.Tensor,
+            global_scale: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+        import cuda.bindings.driver as cuda
+        import cutlass
+        from b12x.gemm.blockscaled._fp6 import execute
+        from b12x.gemm.blockscaled._sm103 import pointer
+        q, w = self.query, self.workspace
+        m, k, n = q.max_tokens, q.in_features, q.out_features
+        if x.shape != (m, k) or x.dtype != torch.bfloat16 or x.device != self.device or not x.is_contiguous():
+            raise ValueError("FP6 source differs from prepared exact invocation")
+        if weight.ndim == 3 and weight.shape[-1] == 1:
+            weight = weight[..., 0]
+        stored_k = k if q.weight_storage == "expanded" else 3 * k // 4
+        if tuple(weight.shape) != (n, stored_k) or weight.device != self.device:
+            raise ValueError("FP6 weights differ from the prepared storage and device")
+        if weight_scales.device != self.device or global_scale.device != self.device:
+            raise ValueError("FP6 weight tensors differ from prepared device")
+        if out is None:
+            out = torch.empty((m, n, 1), dtype=torch.bfloat16, device=self.device)
+        w._validate(x, global_scale)
+        stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
+        self.compiled.scales(*(pointer(t, v) for t, v in zip(
+            (cutlass.BFloat16, cutlass.Float32, cutlass.Float32, cutlass.BFloat16, cutlass.Float32),
+            (x, global_scale, w.global_scales, w.inverse_scales, w.alpha), strict=True,
+        )), cutlass.Int32(m), stream)
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.compiled.quantize(
+            pointer(cutlass.BFloat16, x), pointer(cutlass.Float32, w.global_scales),
+            pointer(cutlass.Uint8, w.values), pointer(cutlass.Uint8, w.scale_storage),
+            cutlass.Int32(m), cutlass.Int32(min((m * (k // 32) + 127) // 128, sms * 4)), stream,
+        )
+        execute(
+            (w.values[:m, :, None], w.scale_view(m)),
+            (weight.reshape(n, stored_k, 1), as_grouped_mxfp6_scale_view(weight_scales.view(1, -1), n, k)),
+            out, alpha=w.alpha, ab_dtype=f"float6_{q.weight_format}fn",
+            sf_dtype="float8_e8m0fnu", sf_vec_size=32, c_dtype="bfloat16",
+            a_fmt=q.activation_format, b_fmt=q.weight_format, a_preexpanded=not w.packed,
+            b_preexpanded=q.weight_storage == "expanded", b_packed=q.weight_storage == "packed",
+            row_scale=w.inverse_scales[:m] if q.per_row_global_scale else None,
+            compiled=self.compiled.gemm,
+        )
+        return out[:, :, 0]
+
+
+def _is_sm103(device) -> bool:
+    return tuple(device.identity.compute_capability) == (10, 3)
+
+
 def plan(query: Mxfp6DenseQuery, *, invocation=FrozenMapping(), override=None) -> Plan:
     if not isinstance(query, Mxfp6DenseQuery):
         raise TypeError("plan requires Mxfp6DenseQuery")
@@ -168,26 +259,46 @@ def plan(query: Mxfp6DenseQuery, *, invocation=FrozenMapping(), override=None) -
     if invocation:
         raise ValueError("MX-FP6 invocation semantics belong in Mxfp6DenseQuery")
     def jobs(config, device):
+        if _is_sm103(device):
+            return (CompileJob.create("b12x.quantization.mxfp6._preparation:compile_mxfp6_dense_sm103", TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal),)
         return (CompileJob.create("b12x.quantization.mxfp6._preparation:compile_mxfp6_dense", TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal, device.identity.sm_count),)
     def memory(config, device):
-        del config, device
-        required, resident = _storage_nbytes(query.max_tokens, query.in_features), 0
+        del config
         state = current_prepared_state()
-        if isinstance(state, _Mxfp6DenseState):
-            required = resident = _owned_tensor_nbytes((
-                state.codes, state.scales, state.alpha, state.row_scales,
-                state.inverse_row_scales, state.source_storage,
-            ))
+        if _is_sm103(device):
+            required, resident = _sm103_storage_nbytes(query), 0
+            if isinstance(state, _Mxfp6Sm103State):
+                w = state.workspace
+                required = resident = _owned_tensor_nbytes((
+                    w.values, w.scale_storage, w.global_scales, w.inverse_scales, w.alpha,
+                ))
+        else:
+            required, resident = _storage_nbytes(query.max_tokens, query.in_features), 0
+            if isinstance(state, _Mxfp6DenseState):
+                required = resident = _owned_tensor_nbytes((
+                    state.codes, state.scales, state.alpha, state.row_scales,
+                    state.inverse_row_scales, state.source_storage,
+                ))
         return MemoryRequirements(persistent=(PersistentMemory(
             ("quantization.mxfp6", current_plan()),
             required, resident,
         ),))
     def materialize(selection, device):
+        target = torch.device("cuda", device.ordinal)
+        if _is_sm103(device):
+            from ._linear_workspace import allocate_fp6_linear_workspace
+            compiled = compile_mxfp6_dense_sm103(
+                TUNING.encode_query(query), TUNING.encode_config(selection.config), device.ordinal,
+            )
+            return _Mxfp6Sm103State(query, target, compiled, allocate_fp6_linear_workspace(
+                query.max_tokens, query.in_features, device=target,
+                act_fmt=query.activation_format, per_row=query.per_row_global_scale,
+            ))
         compiled = compile_mxfp6_dense(
             TUNING.encode_query(query), TUNING.encode_config(selection.config),
             device.ordinal, device.identity.sm_count,
         )
-        target, padded_m = torch.device("cuda", device.ordinal), align_up(query.max_tokens, 128)
+        padded_m = align_up(query.max_tokens, 128)
         dense = __import__("b12x._lib.dense_gemm", fromlist=["_DenseExecutionState"])
         return _Mxfp6DenseState(
             query, target,
@@ -207,4 +318,4 @@ def plan(query: Mxfp6DenseQuery, *, invocation=FrozenMapping(), override=None) -
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, _compile_jobs=jobs, _memory_requirements=memory, _materialize=materialize)
 
 
-__all__ = ["Mxfp6DenseQuery", "Mxfp6DenseConfig", "TUNING", "compile_mxfp6_dense", "plan"]
+__all__ = ["Mxfp6DenseQuery", "Mxfp6DenseConfig", "TUNING", "compile_mxfp6_dense", "compile_mxfp6_dense_sm103", "plan"]
