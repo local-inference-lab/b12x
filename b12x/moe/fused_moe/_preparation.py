@@ -554,7 +554,10 @@ def _compact_launches(plan, caps):
             plan.weight_E, plan.weight_E, plan.swiglu_limit, caps.w4a16_fast_math,
         ) for dtype in (torch.int32, torch.int64)
     }
-    topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
+    # The compact kernels write router-weighted routes: an unweighted sum.
+    topk_sum = compile_w4a16_topk_sum(
+        m=m, topk=plan.num_topk, hidden_size=plan.k, apply_topk_weights=False
+    )
     return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
                            tuple(kernels.values()), quantize, topk_sum)
 
