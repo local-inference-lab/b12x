@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-417",
+  "category": "fix",
+  "summary": "Stop startup from stalling forever during kernel autotuning",
+  "models": ["all"],
+  "compatibility": "No user action required. A startup that stalled can simply be restarted; completed tuning results remain cached.",
+  "details": [
+    "A garbage collection during a timed autotuning sample could unload a kernel module whose work was still held for timing, stalling startup with one CPU core busy and the GPU idle, for example at sequence.gdn_prefill with no progress."
+  ],
+  "pull_requests": [417],
+  "evidence": ["https://github.com/local-inference-lab/b12x/pull/417"]
+}
