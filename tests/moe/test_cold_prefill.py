@@ -56,9 +56,10 @@ def test_traffic_counts_route_blocks_not_token_count():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="physical SM120 required")
 @pytest.mark.parametrize("variant", ["two_cta", "two_cta_pipeline3"])
-def test_two_cta_graph_promotion_and_live_routes(tmp_path, variant):
+@pytest.mark.parametrize("geometry", [(128, 128), (2048, 512)])
+def test_two_cta_graph_promotion_and_live_routes(tmp_path, variant, geometry):
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("physical SM120 required")
     from tests.moe.test_prepared_expert_cache import _graph_parity, source
-    _graph_parity(tmp_path, torch.int32, source(128, 128, 64), 64, 4, 32,
+    _graph_parity(tmp_path, torch.int32, source(*geometry, 64), 64, 4, 32,
                   ExpertCacheConfig(cold_prefill=variant))
