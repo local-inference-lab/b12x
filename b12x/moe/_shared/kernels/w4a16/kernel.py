@@ -9142,6 +9142,7 @@ def compile_w4a16_fused_moe(
     collect_activation_amax: bool = False,
     schedule_whole_tiles: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
+    cold_prefill_two_cta: bool = False,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     coupled_hadamard: bool = False,
@@ -9455,6 +9456,19 @@ def compile_w4a16_fused_moe(
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
             fc2_cta_threads = 256
+    if cold_prefill_two_cta:
+        if not (
+            weight_layout == "modelopt" and scale_format == "e4m3_k16"
+            and element_dtype == "bf16" and activation == "silu"
+            and schedule_whole_tiles and zero_fc2_output
+            and not apply_router_weight_on_input and not direct_topk_routes
+            and not collect_activation_amax and not intermediate_rotation
+            and not full_rotation and not tc_decode_fused_sum
+            and hidden_size % 128 == 0 and intermediate_size % 128 == 0
+            and force_tile_config is None
+        ):
+            raise ValueError("two-CTA cold prefill requires whole-K mapped ModelOpt BF16 SiLU")
+        force_tile_config = (64, 128, 64, 128)
     if force_tile_config is not None:
         # Some weight layouts are packed for a specific CTA N-tile. An explicit
         # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple therefore pins
@@ -9532,6 +9546,14 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
     )
+    if cold_prefill_two_cta:
+        # Whole-K tiles do not use split-K lock rows. The shared global barrier
+        # needs every CTA resident; compilation enforces the register bound and
+        # admission checks the physical SM shared-memory capacity.
+        props = torch.cuda.get_device_properties(device)
+        if 2 * (kernel.shared_words * 4 + 512) > props.shared_memory_per_multiprocessor:
+            raise ValueError("two cold-prefill CTAs exceed SM shared-memory capacity")
+        kernel.blocks_per_sm = 2
     cache_key = (
         "w4a16_fused_moe",
         device,

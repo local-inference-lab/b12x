@@ -7,6 +7,7 @@ Profiler traces are separate from timed samples.
 """
 
 import argparse
+from collections import Counter
 from dataclasses import asdict
 import importlib.util
 import json
@@ -23,6 +24,40 @@ from b12x.testing.artifacts import sha256
 from scripts._sm103_source import source_identity
 
 
+def weight_schedule(ids, *, hidden, intermediate, block_rows, fc1_tile, fc2_tile):
+    """Infer whole-K weight requests; these are not measured PCIe transactions.
+
+    Each packed route block traverses every FC1/FC2 weight tile once. Cache
+    hits, transaction amplification and per-instruction lane behavior are not
+    represented. Global scalar loads are excluded from these byte estimates.
+    """
+    counts = Counter(ids)
+    if min(hidden, intermediate, block_rows) <= 0 or min(counts, default=0) < 0:
+        raise ValueError("invalid geometry or expert ID")
+    experts = []
+    for expert, rows in sorted(counts.items()):
+        blocks = (rows + block_rows - 1) // block_rows
+        experts.append(dict(expert=expert, rows=rows, blocks=blocks))
+    result = dict(experts=experts, active_experts=len(experts), routes=len(ids), block_rows=block_rows)
+    for phase, n, k, tile in (("fc1", 2 * intermediate, hidden, fc1_tile), ("fc2", hidden, intermediate, fc2_tile)):
+        tile_k, tile_n = tile
+        if n % tile_n or k % tile_k or k % 16:
+            raise ValueError("traffic estimate requires aligned ModelOpt tiles")
+        tiles = (n // tile_n) * (k // tile_k)
+        packed, scales = n * k // 2, n * k // 16
+        for item in experts:
+            item[phase + "_tile_requests"] = item["blocks"] * tiles
+        blocks = sum(item["blocks"] for item in experts)
+        result[phase] = dict(
+            packed_bytes_per_expert=packed, scale_bytes_per_expert=scales,
+            unique_weight_scale_bytes=len(experts) * (packed + scales),
+            scheduled_weight_scale_bytes=blocks * (packed + scales),
+            tile_requests=blocks * tiles, repeated_tile_requests=(blocks - len(experts)) * tiles,
+            routed_rows_per_unique_mib=len(ids) * (1 << 20) / max(len(experts) * (packed + scales), 1),
+        )
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -31,6 +66,7 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 16, 64, 128, 256])
     parser.add_argument("--samples", type=int, default=6)
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument("--cold-prefill", choices=("two_cta",))
     parser.add_argument(
         "--diagnostic-only",
         action="store_true",
@@ -85,7 +121,10 @@ def main():
         }
         inputs["ids"] = inputs["ids"].to(torch.int32)
         plans, bindings, graphs, programs = {}, {}, {}, {}
-        for mode, residents in (("resident", tuple(range(e))), ("mapped", (unused,))):
+        arms = [("resident", tuple(range(e))), ("mapped", (unused,))]
+        if args.cold_prefill:
+            arms.append(("prototype", (unused,)))
+        for mode, residents in arms:
             plan = moe.plan_execution(
                 experts=source,
                 capacity=moe.ExecutionCapacity(
@@ -103,6 +142,8 @@ def main():
                 memory_budget=moe.ExpertMemoryBudget(
                     hbm_bytes=4 << 30, grace_bytes=4 << 30
                 ),
+                override=moe.ExpertCacheConfig(cold_prefill=args.cold_prefill)
+                if mode == "prototype" and rows >= 16 else None,
             )
             plans[mode] = plan
 
@@ -152,9 +193,8 @@ def main():
                 assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
                 assert pointers[mode] == plans[mode].prepared.state.pointers()
             resident = bindings["resident"].output.cpu()
-            torch.testing.assert_close(
-                resident, bindings["mapped"].output.cpu(), atol=0, rtol=0
-            )
+            for mode in bindings:
+                torch.testing.assert_close(resident, bindings[mode].output.cpu(), atol=0, rtol=0)
             assert torch.isfinite(resident).all() and torch.count_nonzero(resident)
             expected = oracle.routed_oracle(
                 source,
@@ -168,11 +208,8 @@ def main():
             )
             samples = {mode: [] for mode in graphs}
             for sample in range(0 if args.diagnostic_only else args.samples):
-                for mode in (
-                    ("resident", "mapped")
-                    if sample % 2 == 0
-                    else ("mapped", "resident")
-                ):
+                order = list(graphs)
+                for mode in (order if sample % 2 == 0 else order[::-1]):
                     graph = graphs[mode]
                     for _ in range(3):
                         graph.replay()
@@ -223,6 +260,29 @@ def main():
                         n: asdict(p.prepared.state.memory) for n, p in plans.items()
                     },
                     programs=programs,
+                    schedules={
+                        mode: weight_schedule(
+                            inputs["ids"].cpu().flatten().tolist(),
+                            hidden=source.plan.geometry.hidden_size,
+                            intermediate=source.plan.geometry.intermediate_size,
+                            block_rows=launch.moe_block_size,
+                            fc1_tile=(launch.fc1_tile_k, launch.fc1_tile_n),
+                            fc2_tile=(launch.fc2_tile_k, launch.fc2_tile_n),
+                        )
+                        for mode, p in plans.items()
+                        for launch in [p.prepared.state.states[1].w4a16_launches.select(
+                            tokens=rows, route_ids_dtype=torch.int32, has_route_map=True, activation_amax=None
+                        )[0]]
+                    },
+                    launches={
+                        mode: {key: getattr(launch, key) for key in (
+                            "fc1_tile_k", "fc1_tile_n", "fc2_tile_k", "fc2_tile_n", "blocks_per_sm", "moe_block_size"
+                        )}
+                        for mode, p in plans.items()
+                        for launch in [p.prepared.state.states[1].w4a16_launches.select(
+                            tokens=rows, route_ids_dtype=torch.int32, has_route_map=True, activation_amax=None
+                        )[0]]
+                    },
                 )
             )
         assert all(p.prepared is None for p in plans.values())

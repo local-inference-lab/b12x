@@ -23,6 +23,7 @@ class ExpertCacheQuery:
 @dataclass(frozen=True, kw_only=True)
 class ExpertCacheConfig:
     backend: str = "sm120_w4a16_canonical_mapped"
+    cold_prefill: str = "fused"
 
 
 def validate(query, device):
@@ -66,14 +67,18 @@ def validate(query, device):
 
 def validate_config(query, config, device):
     validate(query, device)
-    if config != ExpertCacheConfig():
+    if not isinstance(config, ExpertCacheConfig) or config.backend != ExpertCacheConfig().backend:
         raise ValueError("unsupported canonical cache backend")
+    if config.cold_prefill not in ("fused", "two_cta"):
+        raise ValueError("unsupported cold-prefill variant")
+    if config.cold_prefill != "fused" and query.max_tokens < 16:
+        raise ValueError("cold-prefill variants require capacity of at least 16 tokens")
 
 
 TUNING = TuningContract(
     component_id="moe.expert_cache",
     query_schema_version=1,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(ExpertCacheQuery.__dataclass_fields__),
     config_fields=frozenset(ExpertCacheConfig.__dataclass_fields__),
     encode_query=asdict,
@@ -88,8 +93,11 @@ TUNING = TuningContract(
             values=(ExpertCacheConfig().backend,),
             binding=ParameterBinding.COMPILE,
         ),
+        # Experimental variants require an explicit pin; automatic races retain
+        # the qualified fused implementation.
+        Knob(name="cold_prefill", values=("fused",), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=1,
+    candidate_contract_version=2,
     parameters=lambda query, device: ParameterSpace.create(TUNING.knobs),
     materialize=lambda query, device, choice: ExpertCacheConfig(**dict(choice)),
 )

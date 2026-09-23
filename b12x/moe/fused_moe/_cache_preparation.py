@@ -16,7 +16,7 @@ from b12x.preparation import (
     current_plan,
 )
 from . import _preparation as native
-from ._cache_tuning import ExpertCacheQuery, TUNING
+from ._cache_tuning import ExpertCacheConfig, ExpertCacheQuery, TUNING
 from ._residency_storage import align
 from .execution import ExecutionCapacity, RoutingSpec
 from .planning import MoEGeometry, plan_weights, prepare_weights
@@ -142,7 +142,7 @@ def memory_for(q, device, source_bytes):
 
 
 @program_cache
-def compile_programs(payload, ordinal):
+def compile_programs(payload, ordinal, config_payload=None):
     import cutlass
     import cuda.bindings.driver as cuda
     from b12x._lib.architecture import architecture_for
@@ -151,6 +151,8 @@ def compile_programs(payload, ordinal):
     from b12x.moe._shared.kernels.w4a16.residency import Remap, OrderedSum
 
     q = ExpertCacheQuery(**dict(payload))
+    config = ExpertCacheConfig(**dict(config_payload or {}))
+    TUNING.validate_config(q, config, None)
     programs, scratches = {}, []
     with torch.cuda.device(ordinal):
         target = architecture_for(torch.cuda.get_device_capability()).compilation_target
@@ -165,6 +167,13 @@ def compile_programs(payload, ordinal):
                     ordinal,
                 )
             )
+        if config.cold_prefill != "fused":
+            wp, nq = native_query(q, q.experts)
+            caps = native._lower_caps(nq, NATIVE_CONFIG, wp._impl, torch.device("cuda", ordinal))
+            launchers = native._w4a16_primary_launches(
+                scratches[-1], caps, cold_prefill=config.cold_prefill
+            )
+            programs["cold_prefill"] = launchers.carriers()
         for dtype, suffix in ((cutlass.Int32, "i32"), (cutlass.Int64, "i64")):
             for name, kernel, types in (
                 (
@@ -232,7 +241,7 @@ class ExpertCacheBinding:
 
 
 class ExpertCacheState:
-    def __init__(self, q, source, placement, memory, device, programs):
+    def __init__(self, q, source, placement, memory, device, programs, config=ExpertCacheConfig()):
         from b12x.sequence._shared.disk_table import MappedHostAllocation
         from ._cache_updates import CanonicalSlotUpdates
         from ._residency_updates import _CudaTransfer
@@ -275,10 +284,10 @@ class ExpertCacheState:
                 for _ in range(3)
             )
             states, scratches = [], []
-            for count, fields in (
+            for tier, (count, fields) in enumerate((
                 (q.resident, self.resident),
                 (q.experts, self.backing),
-            ):
+            )):
                 wp, nq = native_query(q, count)
                 experts = prepare_weights(
                     plan=wp,
@@ -297,7 +306,9 @@ class ExpertCacheState:
                 )
                 caps = native._lower_caps(nq, NATIVE_CONFIG, wp._impl, device)
                 scratch = native.plan_tp_moe_scratch(caps, prewarm_launches=True)
-                launchers = native._w4a16_primary_launches(scratch, caps)
+                launchers = native._w4a16_primary_launches(
+                    scratch, caps, cold_prefill=config.cold_prefill if tier else "fused"
+                )
                 states.append(
                     native._FusedMoeState(
                         experts,
@@ -507,10 +518,12 @@ def plan(*, source, capacity, placement, memory_budget, updates=None, override=N
         target = torch.device("cuda", device.ordinal)
         memory = memory_for(q, target, source.source_bytes)
         memory_budget.admit(memory)
-        programs = compile_programs(FrozenMapping(asdict(q)), device.ordinal)
+        programs = compile_programs(
+            FrozenMapping(asdict(q)), device.ordinal, FrozenMapping(asdict(selection.config))
+        )
         load_programs(programs)
         return attach_programs(
-            ExpertCacheState(q, source, placement, memory, target, programs), programs
+            ExpertCacheState(q, source, placement, memory, target, programs, selection.config), programs
         )
 
     return Plan(
@@ -522,6 +535,7 @@ def plan(*, source, capacity, placement, memory_budget, updates=None, override=N
                 "b12x.moe.fused_moe._cache_preparation:compile_programs",
                 FrozenMapping(asdict(q)),
                 d.ordinal,
+                FrozenMapping(asdict(c)),
             ),
         ),
         _memory_requirements=lambda c, d: MemoryRequirements(

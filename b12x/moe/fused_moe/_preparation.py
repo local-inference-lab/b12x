@@ -271,6 +271,7 @@ class _W4A16PrimaryLaunches:
     topk_sum: object
     mapped_topk_sum: object
     route_pack: object | None
+    cold_prefill: object | None = None
 
     def select(
         self,
@@ -285,6 +286,10 @@ class _W4A16PrimaryLaunches:
                 "W4A16 execution exceeds its prepared capacity: "
                 f"requested={int(tokens)}, prepared={self.tokens}"
             )
+        if self.cold_prefill is not None and has_route_map and tokens >= 16:
+            if activation_amax is not None:
+                raise ValueError("cold-prefill variant does not collect activation maxima")
+            return self.cold_prefill, self.topk_sum, self.route_pack
         native_direct = (
             int(tokens) == self.tokens
             and not getattr(self.packed, "schedule_whole_tiles", False)
@@ -325,6 +330,7 @@ class _W4A16PrimaryLaunches:
             for launcher in (
                 self.packed,
                 self.packed_mapped,
+                self.cold_prefill,
                 self.direct,
                 self.direct_mapped,
                 self.topk_sum,
@@ -337,7 +343,7 @@ class _W4A16PrimaryLaunches:
         )
 
 
-def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
+def _w4a16_primary_launches(scratch, caps, *, cold_prefill="fused") -> _W4A16PrimaryLaunches:
     """Compile capacity launches and exact direct routing from metadata.
 
     This intentionally uses only immutable declaration metadata and compiler
@@ -401,6 +407,14 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         packed_mapped = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
         )
+        if cold_prefill not in ("fused", "two_cta"):
+            raise ValueError("unsupported cold-prefill variant")
+        cold_launch = None
+        if cold_prefill == "two_cta":
+            cold_launch = compile_w4a16_fused_moe(
+                **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
+                cold_prefill_two_cta=True,
+            )
         direct = direct_mapped = None
         if weight_layout == "packed":
             if tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
@@ -434,6 +448,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         packed=packed, packed_mapped=packed_mapped, direct=direct,
         direct_mapped=direct_mapped, topk_sum=topk_sum,
         mapped_topk_sum=mapped_topk_sum, route_pack=route_pack,
+        cold_prefill=cold_launch,
     )
 
 

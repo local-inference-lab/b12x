@@ -41,7 +41,7 @@ def source(h=128, i=128, e=4):
     )
 
 
-def declaration(s, capacity=4, top_k=4, hot_count=2):
+def declaration(s, capacity=4, top_k=4, hot_count=2, override=None):
     e = s.plan.geometry.num_experts
     placement = moe.ExpertResidencyPlan(
         total_experts=e,
@@ -60,6 +60,7 @@ def declaration(s, capacity=4, top_k=4, hot_count=2):
         updates=moe.ResidencyUpdateCapacity(max_pairs=min(2, hot_count, e - hot_count))
         if hot_count < e
         else None,
+        override=override,
     )
 
 
@@ -158,13 +159,13 @@ def test_capacity_extremes_match_all_resident_whole_k(tmp_path, hot_count):
     _graph_parity(tmp_path, torch.int32, source(), 4, 4, hot_count)
 
 
-def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count):
+def _graph_parity(tmp_path, dtype, s, capacity, top_k, hot_count, override=None):
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x._lib.runtime_control import kernel_resolution_guard
     from benchmarks.moe.sm120_residency_poc import make_tier
 
     e, h = s.plan.geometry.num_experts, s.plan.geometry.hidden_size
-    plan = declaration(s, capacity, top_k, hot_count)
+    plan = declaration(s, capacity, top_k, hot_count, override)
     rows = [s.row(expert) for expert in range(e)]
     fields = {n: torch.stack([row[n] for row in rows]) for n in rows[0]}
     control_tier = make_tier(fields, range(e), torch.device("cuda", 0), mapped=False)
