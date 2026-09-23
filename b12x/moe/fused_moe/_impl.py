@@ -836,6 +836,7 @@ class TPMoEScratchCaps:
     w4a16_fast_math: bool = True
     w4a16_prefill_fused_sum: bool | None = None
     w4a16_stable_route_pack: bool | None = None
+    trellis_decode_table: str = "auto"
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -889,6 +890,8 @@ class TPMoEScratchCaps:
                 raise ValueError("w4a16_block_size_m must be one of 8, 16, 32, 48, 64")
             object.__setattr__(self, "w4a16_block_size_m", block_size_m)
         object.__setattr__(self, "w4a16_fast_math", bool(self.w4a16_fast_math))
+        if self.trellis_decode_table not in {"auto", "compact", "full"}:
+            raise ValueError("trellis decode table must be auto, compact, or full")
         if self.w4a16_prefill_fused_sum is None:
             from b12x.moe._shared.kernels.w4a16.host import prefill_fused_sum_enabled
 
@@ -963,6 +966,7 @@ class TPMoEScratchPlan:
     _mixed_trellis_launches: tuple[tuple[torch.dtype, bool, bool, object], ...] = field(
         default=(), repr=False
     )
+    _prewarmed_route_pack_launches: object | None = field(default=None, repr=False)
 
     @property
     def full_rotation(self) -> bool:
@@ -1071,6 +1075,7 @@ class TPMoEScratchPlan:
                 activation_amax=activation_amax,
             )
         elif self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation:
+            route_pack_launches = self._prewarmed_route_pack_launches
             tokens = int(a.shape[0])
             prepared = experts.representation_for("w4a16")
             broadcast_suh = prepared.gate_suh.numel() == self.caps.k
@@ -8015,10 +8020,8 @@ def _plan_full_rotation_w4a16_launches(
 ]:
     """Compile the fixed Trellis launches before serving memory profiling.
 
-    The caller-owned scratch path cannot use the mutable workspace prewarm
-    dictionaries.  Keeping the launch objects on the immutable scratch plan
-    preserves the old Trellis API contract and prevents first-use compilation
-    from being charged as peak activation memory by vLLM.
+    The immutable scratch plan owns compiled programs independently of module
+    cache eviction. Runtime binding performs no kernel resolution or allocation.
     """
     if not core_plan.full_rotation or core_plan.projection_mixed_trellis:
         return (), ()
@@ -8031,15 +8034,11 @@ def _plan_full_rotation_w4a16_launches(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
-    from b12x.moe._shared.kernels.w4a16.host import (
-        route_pack_capacity,
-        route_pack_warmup_token_counts,
-    )
+    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
         compile_w4a16_fused_moe,
         compile_w4a16_topk_sum,
-        pack_topk_routes_by_expert,
     )
 
     capacity_tokens = max(int(capacity_tokens), 1)
@@ -8065,7 +8064,7 @@ def _plan_full_rotation_w4a16_launches(
             f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
         )
     w13_layout = "trellis_t256_proj"
-    _, capacity_route_slots, capacity_m_blocks = route_pack_capacity(
+    _, _, capacity_m_blocks = route_pack_capacity(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
         core_plan.route_E,
@@ -8120,6 +8119,7 @@ def _plan_full_rotation_w4a16_launches(
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
                 trellis_codebook=core_plan.trellis_codebook or LUT_E4M3,
+                trellis_decode_table=caps.trellis_decode_table,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
@@ -8155,83 +8155,6 @@ def _plan_full_rotation_w4a16_launches(
             for mapped in (False, True)
             for broadcast_svh in (False, True)
         )
-        packed_route_indices = torch.empty(
-            capacity_route_slots,
-            dtype=torch.int32,
-            device=core_plan.device,
-        )
-        block_expert_ids = torch.empty(
-            capacity_m_blocks,
-            dtype=torch.int32,
-            device=core_plan.device,
-        )
-        packed_route_count = torch.empty(
-            1,
-            dtype=torch.int32,
-            device=core_plan.device,
-        )
-        expert_offsets = torch.empty(
-            core_plan.route_E + 1,
-            dtype=torch.int32,
-            device=core_plan.device,
-        )
-        expert_counts = torch.empty(
-            core_plan.route_E,
-            dtype=torch.int32,
-            device=core_plan.device,
-        )
-        pending_route_pack_keys: list[tuple[object, ...]] = []
-        for route_ids_dtype in (torch.int32, torch.int64):
-            dummy_topk_ids = torch.zeros(
-                capacity_tokens,
-                core_plan.num_topk,
-                dtype=route_ids_dtype,
-                device=core_plan.device,
-            )
-            for mapped in (False, True):
-                expert_map = None
-                if mapped:
-                    expert_map = torch.arange(
-                        core_plan.route_E,
-                        dtype=torch.int32,
-                        device=core_plan.device,
-                    )
-                for token_count in route_pack_warmup_token_counts(capacity_tokens):
-                    route_pack_key = route_pack_prewarm_key(
-                        core_plan.device.type,
-                        int(torch.cuda.current_device()),
-                        route_ids_dtype,
-                        token_count,
-                        core_plan.num_topk,
-                        capacity_route_slots,
-                        capacity_m_blocks,
-                        int(block_size_m),
-                        int(core_plan.route_E),
-                        mapped,
-                    )
-                    if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
-                        continue
-                    pack_topk_routes_by_expert(
-                        dummy_topk_ids[:token_count],
-                        block_size_m,
-                        core_plan.route_E,
-                        expert_map=expert_map,
-                        packed_route_indices=packed_route_indices,
-                        block_expert_ids=block_expert_ids,
-                        packed_route_count=packed_route_count,
-                        expert_offsets=expert_offsets,
-                        expert_counts=expert_counts,
-                    )
-                    pending_route_pack_keys.append(route_pack_key)
-        torch.cuda.current_stream(core_plan.device).synchronize()
-        _W4A16_ROUTE_PACK_PREWARMED.update(pending_route_pack_keys)
-        if pending_route_pack_keys:
-            logger.info(
-                "Prewarmed %d full-rotation W4A16 route-pack variant(s) "
-                "for token capacity %d.",
-                len(pending_route_pack_keys),
-                capacity_tokens,
-            )
     return fused_launches, topk_sum_launches
 
 
@@ -8603,11 +8526,51 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
         bucket_w4a16_tokens=False,
     )
     route_experts = caps.route_num_experts or caps.weight_E
-    return select_route_block_size_m(
+    preferred = select_route_block_size_m(
         max(token_counts),
         caps.num_topk,
         route_experts,
     )
+    tile = caps.weight_plan.trellis_tile_config
+    if tile is None or torch.device(caps.device).type != "cuda":
+        return preferred
+    # Native Trellis packing fixes both projection tiles. The route block
+    # must fit those tiles' shared memory, not a different automatically
+    # selected GEMM tile with the same logical weight dimensions.
+    from b12x.moe._shared.kernels.w4a16.host import (
+        route_block_sizes_for_capacity,
+    )
+    from b12x.moe._shared.kernels.w4a16.kernel import _candidate_tile_fits
+
+    props = torch.cuda.get_device_properties(caps.device)
+    budget = int(props.shared_memory_per_block_optin) - 512
+    candidates = route_block_sizes_for_capacity(
+        max_tokens=max(token_counts),
+        topk=caps.num_topk,
+        num_experts=route_experts,
+    )
+    dimensions = (
+        (_activation_w1_rows(caps.weight_plan.activation, caps.n), caps.k),
+        (caps.k, caps.n),
+    )
+    for block_rows in reversed(candidates):
+        if all(
+            _candidate_tile_fits(
+                problem_n=n,
+                problem_k=k,
+                cta_m_blocks=(block_rows + 15) // 16,
+                tile_k=tk,
+                tile_n=tn,
+                cta_threads=tk * tn // 64,
+                max_shared_mem=budget,
+                scale_format="e4m3_k32",
+                weight_layout="trellis_t256",
+                weight_bits=max(4, caps.weight_plan.trellis_bits or 3),
+            )
+            for (n, k), (tk, tn) in zip(dimensions, (tile[:2], tile[2:]))
+        ):
+            return block_rows
+    raise ValueError("Native Trellis projection tiles exceed shared-memory capacity")
 
 
 def _plan_tp_moe_arena_layout_from_caps(
@@ -8726,6 +8689,30 @@ def plan_tp_moe_scratch(
         fused_launches = ()
         topk_sum_launches = ()
         mixed_trellis_launches = ()
+    route_pack_launches = None
+    if (
+        prewarm_launches
+        and core_workspace_plan.full_rotation
+        and not core_workspace_plan.projection_mixed_trellis
+        and core_workspace_plan.device.type == "cuda"
+    ):
+        from b12x.moe._shared.kernels.w4a16.route_pack import (
+            compile_w4a16_route_pack_launches,
+        )
+
+        route_pack_launches = compile_w4a16_route_pack_launches(
+            tokens=capacity_tokens,
+            topk=core_workspace_plan.num_topk,
+            block_size=resolved_block_size_m,
+            num_experts=core_workspace_plan.route_E,
+            ordinal=(
+                core_workspace_plan.device.index
+                if core_workspace_plan.device.index is not None
+                else torch.cuda.current_device()
+            ),
+            stable_order=caps.w4a16_stable_route_pack,
+            bucket_tokens=False,
+        )
     return TPMoEScratchPlan(
         caps=caps,
         layout=layout,
@@ -8738,13 +8725,11 @@ def plan_tp_moe_scratch(
                 device=torch.device(caps.device),
             ),
         ),
-        # Keep strong references to the launches primed in the module caches,
-        # but leave the runtime binding unresolved.  ``run_w4a16_moe`` uses a
-        # None launch as a dispatch signal and then gets these exact objects
-        # from its compile cache without doing first-use JIT work.
+        # Retain every route/GEMM/reduction program required after cache eviction.
         _prewarmed_fused_launches=fused_launches,
         _prewarmed_topk_sum_launches=topk_sum_launches,
         _mixed_trellis_launches=mixed_trellis_launches,
+        _prewarmed_route_pack_launches=route_pack_launches,
     )
 
 

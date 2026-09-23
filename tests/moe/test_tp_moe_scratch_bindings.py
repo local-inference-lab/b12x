@@ -20,6 +20,7 @@ from b12x.moe.fused_moe._impl import (
 )
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 def _weight_plan(
     quant_mode: str = "nvfp4",
     *,
@@ -683,6 +684,9 @@ def test_trellis_scratch_plan_resolves_default_route_block(
         device="cpu",
         weight_plan=weight_plan,
         quant_mode="w4a16",
+        decode_config=MoeDecodeConfig(
+            backend="w4a16", route_planner="internal", max_active_clusters=None,
+        ),
     )
 
     plan = plan_tp_moe_scratch(caps)
@@ -690,6 +694,33 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     assert plan._core_workspace_plan.route_block_size_m == 64
     assert plan.layout.core_token_counts[0] == 3072
     assert 4096 not in plan.layout.core_token_counts
+
+
+@pytest.mark.parametrize(
+    "shared_memory, expected_rows", [(101376, 48), (65536, 16), (131072, 64)]
+)
+def test_trellis_route_block_respects_fixed_tile_shared_memory(
+    monkeypatch: pytest.MonkeyPatch, shared_memory: int, expected_rows: int
+) -> None:
+    """Packed projection tiles constrain route size before launches are compiled."""
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda _device: SimpleNamespace(shared_memory_per_block_optin=shared_memory),
+    )
+    plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16", source_format="exl3", trellis_codebook="lut_e4m3",
+        activation="silu", params_dtype=torch.bfloat16,
+        num_experts=2, hidden_size=512, intermediate_size=256,
+        trellis_bits=2, trellis_tile_config=(128, 128, 128, 128),
+    )
+    caps = TPMoEScratchCaps(
+        max_tokens=129, num_topk=2, device="cuda:0", weight_plan=plan,
+        quant_mode="w4a16",
+        decode_config=MoeDecodeConfig(
+            backend="w4a16", route_planner="internal", max_active_clusters=None,
+        ),
+    )
+    assert tp_moe_impl._resolve_trellis_route_block_size(caps) == expected_rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
