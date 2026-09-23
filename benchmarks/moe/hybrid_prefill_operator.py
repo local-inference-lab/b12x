@@ -166,7 +166,10 @@ def main():
                     for n, p in plans.items()
                 )
             )
+            states = {n: p.prepared.state for n, p in plans.items()}
             pointers = {n: p.prepared.state.pointers() for n, p in plans.items()}
+            if "prototype" in plans:
+                assert states["prototype"].memory == states["mapped"].memory
             for mode, binding in bindings.items():
                 graph = torch.cuda.CUDAGraph()
                 with (
@@ -295,6 +298,8 @@ def main():
                 )
             )
         assert all(p.prepared is None for p in plans.values())
+        assert all(s.closed and s.backing_owner._closed for s in states.values())
+        report["rows"][-1]["prepared_mapped_owners_released"] = True
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     report["gpu_after"] = subprocess.check_output(["nvidia-smi", "-q"], text=True)
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")

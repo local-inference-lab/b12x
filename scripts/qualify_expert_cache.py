@@ -33,6 +33,7 @@ HOST = [
             "expert_cache_capacity",
             "phase_profile",
             "hybrid_prefill_summary",
+            "cold_prefill",
             "lifecycle_report",
             "routing_health",
             "prepared_expert_cache",
