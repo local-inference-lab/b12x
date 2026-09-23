@@ -15,8 +15,9 @@ from ._impl import (
     prepare_b12x_iq2_xs_weights,
 )
 from .config import TrellisConfig
-from .source import PackedSource, WeightSource
+from .source import Exl3Source, PackedSource, WeightSource
 from .weights import (
+    Exl3Weights,
     PackedWeights,
     IQ2XSWeights,
     PreparedExperts,
@@ -174,7 +175,7 @@ def _prepared_format(
             f"required packing {packing.value!r} is not available; "
             f"planner produced {sorted(value.value for value in available)}"
         )
-    if isinstance(source, TrellisConfig):
+    if isinstance(source, (TrellisConfig, Exl3Source)):
         weights = WeightEncoding.TRELLIS
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
@@ -247,6 +248,54 @@ def plan_weights(
             w13_layout=source.w13_layout.value,
             w4a16_layout=requested_layout,
         )
+    elif isinstance(source, Exl3Source):
+        manifest = source.manifest
+        if activation.mode is not ActivationMode.A16:
+            raise ValueError("EXL3 canonical preparation requires A16 activations")
+        if constraints.required_packing not in {
+            None,
+            WeightPacking.TRELLIS_NATIVE,
+        }:
+            raise ValueError("EXL3 weights require trellis_native packing")
+        if manifest.rates.structure != "uniform":
+            raise NotImplementedError(
+                "EXL3 canonical preparation requires uniform rates"
+            )
+        if (geometry.num_experts, geometry.hidden_size) != (
+            manifest.geometry.num_experts,
+            manifest.geometry.hidden_size,
+        ):
+            raise ValueError(
+                "EXL3 expert count and hidden width must match the manifest"
+            )
+        if geometry.intermediate_size > manifest.geometry.intermediate_size:
+            raise ValueError("EXL3 local intermediate width exceeds the source width")
+        recipe = "w4a16"
+        raw_plan = plan_b12x_fp4_moe_weights(
+            quant_modes=recipe,
+            source_format="exl3",
+            activation=activation.nonlinearity,
+            params_dtype=activation.io_dtype,
+            num_experts=geometry.num_experts,
+            hidden_size=geometry.hidden_size,
+            intermediate_size=geometry.intermediate_size,
+            w13_layout="w31",
+            w4a16_layout="trellis_native",
+            trellis_bits=manifest.rates.bits,
+            trellis_tile_config=(
+                (128, 128, 128, 128)
+                if manifest.hadamard.intermediate_hadamard and manifest.rates.bits == 2
+                else (64, 256, 64, 256)
+            ),
+            intermediate_hadamard=manifest.hadamard.intermediate_hadamard,
+            trellis_codebook=manifest.codebook,
+            trellis_rate_granularity=manifest.rates.structure,
+            intermediate_hadamard_blocks=(
+                (manifest.hadamard.pre_block, manifest.hadamard.post_block)
+                if manifest.hadamard.intermediate_hadamard
+                else None
+            ),
+        )
     elif isinstance(source, TrellisConfig):
         if activation.mode is not ActivationMode.A16:
             raise ValueError("Trellis fused MoE currently requires A16 activations")
@@ -284,7 +333,7 @@ def plan_weights(
             ),
         )
     else:
-        raise TypeError("source must be a PackedSource or TrellisConfig")
+        raise TypeError("source must be a PackedSource, TrellisConfig or Exl3Source")
 
     return WeightPlan(
         source=source,
@@ -303,7 +352,7 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights | Exl3Weights,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
@@ -313,6 +362,17 @@ def prepare_weights(
         if not isinstance(weights, IQ2XSWeights):
             raise TypeError("IQ2_XS preparation requires IQ2XSWeights")
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
+    elif isinstance(plan.source, Exl3Source):
+        if not isinstance(weights, Exl3Weights):
+            raise TypeError("EXL3 preparation requires Exl3Weights")
+        if weights.layer.manifest != plan.source.manifest:
+            raise ValueError("EXL3 extent manifest differs from its weight plan")
+        prepared = prepare_b12x_fp4_moe_weights(
+            plan=plan._impl,
+            params_dtype=plan.activation.io_dtype,
+            exl3_layer=weights.layer,
+            exl3_device=weights.device,
+        )
     elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")

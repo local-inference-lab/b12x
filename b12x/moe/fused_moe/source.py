@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TypeAlias
 
+from .._shared.exl3_schema import Exl3Manifest
 from .config import TrellisConfig
 
 
@@ -38,10 +39,22 @@ class PackedSource:
         object.__setattr__(self, "w13_layout", W13Layout(self.w13_layout))
 
 
-WeightSource: TypeAlias = PackedSource | TrellisConfig
+@dataclass(frozen=True, kw_only=True)
+class Exl3Source:
+    """Trellis slot encoding with checkpoint-global transform coordinates."""
+
+    manifest: Exl3Manifest
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest, Exl3Manifest):
+            raise TypeError("Exl3Source.manifest must be a Exl3Manifest")
+
+
+WeightSource: TypeAlias = PackedSource | TrellisConfig | Exl3Source
 
 
 __all__ = [
+    "Exl3Source",
     "PackedSource",
     "PackedSourceFormat",
     "W13Layout",
