@@ -9468,7 +9468,9 @@ def compile_w4a16_fused_moe(
             and force_tile_config is None
         ):
             raise ValueError("two-CTA cold prefill requires whole-K mapped ModelOpt BF16 SiLU")
-        force_tile_config = (64, 128, 64, 128)
+        # Preserve the qualified K traversal and reduction boundary. Halving K
+        # changes BF16 rounding on real checkpoint activations.
+        force_tile_config = (fc1_tile_k, fc1_tile_n // 2, fc2_tile_k, fc2_tile_n // 2)
     if force_tile_config is not None:
         # Some weight layouts are packed for a specific CTA N-tile. An explicit
         # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple therefore pins
