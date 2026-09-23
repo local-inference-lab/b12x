@@ -33,6 +33,7 @@ TUNING_COMPONENTS = (
     KernelTuningRegistration(op_qualname='attention.dense_mla', contract_ref='b12x.attention.dense_mla._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='attention.dsa_indexer', contract_ref='b12x.attention.dsa_indexer._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='attention.paged', contract_ref='b12x.attention.paged._tuning:TUNING', variant='default'),
+    KernelTuningRegistration(op_qualname='attention.paged_decode', contract_ref='b12x.attention.paged_decode._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='attention.qsa', contract_ref='b12x.attention.qsa._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='attention.sparse_mla', contract_ref='b12x.attention.sparse_mla._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='attention.varlen', contract_ref='b12x.attention.varlen._tuning:TUNING', variant='default'),
