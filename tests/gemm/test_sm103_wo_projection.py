@@ -204,7 +204,8 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
     plan = wo.plan(wo.Caps(device=source.device, max_tokens=capacity, groups=groups,
                            group_width=width, rank=rank, hidden=hidden),
                    invocation=FrozenMapping(dict(operation="inv_rope", heads_per_group=width // head,
-                       nope_dim=head - rope, rope_dim=rope) if inverse else {"operation": "plain"}))
+                       nope_dim=head - rope, rope_dim=rope, dynamic_tokens=True) if inverse
+                       else {"operation": "plain", "dynamic_tokens": True}))
     spec, = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     output = torch.empty(capacity, hidden, device="cuda", dtype=torch.bfloat16)
@@ -218,7 +219,7 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
             binding = wo.bind(plan, scratch=scratch, source_tgd=source[:m].reshape(m, groups, width), weights=weights, out=output[:m])
         bindings.append(binding)
     fn = wo.run_inv_rope if inverse else wo.run
-    fn(binding=bindings[0])
+    fn(plan=plan, binding=bindings[0])
     frozen_pointers = tuple(t.data_ptr() for t in (source, scratch, weights.wo_a.values, weights.wo_b.values))
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -236,16 +237,16 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
             for binding in bindings:
                 scratch.fill_(0xFF)
                 output.fill_(float("nan"))
-                out = fn(binding=binding)
+                out = fn(plan=plan, binding=binding)
                 assert out.data_ptr() == output.data_ptr()
                 verify(binding)
             binding = bindings[-1]
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                fn(binding=binding)
+                fn(plan=plan, binding=binding)
             for _ in range(2):
                 source.normal_().mul_(.25)
-                eager = fn(binding=binding).clone()
+                eager = fn(plan=plan, binding=binding).clone()
                 scratch.fill_(0xA5)
                 output.fill_(float("nan"))
                 graph.replay()
@@ -253,14 +254,14 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
                 verify(binding)
             other = torch.cuda.Stream()
             other.wait_stream(torch.cuda.current_stream())
-            fn(binding=binding, stream=other)
+            fn(plan=plan, binding=binding, stream=other)
             torch.cuda.current_stream().wait_stream(other)
             verify(binding)
             torch.cuda.synchronize()
             before = torch.cuda.memory_stats()
             with monkeypatch.context() as patch:
                 patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("native WO allocated"))
-                fn(binding=binding)
+                fn(plan=plan, binding=binding)
                 graph.replay()
                 torch.cuda.synchronize()
             after = torch.cuda.memory_stats()

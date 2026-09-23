@@ -13,7 +13,7 @@ from tests._reference.trellis_reference import moe_reference
 from tests._reference.trellis_atoms import atom_fixture, exl3_atom_fixture
 
 
-def _btx_plan(raw, layer):
+def _exl3_plan(raw, layer):
     return fused_moe.plan_weights(
         source=fused_moe.Exl3Source(manifest=layer.manifest),
         activation=fused_moe.ActivationSpec(
@@ -90,7 +90,7 @@ def test_exl3_pair_preparation_and_independent_oracle(tmp_path, codebook, interm
     from unittest.mock import patch
 
     public, layer, _ = exl3_atom_fixture(tmp_path, codebook=codebook, intermediate_hadamard=intermediate_hadamard)
-    public = _btx_plan(public, layer)
+    public = _exl3_plan(public, layer)
     # This qualifies CUDA byte preparation only; no SM103 kernel executes here.
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
         experts = fused_moe.prepare_weights(
@@ -142,7 +142,7 @@ def _run_native_atom_moe(codebook, intermediate_hadamard, group_size, width, *, 
             exl3_path, codebook=codebook, intermediate_hadamard=intermediate_hadamard, width=width,
             first_slot=first_slot, global_width=1024 if first_slot else 768,
         )
-        public = _btx_plan(public, layer)
+        public = _exl3_plan(public, layer)
         experts = fused_moe.prepare_weights(
             plan=public, weights=fused_moe.Exl3Weights(layer=layer, device="cuda"),
         )
