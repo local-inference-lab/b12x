@@ -70,10 +70,12 @@ def _alignment(tensor):
 
 def _tensor_call(tensor):
     return FrozenMapping(
-        dtype=str(tensor.dtype),
-        shape=tuple(int(size) for size in tensor.shape),
-        stride=tuple(int(stride) for stride in tensor.stride()),
-        alignment=_alignment(tensor),
+        {
+            "dtype": str(tensor.dtype),
+            "shape": tuple(int(size) for size in tensor.shape),
+            "stride": tuple(int(stride) for stride in tensor.stride()),
+            "alignment": _alignment(tensor),
+        }
     )
 def query_from_runtime(runtime, *, surface: str | None = None, call=FrozenMapping()) -> PcieQuery:
     """Snapshot an existing runtime's immutable native specialization."""

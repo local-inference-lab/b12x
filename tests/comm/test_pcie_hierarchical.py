@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -31,12 +31,56 @@ from b12x.comm.pcie.pcie_hierarchical import (
 from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
 
 
+def _prepared_dispatch(manager, inp, **call):
+    """Exercise plan-time dispatch without compiling a GPU program in CPU tests."""
+    from b12x.comm.pcie import _preparation
+
+    with (
+        patch.object(_preparation, "query_from_runtime", side_effect=lambda runtime, **_: runtime),
+        patch.object(_preparation, "plan", side_effect=lambda query, **_: SimpleNamespace(runtime=query)),
+        patch.object(pcie_allreduce, "require_prepared", side_effect=lambda plan, *_: plan),
+    ):
+        plan = manager.plan(inp, **call)
+        manager.all_reduce(inp, plan=plan, **call)
+    return plan
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_hierarchical_query_preserves_tensor_metadata(strided: bool) -> None:
+    from b12x.comm.pcie import _owner_preparation
+    from b12x.preparation import FrozenMapping
+
+    runtime = SimpleNamespace(
+        rank=0, world_size=16, threads=256, wait_nanosleep_cycles=0,
+        double_buffered=True, deferred_consumption=False,
+        vectorized_bf16x2=True, vectorized_bf16x2_max_elements=7168,
+        max_elements=8192, blocks=None, slab_bytes=65536,
+        mapped_peers=(1, 2, 3, 4, 8, 12),
+    )
+    inp = torch.empty((2, 64), dtype=torch.bfloat16)
+    if strided:
+        inp = inp[:, ::2]
+    out = torch.empty_like(inp)
+    query = _owner_preparation.query_from_runtime(
+        runtime, surface="PCIeHierarchicalAllReduce.all_reduce",
+        call={"inp": inp, "out": out},
+    )
+    encoded = query.call["inp"]
+    assert isinstance(encoded, FrozenMapping)
+    assert encoded["shape"] == tuple(inp.shape)
+    assert encoded["stride"] == tuple(inp.stride())
+    assert encoded["dtype"] == str(inp.dtype)
+    assert encoded["alignment"] >= 4
+    assert query.call["output"]["shape"] == tuple(out.shape)
+    assert hash(query.call) == hash(FrozenMapping(query.call.to_dict()))
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
 def test_allreduce_uses_direct_path_for_peer_safe_worlds(world_size: int) -> None:
     assert _algorithm_for_world_size(world_size) == "oneshot"
 
 
-@pytest.mark.parametrize("world_size", [12, 16])
+@pytest.mark.parametrize("world_size", [9, 10, 12, 16])
 def test_allreduce_uses_bounded_degree_path_for_large_worlds(
     world_size: int,
 ) -> None:
@@ -103,6 +147,9 @@ def test_allreduce_factory_keeps_tp16_equal_quarter_opt_in(
     [
         (2, "auto", 512 * 1024),
         (8, "auto", 84 * 1024),
+        (9, "auto", 32 * 1024),
+        (10, "auto", 32 * 1024),
+        (10, "island_rs", 32 * 1024),
         (12, "auto", 84 * 1024),
         (16, "auto", 84 * 1024),
         (16, "island_rs", ISLAND_RS_MAX_BYTES),
@@ -128,6 +175,11 @@ def test_recommended_max_bytes_rejects_unknown_algorithm(
         recommended_max_bytes(16, default=84 * 1024)
 
 
+@pytest.mark.parametrize("world_size", [9, 10])
+def test_partial_island_recommendation_does_not_raise_smaller_limit(world_size):
+    assert recommended_max_bytes(world_size, default=16 * 1024) == 16 * 1024
+
+
 def test_tp16_auto_routes_by_message_size() -> None:
     hierarchy = MagicMock()
     hierarchy.rank = 0
@@ -142,11 +194,12 @@ def test_tp16_auto_routes_by_message_size() -> None:
     small_out = torch.empty_like(small)
     large_out = torch.empty_like(large)
 
-    allreduce.all_reduce(small, out=small_out)
-    allreduce.all_reduce(large, out=large_out)
+    small_plan = _prepared_dispatch(allreduce, small, out=small_out)
+    large_plan = _prepared_dispatch(allreduce, large, out=large_out)
 
     hierarchy.all_reduce.assert_called_once_with(
         small,
+        plan=small_plan,
         out=small_out,
         blocks=None,
         stream=None,
@@ -154,6 +207,7 @@ def test_tp16_auto_routes_by_message_size() -> None:
     )
     island.all_reduce.assert_called_once_with(
         large,
+        plan=large_plan,
         out=large_out,
         blocks=None,
         stream=None,
@@ -177,15 +231,20 @@ def test_island_capture_allocates_implicit_output(
     runtime.quarter_capacity = 2
     inp = torch.empty(8, dtype=torch.bfloat16)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    state = MagicMock()
+    state.query.call = {"inp": {"shape": (8,)}, "blocks": 1}
+    state.launcher.return_value = runtime._launcher
+    monkeypatch.setattr(pcie_island_rs, "require_prepared", lambda *_: state)
 
     with runtime.capture() as captured:
-        out = captured.all_reduce(inp)
+        out = captured.all_reduce(inp, plan=object())
 
     assert captured is runtime
     assert out.shape == inp.shape
     assert out.dtype == inp.dtype
     assert out.device == inp.device
     runtime._launcher.assert_called_once()
+    state.require_runtime.assert_called_once_with(runtime)
 
 
 def test_island_close_coordinates_ipc_teardown_and_is_idempotent(
@@ -275,10 +334,11 @@ def test_tp16_auto_implicit_output_uses_island_for_large_aligned_input() -> None
         dtype=torch.bfloat16,
     )
 
-    allreduce.all_reduce(inp)
+    plan = _prepared_dispatch(allreduce, inp)
 
     island.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=None,
         blocks=None,
         stream=None,
@@ -318,10 +378,11 @@ def test_tp16_island_opt_in_keeps_small_input_on_hierarchy(
     allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
     inp = torch.empty(2)
 
-    allreduce.all_reduce(inp)
+    plan = _prepared_dispatch(allreduce, inp)
 
     hierarchy.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=None,
         blocks=None,
         stream=None,
@@ -342,10 +403,11 @@ def test_tp16_auto_uses_island_when_hierarchy_rejects_below_crossover() -> None:
     inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS - 2)
 
     assert allreduce.should_allreduce(inp)
-    allreduce.all_reduce(inp, stream="17", channel_id="target")
+    plan = _prepared_dispatch(allreduce, inp, stream="17", channel_id="target")
 
     island.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=None,
         blocks=None,
         stream="17",
@@ -365,10 +427,11 @@ def test_tp16_auto_keeps_unaligned_large_input_on_hierarchy() -> None:
     allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
     inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2 + 2)
 
-    allreduce.all_reduce(inp)
+    plan = _prepared_dispatch(allreduce, inp)
 
     hierarchy.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=None,
         blocks=None,
         stream=None,
@@ -403,10 +466,11 @@ def test_tp16_auto_falls_back_when_island_rejects_shape() -> None:
     allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
     inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2)
 
-    allreduce.all_reduce(inp)
+    plan = _prepared_dispatch(allreduce, inp)
 
     hierarchy.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=None,
         blocks=None,
         stream=None,
@@ -487,7 +551,7 @@ def test_allreduce_oneshot_forwards_named_channel_contract() -> None:
 
     allreduce.prepare_channels(("target", "draft"))
     allreduce.for_stream(stream, channel_id="target")
-    allreduce.all_reduce(inp, out=out, stream=stream, channel_id="target")
+    plan = _prepared_dispatch(allreduce, inp, out=out, stream=stream, channel_id="target")
     with allreduce.capture(stream, channel_id="target"):
         pass
 
@@ -495,6 +559,7 @@ def test_allreduce_oneshot_forwards_named_channel_contract() -> None:
     runtime.for_stream.assert_called_once_with(stream, channel_id="target")
     runtime.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=out,
         peer_input_ptrs=None,
         stream=stream,
@@ -525,7 +590,7 @@ def test_allreduce_hierarchy_accepts_named_channel_contract() -> None:
 
     allreduce.prepare_channels(("target", "draft"))
     allreduce.for_stream(stream, channel_id="target")
-    allreduce.all_reduce(inp, out=out, stream=stream, channel_id="target")
+    plan = _prepared_dispatch(allreduce, inp, out=out, stream=stream, channel_id="target")
     with allreduce.capture(stream, channel_id="target"):
         pass
 
@@ -533,6 +598,7 @@ def test_allreduce_hierarchy_accepts_named_channel_contract() -> None:
     runtime.for_stream.assert_called_once_with(stream, channel_id="target")
     runtime.all_reduce.assert_called_once_with(
         inp,
+        plan=plan,
         out=out,
         blocks=None,
         stream=stream,
@@ -551,7 +617,7 @@ def test_hierarchical_named_channel_surface_remains_serial() -> None:
         assert captured is runtime
 
 
-@pytest.mark.parametrize("world_size", [1, 3, 10, 14, 20])
+@pytest.mark.parametrize("world_size", [1, 3, 11, 14, 20])
 def test_allreduce_rejects_unsupported_or_peer_unsafe_worlds(
     world_size: int,
 ) -> None:
@@ -562,6 +628,11 @@ def test_allreduce_rejects_unsupported_or_peer_unsafe_worlds(
 @pytest.mark.parametrize(
     ("world_size", "rank", "expected"),
     [
+        (9, 0, (1, 2, 3, 4, 8)),
+        (9, 8, (0, 4)),
+        (10, 0, (1, 2, 3, 4, 8)),
+        (10, 8, (0, 4, 9)),
+        (10, 9, (8,)),
         (12, 0, (1, 2, 3, 4, 8)),
         (12, 1, (0,)),
         (12, 3, (0,)),
@@ -584,7 +655,7 @@ def test_selected_peers_respect_four_gpu_islands(
 
 
 def test_selected_peers_never_exceed_cuda_peer_limit() -> None:
-    expected_maximums = {12: 5, 16: 6}
+    expected_maximums = {9: 5, 10: 5, 12: 5, 16: 6}
     for world_size, expected in expected_maximums.items():
         mapped_peers = [
             len(_selected_peers(rank, world_size)) for rank in range(world_size)
@@ -593,7 +664,7 @@ def test_selected_peers_never_exceed_cuda_peer_limit() -> None:
         assert max(mapped_peers) <= 8
 
 
-@pytest.mark.parametrize("world_size", [12, 16])
+@pytest.mark.parametrize("world_size", [9, 10, 12, 16])
 def test_selected_peer_graph_is_reciprocal_and_connected(world_size: int) -> None:
     peer_sets = {
         rank: set(_selected_peers(rank, world_size)) for rank in range(world_size)
@@ -612,7 +683,7 @@ def test_selected_peer_graph_is_reciprocal_and_connected(world_size: int) -> Non
     assert reached == set(range(world_size))
 
 
-@pytest.mark.parametrize("world_size", [12, 16])
+@pytest.mark.parametrize("world_size", [9, 10, 12, 16])
 def test_hierarchical_protocol_simulation_matches_full_sum(world_size: int) -> None:
     generator = torch.Generator().manual_seed(1234 + world_size)
     inputs = torch.randn(world_size, 257, generator=generator)
@@ -623,7 +694,7 @@ def test_hierarchical_protocol_simulation_matches_full_sum(world_size: int) -> N
 
     partials = {}
     for leader in leaders:
-        local_ranks = set(range(leader, leader + 4))
+        local_ranks = set(range(leader, min(leader + 4, world_size)))
         assert local_ranks - {leader} <= peer_sets[leader]
         partials[leader] = inputs[leader : leader + 4].sum(dim=0)
 
@@ -837,6 +908,9 @@ def test_hierarchical_protocol_intrinsics_pin_native_ptx_modifiers() -> None:
 @pytest.mark.parametrize(
     ("world_size", "rank", "island", "local_rank", "leader_rank"),
     [
+        (9, 8, 2, 0, 8),
+        (10, 8, 2, 0, 8),
+        (10, 9, 2, 1, 8),
         (12, 0, 0, 0, 0),
         (12, 5, 1, 1, 4),
         (12, 11, 2, 3, 8),
@@ -856,6 +930,8 @@ def test_hierarchical_launch_specializes_rank_topology(
     assert launch._island == island
     assert launch._local_rank == local_rank
     assert launch._leader_rank == leader_rank
+    assert launch._num_islands == (world_size + 3) // 4
+    assert launch._local_size == min(4, world_size - leader_rank)
 
 
 def test_hierarchical_launch_uses_direct_slab_pointer_parameters() -> None:
