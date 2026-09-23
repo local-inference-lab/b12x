@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-422",
+  "category": "performance",
+  "summary": "Run serialized block-FP8 projections with up to eight rows as a tensor-core GEMV",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Decode-sized block-FP8 linears no longer take the latency-bound dense GEMM path; results stay deterministic with FP32 block sums."
+  ],
+  "pull_requests": [
+    422
+  ]
+}
