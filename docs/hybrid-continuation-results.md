@@ -17,6 +17,10 @@ execution lead, while larger prepared capacity reduces the measured C1 TTFT
 from 12.78 to 7.95 s. TP2 exchange analysis finds both eviction harm and
 substantial maintenance cost even with zero movement.
 
+The subsequent [prepared cold-prefill experiments](cold-prefill-results.md)
+test mapped-request traffic and two explicit launch variants. Their results are
+separate from the measurements below.
+
 ## Source and execution environment
 
 Both requested working branches and remote heads matched the qualification
