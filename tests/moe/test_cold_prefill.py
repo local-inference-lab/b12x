@@ -54,6 +54,18 @@ def test_traffic_counts_route_blocks_not_token_count():
     assert result["fc2"]["scheduled_weight_scale_bytes"] * 2 == result["fc1"]["scheduled_weight_scale_bytes"]
 
 
+def test_narrow_scale_tiles_repeat_sectors_without_repeating_logical_bytes():
+    common = dict(hidden=2048, intermediate=512, block_rows=8)
+    wide = weight_schedule([0] * 9, **common, fc1_tile=(128, 128), fc2_tile=(128, 128))
+    narrow = weight_schedule([0] * 9, **common, fc1_tile=(128, 64), fc2_tile=(128, 64))
+    for phase in ("fc1", "fc2"):
+        assert wide[phase]["scheduled_weight_scale_bytes"] == narrow[phase]["scheduled_weight_scale_bytes"]
+        scales = 2 * wide[phase]["scale_bytes_per_expert"]
+        field = "inferred_scale_sector_bytes_without_cross_tile_reuse"
+        assert wide[phase][field] == scales
+        assert narrow[phase][field] == 2 * scales
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="physical SM120 required")
 @pytest.mark.parametrize("variant", ["two_cta", "two_cta_pipeline3"])
 @pytest.mark.parametrize("geometry", [(128, 128), (2048, 512)])

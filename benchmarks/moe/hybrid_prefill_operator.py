@@ -24,6 +24,28 @@ from b12x.testing.artifacts import sha256
 from scripts._sm103_source import source_identity
 
 
+def _scale_tile_sectors(*, reduction, tile_k, tile_n):
+    """Count 32-byte sectors touched by one canonical K16 scale tile.
+
+    This mirrors source addresses, not GPU cache behavior. Canonical expert
+    bases and gate/up rotations are 128-column aligned on this measured path.
+    Separate N64 tiles touch disjoint words in the same source sectors.
+    """
+    if tile_k % 64 or tile_n % 64:
+        raise ValueError("scale-sector estimate requires K64/N64 alignment")
+    vector_n = 128 if tile_n % 128 == 0 else 64
+    vector_words = vector_n // 32
+    scale_cols = (reduction // 16 + 3) // 4 * 4
+    sectors = set()
+    for k_word in range(tile_k // 64):
+        for group in range(tile_n // vector_words):
+            n = group // 32 * vector_n + group % 32
+            offset = n // 128 * scale_cols * 32 + k_word * 128
+            offset += n % 32 * 4 + n % 128 // 32
+            sectors.update((offset + word) // 8 for word in range(vector_words))
+    return len(sectors)
+
+
 def weight_schedule(ids, *, hidden, intermediate, block_rows, fc1_tile, fc2_tile):
     """Infer whole-K weight requests; these are not measured PCIe transactions.
 
@@ -53,6 +75,11 @@ def weight_schedule(ids, *, hidden, intermediate, block_rows, fc1_tile, fc2_tile
             unique_weight_scale_bytes=len(experts) * (packed + scales),
             scheduled_weight_scale_bytes=blocks * (packed + scales),
             tile_requests=blocks * tiles, repeated_tile_requests=(blocks - len(experts)) * tiles,
+            inferred_scale_sector_bytes_without_cross_tile_reuse=(
+                blocks * tiles * 32 * _scale_tile_sectors(
+                    reduction=k, tile_k=tile_k, tile_n=tile_n
+                )
+            ),
             routed_rows_per_unique_mib=len(ids) * (1 << 20) / max(len(experts) * (packed + scales), 1),
         )
     return result
