@@ -8,7 +8,7 @@ from b12x.norm.mhc import _impl
 from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall, require_prepared
 from b12x.testing.mhc import make_inputs, post_reference, pre_reference
 
-from ..conftest import require_b12x
+from ..conftest import require_sm103_or_sm12x as require_b12x
 
 
 def _declaration(device: torch.device, *, tokens: int, hidden_size: int, norm: bool = False):
