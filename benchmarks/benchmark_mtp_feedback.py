@@ -623,4 +623,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
+    from b12x.testing.memory import absorb_small_page_fragments
+
+    absorb_small_page_fragments()
     main()

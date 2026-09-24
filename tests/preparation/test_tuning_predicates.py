@@ -531,6 +531,8 @@ def test_recorded_selections_stay_eligible(key):
     if key[0] == "moe.decode":
         # The recorded programs use unshared input and monolithic NVFP4 execution.
         values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False)
+        values.update(w4a16_tile_config=None, w4a16_block_size_m=None,
+                      w4a16_pipeline_stages=None)
     if key[0] == "gemm.blockscaled_precision":
         values["tile_m"] = 16 if values["mode"] == "a16" else None
     assignment = FrozenMapping(values)
@@ -611,6 +613,7 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
         backend="dynamic", route_planner="triton", dynamic_tile_m=16,
         dynamic_route_mode="grouped", w4a16_route_mode=None, max_active_clusters=30,
         nvfp4_share_input=False, nvfp4_materialize_intermediate=False,
+        w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None,
     )
     space.validate(triton)
     for outside in (31, 64, 188):

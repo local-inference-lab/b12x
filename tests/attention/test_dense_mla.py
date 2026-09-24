@@ -97,7 +97,11 @@ def _prepare(
         session.close()
         raise RuntimeError("dense MLA test preparation requires _prepared_scope")
     prepared.append((result, session))
-    assert scratch_spec is not None
+    if scratch_spec is None:
+        # A declaration prepared earlier in this scope is not primed again;
+        # later bindings reuse its session-planned scratch contract.
+        assert declaration.prepared is not None
+        (scratch_spec,) = declaration.scratch_specs()
     return declaration, scratch_spec
 
 

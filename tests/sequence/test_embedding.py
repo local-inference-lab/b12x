@@ -142,3 +142,52 @@ def test_invalid_ids_raise_device_error_instead_of_zero_or_oob(bad_id):
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_q8_blocks_decode_exactly_with_frozen_counts_and_graph_replay(id_dtype):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.sequence import embedding
+    from b12x.testing.q8_0_reference import dequantize_blocks
+
+    raw = torch.arange(19 * 3 * 34, dtype=torch.int32).to(torch.uint8).reshape(19, 3, 34)
+    bases = torch.tensor([0., -0., 2**-24, -2**-14, 0.125, -0.25, 65504.], dtype=torch.float16)
+    raw[..., :2] = bases[torch.arange(19 * 3).reshape(19, 3) % len(bases)][..., None].view(torch.uint8)
+    expected = dequantize_blocks(raw).bfloat16().cuda()
+    weight = raw.cuda()
+    ids = torch.zeros(11, device="cuda", dtype=id_dtype)
+    out = torch.empty((11, 96), device="cuda", dtype=torch.bfloat16)
+    with _prepared(weight, ids, out) as plan, kernel_resolution_guard("Q8 embedding"):
+        for rows in (1, 11, 3):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                embedding.run(weight, ids[:rows], out=out[:rows], plan=plan)
+            ids[:rows].copy_((torch.arange(rows, device="cuda") * 3 % 19).to(id_dtype))
+            out.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(out[:rows].view(torch.int16), expected[ids[:rows].long()].view(torch.int16), rtol=0, atol=0)
+            assert torch.isnan(out[rows:]).all()
+
+
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_q8_high_row_uses_64_bit_byte_addressing(id_dtype):
+    from b12x.sequence import embedding
+    from b12x.testing.q8_0_reference import dequantize_blocks
+
+    width, stride = 128, 136
+    high_row = 2**31 // stride + 3
+    required = (high_row + 1) * stride
+    if torch.cuda.mem_get_info()[0] < required + 512 * 1024**2:
+        pytest.skip("requires just over 2 GiB for high Q8 row offsets")
+    weight = torch.empty((high_row + 1, width // 32, 34), device="cuda", dtype=torch.uint8)
+    tail = torch.arange(width // 32 * 34, dtype=torch.int32).to(torch.uint8).reshape(width // 32, 34)
+    tail[:, :2] = torch.tensor([0.125], dtype=torch.float16).view(torch.uint8)
+    weight[high_row].copy_(tail)
+    ids = torch.full((1,), high_row, device="cuda", dtype=id_dtype)
+    out = torch.empty((1, width), device="cuda", dtype=torch.bfloat16)
+    with _prepared(weight, ids, out) as plan:
+        embedding.run(weight, ids, out=out, plan=plan)
+    torch.testing.assert_close(out[0], dequantize_blocks(tail).bfloat16().cuda(), rtol=0, atol=0)

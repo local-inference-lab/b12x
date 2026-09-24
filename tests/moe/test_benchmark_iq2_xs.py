@@ -11,7 +11,9 @@ from .test_iq2_xs_checkpoint import make_snapshot
 from .test_iq2_xs import blocks
 
 
-def test_puzzle3_layer_geometry_relu2_and_tp_slicing(tmp_path):
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
+def test_puzzle3_layer_geometry_relu2_and_tp_slicing(tmp_path, codec):
+    block_bytes = 66 if codec == "iq2_xxs" else 74
     config = dict(
         model_type="nemotron_h_puzzle",
         hidden_size=512,
@@ -42,12 +44,12 @@ def test_puzzle3_layer_geometry_relu2_and_tp_slicing(tmp_path):
                 name = (
                     f"backbone.layers.{layer}.mixer.experts.{expert}.{projection}_proj"
                 )
-                tensors[name + ".weight"] = blocks(e=1, n=n, k=k)[0]
+                tensors[name + ".weight"] = blocks(e=1, n=n, k=k, codec=codec)[0]
                 recipes[name] = dict(
-                    quant_algo="IQ2_XS",
+                    quant_algo=codec.upper(),
                     packing="ggml",
                     group_size=256,
-                    block_payload_bytes=74,
+                    block_payload_bytes=block_bytes,
                 )
     save_file(tensors, tmp_path / "model.safetensors")
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -57,7 +59,7 @@ def test_puzzle3_layer_geometry_relu2_and_tp_slicing(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps(dict(weight_map=dict.fromkeys(tensors, "model.safetensors")))
     )
-    profile = benchmark.MODEL_PROFILES["puzzle3-iq2-xs"]
+    profile = benchmark.MODEL_PROFILES["puzzle3-" + codec.replace("_", "-")]
     assert profile.hf_repo_id is None
     for layer, width, top_k in ((1, 512, 2), (2, 1024, 1)):
         spec = benchmark.build_model_spec(
@@ -67,8 +69,8 @@ def test_puzzle3_layer_geometry_relu2_and_tp_slicing(tmp_path):
         weights = benchmark.load_iq2_xs_expert_weights(
             tmp_path, spec, layer_idx=layer, activation="relu2", device="cpu"
         )
-        assert weights.w13_weight.shape == (3, width // 2, 1, 74)
-        assert weights.w2_weight.shape == (3, 256, width // 512, 74)
+        assert weights.w13_weight.shape == (3, width // 2, 1, block_bytes)
+        assert weights.w2_weight.shape == (3, 256, width // 512, block_bytes)
         assert torch.equal(
             weights.w13_weight[0],
             tensors[f"backbone.layers.{layer}.mixer.experts.0.up_proj.weight"][
@@ -95,33 +97,40 @@ def test_puzzle3_layer_geometry_relu2_and_tp_slicing(tmp_path):
         benchmark.build_model_spec(tmp_path, profile, layer_idx=0)
 
 
+@pytest.fixture(params=["iq2_xs", "iq2_xxs"])
+def codec(request):
+    return request.param
+
+
 @pytest.fixture
-def snapshot(tmp_path):
-    return make_snapshot(tmp_path)
+def snapshot(tmp_path, codec):
+    return make_snapshot(tmp_path, codec=codec)
 
 
-def test_benchmark_profile_and_checkpoint_adapter(snapshot, monkeypatch):
-    profile = benchmark.MODEL_PROFILES["qwen36-35b-iq2-xs"]
+def test_benchmark_profile_and_checkpoint_adapter(snapshot, monkeypatch, codec):
+    block_bytes = 66 if codec == "iq2_xxs" else 74
+    profile = benchmark.MODEL_PROFILES["qwen36-35b-" + codec.replace("_", "-")]
     assert profile.hf_repo_id is None
     assert profile.default_quant_mode == "w4a16"
     spec = benchmark.build_model_spec(snapshot, profile, tp_size_override=2, tp_rank=1)
     weights = benchmark.load_iq2_xs_expert_weights(
         snapshot, spec, layer_idx=0, activation="silu", device="cpu"
     )
-    assert weights.source_format == "iq2_xs"
-    assert weights.w13_weight.shape == (3, 512, 1, 74)
-    assert weights.w2_weight.shape == (3, 256, 1, 74)
+    assert weights.source_format == codec
+    assert weights.w13_weight.shape == (3, 512, 1, block_bytes)
+    assert weights.w2_weight.shape == (3, 256, 1, block_bytes)
     assert weights.w13_permuted is None and weights.w13_blockscale_swizzled is None
     params = benchmark.get_quant_mode_params(weights, "per-expert", "w4a16")
     plan = benchmark.plan_b12x_benchmark_weights(
         weights, quant_mode="w4a16", activation="silu"
     )
-    assert plan.prepared_format.packing is fused_moe.WeightPacking.IQ2_XS_COMPACT
+    assert plan.prepared_format.packing is fused_moe.WeightPacking(codec + "_compact")
 
     sentinel = object()
 
     def prepare(*, plan, weights):
         assert isinstance(weights, fused_moe.IQ2XSWeights)
+        assert weights.codec == codec
         return sentinel
 
     monkeypatch.setattr(fused_moe, "prepare_weights", prepare)
@@ -131,8 +140,8 @@ def test_benchmark_profile_and_checkpoint_adapter(snapshot, monkeypatch):
     assert actual is sentinel and actual_params is params
 
 
-def test_benchmark_iq2_xs_oracle_and_invalid_precision(snapshot):
-    profile = benchmark.MODEL_PROFILES["qwen36-35b-iq2-xs"]
+def test_benchmark_iq2_xs_oracle_and_invalid_precision(snapshot, codec):
+    profile = benchmark.MODEL_PROFILES["qwen36-35b-" + codec.replace("_", "-")]
     spec = benchmark.build_model_spec(snapshot, profile)
     weights = benchmark.load_iq2_xs_expert_weights(
         snapshot, spec, layer_idx=0, activation="silu", device="cpu"
