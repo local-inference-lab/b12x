@@ -1,19 +1,14 @@
 # b12x
 
-`b12x` is a CuTe DSL and Triton kernel library for local LLM inference on
-Blackwell GPUs. SM120/SM121 paths target DGX Spark and Blackwell RTX cards.
-The SM103/B300 prototype implements NVFP4 and Trellis MoE, CuTe KDA/GDN
-recurrence, dense/GLM/compressed DeepSeek MLA, DSA indexing, mHC residual
-mixing, and unquantized or FP4/FP6/FP8 projections behind the existing public
-APIs. It also provides Engram memory placement and an explicitly enabled
-Grace TP2 transport.
-SM103 kernels are cross-compiled; B300 execution and model serving remain
-unqualified. See the [SM103 qualification guide](docs/sm103-qualification.md)
-for supported contracts, deferred operations, and bring-up commands.
+`b12x` is a CuTe DSL and Triton kernel library for local LLM inference.
+It specifically targets DGX Spark, RTX Spark and the Blackwell-based RTX
+cards (RTX 6000 Pro, RTX 5090). SM103 (B300/GB300) support covers NVFP4 and
+Trellis MoE, KDA/GDN recurrence, MLA and DSA attention, mHC and FP4/FP6/FP8
+projections; see the [SM103 guide](docs/sm103-qualification.md).
 
-The library is experimental. Architecture recognition does not establish
-operator support or production readiness; consult each operator's capability
-query and planning contract.
+It is *not* intended to be used in production/datacenter environments, both due to
+architecture mismatches and the fast-moving pace of the library. For mission-critical
+use cases please use FlashInfer, CUTLASS or TRTLLM.
 
 ## Install
 
@@ -21,8 +16,7 @@ query and planning contract.
 pip install b12x
 ```
 
-You need Python 3.10+, `torch >= 2.12`, and a GPU supported by the selected
-operator. The CuTe DSL
+You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 or SM103 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
 (`nvidia-cutlass-dsl == 4.6.2`), so there is no separate build step. A
 `PreparationSession` compiles missing kernels before publishing execution.
