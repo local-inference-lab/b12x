@@ -78,6 +78,7 @@ def require_kernel_architecture(
         "b12x.sequence.mtp_feedback._fp8",
         "b12x.sequence.mtp_feedback._cute_prefill",
         "b12x.sequence.gdn_decode._cute_kda",
+        "b12x.sequence.gdn_decode._recovery",
         "b12x.sequence._shared.delta_prefill._cute_kernels",
         "b12x.attention.dense_mla._forward",
         "b12x.attention.dense_mla._merge",

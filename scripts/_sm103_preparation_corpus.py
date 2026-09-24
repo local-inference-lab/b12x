@@ -16,7 +16,7 @@ CASES = (
     "trellis:uniform", "trellis:intermediate_hadamard", "trellis:mixed", "trellis:grouped", "trellis:exl3", "trellis:exl3_intermediate_hadamard",
     "packed:nvfp4", "packed:mxfp8", "packed:mxfp8_fp16", "prefill:gdn", "prefill:kda", "wo:plain", "wo:inv_rope", "vocab",
     "mtp:rms_concat", "mtp:rms_streams_fp8", "mtp:qwen_multistream",
-    "gdn:kda", "gdn:qwen", "glm:1", "glm:2", "compressed:deepseek_v4", "compressed:deepseek_v41",
+    "gdn:kda", "gdn:kda_recovery", "gdn:qwen", "glm:1", "glm:2", "compressed:deepseek_v4", "compressed:deepseek_v41",
     "mhc:pre", "mhc:post_pre",
     *(f"mhc:{op}:{hidden}:{capacity}:{variant}"
       for op in ("pre", "post_pre") for hidden in (4096, 5120, 7168)
@@ -84,9 +84,11 @@ def declare(case):
                                max_state_slots=31, checkpoint_export=True, **heads))
     if family == "gdn":
         from b12x.sequence import gdn_decode as op
+        recovery = dict(state_dtype=torch.float32, qk_l2norm=True,
+                        recover_speculative_state=True) if recipe == "kda_recovery" else {}
         return op.plan(op.Caps(device="cuda:0", max_tokens=16, max_seqs=4, max_state_slots=31,
-                               key_heads=4, value_heads=4 if recipe == "kda" else 12,
-                               state_index_columns=4, gate_activation="sigmoid"))
+                               key_heads=4, value_heads=12 if recipe == "qwen" else 4,
+                               state_index_columns=4, gate_activation="sigmoid", **recovery))
     if family == "glm":
         from b12x.attention import sparse_mla as op
         return op.plan(op.Caps(device="cuda:0", num_q_heads=24, max_q_rows=17, max_width=257,
