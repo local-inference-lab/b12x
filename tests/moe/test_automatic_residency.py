@@ -113,6 +113,27 @@ def test_profile_mode_never_activates_and_cache_disable(tmp_path):
     assert pin.startup().profile == p
 
 
+def test_static_serves_balanced_placement_without_counters(tmp_path):
+    static, auto = controller(tmp_path, mode="static"), controller(tmp_path)
+    assert static.startup().state == "ready" and auto.startup().state == "calibrating"
+    assert static.profiler_query() is None and static.active is None
+    assert static.budget.profiling_bytes < auto.budget.profiling_bytes
+    assert [(p.hbm_expert_ids, p.grace_expert_ids) for p in static.placements()] == [
+        (p.hbm_expert_ids, p.grace_expert_ids) for p in auto.placements()]
+    assert all(p.provenance == "balanced static placement" for p in static.placements())
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_static_reuses_valid_profile_and_rejects_unusable_pin(tmp_path):
+    _, p = completed(tmp_path)
+    reused = controller(tmp_path, mode="static")
+    assert reused.startup().state == "ready" and reused.active == p
+    assert reused.placements() == p.placements and reused.profiler_query() is None
+    assert controller(tmp_path, mode="static", workload="math").startup().state == "ready"
+    missing = controller(tmp_path, mode="static", profile_path=str(tmp_path / "missing.json"))
+    with pytest.raises(ValueError, match="pinned residency profile"):
+        missing.startup()
+
 def test_off_does_not_read_store_or_probe(monkeypatch, tmp_path):
     c = controller(tmp_path, mode="off")
     def forbidden(*args, **kwargs): pytest.fail("off mode performed discovery")

@@ -260,8 +260,8 @@ class AutomaticResidencyConfig:
     activation: str = "converged"
 
     def __post_init__(self):
-        if self.mode not in ("off", "profile", "auto", "monitor"):
-            raise ValueError("residency mode must be off, profile, auto, or monitor")
+        if self.mode not in ("off", "static", "profile", "auto", "monitor"):
+            raise ValueError("residency mode must be off, static, profile, auto, or monitor")
         for name in ("workload", "provenance"):
             _text(name, getattr(self, name))
         if not isinstance(self.calibration, ResidencyCalibrationConfig) or not isinstance(self.monitor, ResidencyMonitorConfig):
@@ -531,7 +531,8 @@ class ResidencyController:
         self.config, self.model, self.hardware = config, model, hardware
         # Counter storage is model-wide and never subtracted again by a layer.
         phases = len(PHASES) if config.calibration.phase == "all" else 1
-        counters = (sum((s.experts+6)//2*2*8 for s in model.layers)*phases + 16) if config.mode != "off" else 0
+        counted = config.mode not in ("off", "static")
+        counters = (sum((s.experts+6)//2*2*8 for s in model.layers)*phases + 16) if counted else 0
         self.budget = replace(budget, profiling_bytes=budget.profiling_bytes+counters)
         self.store = store if store is not None else ResidencyProfileStore()
         _integer("owner_rank", owner_rank)
@@ -558,6 +559,26 @@ class ResidencyController:
             raise ValueError("automatic hierarchical deployment requires SM103")
         self.budget.expert_capacity(self.model)
         reason = "profile discovery disabled"
+        if c.mode == "static":
+            # A static lane never counts routes: it serves a validated profile
+            # or the balanced bootstrap placement until the engine restarts.
+            if c.reuse_cache or c.profile_path is not None:
+                try:
+                    profile = self.store.read(model=self.model, config=c)
+                    profile.validate(model=self.model, config=c, budget=self.budget, hardware=self.hardware)
+                    profile.validate_activation(c)
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    if c.profile_path is not None:
+                        raise ValueError(f"pinned residency profile is unusable: {error}") from error
+                    reason = f"profile invalid or unavailable: {error}"
+                else:
+                    self.active = profile
+                    self.progress = ResidencyProgress(state="ready",
+                        reason="compatible static profile found; prepare before serving", profile=profile,
+                        expected_cold_fraction=profile.expected_cold_fraction)
+                    return self.progress
+            self.progress = ResidencyProgress(state="ready", reason=f"{reason}; balanced static placement")
+            return self.progress
         if c.mode in ("auto", "monitor") and (c.reuse_cache or c.profile_path is not None):
             try:
                 profile = self.store.read(model=self.model, config=c)
@@ -595,10 +616,12 @@ class ResidencyController:
         """
         if self.active is not None:
             return self.active.placements
-        if self.progress.state not in ("calibrating", "profile_saved", "restart_required", "insufficient"):
+        static = self.config.mode == "static" and self.progress.state == "ready"
+        if not static and self.progress.state not in ("calibrating", "profile_saved", "restart_required", "insufficient"):
             raise RuntimeError("automatic placement is not active")
+        provenance = "balanced static placement" if static else "balanced fractional calibration bootstrap"
         return _allocate_placement(self.model, self.budget, None, workload=self.config.workload,
-            provenance="balanced fractional calibration bootstrap", phase=self.config.calibration.phase)
+            provenance=provenance, phase=self.config.calibration.phase)
 
     def plan_execution(self, *, layer, weight_plan, weights):
         """Declare the existing public execution Plan using apportioned storage."""
