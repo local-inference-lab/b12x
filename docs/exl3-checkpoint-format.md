@@ -144,7 +144,7 @@ knowing the reasons.
 A rank shorter than the serving kernel's minimum local width is padded at
 preparation time, exactly as any other legal extent.
 
-`BtxManifest.partition_extents(world_size)` plans complete storage ownership
+`Exl3Manifest.partition_extents(world_size)` plans complete storage ownership
 from alignment and barrier metadata. It returns ordered `(first_slot, slot_count)`
 pairs covering every slot exactly once. Local intermediate widths may differ:
 V4.1's 2,304 channels contain nine 256-channel records, so TP2 assigns five
