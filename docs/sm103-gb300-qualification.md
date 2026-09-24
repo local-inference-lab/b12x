@@ -163,17 +163,49 @@ and 630.9 μs at eight, so the expansion now costs about 15–25%.
 The byte-wise copy also hid the cost of Grace-served experts, which was 4% or
 less in the earlier round. With it removed, about 2% of routes on Grace makes the
 tiered operator 28–30% slower at 64–128 tokens: roughly 200 μs per cold route
-against about 15 μs per HBM route at 128 tokens. The routed GEMM launches one
-128-row M tile per route and waits for each K tile's TMA before its MMA, so
-Grace latency is exposed on every K tile; that attribution is inferred, not
-profiled. The benchmark's isolated stage graphs are empty (Torch warns during
-capture), so its per-stage medians are not interpretable.
+against about 15 μs per HBM route at 128 tokens. The benchmark's isolated stage
+graphs are empty (Torch warns during capture), so its per-stage medians are not
+interpretable.
+
+## Pipelined K tiles
+
+After `formal2`, `d2ddd054` raises the shared block-scaled GEMM from two to four
+TMA stages. The DSL's automatic pipelining then prefetches two K tiles ahead
+instead of none. Accumulation order is unchanged. A seeded capture of dense
+NVFP4/MXFP4/MXFP8/FP6 outputs and the production-geometry residency operator in
+both placements reproduces the two-stage results bitwise, and discovery sweep
+`r3` passes all 32 components (1,249 tests). Formal requalification is deferred to
+the master-based branch.
+
+| Tokens | Tiered, μs | All-HBM, μs | Ratio | Two-stage tiered, μs | Two-stage all-HBM, μs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 94.5 | 91.6 | 1.0316 | 155.1 | 151.6 |
+| 8 | 440.4 | 426.5 | 1.0326 | 794.7 | 780.8 |
+| 16 | 1,022.4 | 797.0 | 1.2828 | 1,692.7 | 1,465.8 |
+| 64 | 4,765.3 | 3,041.0 | 1.5670 | 7,282.9 | 5,603.4 |
+| 128 | 9,251.2 | 6,019.4 | 1.5369 | 14,262.9 | 11,156.9 |
+
+All-HBM time falls 1.65–1.85×; bitwise all-HBM parity holds at every count.
+Three stages measured 106.5/491.0 μs at one/eight tokens, four 99.4/429.4 and
+five 103.8/423.9. Prefetching three tiles ahead with four stages was slower.
+Dense 4096³ GEMMs improve from 202.9 to 179.6 μs (NVFP4), 199.3 to 177.2 μs
+(MXFP4) and 285.7 to 206.0 μs (MXFP8). Small-row dense shapes are
+host-dispatch bound in that eager measurement and unchanged.
+
+Grace-served routes do not speed up, so the earlier K-tile-latency explanation
+is wrong. With every expert on Grace, the operator takes 1,357.8 μs at one token
+and 10,697.9 μs at eight: about 223 μs per route against 9–16 μs from HBM. Each
+route reads its expert's roughly 18.8 MB of FC1/FC2 weights and scales, an
+effective 84 GB/s from Grace. Deeper prefetch did not change that, so the limit
+is not per-tile latency; it needs profiling. Candidates include the 64-byte
+row segments of each TMA box and address translation of mapped host
+memory.
 
 ## Remaining limits
 
-The next performance target is the routed GEMM mainloop. It does not overlap
-TMA with MMA, which particularly penalizes Grace-served experts, and it gives
-each route its own 128-row M tile. The E2M1 expansion still runs on one warp.
+Grace-served expert GEMMs reach about 84 GB/s and need profiling before any
+Grace-residency performance claim. The routed GEMM still gives each route its
+own 128-row M tile, and the E2M1 expansion still runs on one warp.
 Complete-model SM103 serving still needs the native MXFP4/MXFP8 checkpoint
 adapter. Station RDMA, the vLLM plugin and B300 performance are not
 qualified. The optional vLLM FP8 comparison remains unexecuted. Results are
