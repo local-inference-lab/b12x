@@ -57,7 +57,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         }))
         self.modules = {name: ModuleType(name) for name in (
             "b12x", "b12x._lib", "b12x._lib.compiler", "b12x._lib.compile_plan",
-            "b12x._lib.runtime_control", "cutlass", "cutlass.cute",
+            "b12x._lib.runtime_control", "b12x._lib.architecture", "b12x._lib.gating",
+            "cutlass", "cutlass.cute",
             "cutlass.base_dsl", "cutlass.base_dsl.export",
             "cutlass.base_dsl.export.external_binary_module",
         )}
@@ -65,6 +66,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         self.modules["cutlass.cute"].compile = Mock()
         self.modules["cutlass.base_dsl.export.external_binary_module"].ExternalBinaryModule = self.loader
         self.modules["b12x._lib.runtime_control"].raise_if_kernel_resolution_frozen = Mock()
+        self.modules["b12x._lib.architecture"].require_kernel_architecture = Mock()
+        self.modules["b12x._lib.gating"].get_compute_capability = lambda: None
         self.program_type = namedtuple("ProgramKey", "dialect key name")
         plan = self.modules["b12x._lib.compile_plan"]
         plan.ProgramKey = self.program_type

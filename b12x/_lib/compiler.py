@@ -2483,7 +2483,7 @@ def _write_compile_manifest(
     manifest = _build_compile_manifest(
         cache_key, cache_payload, func, object_bytes, compiled=compiled
     )
-    if compiled is not None:
+    if compiled is not None and manifest.get("launch_metadata") is not None:
         compiled._b12x_launch_metadata = manifest["launch_metadata"]
     data = json.dumps(
         manifest, sort_keys=True, separators=(",", ":"),
@@ -2549,23 +2549,27 @@ def _load_cute_compile_from_disk(cache_key: str):
             if not valid_object(staged_object, manifest_path, cache_key):
                 return None
             manifest = json.loads(manifest_path.read_text())
+            # Launch metadata sizes cooperative grids, so it must belong to this
+            # object. Without it, callers fall back to the kernel's maximum
+            # dynamic shared memory.
             launch_metadata = manifest.get("launch_metadata")
-            evidence = {
-                "cache_key": cache_key,
-                "object_sha256": manifest["object_sha256"],
-                "launch_metadata": launch_metadata,
-            }
-            evidence_hash = hashlib.sha256(
-                json.dumps(
-                    evidence,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=True,
-                    allow_nan=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            if manifest.get("artifact_evidence_sha256") != evidence_hash:
-                return None
+            if launch_metadata is not None:
+                evidence = {
+                    "cache_key": cache_key,
+                    "object_sha256": manifest["object_sha256"],
+                    "launch_metadata": launch_metadata,
+                }
+                evidence_hash = hashlib.sha256(
+                    json.dumps(
+                        evidence,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if manifest.get("artifact_evidence_sha256") != evidence_hash:
+                    return None
             module = ExternalBinaryModule(str(staged_object))
             compiled = getattr(module, _cache_prefix(cache_key))
             if launch_metadata is not None:
