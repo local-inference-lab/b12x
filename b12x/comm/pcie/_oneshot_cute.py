@@ -9,6 +9,7 @@ atomic operation.
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -208,6 +209,7 @@ class _OneshotLaunch(_PackedMath):
         self._slot_bias = int(slot_bias) & 1
         self._transport = transport
         self._threads = int(threads)
+        self._pdl = _ONESHOT_PDL and transport == "pull"
 
     @cute.jit
     def __call__(
@@ -342,6 +344,8 @@ class _OneshotLaunch(_PackedMath):
                     stage_index += stride
 
             self._multi_gpu_barrier(signal_ptrs)
+            if cutlass.const_expr(self._pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
             while index < size_packs:
                 accumulator = cute.make_rmem_tensor(
@@ -1145,6 +1149,13 @@ class _FusedOneshotLaunch(_PackedMath):
                 )
 
 
+# Release the dependent launch once this rank's input is published and every
+# peer has arrived. The dependent kernel (the mHC partial) waits in-kernel for
+# this grid to complete before reading its output, so the release only hides
+# the dependent's launch latency and can never expose a partial result.
+_ONESHOT_PDL = os.getenv("B12X_PCIE_ONESHOT_PDL", "0") != "0"
+
+
 def _dummy(dtype, alignment: int):
     return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=alignment)
 
@@ -1246,6 +1257,7 @@ def get_oneshot_launcher(
         slot_bias,
         str(transport),
         int(threads),
+        ("pdl", bool(launch._pdl)),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -1265,7 +1277,7 @@ def get_oneshot_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 4, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 5, cache_key),
     )
 
     def run(
