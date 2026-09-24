@@ -9,14 +9,13 @@ and the vLLM plugin remain outside its scope, as the launcher receipt records.
 ## Sources and environment
 
 The base is `work/sm103-hybrid-continuation` at
-`2e3115ae56153336ba1b1a7e2f23b8b91f7acd99`. The fixes are commits `780532c8`
-through `552eb925` on `work/gb300-qualification`. Every physical receipt
-executes a frozen archive with package hash
-`977eadadf855f676d61bc81eaa2e63a0d655a0719df9029f0799e18a990f3a7b` and one test
-hash, both reproduced by the committed tree. The synccheck and racecheck
-receipts use the committed launcher; the operator and memcheck receipts used
-its predecessor, which lacked only the recorded kernel exclusion. The compile
-manifest is shared.
+`2e3115ae56153336ba1b1a7e2f23b8b91f7acd99`. The fixes are the commits after it
+on `work/gb300-qualification`. The results below are round `formal2`, which
+executes a frozen archive of `2d29ee35` with package hash
+`c31956ef1dff06dca580d4b9fabc7c8f088f3e0d99860559002aceacdccd6d0c` and one test
+hash. Every physical receipt shares that archive and its compile manifest.
+The earlier round `final`, at package hash `977eadad` with the byte-wise E2M1
+expansion, passed the same gates and remains in the evidence bundle.
 
 The host `gracie` is aarch64 Ubuntu 24.04 with Grace memory and two GPUs. The
 qualified device is an NVIDIA GB300, UUID
@@ -41,7 +40,7 @@ B300; this part has 152 SMs. Raw evidence is outside the repository in
 | Production residency geometry (H5120/I2304/E384/295 hot/top-6) | 12 callables, `cross-compiled` |
 | Host tests, `tests/architecture tests/preparation` | 962 passed, 43 skipped from the checkout |
 | Physical operator suite, `qualify_sm103.py --execute` | `operator-qualification-passed`: 32/32 components, 1,249 tests, 0 failures/errors/skips |
-| Memcheck over every component | Passed: 32/32 components, 1,243 tests, 0 errors in every summary |
+| Memcheck over every component, cuBLAS `nvjet` kernels uninstrumented | Passed: 32/32 components, 1,243 tests, 0 errors in every summary |
 | Synccheck over every component, cuBLAS `nvjet` kernels uninstrumented | Passed: 32/32 components, 1,243 tests, 0 errors in every summary |
 | Racecheck, residency and blockscaled components | Passed: 113 tests, 0 hazards |
 | Residency production-geometry benchmark | Bitwise all-HBM parity, mutation replay and no allocator events at 1–128 tokens |
@@ -62,8 +61,10 @@ one-hot probe showed K indices 16–31 of every MMA reading codes 32–47, and t
 last instruction of each K tile reading past the stage. FC1 errors reached 80%
 of the output magnitude in every placement, and the first run was
 nondeterministic. TMA now stages packed rows unchanged and the MMA warp copies
-each group into the byte-addressed SW128 operand. Checkpoint storage and tier
-footprints are unchanged. All HBM, Grace and mixed placements, quiescent slot
+each group into the byte-addressed SW128 operand with batched eight-byte
+loads and stores. The 1024-byte-aligned operand places group g of row r in
+slot g ^ (r % 8), and a trace-time check pins that geometry. Checkpoint storage
+and tier footprints are unchanged. All HBM, Grace and mixed placements, quiescent slot
 exchange and native cache control now pass exact parity and the independent
 oracle.
 
@@ -143,33 +144,36 @@ resident, top-6 and SwiGLU limit 10. Each row is the median of ten graph samples
 the ratio is tiered latency divided by all-HBM latency. Correctness precedes
 timing and passes at every count.
 
-| Tokens | Actual cold fraction | Tiered, μs | All-HBM, μs | Ratio |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 0 | 680.4 | 678.2 | 1.0032 |
-| 2 | 0 | 1,109.6 | 1,105.8 | 1.0034 |
-| 4 | 0 | 2,089.8 | 2,082.5 | 1.0035 |
-| 8 | 0 | 4,043.9 | 4,031.3 | 1.0031 |
-| 16 | 0.0104 | 8,122.6 | 7,804.9 | 1.0407 |
-| 32 | 0.0052 | 15,854.4 | 15,441.3 | 1.0268 |
-| 64 | 0.0208 | 31,969.2 | 30,636.8 | 1.0435 |
-| 128 | 0.0195 | 63,317.3 | 61,116.7 | 1.0360 |
+| Tokens | Actual cold fraction | Tiered, μs | All-HBM, μs | Ratio | Byte-wise expansion, tiered μs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0 | 155.1 | 151.6 | 1.0234 | 680.4 |
+| 2 | 0 | 239.7 | 235.1 | 1.0194 | 1,109.6 |
+| 4 | 0 | 428.9 | 421.5 | 1.0176 | 2,089.8 |
+| 8 | 0 | 794.7 | 780.8 | 1.0178 | 4,043.9 |
+| 16 | 0.0104 | 1,692.7 | 1,465.8 | 1.1547 | 8,122.6 |
+| 32 | 0.0052 | 3,050.8 | 2,816.0 | 1.0834 | 15,854.4 |
+| 64 | 0.0208 | 7,282.9 | 5,603.4 | 1.2997 | 31,969.2 |
+| 128 | 0.0195 | 14,262.9 | 11,156.9 | 1.2784 | 63,317.3 |
 
-Grace-served experts cost at most 4.4% here. Both placements scale linearly at
-about 113 μs per route. This is a correctness baseline, not a serving-speed
-result. The benchmark's isolated stage graphs are empty (Torch warns during
+The last column is the earlier round with single-byte copies; the batched
+expansion is 4.4–5.2× faster at every count. A timing-only control that removes
+the copy (and therefore computes wrong values) measures 131.7 μs at one token
+and 630.9 μs at eight, so the expansion now costs about 15–25%.
+
+The byte-wise copy also hid the cost of Grace-served experts, which was 4% or
+less in the earlier round. With it removed, about 2% of routes on Grace makes the
+tiered operator 28–30% slower at 64–128 tokens: roughly 200 μs per cold route
+against about 15 μs per HBM route at 128 tokens. The routed GEMM launches one
+128-row M tile per route and waits for each K tile's TMA before its MMA, so
+Grace latency is exposed on every K tile; that attribution is inferred, not
+profiled. The benchmark's isolated stage graphs are empty (Torch warns during
 capture), so its per-stage medians are not interpretable.
-
-The byte-wise E2M1 expansion dominates that time. A timing-only control that
-removes the copy loop (and therefore computes wrong values) measures the
-all-HBM graph at 131.7 μs for one token and 630.9 μs for eight, against 681.0
-and 4,037.8 μs with the expansion. The routed GEMM also launches one 128-row M
-tile per route and does not overlap TMA with MMA.
 
 ## Remaining limits
 
-The E2M1 expansion is the first performance target: it copies one byte at a
-time on the MMA warp while three warps idle. Eight-byte copies across all four
-warps preserve the operand layout; any change requires rerunning these gates.
+The next performance target is the routed GEMM mainloop. It does not overlap
+TMA with MMA, which particularly penalizes Grace-served experts, and it gives
+each route its own 128-row M tile. The E2M1 expansion still runs on one warp.
 Complete-model SM103 serving still needs the native MXFP4/MXFP8 checkpoint
 adapter. Station RDMA, the vLLM plugin and B300 performance are not
 qualified. The optional vLLM FP8 comparison remains unexecuted. Results are
@@ -188,7 +192,7 @@ python scripts/qualify_sm103.py --execute --device-uuid "$GB300_UUID" \
   --compile-manifest "$OUT/native/manifest.json" --output-dir "$OUT/runtime"
 python scripts/qualify_sm103.py --execute --device-uuid "$GB300_UUID" \
   --compile-manifest "$OUT/native/manifest.json" --sanitizer "$COMPUTE_SANITIZER" \
-  --sanitizer-tool memcheck --output-dir "$OUT/memcheck"
+  --sanitizer-tool memcheck --sanitizer-exclude-kernel nvjet --output-dir "$OUT/memcheck"
 python scripts/qualify_sm103.py --execute --device-uuid "$GB300_UUID" \
   --compile-manifest "$OUT/native/manifest.json" --sanitizer "$COMPUTE_SANITIZER" \
   --sanitizer-tool synccheck --sanitizer-exclude-kernel nvjet --output-dir "$OUT/synccheck"
