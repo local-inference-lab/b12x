@@ -9,7 +9,9 @@ from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan, current_plan
 from ._residency_tuning import ResidencyQuery, TUNING
-from ._residency_storage import accounting, materialize_tier, validate_source, workspace_layout
+from ._residency_storage import (
+    accounting, host_available_bytes, materialize_tier, validate_source, workspace_layout,
+)
 from .residency import ExpertMemoryBudget, ExpertResidencyPlan, ResidencyUpdateCapacity
 
 
@@ -232,8 +234,7 @@ def plan(*, weight_plan, weights, capacity, placement, memory_budget, routing, i
         free, _ = torch.cuda.mem_get_info(target)
         if memory.hbm_total_bytes + memory_budget.hbm_safety_bytes + memory_budget.kv_reserved_bytes > free:
             raise ValueError("expert placement exceeds free HBM after declared reservations")
-        import os
-        host_free = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        host_free = host_available_bytes()
         if memory.grace_total_bytes + memory_budget.grace_safety_bytes > host_free:
             raise ValueError("expert placement exceeds available host memory after safety reservation")
         programs = compile_programs(FrozenMapping(asdict(q)), device.ordinal)

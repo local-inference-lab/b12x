@@ -173,3 +173,24 @@ def test_old_binding_cannot_lazily_reprepare_a_released_plan():
     binding = ResidencyBinding(a=torch.empty(1, 256), calls=(), output=torch.empty(1, 256), owners=(), plan=plan)
     with pytest.raises(RuntimeError, match="released"):
         moe.run(binding=binding)
+
+
+def test_host_capacity_counts_only_cpu_numa_nodes(tmp_path):
+    from b12x.moe.fused_moe._residency_storage import host_available_bytes
+
+    def node(index, cpus, free_kb, file_kb):
+        path = tmp_path / f"node{index}"
+        path.mkdir()
+        (path / "cpulist").write_text(cpus + "\n")
+        (path / "meminfo").write_text(
+            f"Node {index} MemTotal:       99999999 kB\n"
+            f"Node {index} MemFree:        {free_kb} kB\n"
+            f"Node {index} Active(file):   {file_kb} kB\n"
+            f"Node {index} Inactive(file): {file_kb} kB\n"
+            f"Node {index} SReclaimable:   0 kB\n"
+        )
+
+    node(0, "0-71", 1000, 500)
+    # Coherent GPU memory is a CPU-less node and is not Grace capacity.
+    node(1, "", 9_000_000, 0)
+    assert host_available_bytes(tmp_path) == (1000 + 2 * 500) * 1024

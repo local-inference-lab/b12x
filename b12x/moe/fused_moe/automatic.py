@@ -176,7 +176,8 @@ class ModelExpertMemoryBudget:
                 raise RuntimeError("memory budgeting cannot execute during CUDA graph capture")
             free, _ = torch.cuda.mem_get_info(device)
         if grace_bytes is None:
-            grace_bytes = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            from ._residency_storage import host_available_bytes
+            grace_bytes = host_available_bytes()
         return cls(hbm_bytes=free, grace_bytes=grace_bytes, **outstanding_reservations)
 
     @property

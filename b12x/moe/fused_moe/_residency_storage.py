@@ -7,6 +7,35 @@ import torch
 from .residency import ExpertMemoryAccounting
 
 
+def host_available_bytes(root="/sys/devices/system/node"):
+    """Free and reclaimable file-backed memory on NUMA nodes that have CPUs.
+
+    Coherent GPU memory, such as GB300 HBM, appears as a CPU-less NUMA node and
+    is not Grace capacity. Page cache holding checkpoint files is reclaimable.
+    Falls back to free physical pages when per-node statistics are unavailable.
+    """
+    import os
+    from pathlib import Path
+
+    fields = ("MemFree:", "Active(file):", "Inactive(file):", "SReclaimable:")
+    total, found = 0, False
+    for node in sorted(Path(root).glob("node[0-9]*")):
+        try:
+            if not (node / "cpulist").read_text().strip():
+                continue
+            lines = (node / "meminfo").read_text().splitlines()
+        except OSError:
+            continue
+        found = True
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] in fields:
+                total += int(parts[3]) * 1024
+    if not found:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    return total
+
+
 def align(value):
     return (value + 255) // 256 * 256
 
