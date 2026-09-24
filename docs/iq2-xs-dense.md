@@ -1,6 +1,7 @@
 # IQ2_XS dense GEMM
 
-Status: implemented on SM120 and SM121. Other IQ codecs are unsupported.
+Status: implemented on SM120 and SM121. [IQ2_XXS](iq2-xxs.md) shares this
+engine with compile-time codec specialization and 66-byte packed blocks.
 
 `b12x.gemm.blockscaled` accepts IQ2_XS safetensors block payloads through
 `pack_weight(blocks, recipe="iq2_xs")` and the prepared `mm` API. Inputs are

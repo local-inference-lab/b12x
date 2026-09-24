@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 import argparse
 import json
 from pathlib import Path
@@ -29,7 +31,7 @@ def main():
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[1])
-    parser.add_argument("--recipe", choices=("iq2_xs", "nvfp4"))
+    parser.add_argument("--recipe", choices=("iq2_xs", "iq2_xxs", "q8_0", "nvfp4"))
     args = parser.parse_args()
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -60,8 +62,8 @@ def main():
                 override=blockscaled.BlockscaledConfig(**record["config"]),
             )
             values = weight.values
-            scales = weight.metadata if case["recipe"] == "iq2_xs" else weight.scale_mma
-            global_scale = None if case["recipe"] == "iq2_xs" else weight.global_scale
+            scales = weight.metadata if case["recipe"] in BLOCK_CODECS else weight.scale_mma
+            global_scale = None if case["recipe"] in BLOCK_CODECS else weight.global_scale
 
             def prepare(state):
                 scratch = (

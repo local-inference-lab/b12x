@@ -37,6 +37,30 @@ def test_dense_nvfp4_without_activation_scale_excludes_a4():
     assert {config.mode for _, config in TUNING.eligible_plan(query, DEVICE).candidates} == {"a16"}
 
 
+@pytest.mark.parametrize("k,n", ((4096, 18560), (8192, 4096)))
+@pytest.mark.parametrize("rows", (1, 2, 4, 8, 16, 256))
+def test_super3_mamba_tuning_can_select_wide_k_without_changing_precision(k, n, rows):
+    from itertools import product
+
+    from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING
+
+    query = BlockscaledQuery(
+        recipe="nvfp4", num_tokens=rows, in_features=k, padded_in_features=k,
+        out_features=n, activation_mode="a16", activation_scale_available=False,
+        output_mode="functional", workspace_form="provided",
+        workspace_nbytes=2_000_000_000, expected_m=rows if rows <= 16 else None,
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    configs = [config for _, config in TUNING.eligible_plan(query, device).candidates]
+    assert {config.mode for config in configs} == {"a16"}
+    # Every production decode tile/K-split combination must survive filtering;
+    # prefill additionally admits the larger row tiles supported by this path.
+    row_tiles = (16,) if rows <= 16 else (16, 32, 64)
+    assert {(c.tile_m, c.tile_n, c.tile_k, c.split_k) for c in configs} == set(
+        product(row_tiles, (64, 128), (64, 128, 256), (1, 2, 4, 8))
+    )
+
+
 def _nvfp4_query():
     from b12x.moe.fused_moe._tuning import MoeDecodeQuery
 

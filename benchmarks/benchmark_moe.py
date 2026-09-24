@@ -9,6 +9,8 @@ deterministic top-k + softmax routing step in the measured closure.
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import IQ2_CODECS, block_codec
+
 import argparse
 import hashlib
 import json
@@ -307,8 +309,8 @@ def logical_expert_bytes(
     elements = spec.hidden_size * (
         moe_activation_w1_rows(activation, spec.I_tp) + spec.I_tp
     )
-    if source_format == "iq2_xs":
-        return elements // 256 * 74
+    if source_format in IQ2_CODECS:
+        return elements // block_codec(source_format).block_weights * block_codec(source_format).block_bytes
     if quant_mode == "w4a8_nvfp4":
         # Native FP4 plus K32 exponents and K16 residual scales.
         return elements // 2 + elements // 32 + elements // 16
@@ -615,6 +617,12 @@ MODEL_PROFILES = {
         default_swiglu_beta=SWIGLUOAI_DEFAULT_BETA,
     ),
 }
+
+# Both GGML IQ2 codecs share checkpoint geometry and the same production route.
+for _profile in ("puzzle3-iq2-xs", "qwen36-35b-iq2-xs"):
+    MODEL_PROFILES[_profile.replace("-iq2-xs", "-iq2-xxs")] = replace(
+        MODEL_PROFILES[_profile], label=MODEL_PROFILES[_profile].label.replace("IQ2_XS", "IQ2_XXS"),
+    )
 
 
 def _cached_snapshot_path(repo_id: str) -> pathlib.Path | None:
@@ -1016,7 +1024,7 @@ def load_iq2_xs_expert_weights(model_path, spec, *, layer_idx, activation, devic
         w13_input_scale_per_expert=unit, w2_input_scale_per_expert=unit,
         w13_input_scale_quant_per_expert=unit, w2_input_scale_quant_per_expert=unit,
         g1_alphas=unit, g2_alphas=unit, g1_alphas_per_expert=unit, g2_alphas_per_expert=unit,
-        source_format="iq2_xs", w13_layout="w31",
+        source_format=layer.weights.codec, w13_layout="w31",
     )
 
 
@@ -1953,7 +1961,7 @@ def prepare_b12x_benchmark_weights(
             w4a16_native=w4a16_native,
             activation_params=activation_params,
         )
-    if weights.source_format == "iq2_xs":
+    if weights.source_format in IQ2_CODECS:
         if quant_mode != "w4a16":
             raise ValueError("IQ2_XS benchmark requires W4A16")
         experts = fused_moe.prepare_weights(
@@ -1961,6 +1969,7 @@ def prepare_b12x_benchmark_weights(
             weights=fused_moe.IQ2XSWeights(
                 weights.w13_weight.to(params.g1_alphas.device),
                 weights.w2_weight.to(params.g2_alphas.device),
+                codec=weights.source_format,
             ),
         )
         return experts, params
@@ -2483,7 +2492,7 @@ def make_oracle_reference(
     activation_params = activation_params or ActivationParams()
     spec = weights.spec
     quant_mode = quant_mode.lower()
-    if weights.source_format == "iq2_xs":
+    if weights.source_format in IQ2_CODECS:
         from b12x.testing.iq2_xs_reference import moe_reference_iq2_xs
 
         if quant_mode != "w4a16" or oracle_mode != "w4a16":
@@ -3774,7 +3783,7 @@ def bench_e2e() -> None:
 
         args.raw_samples_jsonl.parent.mkdir(parents=True, exist_ok=True)
         payload_hashes = {}
-        if weights.source_format == "iq2_xs":
+        if weights.source_format in IQ2_CODECS:
             payload_hashes = {
                 name: hashlib.sha256(memoryview(tensor.numpy())).hexdigest()
                 for name, tensor in (("w13", weights.w13_weight), ("w2", weights.w2_weight))
@@ -3974,7 +3983,7 @@ def bench_e2e() -> None:
         active_experts = int(torch.unique(topk_ids[local_routes]).numel())
         packed_expert_bytes = (
             sum(t[0].numel() * t.element_size() for t in (weights.w13_weight, weights.w2_weight))
-            if weights.source_format == "iq2_xs" else None
+            if weights.source_format in IQ2_CODECS else None
         )
         active_density = int(local_routes.sum().item()) / max(active_experts, 1)
         print(
@@ -4141,7 +4150,7 @@ def bench_e2e() -> None:
                     min_cosine=args.min_cosine,
                 )
             )
-            if weights.source_format == "iq2_xs":
+            if weights.source_format in IQ2_CODECS:
                 reference_norm = oracle_ref.float().norm().item()
                 relative_l2 = (backend_out.float() - oracle_ref.float()).norm().item() / max(reference_norm, 1e-30)
                 if not torch.isfinite(backend_out).all() or not torch.count_nonzero(backend_out) or reference_norm == 0 or backend_metrics.cos < 0.999 or relative_l2 > 0.01:

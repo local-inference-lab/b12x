@@ -21,11 +21,12 @@ from tests.moe.test_iq2_xs import blocks
 
 
 @pytest.mark.parametrize("mapped", [False, True])
-def test_direct_topk_sum_is_stable_across_graph_replays(mapped):
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "q8_0"])
+def test_direct_topk_sum_is_stable_across_graph_replays(mapped, codec):
     device = require_b12x()
     ids = tuple(reversed(range(16))) if mapped else tuple(range(16))
     layer = IQ2XSLayer(
-        moe.IQ2XSWeights(blocks(e=16, n=1280, k=1024), blocks(e=16, n=1024, k=1280)),
+        moe.BlockQuantWeights(blocks(e=16, n=1280, k=1024, codec=codec), blocks(e=16, n=1024, k=1280, codec=codec), codec=codec),
         1024, 1280, 16, 14, ids, Path("synthetic-iq2-xs"), 0, 1, 0,
     )
     experts, _ = prepare_experts(layer, device, activation="relu2")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 from dataclasses import dataclass
 
 import torch
@@ -265,7 +267,7 @@ def packed_gemm_scratch_elements(
     )
     if moe_block_size == 8:
         elements *= 2
-        if weight_layout == "iq2_xs":
+        if weight_layout in BLOCK_CODECS:
             # Parallel split-K retains one M8 partial per resident CTA.
             elements = max(elements, int(sms) * 2 * 8 * 256)
     return max(elements, 1)
@@ -307,7 +309,7 @@ def plan_w4a16_buffers(
     # upper bound once routed_rows > route_num_experts. Keep the generic buffer
     # helper graph-safe for every currently supported TC-decode shape.
     gemm_route_slots = route_slots
-    if int(m) <= 8 and (bool(prepared.is_gated) or prepared.weight_layout == "iq2_xs"):
+    if int(m) <= 8 and (bool(prepared.is_gated) or prepared.weight_layout in BLOCK_CODECS):
         gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
     return W4A16BufferPlan(

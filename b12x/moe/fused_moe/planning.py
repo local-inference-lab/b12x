@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 from dataclasses import dataclass
 from enum import Enum
 
@@ -179,7 +181,7 @@ def _prepared_format(
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
         weights = (
-            WeightEncoding.IQ2_XS if source.format.value == "iq2_xs" else
+            WeightEncoding(source.format.value) if source.format.value in BLOCK_CODECS else
             WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
             else WeightEncoding.FP4_E2M1
@@ -231,6 +233,8 @@ def plan_weights(
                 WeightPacking.SOURCE_NATIVE,
                 WeightPacking.MMA_PACKED,
                 WeightPacking.IQ2_XS_COMPACT,
+                WeightPacking.IQ2_XXS_COMPACT,
+                WeightPacking.Q8_0_COMPACT,
             }:
                 raise ValueError(
                     "A16 preparation requires source_native or mma_packed packing"
@@ -309,9 +313,9 @@ def prepare_weights(
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if isinstance(plan.source, PackedSource) and plan.source.format.value == "iq2_xs":
-        if not isinstance(weights, IQ2XSWeights):
-            raise TypeError("IQ2_XS preparation requires IQ2XSWeights")
+    if isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
+        if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
+            raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):

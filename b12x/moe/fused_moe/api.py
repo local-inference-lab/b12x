@@ -41,6 +41,7 @@ from .source import PackedSource, PackedSourceFormat, W13Layout, WeightSource
 from .weights import (
     PackedWeights,
     IQ2XSWeights,
+    BlockQuantWeights,
     PreparedExperts,
     PreparedWeightFormat,
     ScaleEncoding,
@@ -203,6 +204,7 @@ __all__ = [
     "PackedSourceFormat",
     "PackedWeights",
     "IQ2XSWeights",
+    "BlockQuantWeights",
     "PreparedExperts",
     "PreparedWeightFormat",
     "RoutingSpec",

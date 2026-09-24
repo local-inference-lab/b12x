@@ -25,11 +25,13 @@ def write_checkpoint(root, tensors, recipes):
     )
 
 
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
 def test_checkpoint_cases_exclude_routed_and_preserve_heterogeneous_dense_roles(
-    tmp_path,
+    tmp_path, codec,
 ):
+    block_bytes = 66 if codec == "iq2_xxs" else 74
     iq2 = dict(
-        quant_algo="IQ2_XS", group_size=256, block_payload_bytes=74, packing="ggml"
+        quant_algo=codec.upper(), group_size=256, block_payload_bytes=block_bytes, packing="ggml"
     )
     tensors, recipes = {}, {}
     for name, n in (
@@ -38,7 +40,7 @@ def test_checkpoint_cases_exclude_routed_and_preserve_heterogeneous_dense_roles(
         ("backbone.layers.5.mixer.shared_experts.up_proj", 16),
         ("backbone.layers.1.mixer.experts.0.up_proj", 8),
     ):
-        tensors[name + ".weight"] = torch.zeros(n, 1, 74, dtype=torch.uint8)
+        tensors[name + ".weight"] = torch.zeros(n, 1, block_bytes, dtype=torch.uint8)
         recipes[name] = iq2
     dense = "backbone.layers.0.mixer.in_proj"
     tensors[dense + ".weight"] = torch.zeros(8, 128, dtype=torch.uint8)
@@ -49,8 +51,8 @@ def test_checkpoint_cases_exclude_routed_and_preserve_heterogeneous_dense_roles(
     assert sorted(
         (c["recipe"], c["n"], c["k"], len(c["equivalent_weights"])) for c in cases
     ) == [
-        ("iq2_xs", 8, 256, 2),
-        ("iq2_xs", 16, 256, 1),
+        (codec, 8, 256, 2),
+        (codec, 16, 256, 1),
         ("nvfp4", 8, 256, 1),
     ]
     assert all(

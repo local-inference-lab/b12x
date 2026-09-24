@@ -11,6 +11,7 @@ from safetensors import safe_open
 import torch
 
 from b12x.moe.fused_moe import IQ2XSWeights
+from b12x._lib.quant.block_codec import block_codec
 
 
 @dataclass(frozen=True)
@@ -50,19 +51,19 @@ def load_iq2_xs_layer(
     """
     snapshot = Path(snapshot).expanduser().resolve()
     config = json.loads((snapshot / "config.json").read_text())
-    text = config.get("text_config", config)
-    if not 0 <= layer < int(text["num_hidden_layers"]):
+    text = config.get("llm_config", config.get("text_config", config))
+    num_layers = len(text["block_configs"]) if "block_configs" in text else int(text["num_hidden_layers"])
+    if not 0 <= layer < num_layers:
         raise ValueError("layer is outside the checkpoint")
     if text.get("model_type") == "nemotron_h_puzzle":
         block = text["block_configs"][layer]
         if block["block_type"] != "moe" or text["mlp_hidden_act"] != "relu2":
             raise ValueError("the selected Puzzle 3 layer must be a ReLU2 MoE block")
-        h, i, e = (
-            int(block[key])
-            for key in ("moe_latent_size", "moe_intermediate_size", "n_routed_experts")
-        )
+        h = int(block.get("moe_latent_size", text.get("moe_latent_size", text.get("hidden_size"))))
+        i, e = (int(block[key]) for key in ("moe_intermediate_size", "n_routed_experts"))
         top_k = int(block["num_experts_per_tok"])
-        prefix = f"backbone.layers.{layer}.mixer.experts"
+        backbone = "language_model.model" if "llm_config" in config else "backbone"
+        prefix = f"{backbone}.layers.{layer}.mixer.experts"
         activation = "relu2"
         projections = ("up", "down")
     else:
@@ -90,10 +91,14 @@ def load_iq2_xs_layer(
     ):
         raise ValueError("expert_ids must be distinct checkpoint expert indices")
     quant = json.loads((snapshot / "hf_quant_config.json").read_text())["quantization"]
+    recipes = quant["quantized_layers"]
+    first_name = f"{prefix}.{selected[0]}.{projections[0]}_proj"
+    codec = recipes.get(first_name, recipes.get(prefix, {})).get("quant_algo", "").lower()
+    spec = block_codec(codec)
     expected = {
-        "quant_algo": "IQ2_XS",
+        "quant_algo": codec.upper(),
         "group_size": 256,
-        "block_payload_bytes": 74,
+        "block_payload_bytes": spec.block_bytes,
         "packing": "ggml",
     }
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())[
@@ -102,10 +107,10 @@ def load_iq2_xs_layer(
     local_i = i // tp_size
     lo, hi = tp_rank * local_i, (tp_rank + 1) * local_i
     w13 = torch.empty(
-        (len(selected), (2 if activation == "silu" else 1) * local_i, h // 256, 74),
+        (len(selected), (2 if activation == "silu" else 1) * local_i, h // 256, spec.block_bytes),
         dtype=torch.uint8,
     )
-    w2 = torch.empty((len(selected), h, local_i // 256, 74), dtype=torch.uint8)
+    w2 = torch.empty((len(selected), h, local_i // 256, spec.block_bytes), dtype=torch.uint8)
     with ExitStack() as stack:
         handles = {}
         for local, expert in enumerate(selected):
@@ -127,7 +132,7 @@ def load_iq2_xs_layer(
                         safe_open(snapshot / shard, framework="pt", device="cpu")
                     )
                 source = handles[shard].get_slice(name)
-                shape = (h, i // 256, 74) if projection == "down" else (i, h // 256, 74)
+                shape = (h, i // 256, spec.block_bytes) if projection == "down" else (i, h // 256, spec.block_bytes)
                 if tuple(source.get_shape()) != shape or source.get_dtype() != "U8":
                     raise ValueError(
                         f"invalid IQ2_XS tensor {name}: expected uint8{shape}"
@@ -140,7 +145,7 @@ def load_iq2_xs_layer(
                     )
                     w13[local, offset : offset + local_i].copy_(source[lo:hi, :, :])
     return IQ2XSLayer(
-        IQ2XSWeights(w13, w2),
+        IQ2XSWeights(w13, w2, codec=codec),
         h,
         local_i,
         e,

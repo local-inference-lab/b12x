@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 from b12x.preparation import Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 
@@ -419,14 +421,16 @@ def pack_weight(
     (``'multiplier'`` or ``'reciprocal'``); no scale transformation occurs.
 
     ``recipe='iq2_xs'`` takes CUDA uint8 ``[N,K/256,74]`` safetensors block
-    payloads with embedded scales. Omit ``scale`` and ``global_scale``.
+    payloads with embedded scales; ``iq2_xxs`` takes 66-byte blocks.
+    ``q8_0`` takes ``[N,K/32,34]`` blocks containing INT8 values and FP16 scales.
+    Omit ``scale`` and ``global_scale``.
     Preparation losslessly rearranges descriptors and metadata for A16 GEMM.
     """
 
-    if recipe == "iq2_xs":
+    if recipe in BLOCK_CODECS:
         if scale is not None or global_scale is not None or global_scale_kind != "multiplier":
             raise ValueError("IQ2_XS scales are embedded in its block payload")
-        return pack_iq2_xs_weight(weight)
+        return pack_iq2_xs_weight(weight, codec=recipe)
     if scale is None:
         raise ValueError("this weight recipe requires a scale tensor")
     if recipe == "nvfp4":

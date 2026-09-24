@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from b12x._lib.quant.block_codec import block_codec
+
 if TYPE_CHECKING:
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
@@ -20,6 +22,8 @@ class WeightEncoding(str, Enum):
     FP6_E2M3 = "fp6_e2m3"
     TRELLIS = "trellis"
     IQ2_XS = "iq2_xs"
+    IQ2_XXS = "iq2_xxs"
+    Q8_0 = "q8_0"
 
 
 class ScaleEncoding(str, Enum):
@@ -31,6 +35,8 @@ class ScaleEncoding(str, Enum):
     E8M0_K32_E4M3_RESIDUAL = "e8m0_k32_x_e4m3_k16_residual"
     TRELLIS_SCALES = "trellis_scales"
     IQ2_XS = "iq2_xs"
+    IQ2_XXS = "iq2_xxs"
+    Q8_0 = "q8_0"
 
 
 class WeightPacking(str, Enum):
@@ -42,6 +48,8 @@ class WeightPacking(str, Enum):
     QMMA_REPACKED = "qmma_repacked"
     TRELLIS_NATIVE = "trellis_native"
     IQ2_XS_COMPACT = "iq2_xs_compact"
+    IQ2_XXS_COMPACT = "iq2_xxs_compact"
+    Q8_0_COMPACT = "q8_0_compact"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -114,19 +122,27 @@ class TrellisWeights:
 
 
 @dataclass(frozen=True)
-class IQ2XSWeights:
-    """Safetensors uint8[E,N,K/256,74] blocks in PackedSource.w13_layout order."""
+class BlockQuantWeights:
+    """Raw uint8[E,N,K/block_weights,block_bytes] checkpoint blocks.
+
+    Codec identity must match PackedSource; w13 uses its projection order.
+    """
 
     w13: torch.Tensor
     w2: torch.Tensor
+    codec: str = "iq2_xs"
 
     def __post_init__(self) -> None:
+        spec = block_codec(self.codec)
         for name in ("w13", "w2"):
             tensor = getattr(self, name)
             if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.uint8:
                 raise TypeError(f"IQ2XSWeights.{name} must be a uint8 tensor")
-            if tensor.ndim != 4 or tensor.shape[-1] != 74:
-                raise ValueError(f"IQ2XSWeights.{name} must have shape [E,N,K/256,74]")
+            if tensor.ndim != 4 or tensor.shape[-1] != spec.block_bytes:
+                raise ValueError(f"{self.codec} {name} must have shape [E,N,K/{spec.block_weights},{spec.block_bytes}]")
+
+
+IQ2XSWeights = BlockQuantWeights
 
 
 @dataclass(frozen=True)
@@ -206,6 +222,7 @@ class PreparedExperts:
 __all__ = [
     "PackedWeights",
     "IQ2XSWeights",
+    "BlockQuantWeights",
     "PreparedExperts",
     "PreparedWeightFormat",
     "ScaleEncoding",

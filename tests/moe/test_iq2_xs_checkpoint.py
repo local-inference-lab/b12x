@@ -14,13 +14,13 @@ from b12x.testing.iq2_xs_reference import dequantize_blocks
 from .test_iq2_xs import blocks, unpack_planes
 
 
-def make_snapshot(tmp_path):
+def make_snapshot(tmp_path, codec="iq2_xs"):
     prefix = "model.language_model.layers.0.mlp.experts"
     tensors = {}
     for e in range(3):
         for name in ("gate", "up", "down"):
             n, k = (256, 512) if name == "down" else (512, 256)
-            tensors[f"{prefix}.{e}.{name}_proj.weight"] = blocks(e=1, n=n, k=k)[0]
+            tensors[f"{prefix}.{e}.{name}_proj.weight"] = blocks(e=1, n=n, k=k, codec=codec)[0]
     save_file(tensors, tmp_path / "model.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps(
@@ -48,10 +48,10 @@ def make_snapshot(tmp_path):
                 "quantization": {
                     "quantized_layers": {
                         prefix: {
-                            "quant_algo": "IQ2_XS",
+                            "quant_algo": codec.upper(),
                             "packing": "ggml",
                             "group_size": 256,
-                            "block_payload_bytes": 74,
+                            "block_payload_bytes": 66 if codec == "iq2_xxs" else 74,
                         }
                     },
                 }
@@ -61,9 +61,9 @@ def make_snapshot(tmp_path):
     return tmp_path
 
 
-@pytest.fixture
-def snapshot(tmp_path):
-    return make_snapshot(tmp_path)
+@pytest.fixture(params=["iq2_xs", "iq2_xxs"])
+def snapshot(tmp_path, request):
+    return make_snapshot(tmp_path, codec=request.param)
 
 
 def test_tp_reconstruction_and_expert_map(snapshot):
@@ -100,6 +100,30 @@ def test_tp_reconstruction_and_expert_map(snapshot):
 def test_invalid_selection(snapshot, kwargs):
     with pytest.raises(ValueError):
         load_iq2_xs_layer(snapshot, **{"layer": 0, **kwargs})
+
+
+def test_super3_nested_config_global_latent_size_and_layer_prefix(tmp_path):
+    prefix = "language_model.model.layers.1.mixer.experts"
+    w1, w2 = blocks(e=1, n=512, k=256, codec="iq2_xxs")[0], blocks(e=1, n=256, k=512, codec="iq2_xxs")[0]
+    tensors = {f"{prefix}.0.up_proj.weight": w1, f"{prefix}.0.down_proj.weight": w2}
+    save_file(tensors, tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": dict.fromkeys(tensors, "model.safetensors")}
+    ))
+    (tmp_path / "config.json").write_text(json.dumps({"llm_config": {
+        "model_type": "nemotron_h_puzzle", "moe_latent_size": 256,
+        "mlp_hidden_act": "relu2", "block_configs": [
+            {"block_type": "mamba"}, {"block_type": "moe", "moe_intermediate_size": 512,
+                                    "n_routed_experts": 1, "num_experts_per_tok": 1},
+        ],
+    }}))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": {"quantized_layers": {
+        prefix: {"quant_algo": "IQ2_XXS", "group_size": 256, "packing": "ggml", "block_payload_bytes": 66},
+    }}}))
+    layer = load_iq2_xs_layer(tmp_path, layer=1)
+    assert (layer.hidden_size, layer.intermediate_size, layer.activation) == (256, 512, "relu2")
+    assert torch.equal(layer.weights.w13[0], w1)
+    assert torch.equal(layer.weights.w2[0], w2)
 
 
 @pytest.mark.parametrize("layer", [0, 20, 39])

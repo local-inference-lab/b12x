@@ -9,7 +9,15 @@ from ._preparation import plan, query_from_call
 from ._tuning import EmbeddingQuery
 
 
+def _weight_width(weight):
+    return weight.shape[1] * 32 if weight.dtype == torch.uint8 else weight.shape[1]
+
+
 def _check_weight(weight):
+    if weight.is_cuda and weight.dtype == torch.uint8:
+        if weight.ndim != 3 or weight.shape[1] <= 0 or weight.shape[2] != 34 or not weight.is_contiguous():
+            raise ValueError("Q8_0 embedding requires contiguous uint8 [table_rows,K/32,34]")
+        return
     if not weight.is_cuda or weight.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError("embedding weight must be CUDA BF16 or FP32")
     if weight.ndim != 2 or weight.shape[1] <= 0:
@@ -25,7 +33,7 @@ def _check_tensors(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
         raise TypeError("embedding IDs must be contiguous Int32 or Int64")
     if ids.device != weight.device or out.device != weight.device:
         raise ValueError("embedding tensors must share the CUDA device")
-    if out.shape != (*ids.shape, weight.shape[1]) or out.dtype != weight.dtype:
+    if out.shape != (*ids.shape, _weight_width(weight)) or out.dtype != (torch.bfloat16 if weight.dtype == torch.uint8 else weight.dtype):
         raise ValueError("embedding output must have ids.shape + (width,) and weight dtype")
     if not out.is_contiguous() or ids.numel() >= 2**31:
         raise ValueError("embedding requires contiguous output and an Int32 launch count")

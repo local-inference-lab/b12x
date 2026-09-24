@@ -17,6 +17,8 @@ class PackedSourceFormat(str, Enum):
     COMPRESSED_TENSORS_FP4 = "compressed_tensors"
     MXFP6_E8M0_K32 = "mxfp6_e2m3"
     IQ2_XS = "iq2_xs"
+    IQ2_XXS = "iq2_xxs"
+    Q8_0 = "q8_0"
 
 
 class W13Layout(str, Enum):

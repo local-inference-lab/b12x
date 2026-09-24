@@ -1,7 +1,7 @@
 # IQ2_XS routed experts
 
-Status: implemented on SM120 and SM121. Other IQ encodings and standalone
-IQ2_XS FC2 are unsupported.
+Status: implemented on SM120 and SM121. [IQ2_XXS](iq2-xxs.md) shares the
+same engine with compile-time codec specialization. Standalone IQ2 FC2 is unsupported.
 
 `moe.fused_moe` accepts `PackedSource(format="iq2_xs")` with
 `IQ2XSWeights(w13, w2)`. Inputs are safetensors payload views of dtype uint8

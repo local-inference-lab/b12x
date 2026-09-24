@@ -14,10 +14,11 @@ from b12x.moe._shared.kernels.w4a16.iq2_xs import pack_iq2_xs_matrix
 from b12x.testing.iq2_xs_reference import dequantize_blocks, descriptor_vectors
 
 
-def blocks(e=2, n=544, k=768):
+def blocks(e=2, n=544, k=768, codec="iq2_xs"):
+    block_size = 32 if codec == "q8_0" else 256
     g = torch.Generator().manual_seed(712)
-    raw = torch.randint(0, 256, (e, n, k // 256, 74), dtype=torch.uint8, generator=g)
-    bases = (torch.randn(e, n, k // 256, generator=g) * 0.01).half()
+    raw = torch.randint(0, 256, (e, n, k // block_size, 34 if codec == "q8_0" else 66 if codec == "iq2_xxs" else 74), dtype=torch.uint8, generator=g)
+    bases = (torch.randn(e, n, k // block_size, generator=g) * 0.01).half()
     raw[..., :2] = bases[..., None].view(torch.uint8)
     return raw
 
@@ -69,23 +70,28 @@ def test_byte_selectors_reconstruct_the_independent_magnitude_grid():
 def unpack_planes(words, metadata, shape):
     e, n, kb, _ = shape
     raw = torch.empty(shape, dtype=torch.uint8)
+    q8 = shape[-1] == 34
+    k16 = kb * (2 if q8 else 16)
+    row_words = 4 if q8 else 1
+    payload_bytes = 32 if q8 else 64
     q = (
-        words.reshape(e, kb * 16, n // 16, 8, 2)
-        .transpose(-2, -1).reshape(e, kb * 16, n, 1).view(torch.uint8)
+        words.reshape(e, k16, n // 16, 8, 2, row_words)
+        .transpose(3, 4).reshape(e, k16, n, row_words).view(torch.uint8)
     )
-    raw[..., 2:66] = q.permute(0, 2, 1, 3).reshape(e, n, kb, 64)
+    raw[..., 2:2 + payload_bytes] = q.permute(0, 2, 1, 3).reshape(e, n, kb, payload_bytes)
     raw[..., :2] = (
         metadata[: e * kb * n * 2].view(torch.int16)
         .reshape(e, kb, n // 16, 8, 2).transpose(-2, -1)
         .reshape(e, kb, n, 1).view(torch.uint8).permute(0, 2, 1, 3)
     )
-    raw[..., 66:] = (
-        metadata[e * kb * n * 2 :]
-        .reshape(e, kb, n // 16, 8, 8, 2).transpose(-2, -1)
-        .reshape(e, kb, n // 16, 8, 16)
-        .permute(0, 2, 4, 1, 3)
-        .reshape(e, n, kb, 8)
-    )
+    if shape[-1] == 74:
+        raw[..., 66:] = (
+            metadata[e * kb * n * 2 :]
+            .reshape(e, kb, n // 16, 8, 8, 2).transpose(-2, -1)
+            .reshape(e, kb, n // 16, 8, 16)
+            .permute(0, 2, 4, 1, 3)
+            .reshape(e, n, kb, 8)
+        )
     return raw
 
 
@@ -99,10 +105,11 @@ def test_every_descriptor_matches_independent_table():
 
 
 @pytest.mark.parametrize("swap", [False, True])
-def test_compact_planes_preserve_source_bytes_and_projection_order(swap):
-    source = blocks()
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "q8_0"])
+def test_compact_planes_preserve_source_bytes_and_projection_order(swap, codec):
+    source = blocks(codec=codec)
     original = source.clone()
-    words, metadata = pack_iq2_xs_matrix(source, swap_halves=swap)
+    words, metadata = pack_iq2_xs_matrix(source, codec=codec, swap_halves=swap)
     assert words.numel() * words.element_size() + metadata.numel() == source.numel()
     assert (
         words.untyped_storage().nbytes() + metadata.untyped_storage().nbytes()
@@ -117,20 +124,21 @@ def test_compact_planes_preserve_source_bytes_and_projection_order(swap):
 @pytest.mark.parametrize("swap", [False, True])
 @pytest.mark.parametrize("n,k", [(128, 256), (256, 256), (384, 768), (768, 768)])
 @pytest.mark.parametrize("tile_scales", [False, True])
-def test_tiled_descriptors_preserve_compact_bytes(swap, n, k, tile_scales):
-    source = blocks(e=2, n=n, k=k)
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "q8_0"])
+def test_tiled_descriptors_preserve_compact_bytes(swap, n, k, tile_scales, codec):
+    source = blocks(e=2, n=n, k=k, codec=codec)
     original = source.clone()
     words, metadata = pack_iq2_xs_matrix(
-        source, swap_halves=swap, tile_descriptors=True, tile_scales=tile_scales
+        source, codec=codec, swap_halves=swap, tile_descriptors=True, tile_scales=tile_scales
     )
-    canonical_words, canonical_metadata = pack_iq2_xs_matrix(source, swap_halves=swap)
+    canonical_words, canonical_metadata = pack_iq2_xs_matrix(source, codec=codec, swap_halves=swap)
     untiled = (
-        words.reshape(2, n // 64, k // 128, 8, 4, 8, 2)
-        .permute(0, 2, 3, 1, 4, 5, 6).contiguous().reshape(-1)
+        words.reshape(2, n // 64, k // 128, 8, 4, 8, 2, 4 if codec == "q8_0" else 1)
+        .permute(0, 2, 3, 1, 4, 5, 6, 7).contiguous().reshape(-1)
     )
     assert torch.equal(untiled, canonical_words)
     base_bytes = 2 * (k // 256) * n * 2
-    if tile_scales:
+    if tile_scales and codec == "iq2_xs":
         untiled_scales = (
             metadata[base_bytes:].reshape(2, n // 64, k // 256, 2, 4, 4, 8, 2)
             .permute(0, 2, 1, 5, 3, 4, 6, 7).contiguous().reshape(-1)
@@ -171,11 +179,11 @@ def test_nonfinite_bases_rejected(bits):
 
 
 def weight_plan(
-    *, mode="a16", activation="silu", dtype=torch.bfloat16, h=2048, i=512, packing=None
+    *, mode="a16", activation="silu", dtype=torch.bfloat16, h=2048, i=512, packing=None, codec="iq2_xs"
 ):
     return moe.plan_weights(
         source=moe.PackedSource(
-            format=moe.PackedSourceFormat.IQ2_XS, w13_layout=moe.W13Layout.W31
+            format=codec, w13_layout=moe.W13Layout.W31
         ),
         activation=moe.ActivationSpec(
             mode=mode, nonlinearity=activation, io_dtype=dtype
@@ -187,13 +195,14 @@ def weight_plan(
 
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
 @pytest.mark.parametrize("i", [256, 512])
-def test_public_weight_plan(activation, i):
-    plan = weight_plan(activation=activation, i=i)
-    assert plan.prepared_format.weights is moe.WeightEncoding.IQ2_XS
-    assert plan.prepared_format.scales is moe.ScaleEncoding.IQ2_XS
-    assert plan.prepared_format.packing is moe.WeightPacking.IQ2_XS_COMPACT
-    assert plan._impl.w4a16_weight_layout == "iq2_xs"
-    assert plan._impl.w4a16_scale_format == "iq2_xs"
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
+def test_public_weight_plan(activation, i, codec):
+    plan = weight_plan(activation=activation, i=i, codec=codec)
+    assert plan.prepared_format.weights is moe.WeightEncoding(codec)
+    assert plan.prepared_format.scales is moe.ScaleEncoding(codec)
+    assert plan.prepared_format.packing is moe.WeightPacking(codec + "_compact")
+    assert plan._impl.w4a16_weight_layout == codec
+    assert plan._impl.w4a16_scale_format == codec
 
 
 @pytest.mark.parametrize(
@@ -208,9 +217,10 @@ def test_public_weight_plan(activation, i):
         {"packing": "mma_packed"},
     ],
 )
-def test_unsupported_weight_contracts_fail_at_planning(kwargs):
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
+def test_unsupported_weight_contracts_fail_at_planning(kwargs, codec):
     with pytest.raises((ValueError, NotImplementedError)):
-        weight_plan(**kwargs)
+        weight_plan(**kwargs, codec=codec)
 
 
 @pytest.mark.parametrize(
@@ -249,6 +259,7 @@ def test_direct_route_eligibility(overrides, expected):
         **{
             "source_format": "iq2_xs",
             "quant_mode": "w4a16",
+            "w4a16_weight_layout": None,
             "hidden_size": 2048,
             "intermediate_size": 512,
             "num_tokens": 8,
@@ -287,3 +298,24 @@ def test_relu2_tuning_races_supported_route_modes(capacity):
     assert {config.w4a16_route_mode for config in configs} == expected
     for config in configs:
         assert TUNING.configure(query, device=device, override=config).default == config
+
+
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
+def test_weight_codec_must_match_plan(codec):
+    other = "iq2_xxs" if codec == "iq2_xs" else "iq2_xs"
+    plan = weight_plan(codec=codec)
+    weights = moe.BlockQuantWeights(blocks(e=1, n=16, k=256, codec=other),
+                                   blocks(e=1, n=16, k=256, codec=other), codec=other)
+    with pytest.raises(TypeError, match="matching"):
+        moe.prepare_weights(plan=plan, weights=weights)
+
+
+def test_codec_table_identity_and_sizes():
+    from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
+    from b12x._lib.quant.block_codec import block_codec
+    for selectors in (False, True):
+        xs = iq2_xs_execution_lut("cpu", prepare=True, selectors=selectors)
+        xxs = iq2_xs_execution_lut("cpu", prepare=True, selectors=selectors, codec="iq2_xxs")
+        assert xs.data_ptr() != xxs.data_ptr()
+        assert xxs.numel() * xxs.element_size() == block_codec("iq2_xxs").lut_bytes(selectors=selectors)
+        assert iq2_xs_execution_lut("cpu", selectors=selectors, codec="iq2_xxs") is xxs

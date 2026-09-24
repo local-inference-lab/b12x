@@ -5,7 +5,9 @@ The default profile uses the Nemotron 3 Super shared-expert down projection for
 FP4, the per-rank dense-linear shape from the cached DeepSeek V4 Flash DSpark
 checkpoint at TP=2 for MXFP8, and Qwen linear shapes for regular block FP8. The
 Qwen3.8-27B profile uses its hidden=5120 and intermediate=17408 FFN checkpoint
-projections for every quantization track. End-to-end MXFP8 includes activation
+projections for every quantization track. The super3-mamba profile isolates
+Super3.5's input (K=4096, N=18560) and output (K=8192, N=4096) projections;
+use --dtype fp4-a16 for their serving precision. End-to-end MXFP8 includes activation
 quantization and compares only b12x with DeepGEMM; weight quantization remains
 setup work. Regular block FP8 compares compact FP32 K128 scales with FlashInfer
 groupwise GEMM.
@@ -94,19 +96,33 @@ QWEN38_27B_GEMM_SPECS = [
 
 FP8_BLOCK_GEMM_SPECS = QWEN38_27B_GEMM_SPECS
 
+SUPER3_MAMBA_GEMM_SPECS = [
+    # Each shape occurs in all 40 Mamba blocks of NVIDIA_Super3_5_VL_IQ2XXS-Packed.
+    ("Super3.5 Mamba in_proj", 4096, 18560,
+     "NVFP4 mixer.in_proj: BF16 activations, hidden=4096"),
+    ("Super3.5 Mamba out_proj", 8192, 4096,
+     "NVFP4 mixer.out_proj: BF16 activations, expanded hidden=8192"),
+]
+
 DEFAULT_PROFILE = "default"
 QWEN38_27B_PROFILE = "qwen3.8-27b"
+SUPER3_MAMBA_PROFILE = "super3-mamba"
 GEMM_PROFILES = {
     DEFAULT_PROFILE: "mixed production shapes",
     QWEN38_27B_PROFILE: "Qwen3.8-27B FFN checkpoint projections",
+    SUPER3_MAMBA_PROFILE: "Super3.5 NVFP4 Mamba input/output projections",
 }
 
 
 def gemm_specs_for_mode(mode: str, profile: str = DEFAULT_PROFILE):
     if profile == QWEN38_27B_PROFILE:
         return QWEN38_27B_GEMM_SPECS
+    if profile == SUPER3_MAMBA_PROFILE:
+        return SUPER3_MAMBA_GEMM_SPECS
     if profile != DEFAULT_PROFILE:
         raise ValueError(f"unknown dense GEMM profile: {profile}")
+    if mode in ("fp4-a16", "fp8-a16"):
+        return [*FP4_GEMM_SPECS, *FP8_GEMM_SPECS, *QWEN38_27B_GEMM_SPECS]
     if mode == "fp4":
         return FP4_GEMM_SPECS
     if mode == "fp8-block":
@@ -740,18 +756,28 @@ def main():
         help=(
             "Model shape profile. qwen3.8-27b applies the Qwen3.8-27B FFN "
             "gate/up and down projection shapes to NVFP4, MXFP8, and regular "
-            "K128 block-FP8 modes."
+            "K128 block-FP8 modes. super3-mamba isolates Super3.5 Mamba "
+            "input/output projections; use fp4-a16 for the serving precision."
         ),
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--evidence", type=pathlib.Path, help="JSONL evidence output for A16 comparisons.")
     parser.add_argument("--model-path", type=pathlib.Path, help="Safetensors checkpoint for checkpoint-a16.")
-    parser.add_argument("--checkpoint-recipe", choices=("iq2_xs", "nvfp4"),
+    parser.add_argument("--checkpoint-recipe", choices=("iq2_xs", "iq2_xxs", "q8_0", "nvfp4"),
                         help="Restrict checkpoint-a16 to one stored weight recipe.")
     parser.add_argument("--profile-graphs", action="store_true",
                         help="Expose one cold-L2 replay per checkpoint case to CUDA profiling.")
-    parser.add_argument("--tune-a16", action="store_true", help="Race the 16 A16 tile/split configurations.")
+    a16_config = parser.add_mutually_exclusive_group()
+    a16_config.add_argument("--tune-a16", action="store_true", help="Race the 16 A16 tile/split configurations.")
+    a16_config.add_argument(
+        "--a16-config", type=int, nargs=3, metavar=("TILE_N", "TILE_K", "SPLIT_K"),
+        help="Pin the fp4-a16/fp8-a16 launch configuration instead of tuning.",
+    )
+    parser.add_argument(
+        "--flashinfer-w4a16", choices=("cute-dsl", "cudnn"),
+        help="Add FlashInfer BF16 x NVFP4 to the fp4-a16 graph-replay race.",
+    )
     parser.add_argument(
         "--batch-sizes",
         type=int,
@@ -807,6 +833,10 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.a16_config is not None and args.dtype not in ("fp4-a16", "fp8-a16"):
+        parser.error("--a16-config requires --dtype fp4-a16 or fp8-a16")
+    if args.flashinfer_w4a16 is not None and args.dtype != "fp4-a16":
+        parser.error("--flashinfer-w4a16 requires --dtype fp4-a16")
     if args.dtype == "checkpoint-a16":
         from benchmarks.checkpoint_dense import run
         run(args)
@@ -826,8 +856,7 @@ def main():
         from benchmarks.benchmark_blockscaled_precision import run
         specs = ([(args.shape_name, args.k, args.n, "explicit CLI shape")]
                  if args.n is not None else
-                 QWEN38_27B_GEMM_SPECS if args.profile == QWEN38_27B_PROFILE else
-                 [*FP4_GEMM_SPECS, *FP8_GEMM_SPECS, *QWEN38_27B_GEMM_SPECS])
+                 gemm_specs_for_mode(args.dtype, args.profile))
         run(args, specs, flashinfer_error=_FLASHINFER_IMPORT_ERROR)
         return
     if _FLASHINFER_IMPORT_ERROR is not None:
@@ -881,6 +910,8 @@ def main():
     print(f"Profile: {args.profile} ({GEMM_PROFILES[args.profile]})")
     if args.profile == QWEN38_27B_PROFILE:
         print("Qwen3.8-27B FFN gate/up and down projections")
+    elif args.profile == SUPER3_MAMBA_PROFILE:
+        print("Super3.5 Mamba in_proj and out_proj (40 blocks each)")
     elif args.dtype == "fp4":
         print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     elif args.dtype in ("fp8", "fp8-e2e"):
