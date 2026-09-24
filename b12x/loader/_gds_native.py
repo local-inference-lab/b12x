@@ -83,7 +83,7 @@ def _load():
                     libraries={str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in libraries},
                     sources={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [
                         source, shared, source.with_name("_gds_checkpoint.c"),
-                        source.with_name("_gds_owner.c"), source.with_name("_pool_api.h"), *headers]})
+                        source.with_name("_gds_owner.c"), source.with_name("_cuda_range.h"), *headers]})
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "b12x" / "gds" / digest
     cache.mkdir(parents=True, exist_ok=True)

@@ -10,12 +10,12 @@ from b12x._lib.architecture import UnsupportedArchitectureError
 from b12x.moe import fused_moe
 from b12x.preparation import require_prepared
 from tests._reference.trellis_reference import moe_reference
-from tests._reference.trellis_atoms import atom_fixture, btx_atom_fixture
+from tests._reference.trellis_atoms import atom_fixture, exl3_atom_fixture
 
 
 def _btx_plan(raw, layer):
     return fused_moe.plan_weights(
-        source=fused_moe.BtxSource(manifest=layer.manifest),
+        source=fused_moe.Exl3Source(manifest=layer.manifest),
         activation=fused_moe.ActivationSpec(
             mode="a16", nonlinearity=raw.activation, io_dtype=torch.bfloat16,
         ),
@@ -26,20 +26,20 @@ def _btx_plan(raw, layer):
     )
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
-@pytest.mark.parametrize("coupled", [False, True])
-def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, coupled):
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3", "lut_fp16"])
+@pytest.mark.parametrize("intermediate_hadamard", [False, True])
+def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, intermediate_hadamard):
     if not torch.cuda.is_available():
         pytest.skip("CUDA preparation requires a GPU")
     public, bundle, _, _ = atom_fixture(
-        codebook=codebook, group_size=64, coupled=coupled, device="cuda"
+        codebook=codebook, group_size=64, intermediate_hadamard=intermediate_hadamard, device="cuda"
     )
     prepared = fused_moe.prepare_weights(plan=public, weights=bundle)
     payload = prepared._impl.representation_for("w4a16")
     assert prepared.plan._impl.trellis_group_size == payload.group_size == 64
-    assert payload.w13.data_ptr() == bundle.atoms.data_ptr()
-    assert payload.trellis.coupled_hadamard is coupled
-    assert payload.trellis.input_scale_split == (128 if coupled else None)
+    assert payload.w13.data_ptr() == bundle.codes.data_ptr()
+    assert payload.trellis.intermediate_hadamard is intermediate_hadamard
+    assert payload.trellis.input_scale_split == (128 if intermediate_hadamard else None)
     if torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
         with pytest.raises(
             (UnsupportedArchitectureError, NotImplementedError), match="SM103 backend"
@@ -59,20 +59,20 @@ def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, coupled):
         activation_kind=public.activation.nonlinearity,
     )
     assert torch.isfinite(reference).all() and torch.count_nonzero(reference)
-    poisoned = bundle.atoms.clone()
+    poisoned = bundle.codes.clone()
     poisoned[0, -1] = 1
     for atoms, message in (
         (poisoned, "padding"),
-        (bundle.atoms[:, :16].contiguous(), "shorter"),
+        (bundle.codes[:, :16].contiguous(), "shorter"),
         (
-            torch.empty(bundle.atoms.numel() + 1, dtype=torch.uint8, device="cuda")[
+            torch.empty(bundle.codes.numel() + 1, dtype=torch.uint8, device="cuda")[
                 1:
-            ].view_as(bundle.atoms),
+            ].view_as(bundle.codes),
             "aligned",
         ),
     ):
         with pytest.raises(ValueError, match=message):
-            fused_moe.prepare_weights(plan=public, weights=replace(bundle, atoms=atoms))
+            fused_moe.prepare_weights(plan=public, weights=replace(bundle, codes=atoms))
     with pytest.raises(ValueError, match="group boundary|post-transform blocks"):
         fused_moe.prepare_weights(
             plan=public,
@@ -82,19 +82,19 @@ def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, coupled):
         )
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
-@pytest.mark.parametrize("coupled", [False, True])
-def test_btx_pair_preparation_and_independent_oracle(tmp_path, codebook, coupled):
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3"])
+@pytest.mark.parametrize("intermediate_hadamard", [False, True])
+def test_exl3_pair_preparation_and_independent_oracle(tmp_path, codebook, intermediate_hadamard):
     if not torch.cuda.is_available():
         pytest.skip("CUDA preparation requires a GPU")
     from unittest.mock import patch
 
-    public, layer, _ = btx_atom_fixture(tmp_path, codebook=codebook, coupled=coupled)
+    public, layer, _ = exl3_atom_fixture(tmp_path, codebook=codebook, intermediate_hadamard=intermediate_hadamard)
     public = _btx_plan(public, layer)
     # This qualifies CUDA byte preparation only; no SM103 kernel executes here.
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
         experts = fused_moe.prepare_weights(
-            plan=public, weights=fused_moe.BtxWeights(layer=layer, device="cuda"),
+            plan=public, weights=fused_moe.Exl3Weights(layer=layer, device="cuda"),
         )
     payload = experts._impl.representation_for("w4a16")
     source = torch.randn(3, 512, dtype=torch.bfloat16, device="cuda") * 0.01
@@ -108,43 +108,43 @@ def test_btx_pair_preparation_and_independent_oracle(tmp_path, codebook, coupled
     torch.testing.assert_close(cancelled, torch.zeros_like(cancelled), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3", "lut_fp16"])
 @pytest.mark.parametrize(
-    "coupled,group_size,width",
+    "intermediate_hadamard,group_size,width",
     [
         (False, 32, 256),
         (True, 64, 256),
         (True, None, 384),
     ],
 )
-def test_native_atom_moe_graph_and_capacity(codebook, coupled, group_size, width):
-    _run_native_atom_moe(codebook, coupled, group_size, width)
+def test_native_atom_moe_graph_and_capacity(codebook, intermediate_hadamard, group_size, width):
+    _run_native_atom_moe(codebook, intermediate_hadamard, group_size, width)
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
-@pytest.mark.parametrize("coupled,first,width", [(False, 0, 512), (True, 0, 512), (True, 16, 256)])
-def test_native_btx_pair_moe_graph_and_capacity(tmp_path, codebook, coupled, first, width):
-    _run_native_atom_moe(codebook, coupled, 256, width, btx_path=tmp_path, first_slot=first)
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3"])
+@pytest.mark.parametrize("intermediate_hadamard,first,width", [(False, 0, 512), (True, 0, 512), (True, 16, 256)])
+def test_native_exl3_pair_moe_graph_and_capacity(tmp_path, codebook, intermediate_hadamard, first, width):
+    _run_native_atom_moe(codebook, intermediate_hadamard, 256, width, exl3_path=tmp_path, first_slot=first)
 
 
-def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None, first_slot=0):
+def _run_native_atom_moe(codebook, intermediate_hadamard, group_size, width, *, exl3_path=None, first_slot=0):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for complete grouped Trellis MoE")
 
-    if btx_path is None:
+    if exl3_path is None:
         public, bundle, _, _ = atom_fixture(
-            codebook=codebook, group_size=group_size, coupled=coupled,
+            codebook=codebook, group_size=group_size, intermediate_hadamard=intermediate_hadamard,
             width=width, device="cuda",
         )
         experts = fused_moe.prepare_weights(plan=public, weights=bundle)
     else:
-        public, layer, _ = btx_atom_fixture(
-            btx_path, codebook=codebook, coupled=coupled, width=width,
+        public, layer, _ = exl3_atom_fixture(
+            exl3_path, codebook=codebook, intermediate_hadamard=intermediate_hadamard, width=width,
             first_slot=first_slot, global_width=1024 if first_slot else 768,
         )
         public = _btx_plan(public, layer)
         experts = fused_moe.prepare_weights(
-            plan=public, weights=fused_moe.BtxWeights(layer=layer, device="cuda"),
+            plan=public, weights=fused_moe.Exl3Weights(layer=layer, device="cuda"),
         )
     payload = experts._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
@@ -159,7 +159,7 @@ def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None,
     activation_kind = public.activation.nonlinearity
     assert all(v.config.backend == "tcgen05_trellis" for v in states.values())
     launches = tuple(id(fn) for fn in native_plan._backend_plan.launches.values())
-    assert len(launches) == (15 if coupled else 14)
+    assert len(launches) == (15 if intermediate_hadamard else 14)
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
@@ -215,7 +215,7 @@ def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None,
             for target in (None, external):
                 external.fill_(float("nan"))
                 bound = bind(live, target)
-                assert len(bound._backend_binding.calls) == (7 if coupled and payload.trellis.input_scale_split is None else 8)
+                assert len(bound._backend_binding.calls) == (7 if intermediate_hadamard and payload.trellis.input_scale_split is None else 8)
                 check(run(binding=bound), references[live])
                 if target is not None:
                     assert torch.isnan(external[live:]).all()

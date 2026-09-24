@@ -9,8 +9,8 @@ from typing import Any, Mapping
 
 class TrellisCodebook(str, Enum):
     MCG = "mcg"
-    SQG_E4M3 = "sqg_e4m3"
-    SQG_FP16 = "sqg_fp16"
+    LUT_E4M3 = "lut_e4m3"
+    LUT_FP16 = "lut_fp16"
 
 
 class RateGranularity(str, Enum):
@@ -83,7 +83,7 @@ class TrellisRateConfig:
             if group_size % 32:
                 raise ValueError(
                     "b12x_trellis.rate.group_size must be a multiple of the "
-                    "32-channel atom width"
+                    "32-channel slot width"
                 )
         return cls(
             granularity=_enum(
@@ -244,7 +244,7 @@ class TrellisExpertTransform:
     kind: str
     pre_block_size: int | None = None
     post_block_size: int | None = None
-    draw_granularity: str | None = None
+    sign_pattern_granularity: str | None = None
 
     @classmethod
     def from_dict(cls, value: object) -> "TrellisExpertTransform":
@@ -253,7 +253,7 @@ class TrellisExpertTransform:
             name="b12x_trellis.transform.expert",
             required=frozenset({"kind"}),
             optional=frozenset(
-                {"pre_block_size", "post_block_size", "draw_granularity"}
+                {"pre_block_size", "post_block_size", "sign_pattern_granularity"}
             ),
         )
         kind = data["kind"]
@@ -264,16 +264,16 @@ class TrellisExpertTransform:
                     "expert transform fields are invalid when kind is 'none'"
                 )
             return cls(kind="none")
-        if kind != "coupled_hadamard":
+        if kind != "intermediate_hadamard":
             raise ValueError(
                 "b12x_trellis.transform.expert.kind must be 'none' or "
-                f"'coupled_hadamard'; got {kind!r}"
+                f"'intermediate_hadamard'; got {kind!r}"
             )
-        required = {"pre_block_size", "post_block_size", "draw_granularity"}
+        required = {"pre_block_size", "post_block_size", "sign_pattern_granularity"}
         missing = sorted(required - frozenset(data))
         if missing:
             raise ValueError(
-                "coupled_hadamard expert transform is missing: "
+                "intermediate_hadamard expert transform is missing: "
                 + ", ".join(missing)
             )
         pre = _positive_int(
@@ -286,25 +286,25 @@ class TrellisExpertTransform:
         )
         if pre & (pre - 1) or post & (post - 1):
             raise ValueError("expert transform block sizes must be powers of two")
-        draw_granularity = data["draw_granularity"]
-        if draw_granularity != "per_expert":
+        sign_pattern_granularity = data["sign_pattern_granularity"]
+        if sign_pattern_granularity != "per_expert":
             raise ValueError(
-                "coupled_hadamard draw_granularity must be 'per_expert'"
+                "intermediate_hadamard sign_pattern_granularity must be 'per_expert'"
             )
         return cls(
             kind=kind,
             pre_block_size=pre,
             post_block_size=post,
-            draw_granularity=draw_granularity,
+            sign_pattern_granularity=sign_pattern_granularity,
         )
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {"kind": self.kind}
-        if self.kind == "coupled_hadamard":
+        if self.kind == "intermediate_hadamard":
             result.update(
                 pre_block_size=self.pre_block_size,
                 post_block_size=self.post_block_size,
-                draw_granularity=self.draw_granularity,
+                sign_pattern_granularity=self.sign_pattern_granularity,
             )
         return result
 

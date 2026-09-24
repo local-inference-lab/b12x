@@ -24,6 +24,7 @@ from b12x.gemm._shared.wo_mxfp8 import (
     pack_mxfp8_scales_for_dense_gemm,
 )
 from ._a16 import NVFP4LinearWeight, pack_nvfp4_weight
+from ._iq2_xs import IQ2XSLinearWeight, pack_iq2_xs_weight
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ class TensorFP8LinearWeight:
     out_features: int
 
 
-Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight
+Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight | IQ2XSLinearWeight
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -401,7 +402,7 @@ def pack_tensor_fp8_linear_weight(
 
 def pack_weight(
     weight: torch.Tensor,
-    scale: torch.Tensor,
+    scale: torch.Tensor | None = None,
     *,
     recipe: str | None = None,
     global_scale: torch.Tensor | None = None,
@@ -416,8 +417,18 @@ def pack_weight(
     ``recipe='nvfp4'`` borrows packed uint8 values and swizzled E4M3 scales.
     Pass the weight-only ``global_scale`` and its ``global_scale_kind``
     (``'multiplier'`` or ``'reciprocal'``); no scale transformation occurs.
+
+    ``recipe='iq2_xs'`` takes CUDA uint8 ``[N,K/256,74]`` safetensors block
+    payloads with embedded scales. Omit ``scale`` and ``global_scale``.
+    Preparation losslessly rearranges descriptors and metadata for A16 GEMM.
     """
 
+    if recipe == "iq2_xs":
+        if scale is not None or global_scale is not None or global_scale_kind != "multiplier":
+            raise ValueError("IQ2_XS scales are embedded in its block payload")
+        return pack_iq2_xs_weight(weight)
+    if scale is None:
+        raise ValueError("this weight recipe requires a scale tensor")
     if recipe == "nvfp4":
         return pack_nvfp4_weight(weight, scale, global_scale,
                                  global_scale_kind=global_scale_kind)
@@ -826,13 +837,13 @@ def blockscaled_mm(
     if plan is None:
         raise TypeError("blockscaled.mm requires a prepared Plan")
 
-    if isinstance(rhs, NVFP4LinearWeight) or (
+    if isinstance(rhs, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
         isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
         and lhs.dtype in (torch.bfloat16, torch.float16)
         and plan.component_id == "gemm.blockscaled_precision"
     ):
         if not isinstance(lhs, torch.Tensor):
-            raise TypeError("packed NVFP4 linear requires a BF16 source tensor")
+            raise TypeError("packed linear requires a BF16 source tensor")
         options = dict(kwargs)
         bias = options.pop("bias", None)
         out_dtype = options.pop("out_dtype", None)
@@ -847,11 +858,10 @@ def blockscaled_mm(
         if lhs.shape[-1] != rhs.in_features:
             raise ValueError("source logical K does not match the packed weight")
         from ._ops import linear
-        fp4 = isinstance(rhs, NVFP4LinearWeight)
+        from ._a16 import _weight_parts
+        values, scales, global_scale, fp4 = _weight_parts(rhs)
         result = linear(
-            lhs, rhs.values if fp4 else rhs.weight.values,
-            rhs.scale_mma if fp4 else rhs.weight.scale_mma,
-            rhs.global_scale if fp4 else None, plan=plan,
+            lhs, values, scales, global_scale, plan=plan,
             global_scale_kind=rhs.global_scale_kind if fp4 else "none",
             out=out, **options,
         )

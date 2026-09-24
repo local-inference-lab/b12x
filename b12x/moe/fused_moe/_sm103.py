@@ -50,7 +50,7 @@ def capacity_regime(tokens: int) -> str:
 
 
 def heuristic(query):
-    if query.source_format in {"b12x_trellis", "btx"}:
+    if query.source_format in {"b12x_trellis", "exl3"}:
         from ._sm103_trellis import BACKEND as trellis_backend
 
         config = MoeDecodeConfig(backend=trellis_backend, route_planner="internal", max_active_clusters=None)
@@ -71,7 +71,7 @@ def independent_reference(a, experts, ids, weights):
 
 
 def validate_policy(query, config):
-    if query.source_format in {"b12x_trellis", "btx"}:
+    if query.source_format in {"b12x_trellis", "exl3"}:
         from ._sm103_trellis import validate_policy as validate_trellis
 
         return validate_trellis(query, config)
@@ -165,7 +165,7 @@ def plan_execution(
 ):
     from ._impl import TPMoEPlan
 
-    if weight_plan.source_format in {"b12x_trellis", "btx"}:
+    if weight_plan.source_format in {"b12x_trellis", "exl3"}:
         from ._sm103_trellis import plan_execution as plan_trellis
 
         return plan_trellis(
@@ -407,7 +407,7 @@ class BackendPlan:
 def plan_scratch(caps, *, prewarm_launches):
     from ._impl import TPMoEArenaLayout, TPMoEScratchPlan
 
-    if caps.weight_plan.source_format in {"b12x_trellis", "btx"}:
+    if caps.weight_plan.source_format in {"b12x_trellis", "exl3"}:
         from ._sm103_trellis import plan_scratch as plan_trellis
 
         return plan_trellis(

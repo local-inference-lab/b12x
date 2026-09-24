@@ -281,8 +281,8 @@ def test_qsa_bind_accepts_a_runtime_pool_smaller_than_planned_capacity() -> None
         compressed_k_cache=binding.compressed_k_cache[:1],
     )
 
-    assert rebound.plan.caps.main_table_width == 2
-    assert rebound.plan.caps.compressed_table_width == 2
+    assert rebound.state.caps.main_table_width == 2
+    assert rebound.state.caps.compressed_table_width == 2
     assert rebound.main_k_cache.shape[0] == 1
     assert rebound.compressed_k_cache.shape[0] == 1
 
@@ -1920,6 +1920,67 @@ def test_qsa_paged_representative_scores_match_fp32_reference() -> None:
     torch.testing.assert_close(scores, expected_scores, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize(
+    ("rank", "expected_eligible"), [(0, 1), (1, 0), (2, 0), (3, 0)]
+)
+def test_qsa_cute_score_respects_dcp_rank_eligibility(
+    rank: int,
+    expected_eligible: int,
+) -> None:
+    from b12x.attention.qsa._score_cute import launch_score_representatives
+
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        dcp_size=4,
+        dcp_rank=rank,
+        cp_kv_cache_interleave_size=4,
+    )
+    prepared = torch.ones(
+        (1, caps.index_heads, caps.index_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    cache = torch.ones(
+        (
+            caps.num_compressed_cache_pages,
+            caps.compressed_page_size,
+            caps.index_head_dim,
+        ),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    table = torch.arange(
+        caps.compressed_table_width, dtype=torch.int32, device=device,
+    ).unsqueeze(0)
+    scores = torch.empty((1, caps.max_groups), dtype=torch.float32, device=device)
+    eligible = torch.empty((1,), dtype=torch.int32, device=device)
+    lengths = torch.empty_like(eligible)
+
+    launch_score_representatives(
+        prepared_query=prepared,
+        query_positions=torch.tensor([3], dtype=torch.int64, device=device),
+        request_ids=torch.tensor([0], dtype=torch.int64, device=device),
+        sequence_lengths=torch.tensor([4], dtype=torch.int32, device=device),
+        compressed_cache=cache,
+        compressed_block_table=table,
+        scores=scores,
+        eligible_counts=eligible,
+        merge_lengths=lengths,
+        group_offset=0,
+        group_count=caps.max_groups,
+        caps=caps,
+    )
+
+    assert eligible.item() == expected_eligible
+    assert lengths.item() == expected_eligible
+    if expected_eligible == 0:
+        assert torch.all(scores == -torch.inf)
+
+
 def test_qsa_representative_scores_match_explicit_32_32_1_partition() -> None:
     device = require_sm120()
     caps = _caps(
@@ -3318,7 +3379,7 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
 
 
 def _draft_selection_state(binding):
-    storage_plan = binding.plan.draft_selection_plan()
+    storage_plan = qsa.draft_selection_plan(binding.plan)
     storage = {
         spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
         for spec in storage_plan.storage_specs()
@@ -3500,6 +3561,49 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
     )
 
 
+def test_qsa_draft_reuse_attends_appended_tail_positions() -> None:
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        max_speculative_tokens=3,
+    )
+    binding = _allocate_binding(caps)
+    state = _draft_selection_state(binding)
+    binding = _rebind(binding, draft_selection=state)
+    binding.main_block_table[0, 0] = 0
+    binding.compressed_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.zero_()
+    binding.main_v_cache[0, 4].fill_(1)
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+
+    initial = _dynamic_inputs(binding, positions=(3,), request_ids=(0,))
+    initial["query"].zero_()
+    qsa.run(binding, **initial)
+
+    output = qsa.run(
+        binding,
+        query=torch.zeros_like(initial["query"]),
+        request_ids=initial["request_ids"],
+        query_positions=torch.tensor([4], dtype=torch.int64, device=device),
+        reuse=qsa.DraftSelectionReuse(
+            torch.tensor([0], dtype=torch.int64, device=device)
+        ),
+    )
+
+    assert binding._draft_work_positions[0, caps.selection_width].item() == 4
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, 0.2),
+        rtol=0.02,
+        atol=0.02,
+    )
+
+
 @pytest.mark.parametrize("draft", [False, True])
 def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch, draft):
     """Fresh bindings may not construct synchronization resources inside capture."""
@@ -3611,7 +3715,7 @@ def test_qsa_draft_storage_binding_is_caller_owned_and_preserves_contents():
         max_speculative_tokens=3,
     )
     binding = _allocate_binding(caps)
-    storage_plan = binding.plan.draft_selection_plan(max_source_rows=8)
+    storage_plan = qsa.draft_selection_plan(binding.plan, max_source_rows=8)
     (spec,) = storage_plan.storage_specs()
     storage = torch.full(spec.shape, 37, dtype=spec.dtype, device=spec.device)
     expected = storage.clone()
@@ -3636,7 +3740,7 @@ def test_qsa_draft_storage_binding_is_caller_owned_and_preserves_contents():
     with pytest.raises(ValueError, match="requires"):
         storage_plan.bind(storage=storage[:1])
     with pytest.raises(ValueError, match="cover planned query rows"):
-        binding.plan.draft_selection_plan(max_source_rows=1)
+        qsa.draft_selection_plan(binding.plan, max_source_rows=1)
     for aliased_storage in (binding.main_k_cache.view(torch.uint8), binding.scratch):
         with pytest.raises(ValueError, match="overlap"):
             _rebind(binding, draft_selection=storage_plan.bind(storage=aliased_storage))
@@ -3676,11 +3780,11 @@ def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
             ),
         )
     source_rows = torch.zeros(
-        binding.plan.caps.max_batch, dtype=torch.int64, device=device
+        binding.state.caps.max_batch, dtype=torch.int64, device=device
     )
     with pytest.raises(ValueError, match="does not accept selector inputs"):
         qsa.run(binding, **dynamic, reuse=qsa.DraftSelectionReuse(source_rows))
-    aliased_rows = binding.scratch[: 8 * binding.plan.caps.max_batch].view(torch.int64)
+    aliased_rows = binding.scratch[: 8 * binding.state.caps.max_batch].view(torch.int64)
     with pytest.raises(ValueError, match="overlap"):
         qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
     assert state.num_source_rows.item() == 0

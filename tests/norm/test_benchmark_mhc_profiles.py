@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
 from benchmarks.mhc_profiles import MODEL_PROFILES, load_mhc_profile
+
+
+def test_vllm_import_preserves_benchmark_discovery_for_spawn(monkeypatch, tmp_path):
+    """Compiler children must resolve b12x's benchmarks after importing vLLM."""
+    from benchmarks import vllm_mhc
+
+    monkeypatch.delitem(sys.modules, "vllm", raising=False)
+    package = SimpleNamespace(__file__=str(tmp_path / "vllm" / "__init__.py"))
+    monkeypatch.setattr(vllm_mhc.importlib, "import_module", lambda name: package)
+    original = list(sys.path)
+    assert vllm_mhc._import_vllm(tmp_path) is package
+    assert sys.path == original
 
 
 def _config(profile_name: str, hidden_size: int) -> dict[str, object]:

@@ -71,7 +71,7 @@ class W4A8MaterializedPhase1Kernel:
         activation: str = "silu",
         swiglu_limit: float | None = None,
         trellis_bits: int | None = None,
-        trellis_coupled: bool = False,
+        trellis_intermediate_hadamard: bool = False,
         trellis_direct_lut: bool = False,
         n64_repacked: bool = False,
         n64_tail: bool = False,
@@ -126,12 +126,12 @@ class W4A8MaterializedPhase1Kernel:
             )
         self.w4a8_trellis = trellis_bits is not None
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
-        if trellis_coupled and not self.w4a8_trellis:
-            raise ValueError("trellis_coupled requires trellis_bits")
-        self.trellis_coupled = bool(trellis_coupled)
+        if trellis_intermediate_hadamard and not self.w4a8_trellis:
+            raise ValueError("trellis_intermediate_hadamard requires trellis_bits")
+        self.trellis_intermediate_hadamard = bool(trellis_intermediate_hadamard)
         # Direct-LUT decode gathers each byte from the rate-indexed 192 KiB
-        # global state table instead of hashing into a 4 KiB shared T12
-        # staircase; the shared region is then not allocated.
+        # global table instead of reading a 4 KiB shared value table; the
+        # shared region is then not allocated.
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         if self.w4a8_trellis:
             self.trellis_lut_offset = self.shared_bytes
@@ -442,7 +442,7 @@ class W4A8MaterializedPhase1Kernel:
 
         if cutlass.const_expr(self.w4a8_trellis):
             # Projection-major [proj][E][K16][N16] trellis windows (the
-            # prepared QSRT layout, shared with the micro kernel); stage
+            # prepared trellis layout, shared with the micro kernel); stage
             # the four K16 rows of this K64 epoch for gate (projection 0)
             # and up (projection 1). B is fully scaled E4M3 after decode,
             # so the SFB regions stay unstaged.
@@ -963,7 +963,7 @@ class W4A8MaterializedPhase1Kernel:
             cute.arch.sync_threads()
             tr_isz = intermediate_tiles * Int32(128)
             tr_col = output_tile * Int32(128) + lane * Int32(4)
-            tr_seg = Int32(6) if cutlass.const_expr(self.trellis_coupled) else Int32(3)
+            tr_seg = Int32(6) if cutlass.const_expr(self.trellis_intermediate_hadamard) else Int32(3)
             tr_rot = expert_idx * (tr_seg * tr_isz) + tr_col
             rg0 = cutlass.Float32(trellis_rotations[tr_rot])
             rg1 = cutlass.Float32(trellis_rotations[tr_rot + Int32(1)])
@@ -994,7 +994,7 @@ class W4A8MaterializedPhase1Kernel:
                     up_tile_base
                     + (seam_row * Int32(self.tile_n) + lane * Int32(4)) * Int32(2)
                 )
-                if cutlass.const_expr(self.trellis_coupled):
+                if cutlass.const_expr(self.trellis_intermediate_hadamard):
                     aa0 = cutlass.Float32(0.0)
                     aa1 = cutlass.Float32(0.0)
                     bb0 = cutlass.Float32(0.0)

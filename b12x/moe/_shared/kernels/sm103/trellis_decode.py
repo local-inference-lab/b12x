@@ -10,8 +10,8 @@ from cutlass import Int32, Int64, Uint32, Uint64
 
 from b12x._lib.intrinsics import (
     fp8x4_e4m3_to_half2x2,
-    packed_decode_sqg_fp16_d3l_to_half2x4,
-    packed_decode_trellis_sqg_direct_lut_to_e4m3x8,
+    packed_decode_lut_fp16_to_half2x4,
+    packed_decode_lut_e4m3_direct_to_e4m3x8,
     packed_dequant_trellis_stream_to_half2x4,
     trellis_align_stream_u32x2,
 )
@@ -54,12 +54,12 @@ def decode_lane(
         second = hi
         if cutlass.const_expr(bits != 6):
             second = Uint32(((Uint64(hi) << 32) | Uint64(lo)) >> (4 * bits))
-        if cutlass.const_expr(codebook == "sqg_fp16"):
-            h0, h1, h2, h3 = packed_decode_sqg_fp16_d3l_to_half2x4(
+        if cutlass.const_expr(codebook == "lut_fp16"):
+            h0, h1, h2, h3 = packed_decode_lut_fp16_to_half2x4(
                 lo, second, lut.toint(), bits
             )
         else:
-            e0, e1 = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+            e0, e1 = packed_decode_lut_e4m3_direct_to_e4m3x8(
                 lo, second, lut.toint(), bits, rate_indexed=True
             )
             h0, h1 = fp8x4_e4m3_to_half2x2(e0)

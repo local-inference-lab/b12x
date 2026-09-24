@@ -12,29 +12,29 @@ from tests.moe.test_trellis_config import _k3_config
 
 def prepare_experts(
     *,
-    coupled,
+    intermediate_hadamard,
     bits,
     dtype,
     device,
     geometry=(3, 512, 256),
-    transform_draw=0,
+    sign_pattern=0,
     global_intermediate_size=None,
     intermediate_offset=0,
     distinct_input_scales=False,
-    codebook="sqg_e4m3",
+    codebook="lut_e4m3",
     swiglu_limit=None,
 ):
     experts, hidden, width = geometry
     config = _k3_config()
     config["codebook"] = codebook
-    if not coupled:
+    if not intermediate_hadamard:
         config["transform"]["expert"] = {"kind": "none"}
     for field in config["scale"]:
         config["scale"][field] = {"vectors": "per_expert", "gains": "none"}
     plan = fused_moe.plan_weights(
         source=fused_moe.TrellisConfig.from_dict(config),
         activation=fused_moe.ActivationSpec(
-            mode="a16", nonlinearity="situ" if coupled else "silu", io_dtype=dtype,
+            mode="a16", nonlinearity="situ" if intermediate_hadamard else "silu", io_dtype=dtype,
             swiglu_limit=swiglu_limit,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -48,7 +48,7 @@ def prepare_experts(
         )
 
     bundle = fused_moe.TrellisWeights(
-        atoms=torch.randint(
+        codes=torch.randint(
             0,
             256,
             (width // 32, experts * 3 * (hidden // 16) * 64 * bits),
@@ -61,10 +61,10 @@ def prepare_experts(
         ),
         intermediate_scales=scales((experts, 3, width)),
         output_scales=scales((experts, hidden)),
-        expert_transform_draws=torch.full(
-            (experts,), transform_draw, dtype=torch.uint8, device=device
+        expert_sign_patterns=torch.full(
+            (experts,), sign_pattern, dtype=torch.uint8, device=device
         )
-        if coupled
+        if intermediate_hadamard
         else None,
         global_intermediate_size=global_intermediate_size,
         intermediate_offset=intermediate_offset,
@@ -73,24 +73,24 @@ def prepare_experts(
 
 
 @pytest.mark.parametrize(
-    "codebook,coupled,bits",
-    [(codebook, coupled, bits)
-     for codebook, rates in (("sqg_e4m3", (2, 3, 4)), ("sqg_fp16", (5, 6)))
-     for coupled in (False, True) for bits in rates],
+    "codebook,intermediate_hadamard,bits",
+    [(codebook, intermediate_hadamard, bits)
+     for codebook, rates in (("lut_e4m3", (2, 3, 4)), ("lut_fp16", (5, 6)))
+     for intermediate_hadamard in (False, True) for bits in rates],
 )
-def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
+def test_canonical_preparation_and_independent_oracle(codebook, intermediate_hadamard, bits):
     if not torch.cuda.is_available():
         pytest.skip("CUDA preparation requires a GPU")
     torch.manual_seed(123)
-    dtype = torch.float16 if coupled else torch.bfloat16
+    dtype = torch.float16 if intermediate_hadamard else torch.bfloat16
     experts = prepare_experts(
-        coupled=coupled,
+        intermediate_hadamard=intermediate_hadamard,
         bits=bits,
         dtype=dtype,
         device="cuda",
-        transform_draw=3 if coupled else 0,
-        global_intermediate_size=1024 if coupled else None,
-        intermediate_offset=256 if coupled else 0,
+        sign_pattern=3 if intermediate_hadamard else 0,
+        global_intermediate_size=1024 if intermediate_hadamard else None,
+        intermediate_offset=256 if intermediate_hadamard else 0,
         codebook=codebook,
     )
     payload = experts._impl.representation_for("w4a16")
@@ -186,8 +186,8 @@ def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
 
 
 def _run_native_moe(
-    coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2, cross_half=False,
-    codebook="sqg_e4m3", swiglu_limit=None,
+    intermediate_hadamard, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2, cross_half=False,
+    codebook="lut_e4m3", swiglu_limit=None,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for native Trellis MoE")
@@ -196,18 +196,18 @@ def _run_native_moe(
     expert_count, hidden, _ = geometry
     route_capacity = max(6, expert_count)
     torch.manual_seed(813)
-    dtype = torch.float16 if coupled else torch.bfloat16
+    dtype = torch.float16 if intermediate_hadamard else torch.bfloat16
     experts = prepare_experts(
-        coupled=coupled,
+        intermediate_hadamard=intermediate_hadamard,
         bits=bits,
         dtype=dtype,
         device="cuda",
         geometry=geometry,
-        transform_draw=7 if coupled else 0,
+        sign_pattern=7 if intermediate_hadamard else 0,
         global_intermediate_size=(geometry[2] if cross_half else 4 * geometry[2])
-        if coupled
+        if intermediate_hadamard
         else None,
-        intermediate_offset=geometry[2] if coupled and not cross_half else 0,
+        intermediate_offset=geometry[2] if intermediate_hadamard and not cross_half else 0,
         distinct_input_scales=cross_half,
         codebook=codebook,
         swiglu_limit=swiglu_limit,
@@ -342,12 +342,12 @@ def _run_native_moe(
 
 
 @pytest.mark.parametrize(
-    "coupled,bits",
+    "intermediate_hadamard,bits",
     [(False, 2), (False, 3), (False, 4), (True, 2), (True, 3), (True, 4)],
 )
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_native_moe_oracle_capacity_binding_and_graph(coupled, bits, id_dtype):
-    _run_native_moe(coupled, bits, id_dtype)
+def test_native_moe_oracle_capacity_binding_and_graph(intermediate_hadamard, bits, id_dtype):
+    _run_native_moe(intermediate_hadamard, bits, id_dtype)
 
 
 def test_v41_geometry_native_moe():
@@ -362,14 +362,14 @@ def test_v41_clamped_silu_geometry_native_moe():
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4])
-def test_native_coupled_cross_half_moe(bits):
+def test_native_intermediate_hadamard_cross_half_moe(bits):
     _run_native_moe(True, bits, torch.int64, geometry=(3, 512, 384), cross_half=True)
 
 
 @pytest.mark.parametrize("bits", [5, 6])
-@pytest.mark.parametrize("coupled,cross_half", [(False, False), (True, False), (True, True)])
-def test_native_sqg_fp16_moe(bits, coupled, cross_half):
+@pytest.mark.parametrize("intermediate_hadamard,cross_half", [(False, False), (True, False), (True, True)])
+def test_native_lut_fp16_moe(bits, intermediate_hadamard, cross_half):
     _run_native_moe(
-        coupled, bits, torch.int64, geometry=(3, 512, 384 if cross_half else 256),
-        cross_half=cross_half, codebook="sqg_fp16",
+        intermediate_hadamard, bits, torch.int64, geometry=(3, 512, 384 if cross_half else 256),
+        cross_half=cross_half, codebook="lut_fp16",
     )

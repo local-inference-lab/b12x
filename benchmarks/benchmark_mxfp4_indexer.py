@@ -19,7 +19,7 @@ import torch
 from b12x.preparation import PreparationSession
 from benchmarks.attention_preparation import prepare_mxfp4
 from b12x.attention import dsa_indexer as indexer
-from benchmarks.common import nvidia_smi_gpu_mode_snapshot
+from benchmarks.common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
 from benchmarks.benchmark_v41_serving import repository_state
 
 
@@ -279,6 +279,7 @@ def run_mode(args, candidates_mode):
                     for _ in range(args.warmup):
                         graph.replay()
                 torch.cuda.synchronize(device)
+                flush = make_l2_flush_fn(args.cold_l2)
                 allocated = torch.cuda.memory_allocated(device)
                 samples = {name: [] for name in graphs}
                 for sample in range(args.samples):
@@ -289,6 +290,8 @@ def run_mode(args, candidates_mode):
                             torch.cuda.Event(enable_timing=True),
                             torch.cuda.Event(enable_timing=True),
                         )
+                        if flush is not None:
+                            flush()
                         begin.record()
                         for _ in range(args.replays):
                             graphs[name].replay()
@@ -370,11 +373,14 @@ def main():
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=200)
+    parser.add_argument("--cold-l2", action="store_true", help="Read-evict L2 before each timed graph; requires --replays 1")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.rows = [int(value) for value in args.rows.split(",")]
     args.widths = [int(value) for value in args.widths.split(",")]
     args.modes = args.modes.split(",")
+    if args.cold_l2 and args.replays != 1:
+        parser.error("--cold-l2 requires --replays 1 so every measured replay is cold")
     if (
         min(*args.rows, *args.widths, args.samples, args.replays, args.warmup) <= 0
         or max(args.widths) > args.capacity

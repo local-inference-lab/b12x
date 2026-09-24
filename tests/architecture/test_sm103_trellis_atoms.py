@@ -46,7 +46,7 @@ def test_input_scale_axes_follow_declarations(experts, per_expert):
     "granularity", ["uniform", "per_layer", "per_expert", "per_expert_projection"]
 )
 @pytest.mark.parametrize("group_size", [None, 32, 256])
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_fp16"])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_fp16"])
 def test_rate_axes_preserve_both_plane_nibbles(granularity, group_size, codebook):
     config = _glm_config()
     config["codebook"] = codebook
@@ -63,7 +63,7 @@ def test_rate_axes_preserve_both_plane_nibbles(granularity, group_size, codebook
     }[granularity]
     if group_size is not None:
         shape += (groups,)
-    first, last = (0x65, 0x56) if codebook == "sqg_fp16" else (0x42, 0x64)
+    first, last = (0x65, 0x56) if codebook == "lut_fp16" else (0x42, 0x64)
     raw = torch.full(shape, first, dtype=torch.uint8)
     if group_size is not None:
         raw[..., -1] = last
@@ -73,7 +73,7 @@ def test_rate_axes_preserve_both_plane_nibbles(granularity, group_size, codebook
     assert atomic and value.shape == (groups, 3, 3) and value.is_contiguous()
     assert torch.all(value[-1] == (last if group_size is not None else first))
     invalid_rates = (0x13, 0x37, 0xFF)
-    if codebook == "sqg_fp16":
+    if codebook == "lut_fp16":
         invalid_rates += (0x45, 0x54, 0x75, 0x57)
     for invalid in invalid_rates:
         raw.fill_(invalid)
@@ -92,7 +92,7 @@ def cpu_prepare(plan, bundle):
         _effective_input_scales,
         _effective_intermediate_scales,
         _effective_output_scales,
-        _coupled_input_scales,
+        _intermediate_hadamard_input_scales,
     )
 
     config = plan.source
@@ -101,7 +101,7 @@ def cpu_prepare(plan, bundle):
         plan.geometry.hidden_size,
         plan.geometry.intermediate_size,
     )
-    device = bundle.atoms.device
+    device = bundle.codes.device
     rates, _ = normalize_rates(
         config, bundle.rate, experts=e, intermediate_size=i, device=device
     )
@@ -112,8 +112,8 @@ def cpu_prepare(plan, bundle):
         hidden_size=h,
         device=device,
     )
-    if config.transform.expert.kind == "coupled_hadamard":
-        gate, up = _coupled_input_scales(bundle, gate, up, i)
+    if config.transform.expert.kind == "intermediate_hadamard":
+        gate, up = _intermediate_hadamard_input_scales(bundle, gate, up, i)
     middle = _effective_intermediate_scales(
         bundle.intermediate_scales,
         config.scale.intermediate_scales,
@@ -143,10 +143,10 @@ def cpu_prepare(plan, bundle):
     )
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
-@pytest.mark.parametrize("coupled,group_size", [(False, 32), (True, 64), (True, None)])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3", "lut_fp16"])
+@pytest.mark.parametrize("intermediate_hadamard,group_size", [(False, 32), (True, 64), (True, None)])
 def test_atom_binding_reuses_capacity_kernels(
-    monkeypatch, codebook, coupled, group_size
+    monkeypatch, codebook, intermediate_hadamard, group_size
 ):
     import cutlass.cute as cute
     from b12x.moe._shared.execution import PreparedWeightLayout
@@ -154,14 +154,14 @@ def test_atom_binding_reuses_capacity_kernels(
     from tests.architecture.test_sm103_trellis_moe import caps
 
     public, bundle, rates, _ = atom_fixture(
-        codebook=codebook, group_size=group_size, coupled=coupled
+        codebook=codebook, group_size=group_size, intermediate_hadamard=intermediate_hadamard
     )
     payload = cpu_prepare(public, bundle)
     torch.testing.assert_close(payload.rates, rates, atol=0, rtol=0)
-    assert payload.w13.data_ptr() == bundle.atoms.data_ptr()
+    assert payload.w13.data_ptr() == bundle.codes.data_ptr()
     raw = replace(public._impl, trellis_group_size=payload.group_size)
     capacity = replace(
-        caps(monkeypatch, coupled=coupled),
+        caps(monkeypatch, intermediate_hadamard=intermediate_hadamard),
         weight_plan=raw,
         num_topk=2,
         route_num_experts=6,
@@ -169,10 +169,10 @@ def test_atom_binding_reuses_capacity_kernels(
     plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
     with patch.object(cute, "compile", side_effect=lambda *args, **kwargs: object()):
         launches = backend.compile_launches(capacity, offline=True)
-    assert len(launches) == (15 if coupled else 14)
+    assert len(launches) == (15 if intermediate_hadamard else 14)
     assert {name for name in launches if name.startswith("fc")} == (
         {"fc1_atoms", "fc2_atoms", "fc1_atoms_dual"}
-        if coupled
+        if intermediate_hadamard
         else {"fc1_atoms", "fc2_atoms"}
     )
     plan = replace(
@@ -230,7 +230,7 @@ def test_atom_binding_reuses_capacity_kernels(
             )
             calls = bound._backend_binding.calls
             assert len(calls) == 8
-            fc1 = launches["fc1_atoms_dual" if coupled else "fc1_atoms"]
+            fc1 = launches["fc1_atoms_dual" if intermediate_hadamard else "fc1_atoms"]
             projections = [
                 args for fn, args in calls if fn in (fc1, launches["fc2_atoms"])
             ]
@@ -248,28 +248,28 @@ def test_atom_binding_reuses_capacity_kernels(
             backend._atom_contract(capacity, corrupted)
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
-@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3"])
+@pytest.mark.parametrize("intermediate_hadamard", [False, True])
 @pytest.mark.parametrize("first,width,global_width", [(0, 512, 768), (8, 256, 1024), (16, 256, 1024)])
-def test_btx_pair_records_retain_public_binding_and_scale_order(
-    tmp_path, monkeypatch, codebook, coupled, first, width, global_width
+def test_exl3_pair_records_retain_public_binding_and_scale_order(
+    tmp_path, monkeypatch, codebook, intermediate_hadamard, first, width, global_width
 ):
     import cutlass.cute as cute
-    from tests._reference.trellis_atoms import btx_atom_fixture
+    from tests._reference.trellis_atoms import exl3_atom_fixture
     from tests.architecture.test_sm103_trellis_moe import caps
 
-    weight_plan, layer, _ = btx_atom_fixture(
-        tmp_path, codebook=codebook, coupled=coupled,
+    weight_plan, layer, _ = exl3_atom_fixture(
+        tmp_path, codebook=codebook, intermediate_hadamard=intermediate_hadamard,
         first_slot=first, width=width, global_width=global_width,
     )
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
         owner = _impl.prepare_b12x_fp4_moe_weights(
             plan=weight_plan, params_dtype=torch.bfloat16,
-            btx_layer=layer, btx_device="cpu",
+            exl3_layer=layer, exl3_device="cpu",
         )
     payload = owner.representation_for("w4a16")
-    assert payload.paired_records and payload.source_format == "btx"
-    assert payload.w13.data_ptr() == layer.atoms.data_ptr()
+    assert payload.paired_records and payload.source_format == "exl3"
+    assert payload.w13.data_ptr() == layer.codes.data_ptr()
     assert payload.group_size == 256
     columns = []
     for projection in range(3):
@@ -286,7 +286,7 @@ def test_btx_pair_records_retain_public_binding_and_scale_order(
         assert torch.equal(payload.rates[:, :, projection] & 15, table >> 4)
         assert torch.equal(payload.rates[:, :, projection] >> 4, table & 15)
     capacity = replace(
-        caps(monkeypatch, coupled=coupled), weight_plan=weight_plan,
+        caps(monkeypatch, intermediate_hadamard=intermediate_hadamard), weight_plan=weight_plan,
         num_topk=2, route_num_experts=6,
     )
     plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
@@ -296,7 +296,7 @@ def test_btx_pair_records_retain_public_binding_and_scale_order(
         return object()
     with patch.object(cute, "compile", side_effect=capture):
         launches = backend.compile_launches(capacity, offline=True)
-    assert len(launches) == (15 if coupled else 14)
+    assert len(launches) == (15 if intermediate_hadamard else 14)
     assert all(kernel.paired_records for kernel in kernels if hasattr(kernel, "paired_records"))
     plan = replace(plan, _backend_plan=replace(plan._backend_plan, launches=launches, lut=torch.zeros(16, dtype=torch.uint8)))
     scratch = {s.name: torch.empty(s.shape, dtype=s.dtype) for s in plan.scratch_specs()}
@@ -306,7 +306,7 @@ def test_btx_pair_records_retain_public_binding_and_scale_order(
         for live in (8, 1, 4, 3):
             bound = plan.bind( scratch=scratch, experts=owner, a=source[:live], topk_ids=ids[:live], topk_weights=router[:live])
             calls = bound._backend_binding.calls
-            assert len(calls) == (7 if coupled and payload.trellis.input_scale_split is None else 8)
+            assert len(calls) == (7 if intermediate_hadamard and payload.trellis.input_scale_split is None else 8)
             fc1 = launches["fc1_atoms_dual" if payload.trellis.input_scale_split else "fc1_atoms"]
             selected = [args for fn, args in calls if fn in (fc1, launches["fc2_atoms"])]
             assert [int(args[7]) for args in selected] == [0, 1, 2]
@@ -315,55 +315,55 @@ def test_btx_pair_records_retain_public_binding_and_scale_order(
         backend._atom_contract(capacity, replace(payload, paired_records=False))
 
 
-@pytest.mark.parametrize("coupled", [False, True])
-def test_btx_pair_preparation_fails_closed(tmp_path, coupled):
-    from tests._reference.trellis_atoms import btx_atom_fixture
-    from b12x.moe.fused_moe.trellis_atoms import prepare_btx_atom_weights
+@pytest.mark.parametrize("intermediate_hadamard", [False, True])
+def test_exl3_pair_preparation_fails_closed(tmp_path, intermediate_hadamard):
+    from tests._reference.trellis_atoms import exl3_atom_fixture
+    from b12x.moe.fused_moe.trellis_atoms import prepare_exl3_atom_weights
 
-    _, layer, _ = btx_atom_fixture(tmp_path, coupled=coupled)
-    poisoned = layer.atoms.clone()
+    _, layer, _ = exl3_atom_fixture(tmp_path, intermediate_hadamard=intermediate_hadamard)
+    poisoned = layer.codes.clone()
     poisoned[0, -1] = 1
     failures = [
         (replace(layer, rates_fc1=None), "rates"),
         (replace(layer, rates_fc2=layer.rates_fc2.int()), "rates"),
         (replace(layer, rates_fc1=torch.full_like(layer.rates_fc1, 0x53)), "pair kinds"),
-        (replace(layer, atoms=layer.atoms[:, :16].contiguous()), "shorter"),
-        (replace(layer, atoms=layer.atoms[:1]), "extent"),
-        (replace(layer, atoms=poisoned), "padding"),
+        (replace(layer, codes=layer.codes[:, :16].contiguous()), "shorter"),
+        (replace(layer, codes=layer.codes[:1]), "extent"),
+        (replace(layer, codes=poisoned), "padding"),
         (replace(layer, rotations=layer.rotations.flatten()), "rotations"),
         (replace(layer, gate_suh=layer.gate_suh.float()), "side tables"),
     ]
-    if coupled:
+    if intermediate_hadamard:
         failures.extend([
-            (replace(layer, rotation_draws=None), "draws"),
-            (replace(layer, rotation_draws=torch.full_like(layer.rotation_draws, 8)), "draws"),
+            (replace(layer, sign_pattern=None), "sign patterns"),
+            (replace(layer, sign_pattern=torch.full_like(layer.sign_pattern, 8)), "sign patterns"),
         ])
     for invalid, message in failures:
         with pytest.raises(ValueError, match=message):
-            prepare_btx_atom_weights(invalid, activation="situ" if coupled else "silu", device="cpu")
+            prepare_exl3_atom_weights(invalid, activation="situ" if intermediate_hadamard else "silu", device="cpu")
 
 
-@pytest.mark.parametrize("coupled,width,kinds", [
+@pytest.mark.parametrize("intermediate_hadamard,width,kinds", [
     (True, 256, ("P33",)), (False, 512, ("P33",)),
     (False, 256, ("P22", "P44")),
 ])
-def test_btx_pair_expansion_does_not_enable_sm12x(monkeypatch, coupled, width, kinds):
+def test_exl3_pair_expansion_does_not_enable_sm12x(monkeypatch, intermediate_hadamard, width, kinds):
     from b12x._lib.architecture import UnsupportedArchitectureError
     from b12x.preparation import DeviceIdentity
     from b12x.moe.fused_moe._tuning import TUNING
     from b12x.moe.fused_moe._sm103 import query_for_weight_plan
 
     plan = _impl.plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16", source_format="btx", activation="situ",
+        quant_modes="w4a16", source_format="exl3", activation="situ",
         params_dtype=torch.bfloat16, num_experts=3, hidden_size=512,
-        intermediate_size=width, trellis_codebook="sqg_e4m3", trellis_bits=3,
+        intermediate_size=width, trellis_codebook="lut_e4m3", trellis_bits=3,
         trellis_rate_granularity="per_expert_pair", trellis_pair_kinds=kinds,
-        coupled_hadamard=coupled, coupled_hadamard_blocks=(512, 128) if coupled else None,
+        intermediate_hadamard=intermediate_hadamard, intermediate_hadamard_blocks=(512, 128) if intermediate_hadamard else None,
     )
     identity = DeviceIdentity(vendor="nvidia", product_name="Synthetic SM120", compute_capability=(12, 0), sm_count=70)
     query = query_for_weight_plan(plan, quant_mode="w4a16", num_tokens=1, num_topk=2)
     config = TUNING.configure(query, device=identity, search=False).default
-    with pytest.raises(UnsupportedArchitectureError, match="SM12x BTX paired"):
+    with pytest.raises(UnsupportedArchitectureError, match="SM12x EXL3 paired"):
         _impl.plan_tp_moe_execution(
             num_tokens=1, num_topk=2, device="cpu", weight_plan=plan,
             quant_mode="w4a16", decode_config=config,

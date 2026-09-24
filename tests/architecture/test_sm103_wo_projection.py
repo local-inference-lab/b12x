@@ -71,7 +71,8 @@ def native_plan(monkeypatch, inverse=False, stages=None):
         out.fill_(7)
     quantizers = SimpleNamespace(quantize_a=quantize, quantize_b=quantize,
                                  quantize_a_inv_rope=inverse_quantize)
-    state = _PreparedWO(scratch_state, plan.query, SimpleNamespace(run=dense),
+    ordinary_a = SimpleNamespace(run=dense, lowering=SimpleNamespace(b_tile_major=False))
+    state = _PreparedWO(scratch_state, plan.query, ordinary_a,
                         SimpleNamespace(run=dense), None, quantizers)
     install_host_state(plan, state, config, scratch=scratch_state.scratch_specs())
     return plan

@@ -13,7 +13,7 @@ CASES = (
     *(f"dense:{recipe}" for recipe in ("nvfp4", "mxfp4", "mxfp8", "tensor_fp8", "block_fp8",
                                         "mxfp6_e2m3", "mxfp6_e3m2", "w6a8_e2m3", "w6a8_e3m2")),
     "block_linear:32", "block_linear:128", "fp8_workspace:tensor_fp8", "fp8_workspace:block_fp8",
-    "trellis:uniform", "trellis:coupled", "trellis:mixed", "trellis:grouped", "trellis:btx", "trellis:btx_coupled",
+    "trellis:uniform", "trellis:intermediate_hadamard", "trellis:mixed", "trellis:grouped", "trellis:exl3", "trellis:exl3_intermediate_hadamard",
     "packed:nvfp4", "packed:mxfp8", "packed:mxfp8_fp16", "prefill:gdn", "prefill:kda", "wo:plain", "wo:inv_rope", "vocab",
     "mtp:rms_concat", "mtp:rms_streams_fp8", "mtp:qwen_multistream",
     "gdn:kda", "gdn:qwen", "glm:1", "glm:2", "compressed:deepseek_v4", "compressed:deepseek_v41",
@@ -176,37 +176,37 @@ def trellis_compiler_declaration(kind):
     import torch
     from b12x.moe import fused_moe as op
     e, k, n = 2, 512, 256
-    coupled, grouped = kind in {"coupled", "btx_coupled"}, kind == "grouped"
+    intermediate_hadamard, grouped = kind in {"intermediate_hadamard", "exl3_intermediate_hadamard"}, kind == "grouped"
     mixed = kind in {"mixed", "grouped"}
     rate = {"granularity": "per_expert_projection" if mixed else "uniform"}
     if grouped:
         rate["group_size"] = 32
     config = op.TrellisConfig.from_dict({
-        "version": 2, "codebook": "mcg" if mixed else "sqg_e4m3", "rate": rate,
+        "version": 2, "codebook": "mcg" if mixed else "lut_e4m3", "rate": rate,
         "scale": {name: {"vectors": "per_expert", "gains": "none"}
                   for name in ("input_scales", "intermediate_scales", "output_scales")},
         "transform": {
             "projection": {"kind": "scaled_hadamard", "block_size": 128},
-            "expert": {"kind": "coupled_hadamard", "pre_block_size": 512,
-                       "post_block_size": 128, "draw_granularity": "per_expert"}
-                      if coupled else {"kind": "none"},
+            "expert": {"kind": "intermediate_hadamard", "pre_block_size": 512,
+                       "post_block_size": 128, "sign_pattern_granularity": "per_expert"}
+                      if intermediate_hadamard else {"kind": "none"},
         },
     })
-    if kind.startswith("btx"):
-        from b12x.moe._shared.btx_schema import BtxManifest
-        from b12x.moe._shared.kernels.w4a16.btx_synth import BtxSynthConfig, _manifest_dict
+    if kind.startswith("exl3"):
+        from b12x.moe._shared.exl3_schema import Exl3Manifest
+        from b12x.moe._shared.kernels.w4a16.exl3_synth import Exl3SynthConfig, _manifest_dict
         rates = torch.tensor([[0x24, 0x43]], dtype=torch.uint8)
-        metadata = _manifest_dict(BtxSynthConfig(
-            codebook="sqg_e4m3", num_experts=e, hidden_size=k, intermediate_size=n,
-            moe_layer_indices=(0,), rate_tables={0: (rates, rates)}, coupled=coupled,
-            pre_block=512 if coupled else None, post_block=128 if coupled else None,
+        metadata = _manifest_dict(Exl3SynthConfig(
+            codebook="lut_e4m3", num_experts=e, hidden_size=k, intermediate_size=n,
+            moe_layer_indices=(0,), rate_tables={0: (rates, rates)}, intermediate_hadamard=intermediate_hadamard,
+            pre_block=512 if intermediate_hadamard else None, post_block=128 if intermediate_hadamard else None,
             per_expert_input_rotations=True, extent_alignment_slots=8,
         ))
         # Offline metadata describes an absent checkpoint; it cannot be materialized.
         metadata["layers"] = {"0": {"file": "offline.safetensors", "sha256": "0" * 64}}
-        config = op.BtxSource(manifest=BtxManifest.from_dict(metadata))
+        config = op.Exl3Source(manifest=Exl3Manifest.from_dict(metadata))
     plan = op.plan_weights(source=config,
-        activation=op.ActivationSpec(mode="a16", nonlinearity="situ" if coupled else "silu",
+        activation=op.ActivationSpec(mode="a16", nonlinearity="situ" if intermediate_hadamard else "silu",
                                      io_dtype=torch.bfloat16),
         geometry=op.MoEGeometry(num_experts=e, hidden_size=k, intermediate_size=n))
     from types import SimpleNamespace

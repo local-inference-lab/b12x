@@ -33,8 +33,8 @@ def test_weight_plan_projection_geometry(stage, n, k):
         {"capacity": 0},
         {"capacity": 2**31},
         {"bits": 1},
-        {"codebook": "sqg_e4m3", "bits": 5},
-        {"codebook": "sqg_fp16", "bits": 3},
+        {"codebook": "lut_e4m3", "bits": 5},
+        {"codebook": "lut_fp16", "bits": 3},
         {"codebook": "unknown"},
     ],
 )

@@ -1,8 +1,8 @@
-"""Materialize coupled uniform-rate QSRT payloads into BF16 weight banks.
+"""Materialize uniform-rate intermediate-Hadamard trellis payloads into BF16 weight banks.
 
 The kernel consumes the same native trellis tensors and scale tables as the
 fused MoE path.  Each CTA reconstructs one final 128x128 weight tile, applies
-the ordinary and coupled Hadamard transforms in FP32 on chip, and publishes
+the ordinary and intermediate Hadamard transforms in FP32 on chip, and publishes
 the BF16 tile with a TMA shared-to-global store.  No dense FP32 matrix is
 written to global memory.
 """
@@ -31,7 +31,7 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_shared_u32,
 )
-from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
+from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table
 from b12x._lib.utils import current_cuda_stream
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
@@ -50,7 +50,7 @@ _RING_WORDS = _WARPS * _MAX_WORDS_PER_TILE
 
 
 @dataclass(frozen=True)
-class CoupledUniformMaterializerInputs:
+class IntermediateHadamardUniformMaterializerInputs:
     """Packed weights and transform tables for one complete expert extent."""
 
     upstream_packed: torch.Tensor
@@ -86,17 +86,18 @@ def _h4_coefficient(source_group: cutlass.Constexpr, output_group: Int32):
     return coefficient
 
 
-class CoupledUniformMaterializer:
+class IntermediateHadamardUniformMaterializer:
     """Decode one uniform K2 or K3 matrix family into its final BF16 basis.
 
     The stored tensor has shape ``[M, K/16, N/16, 16*bits]`` in int16 units. The
     output is the transposed dense matrix family ``[E*N_out, K]``.  Down
-    projections have ``M=E`` and ``N_out=N``.  Coupled upstream extents have
+    projections have ``M=E`` and ``N_out=N``.  Upstream extents with an
+    intermediate Hadamard have
     ``M=2E`` and ``N_out=2N``: the two physical FC1 slots are reassembled into
-    the interleaved gate/up coordinate order consumed by the coupled H128.
+    the interleaved gate/up coordinate order consumed by the intermediate H128.
 
-    ``hidden_axis`` selects the dimension carrying the coupled H512.  The
-    other dimension carries the draw-dependent sign vector after its second
+    ``hidden_axis`` selects the dimension carrying the H512.  The other
+    dimension carries the sign-pattern-dependent sign vector after its second
     H128.  This covers both upstream matrices (hidden K) and W2 (hidden N).
     """
 
@@ -126,7 +127,7 @@ class CoupledUniformMaterializer:
             raise ValueError("hidden_axis must be 'k' or 'n'")
         hidden = self.k if self.hidden_axis == "k" else self.n
         if hidden % 512:
-            raise ValueError("the coupled hidden axis must close H512 blocks")
+            raise ValueError("the hidden axis must close H512 blocks")
         if self.joined_upstream and self.hidden_axis != "k":
             raise ValueError("joined upstream payloads require the K hidden axis")
         self.source_matrices = self.experts * (2 if self.joined_upstream else 1)
@@ -163,7 +164,7 @@ class CoupledUniformMaterializer:
         svh: cute.Tensor,
         signs_k: cute.Tensor,
         signs_n: cute.Tensor,
-        t12_lut: cute.Tensor,
+        value_table: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -193,7 +194,7 @@ class CoupledUniformMaterializer:
             svh,
             signs_k,
             signs_n,
-            t12_lut,
+            value_table,
             tma_store,
             tma_output,
             output_staged_layout,
@@ -308,12 +309,12 @@ class CoupledUniformMaterializer:
                 row = element >> Int32(6)
                 local_col = element & Int32(63)
                 source_col = (source_half << Int32(6)) + local_col
-                atom_in_pair = local_col >> Int32(5)
-                within_atom = local_col & Int32(31)
+                slot_in_pair = local_col >> Int32(5)
+                within_slot = local_col & Int32(31)
                 logical_col = (
-                    atom_in_pair * Int32(64)
+                    slot_in_pair * Int32(64)
                     + Int32(slot * 32)
-                    + within_atom
+                    + within_slot
                 )
                 staging[row, logical_col] = cutlass.BFloat16(
                     work[row, source_col]
@@ -431,7 +432,7 @@ class CoupledUniformMaterializer:
         svh: cute.Tensor,
         signs_k: cute.Tensor,
         signs_n: cute.Tensor,
-        t12_lut: cute.Tensor,
+        value_table: cute.Tensor,
         tma_store: cute.CopyAtom,
         output: cute.Tensor,
         output_staged_layout: cute.ComposedLayout,
@@ -482,7 +483,7 @@ class CoupledUniformMaterializer:
         )
         output_smem = output_smem_full[None, None, 0]
         ring_base = shared_ptr_to_u32(storage.ring.data_ptr())
-        lut_base = get_ptr_as_int64(t12_lut, Int32(0))
+        lut_base = get_ptr_as_int64(value_table, Int32(0))
         if tid == Int32(0):
             cpasync.prefetch_descriptor(tma_store)
         cute.arch.sync_threads()
@@ -660,7 +661,7 @@ class CoupledUniformMaterializer:
 
 
 def _compile_materializer(
-    materializer: CoupledUniformMaterializer,
+    materializer: IntermediateHadamardUniformMaterializer,
     *,
     device: torch.device,
 ):
@@ -697,7 +698,7 @@ def _compile_materializer(
         _cute_tensor(svh.reshape(-1), cutlass.Float16),
         _cute_tensor(signs_k.reshape(-1), cutlass.Float16),
         _cute_tensor(signs_n.reshape(-1), cutlass.Float16),
-        _cute_tensor(sqg_xor_cheb_t12_lut(device), cutlass.Uint8),
+        _cute_tensor(lut_e4m3_value_table(device), cutlass.Uint8),
         _cute_tensor(output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16),
         current_cuda_stream(),
     )
@@ -705,7 +706,7 @@ def _compile_materializer(
         materializer,
         *args,
         compile_spec=KernelCompileSpec.from_key(
-            "moe.trellis.coupled_materialize",
+            "moe.trellis.intermediate_hadamard_materialize",
             1,
             materializer.__cache_key__,
             labels=("experts", "k", "n", "bits", "hidden_axis", "joined_upstream"),
@@ -713,22 +714,22 @@ def _compile_materializer(
     )
 
 
-def prepare_coupled_uniform_materializer_inputs(
+def prepare_intermediate_hadamard_uniform_materializer_inputs(
     lower,
     upper,
-) -> CoupledUniformMaterializerInputs:
-    """Join the two 48-atom coupled extents used by complete Kimi experts.
+) -> IntermediateHadamardUniformMaterializerInputs:
+    """Join two 48-slot intermediate-Hadamard extents into complete experts.
 
-    The atoms-v2 coupled profile has a transform barrier at the midpoint of
-    the 96-atom intermediate axis. ``lower`` and ``upper`` are the two
-    prepared BTX extents on the same CUDA device. The returned tensors retain
+    Uniform checkpoints with an intermediate Hadamard have a transform barrier
+    at the midpoint of a 96-slot intermediate axis. ``lower`` and ``upper`` are the two
+    prepared EXL3 extents on the same CUDA device. The returned tensors retain
     native uniform payloads and arrange only the small transform tables needed by
     the complete-matrix materializers.
     """
 
     values = (lower, upper)
-    if any(not bool(value.coupled_hadamard) for value in values):
-        raise ValueError("materializer inputs require coupled-Hadamard extents")
+    if any(not bool(value.intermediate_hadamard) for value in values):
+        raise ValueError("materializer inputs require intermediate-Hadamard extents")
     bits = int(lower.trellis_bits)
     if bits not in (2, 3) or any(int(value.trellis_bits) != bits for value in values):
         raise ValueError("materializer inputs require matching uniform K2 or K3 extents")
@@ -740,11 +741,11 @@ def prepare_coupled_uniform_materializer_inputs(
         or int(upper.hidden_size) != hidden
         or int(upper.intermediate_size) != half_intermediate
     ):
-        raise ValueError("coupled extent geometry does not match")
+        raise ValueError("extent geometry does not match")
     if lower.w13.device != upper.w13.device:
-        raise ValueError("coupled extents must share one CUDA device")
+        raise ValueError("extents must share one CUDA device")
     if half_intermediate % 32:
-        raise ValueError("coupled extent width must close 32-channel atoms")
+        raise ValueError("extent width must close 32-channel slots")
 
     hidden16 = hidden // 16
     half16 = half_intermediate // 16
@@ -776,28 +777,28 @@ def prepare_coupled_uniform_materializer_inputs(
 
     def expand_rows(value: torch.Tensor, width: int) -> torch.Tensor:
         if value.dtype != torch.float16 or value.dim() != 2:
-            raise TypeError("coupled transform tables must be rank-two FP16")
+            raise TypeError("transform tables must be rank-two FP16")
         if int(value.shape[1]) != width or int(value.shape[0]) not in (1, experts):
-            raise ValueError("coupled transform table geometry is invalid")
+            raise ValueError("transform table geometry is invalid")
         return value.expand(experts, width).contiguous()
 
     def rotation_parts(value) -> tuple[torch.Tensor, ...]:
         rotations = value.intermediate_rotations
         if rotations is None or rotations.dtype != torch.float16:
-            raise TypeError("coupled extents require FP16 rotation rows")
+            raise TypeError("extents require FP16 rotation rows")
         if tuple(rotations.shape) != (experts, 6 * half_intermediate):
-            raise ValueError("coupled rotation rows have incompatible geometry")
+            raise ValueError("rotation rows have incompatible geometry")
         return tuple(rotations.split(half_intermediate, dim=1))
 
     lower_parts = rotation_parts(lower)
     upper_parts = rotation_parts(upper)
 
-    def interleave_atoms(slot0: torch.Tensor, slot1: torch.Tensor) -> torch.Tensor:
-        atoms = half_intermediate // 32
+    def interleave_slots(slot0: torch.Tensor, slot1: torch.Tensor) -> torch.Tensor:
+        slot_count = half_intermediate // 32
         return torch.stack(
             (
-                slot0.reshape(experts, atoms, 32),
-                slot1.reshape(experts, atoms, 32),
+                slot0.reshape(experts, slot_count, 32),
+                slot1.reshape(experts, slot_count, 32),
             ),
             dim=2,
         ).reshape(experts, 2 * half_intermediate)
@@ -811,8 +812,8 @@ def prepare_coupled_uniform_materializer_inputs(
     ).contiguous()
     upstream_svh = torch.cat(
         (
-            interleave_atoms(lower_parts[0], lower_parts[1]),
-            interleave_atoms(upper_parts[0], upper_parts[1]),
+            interleave_slots(lower_parts[0], lower_parts[1]),
+            interleave_slots(upper_parts[0], upper_parts[1]),
         ),
         dim=1,
     ).contiguous()
@@ -838,7 +839,7 @@ def prepare_coupled_uniform_materializer_inputs(
     ).contiguous()
     down_signs_n = torch.ones_like(down_svh)
 
-    return CoupledUniformMaterializerInputs(
+    return IntermediateHadamardUniformMaterializerInputs(
         upstream_packed=upstream_packed,
         upstream_suh=upstream_suh,
         upstream_svh=upstream_svh,
@@ -852,7 +853,7 @@ def prepare_coupled_uniform_materializer_inputs(
     )
 
 
-def compile_coupled_uniform_upstream_materializer(
+def compile_intermediate_hadamard_uniform_upstream_materializer(
     *,
     experts: int,
     hidden: int,
@@ -862,7 +863,7 @@ def compile_coupled_uniform_upstream_materializer(
 ):
     """Compile the joined W1/W3 materializer for one expert shard."""
 
-    materializer = CoupledUniformMaterializer(
+    materializer = IntermediateHadamardUniformMaterializer(
         experts=int(experts),
         k=int(hidden),
         n=int(intermediate),
@@ -873,7 +874,7 @@ def compile_coupled_uniform_upstream_materializer(
     return _compile_materializer(materializer, device=torch.device(device))
 
 
-def compile_coupled_uniform_down_materializer(
+def compile_intermediate_hadamard_uniform_down_materializer(
     *,
     experts: int,
     hidden: int,
@@ -883,7 +884,7 @@ def compile_coupled_uniform_down_materializer(
 ):
     """Compile the W2 materializer for one expert shard."""
 
-    materializer = CoupledUniformMaterializer(
+    materializer = IntermediateHadamardUniformMaterializer(
         experts=int(experts),
         k=int(intermediate),
         n=int(hidden),
@@ -893,7 +894,7 @@ def compile_coupled_uniform_down_materializer(
     return _compile_materializer(materializer, device=torch.device(device))
 
 
-def materialize_coupled_uniform(
+def materialize_intermediate_hadamard_uniform(
     compiled,
     *,
     packed: torch.Tensor,
@@ -926,16 +927,16 @@ def materialize_coupled_uniform(
         _cute_tensor(svh.reshape(-1), cutlass.Float16),
         _cute_tensor(signs_k.reshape(-1), cutlass.Float16),
         _cute_tensor(signs_n.reshape(-1), cutlass.Float16),
-        _cute_tensor(sqg_xor_cheb_t12_lut(device), cutlass.Uint8),
+        _cute_tensor(lut_e4m3_value_table(device), cutlass.Uint8),
         _cute_tensor(output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16),
         current_cuda_stream(),
     )
 
 
-CoupledUniformK2MaterializerInputs = CoupledUniformMaterializerInputs
+IntermediateHadamardUniformK2MaterializerInputs = IntermediateHadamardUniformMaterializerInputs
 
 
-class CoupledUniformK2Materializer(CoupledUniformMaterializer):
+class IntermediateHadamardUniformK2Materializer(IntermediateHadamardUniformMaterializer):
     """Compatibility constructor for the uniform-K2 materializer."""
 
     def __init__(
@@ -957,18 +958,18 @@ class CoupledUniformK2Materializer(CoupledUniformMaterializer):
         )
 
 
-def prepare_coupled_uniform_k2_materializer_inputs(
+def prepare_intermediate_hadamard_uniform_k2_materializer_inputs(
     lower,
     upper,
-) -> CoupledUniformK2MaterializerInputs:
-    """Join two uniform-K2 coupled extents."""
+) -> IntermediateHadamardUniformK2MaterializerInputs:
+    """Join two uniform-K2 intermediate-Hadamard extents."""
 
     if int(lower.trellis_bits) != 2 or int(upper.trellis_bits) != 2:
         raise ValueError("K2 materializer inputs require uniform K2 extents")
-    return prepare_coupled_uniform_materializer_inputs(lower, upper)
+    return prepare_intermediate_hadamard_uniform_materializer_inputs(lower, upper)
 
 
-def compile_coupled_uniform_k2_upstream_materializer(
+def compile_intermediate_hadamard_uniform_k2_upstream_materializer(
     *,
     experts: int,
     hidden: int,
@@ -977,7 +978,7 @@ def compile_coupled_uniform_k2_upstream_materializer(
 ):
     """Compile the uniform-K2 joined W1/W3 materializer."""
 
-    return compile_coupled_uniform_upstream_materializer(
+    return compile_intermediate_hadamard_uniform_upstream_materializer(
         experts=experts,
         hidden=hidden,
         intermediate=intermediate,
@@ -986,7 +987,7 @@ def compile_coupled_uniform_k2_upstream_materializer(
     )
 
 
-def compile_coupled_uniform_k2_down_materializer(
+def compile_intermediate_hadamard_uniform_k2_down_materializer(
     *,
     experts: int,
     hidden: int,
@@ -995,7 +996,7 @@ def compile_coupled_uniform_k2_down_materializer(
 ):
     """Compile the uniform-K2 W2 materializer."""
 
-    return compile_coupled_uniform_down_materializer(
+    return compile_intermediate_hadamard_uniform_down_materializer(
         experts=experts,
         hidden=hidden,
         intermediate=intermediate,
@@ -1004,26 +1005,26 @@ def compile_coupled_uniform_k2_down_materializer(
     )
 
 
-def materialize_coupled_uniform_k2(
+def materialize_intermediate_hadamard_uniform_k2(
     compiled,
     **kwargs,
 ) -> None:
     """Launch a compiled uniform-K2 materializer."""
 
-    materialize_coupled_uniform(compiled, **kwargs)
+    materialize_intermediate_hadamard_uniform(compiled, **kwargs)
 
 
 __all__ = [
-    "CoupledUniformK2MaterializerInputs",
-    "CoupledUniformK2Materializer",
-    "CoupledUniformMaterializerInputs",
-    "CoupledUniformMaterializer",
-    "compile_coupled_uniform_down_materializer",
-    "compile_coupled_uniform_k2_down_materializer",
-    "compile_coupled_uniform_k2_upstream_materializer",
-    "compile_coupled_uniform_upstream_materializer",
-    "materialize_coupled_uniform",
-    "materialize_coupled_uniform_k2",
-    "prepare_coupled_uniform_materializer_inputs",
-    "prepare_coupled_uniform_k2_materializer_inputs",
+    "IntermediateHadamardUniformK2MaterializerInputs",
+    "IntermediateHadamardUniformK2Materializer",
+    "IntermediateHadamardUniformMaterializerInputs",
+    "IntermediateHadamardUniformMaterializer",
+    "compile_intermediate_hadamard_uniform_down_materializer",
+    "compile_intermediate_hadamard_uniform_k2_down_materializer",
+    "compile_intermediate_hadamard_uniform_k2_upstream_materializer",
+    "compile_intermediate_hadamard_uniform_upstream_materializer",
+    "materialize_intermediate_hadamard_uniform",
+    "materialize_intermediate_hadamard_uniform_k2",
+    "prepare_intermediate_hadamard_uniform_materializer_inputs",
+    "prepare_intermediate_hadamard_uniform_k2_materializer_inputs",
 ]

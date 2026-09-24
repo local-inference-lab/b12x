@@ -1,4 +1,4 @@
-"""V4.1 benchmark rank geometry and unbiased global routing contracts."""
+"""DeepSeek benchmark geometry and unbiased global routing contracts."""
 
 import json
 from dataclasses import replace
@@ -39,20 +39,22 @@ def test_v41_checkpoint_shards_intermediate_at_native_width(tmp_path):
         build_model_spec(tmp_path, profile)
 
 
-def test_shared_40_benchmark_uses_identical_oracle_and_timing_routes():
+@pytest.mark.parametrize("sharing,unique", ((0, 48), (20, 38), (40, 29), (60, 19), (80, 10), (100, 6)))
+def test_shared_benchmark_uses_identical_oracle_and_timing_routes(sharing, unique):
     spec = ModelSpec(16, 128, 384, 6, 4, 0)
     profile = MODEL_PROFILES["deepseek-v4.1-flash"]
     oracle = make_benchmark_case(
         profile, None, spec, 8, 50, torch.device("cpu"),
-        routing_workload="shared_40",
+        routing_workload=f"shared_{sharing}",
     )
     timing = make_benchmark_case(
         profile, None, spec, 8, 50, torch.device("cpu"),
-        routing_workload="shared_40",
+        routing_workload=f"shared_{sharing}",
     )
     for left, right in zip(oracle[:3], timing[:3], strict=True):
         torch.testing.assert_close(left, right)
-    assert oracle[1].unique().numel() == 29
+    assert oracle[1].unique().numel() == unique
+    assert all(row.unique().numel() == spec.top_k for row in oracle[1])
     assert oracle[3] is None
     torch.testing.assert_close(oracle[2].sum(-1), torch.ones(8))
 
@@ -97,3 +99,25 @@ def test_v41_checkpoint_shard_offsets_are_exact():
     torch.testing.assert_close(row_shard, source_rows[rank * 576:(rank + 1) * 576])
     torch.testing.assert_close(column_shard, source_columns[:, rank * 288:(rank + 1) * 288])
     torch.testing.assert_close(scale_shard, source_scales[:, rank * 18:(rank + 1) * 18])
+
+
+def test_v4_0731_profile_matches_tp2_serving_geometry_and_route_scale(tmp_path):
+    config = {
+        "model_type": "deepseek_v4", "hidden_size": 4096,
+        "moe_intermediate_size": 2048, "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    profile = MODEL_PROFILES["deepseek-v4-flash-0731"]
+    spec = build_model_spec(tmp_path, profile)
+    assert (spec.hidden_size, spec.I_tp, spec.num_experts, spec.top_k, spec.tp_size) == (4096, 1024, 256, 6, 2)
+    assert profile.default_quant_mode == "w4a8_mx"
+    assert profile.default_scale_contract == "per-expert"
+    assert profile.default_swiglu_limit == 10.0
+    for sharing, unique in ((0, 36), (20, 29), (40, 22), (60, 14), (80, 7)):
+        _, ids, weights, _ = make_benchmark_case(
+            profile, SimpleNamespace(gate_route_scale=1.5), spec, 6, 48,
+            torch.device("cpu"), routing_workload=f"shared_{sharing}",
+        )
+        assert ids.unique().numel() == unique
+        torch.testing.assert_close(weights.sum(-1), torch.full((6,), 1.5))

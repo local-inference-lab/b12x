@@ -154,3 +154,10 @@ first pass gets low pool ids, the second lands on high recycled ones.
   typed-SMEM/pipeline contract while preserving math, quantization,
   synchronization, launch geometry, and planner policy. Treat a performance
   cliff as unresolved until fixed or explicitly documented with evidence.
+
+## LIL integration container changelog
+
+Before pushing or importing a runtime-affecting change into an
+`integration/*` branch, read [`.lil/README.md`](.lil/README.md) and add the
+required `.lil/changes/<id>.json` fragment to the same commit series. Preserve
+published fragments unchanged; corrections use a new fragment.

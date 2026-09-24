@@ -341,6 +341,8 @@ class _WOProjectionState:
                 ),
                 dtype=torch.uint8,
             )
+            # Immediate producers overwrite every logical scale before GEMM.
+            # Padding belongs to masked rows; binding must only create views.
             scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(
                 3,
                 4,
@@ -2555,6 +2557,21 @@ def _materialize_wo_projection_scratch(
     )
 
 
+def _wo_a_mma_tiler(
+    expected_m: int | None, *, rank: int, group_width: int, groups: int,
+) -> tuple[int, int] | None:
+    """Select the grouped projection tile from its declared row capacity."""
+    if expected_m is not None and rank <= 1536:
+        if 1 <= expected_m <= 8:
+            return (16, 64)
+        # B9-15 has only been qualified for the four-group, short-K shape.
+        if expected_m == 16 or (
+            9 <= expected_m <= 15 and rank == 1024 and group_width == 512 and groups == 4
+        ):
+            return (32, 64)
+    return None
+
+
 def wo_a_dense_gemm_mxfp8(
     x_tdg: MXFP8Rows,
     wo_a_rdg: MXFP8Rows,
@@ -2599,19 +2616,9 @@ def wo_a_dense_gemm_mxfp8(
     # When out is None, dense_gemm allocates + returns functionally (no caller
     # view mutated in the compile graph). The returned [M,N,L] is read downstream
     # via strides, so its physical layout does not matter.
-    mma_tiler_mn = None
-    if expected_m is not None and wo_a_rdg.values.shape[0] <= 1536:
-        if 1 <= expected_m <= 8:
-            mma_tiler_mn = (16, 64)
-        # B16 is the existing generic decode policy; the B9-15 extension is
-        # measured for the DSV4 TP2 WO-A shape only.
-        elif expected_m == 16 or (
-            9 <= expected_m <= 15
-            and rank == 1024
-            and int(x_tdg.values.shape[1]) == 512
-            and groups == 4
-        ):
-            mma_tiler_mn = (32, 64)
+    mma_tiler_mn = _wo_a_mma_tiler(
+        expected_m, rank=rank, group_width=int(x_tdg.values.shape[1]), groups=groups,
+    )
     x_values = x_tdg.values
     wo_a_values = wo_a_rdg.values
     if x_values.ndim == 2:

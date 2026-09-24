@@ -1,6 +1,6 @@
 """Trellis expert transforms with fixed storage and runtime route counts.
 
-The ordinary path rounds at each FP16 checkpoint boundary. Coupled transforms
+The ordinary path rounds at each FP16 checkpoint boundary. Intermediate-Hadamard transforms
 retain FP32 between their two Hadamards and use the checkpoint's interleaved
 gate/up basis. Projection kernels consume only the resulting FP16 operands.
 """
@@ -127,9 +127,9 @@ class MapRoutes:
 
 
 class InputRotation:
-    def __init__(self, hidden, experts, top_k, capacity, *, coupled):
+    def __init__(self, hidden, experts, top_k, capacity, *, intermediate_hadamard):
         if min(hidden, experts, top_k, capacity) <= 0 or hidden % (
-            512 if coupled else 128
+            512 if intermediate_hadamard else 128
         ):
             raise ValueError(
                 "Trellis input rotation requires positive geometry and complete Hadamard blocks"
@@ -142,8 +142,8 @@ class InputRotation:
             top_k,
             capacity,
         )
-        self.coupled = coupled
-        self.block = 512 if coupled else 128
+        self.intermediate_hadamard = intermediate_hadamard
+        self.block = 512 if intermediate_hadamard else 128
 
     @cute.jit
     def __call__(
@@ -192,7 +192,7 @@ class InputRotation:
                         .to(Float32)
                     )
                 values[j] = value
-            if cutlass.const_expr(self.coupled):
+            if cutlass.const_expr(self.intermediate_hadamard):
                 values = had512(values, lane)
             for group in cutlass.range_constexpr(self.block // 128):
                 scaled = cute.make_rmem_tensor(4, Float32)
@@ -217,7 +217,7 @@ class InputRotation:
 
 class IntermediateRotation:
     def __init__(
-        self, intermediate, experts, capacity, *, coupled, activation,
+        self, intermediate, experts, capacity, *, intermediate_hadamard, activation,
         swiglu_limit=None,
     ):
         if min(intermediate, experts, capacity) <= 0 or intermediate % 128:
@@ -228,12 +228,12 @@ class IntermediateRotation:
             raise ValueError(
                 "Trellis intermediate rotation exceeds the Int32 grid capacity"
             )
-        if activation not in {"silu", "situ"} or (coupled and activation != "situ"):
+        if activation not in {"silu", "situ"} or (intermediate_hadamard and activation != "situ"):
             raise ValueError(
-                "coupled Trellis requires SiTU; ordinary Trellis supports SiLU or SiTU"
+                "intermediate-Hadamard Trellis requires SiTU; ordinary Trellis supports SiLU or SiTU"
             )
         self.width, self.experts, self.capacity = intermediate, experts, capacity
-        self.coupled, self.activation = coupled, activation
+        self.intermediate_hadamard, self.activation = intermediate_hadamard, activation
         self.swiglu_limit = normalize_swiglu_limit_for_activation(
             activation, swiglu_limit
         )
@@ -265,7 +265,7 @@ class IntermediateRotation:
         gate_t = cute.make_tensor(gate, cute.make_layout(self.capacity * self.width))
         up_t = cute.make_tensor(up, cute.make_layout(self.capacity * self.width))
         routes = cute.make_tensor(ids, cute.make_layout(self.capacity))
-        rot_width = self.width * (6 if self.coupled else 3)
+        rot_width = self.width * (6 if self.intermediate_hadamard else 3)
         scales = cute.make_tensor(rotations, cute.make_layout(self.experts * rot_width))
         dest = cute.make_tensor(output, cute.make_layout(self.capacity * self.width))
         if unit < Int64(live_routes) * blocks:
@@ -275,7 +275,7 @@ class IntermediateRotation:
             rot_base = expert * Int64(rot_width)
             values = cute.make_rmem_tensor(4, Float32)
             values.fill(Float32(0))
-            if cutlass.const_expr(not self.coupled):
+            if cutlass.const_expr(not self.intermediate_hadamard):
                 g, u = (
                     cute.make_rmem_tensor(4, Float32),
                     cute.make_rmem_tensor(4, Float32),
@@ -387,9 +387,9 @@ class IntermediateRotation:
 
 
 class OutputRotation:
-    def __init__(self, hidden, experts, top_k, capacity, *, coupled):
+    def __init__(self, hidden, experts, top_k, capacity, *, intermediate_hadamard):
         if min(hidden, experts, top_k, capacity) <= 0 or hidden % (
-            512 if coupled else 128
+            512 if intermediate_hadamard else 128
         ):
             raise ValueError(
                 "Trellis output rotation requires positive geometry and complete Hadamard blocks"
@@ -402,8 +402,8 @@ class OutputRotation:
             top_k,
             capacity,
         )
-        self.coupled = coupled
-        self.block = 512 if coupled else 128
+        self.intermediate_hadamard = intermediate_hadamard
+        self.block = 512 if intermediate_hadamard else 128
 
     @cute.jit
     def __call__(
@@ -468,7 +468,7 @@ class OutputRotation:
                                 values[j]
                                 * scales[expert * scale_stride + column].to(Float32)
                             ) * router[route].to(Float32)
-            if cutlass.const_expr(self.coupled):
+            if cutlass.const_expr(self.intermediate_hadamard):
                 result = had512(result, lane)
             for j in cutlass.range_constexpr(self.block // 32):
                 column = slab * self.block + (j // 4) * 128 + Int64(lane) * 4 + j % 4

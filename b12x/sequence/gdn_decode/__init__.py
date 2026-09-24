@@ -12,6 +12,17 @@ raw gate while preserving the same state and serving lifecycle. Bindings accept
 live tensor capacities within the plan, so serving runtimes can bind
 projection, metadata, and output tensors directly without staging.
 
+With ``Caps.recover_speculative_state=True``, KDA verification instead reads
+column zero, leaves its FP32 checkpoint unchanged, and writes caller-owned
+``correction_cache`` (FP32) and ``kg_cache`` (BF16 original keys/raw gates).
+The record shapes are ``[slot, head, window, 128]`` and
+``[slot, head, window, 256]``; ``state_index_columns`` sets the maximum window.
+``bind_kda_commit`` / ``run_kda_commit`` apply accepted records across a group
+of layers and optionally export an aligned boundary checkpoint. This mode uses
+CuTe for both recurrence and recovery. Gated output normalization is enabled by
+default; ``run_kda(..., apply_output_norm=False)`` returns the unnormalized
+recurrence output. Only recovery mode supports disabling output normalization.
+
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
 ``[batch, head, key_dim, value_dim]`` state used by slow mathematical PyTorch
@@ -58,15 +69,18 @@ META = OpMeta(
         "GdnConfig",
         "GdnQuery",
         "KdaBinding",
+        "KdaCommitBinding",
         "Plan",
         "bind",
         "bind_kda",
+        "bind_kda_commit",
         "is_supported",
         "plan",
         "invocation_from_tensors",
         "reference",
         "run",
         "run_kda",
+        "run_kda_commit",
     ),
     archs=("sm103a", "sm120a", "sm121a"),
     dtypes=("bf16", "fp32", "int32", "int64"),
@@ -87,8 +101,8 @@ META = OpMeta(
         "capacity with three value heads per Q/K head. BF16 and FP32 recurrent "
         "state and int32 or int64 state indices are supported. Triton is used "
         "only for the gated RMSNorm auxiliary. The separately named GLM/KDA "
-        "API retains its dedicated Triton recurrence "
-        "for equal 128-wide Q/K/V head counts."
+        "API uses Triton for full-checkpoint recurrence and CuTe for "
+        "speculative-state recovery, with equal 128-wide Q/K/V head counts."
     ),
 )
 
@@ -99,15 +113,18 @@ if TYPE_CHECKING:
         GdnConfig,
         GdnQuery,
         KdaBinding,
+        KdaCommitBinding,
         Plan,
         bind,
         bind_kda,
+        bind_kda_commit,
         is_supported,
         plan,
         invocation_from_tensors,
         reference,
         run,
         run_kda,
+        run_kda_commit,
     )
 
 install_lazy_api(globals(), META)

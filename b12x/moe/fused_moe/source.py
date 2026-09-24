@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, TypeAlias
 from .config import TrellisConfig
 
 if TYPE_CHECKING:
-    from b12x.moe._shared.btx_schema import BtxManifest
+    from b12x.moe._shared.exl3_schema import Exl3Manifest
 
 
 class PackedSourceFormat(str, Enum):
@@ -19,6 +19,7 @@ class PackedSourceFormat(str, Enum):
     MODELOPT_NVFP4 = "modelopt_nvfp4"
     COMPRESSED_TENSORS_FP4 = "compressed_tensors"
     MXFP6_E8M0_K32 = "mxfp6_e2m3"
+    IQ2_XS = "iq2_xs"
 
 
 class W13Layout(str, Enum):
@@ -41,23 +42,23 @@ class PackedSource:
 
 
 @dataclass(frozen=True, kw_only=True)
-class BtxSource:
-    """Validated BTX manifest describing native expert records and transforms."""
+class Exl3Source:
+    """Validated EXL3 manifest describing native expert records and transforms."""
 
-    manifest: BtxManifest
+    manifest: Exl3Manifest
 
     def __post_init__(self) -> None:
-        from b12x.moe._shared.btx_schema import BtxManifest
+        from b12x.moe._shared.exl3_schema import Exl3Manifest
 
-        if not isinstance(self.manifest, BtxManifest):
-            raise TypeError("BTX source requires a parsed BtxManifest")
+        if not isinstance(self.manifest, Exl3Manifest):
+            raise TypeError("EXL3 source requires a parsed Exl3Manifest")
 
 
-WeightSource: TypeAlias = PackedSource | TrellisConfig | BtxSource
+WeightSource: TypeAlias = PackedSource | TrellisConfig | Exl3Source
 
 
 __all__ = [
-    "BtxSource",
+    "Exl3Source",
     "PackedSource",
     "PackedSourceFormat",
     "W13Layout",

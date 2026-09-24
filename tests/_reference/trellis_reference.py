@@ -33,17 +33,17 @@ def native_weight(payload: torch.Tensor, bits: int, codebook: str) -> torch.Tens
     words = halves[..., 0] | (halves[..., 1] << np.uint32(16))
     decoded = np.empty((experts, n_tiles, 16, k_tiles, 16), dtype=np.float16)
     table = None
-    if codebook == "sqg_e4m3":
-        from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+    if codebook == "lut_e4m3":
+        from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
 
         table = (
-            sqg_xor_cheb_t12_direct_lut_cpu().view(torch.float8_e4m3fn).half().numpy()
+            lut_e4m3_direct_table_cpu().view(torch.float8_e4m3fn).half().numpy()
         )
         table = table[(bits - 2) * 65536 : (bits - 1) * 65536]
-    elif codebook == "sqg_fp16":
-        from b12x._lib.quant.sqg_fp16_d3l import sqg_fp16_d3l_direct_lut_cpu
+    elif codebook == "lut_fp16":
+        from b12x._lib.quant.lut_fp16 import lut_fp16_direct_table_cpu
 
-        table = sqg_fp16_d3l_direct_lut_cpu(bits).numpy()
+        table = lut_fp16_direct_table_cpu(bits).numpy()
     elif codebook != "mcg":
         raise ValueError(f"unknown test codebook {codebook}")
     for lane in range(32):
@@ -85,14 +85,14 @@ def had512(x):
     return torch.einsum("rgc,gh->rhc", transformed, matrix).reshape_as(x)
 
 
-def input_rotation(source, ids, scales, top_k, coupled):
+def input_rotation(source, ids, scales, top_k, intermediate_hadamard):
     output = torch.zeros(
         (ids.numel(), source.shape[1]), device=source.device, dtype=torch.float16
     )
     for row, expert in enumerate(ids.cpu().tolist()):
         if expert >= 0:
             x = source[row // top_k].half().float()
-            if coupled:
+            if intermediate_hadamard:
                 x = had512(x)
             scale = scales[0 if scales.shape[0] == 1 else expert]
             output[row] = had128((x * scale.float()).half())
@@ -111,17 +111,17 @@ def activation(gate, up, kind, swiglu_limit=None):
 
 
 def intermediate_rotation(
-    gate, up, ids, rotations, coupled, kind, swiglu_limit=None
+    gate, up, ids, rotations, intermediate_hadamard, kind, swiglu_limit=None
 ):
-    if coupled and swiglu_limit is not None:
-        raise ValueError("Coupled Trellis does not declare a SwiGLU input clamp")
+    if intermediate_hadamard and swiglu_limit is not None:
+        raise ValueError("Intermediate-Hadamard Trellis does not declare a SwiGLU input clamp")
     width = gate.shape[1]
     result = torch.zeros_like(gate)
     for row, expert in enumerate(ids.cpu().tolist()):
         if expert < 0:
             continue
         gscale, uscale, down = rotations[expert, : 3 * width].reshape(3, width).float()
-        if coupled:
+        if intermediate_hadamard:
             raw = torch.stack(
                 (gate[row].reshape(-1, 32), up[row].reshape(-1, 32)), 1
             ).flatten()
@@ -143,7 +143,7 @@ def intermediate_rotation(
     return result
 
 
-def output_rotation(source, ids, scales, weights, coupled):
+def output_rotation(source, ids, scales, weights, intermediate_hadamard):
     result = torch.zeros(
         (weights.shape[0], source.shape[1]), dtype=torch.float32, device=source.device
     )
@@ -153,7 +153,7 @@ def output_rotation(source, ids, scales, weights, coupled):
             result[row // weights.shape[1]] += (
                 had128(source[row]) * scale * weights.flatten()[row]
             )
-    return had512(result) if coupled else result
+    return had512(result) if intermediate_hadamard else result
 
 
 def _moe_reference(
@@ -177,7 +177,7 @@ def _moe_reference(
 
         rotations = prepared.rotations
         state = SimpleNamespace(
-            coupled_hadamard=prepared.coupled_hadamard,
+            intermediate_hadamard=prepared.intermediate_hadamard,
             input_scale_split=prepared.input_scale_split,
             gate_suh=rotations.gate_suh[:experts],
             up_suh=rotations.up_suh[:experts],
@@ -189,7 +189,7 @@ def _moe_reference(
     else:
         state = prepared.trellis
     width = state.intermediate_rotations.shape[1] // (
-        6 if state.coupled_hadamard else 3
+        6 if state.intermediate_hadamard else 3
     )
     route_map = None if route_expert_map is None else route_expert_map.cpu().tolist()
     output_map = None if output_expert_map is None else output_expert_map.cpu().tolist()
@@ -219,13 +219,13 @@ def _moe_reference(
     device_ids = torch.tensor(ids, device=source.device, dtype=torch.int64)
     final_ids = torch.tensor(output_ids, device=source.device, dtype=torch.int64)
     gate_input = input_rotation(
-        source, device_ids, state.gate_suh, topk_ids.shape[1], state.coupled_hadamard
+        source, device_ids, state.gate_suh, topk_ids.shape[1], state.intermediate_hadamard
     )
     up_input = (
         gate_input
-        if state.coupled_hadamard and state.input_scale_split is None
+        if state.intermediate_hadamard and state.input_scale_split is None
         else input_rotation(
-            source, device_ids, state.up_suh, topk_ids.shape[1], state.coupled_hadamard
+            source, device_ids, state.up_suh, topk_ids.shape[1], state.intermediate_hadamard
         )
     )
     gate = torch.zeros((len(ids), width), device=source.device, dtype=torch.float16)
@@ -325,7 +325,7 @@ def _moe_reference(
         up,
         device_ids,
         state.intermediate_rotations,
-        state.coupled_hadamard,
+        state.intermediate_hadamard,
         activation_kind,
         swiglu_limit,
     )
@@ -338,7 +338,7 @@ def _moe_reference(
         if weight is not None:
             down[rows] = (middle[rows].float() @ weight.float().T).half()
     return output_rotation(
-        down, final_ids, state.down_svh, topk_weights, state.coupled_hadamard
+        down, final_ids, state.down_svh, topk_weights, state.intermediate_hadamard
     )
 
 

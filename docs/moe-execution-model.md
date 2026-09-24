@@ -38,11 +38,12 @@ The canonical numeric recipes are:
 | native W4A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
 | W4A16 | BF16 / none | E4M3 K/16 or E8M0 K/32 | source-preserving |
 
-## Coupled trellis transforms
+## Intermediate Hadamard trellis transforms
 
 Trellis-coded expert weights use canonical `TrellisWeights` through public
-MoE preparation or the [BTX container](btx-checkpoint-format.md). Their
-coupled transform declaration applies
+MoE preparation or arrive in the EXL3 container
+(``docs/exl3-checkpoint-format.md``), which stores a fixed-rate trellis
+payload for each expert matrix. Its intermediate Hadamard declaration applies
 the same exact activation-boundary coordinate change at K2, K3, and K4:
 
 ```text
@@ -52,9 +53,9 @@ expert input
   -> ordinary 128-wide gate/up transforms
   -> compact trellis FC1
   -> inverse ordinary transforms
-  -> coupled gate/up signs and 128-wide transforms
+  -> intermediate gate/up signs and 128-wide transforms
   -> coordinatewise gated activation
-  -> coupled 128-wide post-activation transform
+  -> intermediate 128-wide post-activation transform
   -> ordinary down-projection transform
   -> compact trellis FC2
   -> route reduction
@@ -68,7 +69,7 @@ ordinary projection rows followed by two preactivation rows and one
 post-activation row. The local hidden width must be divisible by 512 and the
 local intermediate width by 128.
 
-The BTX manifest declares the transform explicitly (``hadamard.coupled``
+The EXL3 manifest declares the transform explicitly (``hadamard.intermediate_hadamard``
 with its block widths). Ordinary per-matrix transforms remain valid only for
 artifacts whose metadata specifies them; the runtime does not infer transform
 type from the trellis bit rate.
@@ -367,14 +368,18 @@ Single-token batches cannot share, and a small expert pool can force more reuse.
 The deterministic generator spreads IDs across the expert pool and favors
 already popular experts when reusing them.
 
-The vLLM preparation adapter uses four seeded realizations for 2–8 token
-batches. Every candidate sees the same inputs and is scored over the complete
-mix before elimination. Other batch sizes retain cyclic, maximally spread
-routing. `shared_40_v1` versions selection-cache inputs; compiled kernels do not
-change when the tuning workload changes. This is a simple assumed workload,
-not a claim that all models or every layer have the same routing distribution.
+The vLLM preparation adapter uses five equally weighted sharing levels for
+2–8 token batches: 0%, 20%, 40%, 60%, and 80%. The nominal mean remains 40%,
+but candidate timing covers variation in expert reuse instead of repeating
+one distinct-expert count. Per-token uniqueness and the available expert pool
+can clamp those levels. Every candidate sees the same deterministic inputs
+and is scored over the complete mix before elimination. Other batch sizes
+retain cyclic, maximally spread routing. `shared_0_20_40_60_80_v1` versions
+selection-cache inputs; compiled kernels do not change when the tuning
+workload changes. These are coverage points, not a claim that every model
+or layer follows a uniform distribution of sharing levels.
 
-The assumption is informed by DSV4.1 TP4 serving observations on GB10: 179,600
+The 40% mean is informed by DSV4.1 TP4 serving observations on GB10: 179,600
 target-layer calls from short/medium-context reasoning and code requests showed
 36–42% reuse at observed 5/7/8-row verification sizes. The separate drafter was
 more concentrated (about 62% reuse). Raw traces are diagnostic artifacts, not
@@ -382,5 +387,7 @@ runtime dependencies.
 
 Use `benchmarks/benchmark_moe.py --routing-workload shared_40 --batch-sizes 4 6 8`
 with the usual checkpoint, quantization, and validation arguments to exercise
-this workload in the pre-routed single-operation benchmark. Input generation
-and routing remain outside the timed region.
+this workload in the pre-routed single-operation benchmark. The CLI also accepts
+`shared_0`, `shared_20`, `shared_60`, `shared_80`, and `shared_100` for separate
+coverage measurements, and reports actual expert row counts after rounding.
+Input generation and routing remain outside the timed region.

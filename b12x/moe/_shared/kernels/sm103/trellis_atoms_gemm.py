@@ -1,4 +1,4 @@
-"""SM103 projection directly from canonical or BTX paired Trellis atom planes."""
+"""SM103 projection directly from canonical or EXL3 paired Trellis atom planes."""
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -19,7 +19,7 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
             k,
             experts,
             capacity,
-            bits=5 if codebook == "sqg_fp16" else 3,
+            bits=5 if codebook == "lut_fp16" else 3,
             codebook=codebook,
             dual_input=dual_input,
         )
@@ -36,14 +36,14 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
             )
         self.group_size = group_size
         if paired_records and group_size != 256:
-            raise ValueError("BTX paired records require 256-channel rate groups")
+            raise ValueError("EXL3 paired records require 256-channel rate groups")
         self.paired_records = paired_records
         self.groups = self.intermediate // group_size
         self.fc1 = fc1
-        self.min_bits = 5 if codebook == "sqg_fp16" else 2
-        if paired_records and codebook not in {"mcg", "sqg_e4m3"}:
-            raise ValueError("BTX paired records require MCG or SQG E4M3")
-        self.max_bits = 4 if codebook == "sqg_e4m3" or paired_records else 6
+        self.min_bits = 5 if codebook == "lut_fp16" else 2
+        if paired_records and codebook not in {"mcg", "lut_e4m3"}:
+            raise ValueError("EXL3 paired records require MCG or LUT E4M3")
+        self.max_bits = 4 if codebook == "lut_e4m3" or paired_records else 6
 
     @cute.jit
     def __call__(
@@ -211,7 +211,7 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
             & (high <= self.max_bits)
         )
         if c.const_expr(self.paired_records):
-            # Internal nibbles are reversed from the BTX rate-byte convention.
+            # Internal nibbles are reversed from the EXL3 rate-byte convention.
             valid = valid & (
                 (code == 0x22) | (code == 0x33) | (code == 0x42)
                 | (code == 0x34) | (code == 0x44)

@@ -187,6 +187,20 @@ def _compact_w4a8_query(query):
     )
 
 
+def _repacked_w4a8_decode_query(query):
+    from ._impl import SITU, _W4A8_DECODE_MAX_ROUTED_ROWS
+
+    return (
+        query.quant_mode == "w4a8_mx"
+        and query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 0
+        and query.activation in {"silu", SITU}
+        and 0 < query.routed_rows <= _W4A8_DECODE_MAX_ROUTED_ROWS
+        and not query.deterministic_output
+        and query.controls.get("dynamic_work_source") != "ready_queue"
+    )
+
+
 def _nvfp4_materialization_eligible(query, config):
     tile = query.controls.get("dynamic_tile_mn")
     return bool(
@@ -211,6 +225,18 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    if query.source_format == "iq2_xs":
+        if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
+            raise ValueError("IQ2_XS requires BF16 W4A16 execution")
+        if query.activation not in {"silu", "relu2"} or query.hidden_size % 256 or query.intermediate_size % 256:
+            raise ValueError("IQ2_XS requires aligned SiLU or ReLU² geometry")
+        if config.w4a16_route_mode == "direct":
+            from ._impl import _w4a16_direct_routing_supported
+            if not _w4a16_direct_routing_supported(query):
+                raise ValueError(
+                    "IQ2_XS direct routing requires nondeterministic SiLU or ReLU² capacity <= 8, "
+                    "without activation amax or input router weights"
+                )
     from ._backends import architecture_backend
 
     backend = architecture_backend(_device)
@@ -256,10 +282,9 @@ def validate_moe_decode_config(
     if (
         query.quant_mode == "w4a8_mx" and query.source_format == "fp4_e8m0_k32"
         and query.intermediate_size % 128 == 64 and config.backend == "dynamic"
-        and (config.dynamic_tile_m != 16 or config.dynamic_route_mode != "grouped"
-             or config.route_planner != "internal")
+        and (config.dynamic_tile_m != 16 or config.dynamic_route_mode != "grouped")
     ):
-        raise ValueError("compact N64 W4A8 dynamic execution requires grouped internal M16 routing")
+        raise ValueError("compact N64 W4A8 dynamic execution requires grouped M16 routing")
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
     if query.quant_mode == "w4a16":
@@ -288,21 +313,43 @@ def validate_moe_decode_config(
     if config.route_planner == "triton" and config.dynamic_tile_m != 16:
         raise ValueError("the Triton route planner requires dynamic_tile_m=16")
     if config.route_planner == "triton" and not (
-        query.quant_mode == "nvfp4" and query.activation == "silu" and 0 < query.routed_rows <= 256
+        (query.quant_mode == "nvfp4" or (
+            _compact_w4a8_query(query) and not query.deterministic_output
+            and query.controls.get("dynamic_work_source", "materialized_queue")
+            in {"materialized_queue", "persistent_grid"}
+        )) and query.activation == "silu" and 0 < query.routed_rows <= 256
     ):
-        raise ValueError("the Triton route planner only supports small NVFP4 SiLU workloads")
+        raise ValueError("the Triton route planner requires small NVFP4 or compact W4A8 SiLU workloads")
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
     if config.max_active_clusters is not None:
+        if (
+            config.route_planner == "triton" and _device is not None
+            and config.max_active_clusters > _device.sm_count
+        ):
+            raise ValueError("NVFP4 grid exceeds the resident SM count")
+        repacked_decode = (
+            _repacked_w4a8_decode_query(query)
+            and config.backend == "dynamic"
+            and config.dynamic_tile_m in {16, 32}
+        )
         if config.route_planner != "triton" and not (
             _compact_w4a8_query(query) and config.backend in {"micro", "dynamic"}
-        ):
-            raise ValueError("max_active_clusters requires Triton routing or compact W4A8")
+        ) and not repacked_decode:
+            raise ValueError(
+                "max_active_clusters requires Triton routing, compact W4A8, "
+                "or repacked W4A8 M16/M32 decode"
+            )
         if (
             _compact_w4a8_query(query) and _device is not None
             and config.max_active_clusters > _device.sm_count
         ):
             raise ValueError("max_active_clusters must not exceed the resident SM count")
+        if (
+            repacked_decode and _device is not None
+            and config.max_active_clusters > 2 * _device.sm_count
+        ):
+            raise ValueError("max_active_clusters exceeds the two-CTA-per-SM resident grid")
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
@@ -416,6 +463,23 @@ def _tuning_parameters(query, device):
             ),
             values={"max_active_clusters": (None, *ladder)},
         )
+    if _repacked_w4a8_decode_query(query):
+        # M16/M32 repacked kernels permit two resident CTAs per SM. The knob
+        # counts physical CTAs after that occupancy expansion, not logical SMs.
+        # Keep the uncapped choice and race smaller grids without recompiling.
+        limit = 2 * device.sm_count
+        ladder = sorted(
+            {1 << exponent for exponent in range(limit.bit_length())}
+            | {device.sm_count, max(1, 3 * limit // 4), limit}
+        )
+        return ParameterSpace.create(
+            tuple(
+                replace(knob, when=FrozenMapping({"backend": "dynamic"}))
+                if knob.name == "max_active_clusters" else knob
+                for knob in TUNING.knobs
+            ),
+            values={"max_active_clusters": (None, *ladder)},
+        )
     from ._impl import (
         _LEVEL_TILE_N,
         _dynamic_kernel_intermediate_size,
@@ -433,9 +497,12 @@ def _tuning_parameters(query, device):
         tile_n=_LEVEL_TILE_N,
     )[2]
     clamp = min(device.sm_count, tasks)
-    # Grid width is a runtime-only knob: the powers of two up to that clamp,
-    # plus the clamp itself, bracket every resident grid within a factor of two.
-    ladder = sorted({1 << exponent for exponent in range(clamp.bit_length())} | {clamp})
+    # Race partial resident grids without compiling another kernel.
+    ladder = sorted(
+        {1 << exponent for exponent in range(clamp.bit_length())}
+        | {clamp, min(clamp, max(1, device.sm_count // 2)),
+           min(clamp, max(1, 3 * device.sm_count // 4))}
+    )
     return {"max_active_clusters": (None, *ladder)}
 
 
@@ -504,8 +571,8 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=8,
-    config_schema_version=5,
+    query_schema_version=9,
+    config_schema_version=7,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -514,7 +581,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=7,
+    candidate_contract_version=15,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),

@@ -10,6 +10,12 @@ row-major or F8_128x4-swizzled UE8M0 scales. Pass swizzled storage flattened
 (or as its native 6D view); a 2D ``[M,K/32]`` scale is interpreted as compact.
 ``expected_m`` and precision constraints are immutable query coordinates.
 
+IQ2_XS uses BF16 activations and inline descriptor decoding in the same dense
+warp-MMA engine. ``pack_weight(blocks, recipe='iq2_xs')`` losslessly rearranges
+CUDA uint8 ``[N,K/256,74]`` safetensors payloads; scales are embedded, so no
+separate scale argument is accepted. K must be divisible by 256 and N by 8.
+Only A16 activation precision is supported for this recipe.
+
 ``plan(query)`` declares an invocation without compiling or allocating.
 ``PreparationSession`` selects and primes its prepared ``Plan`` before
 ``mm`` or the explicit ``w4a16``/``w8a16`` entry points may execute. A16 uses
@@ -43,6 +49,7 @@ META = OpMeta(
     entry_points=(
         "Weight",
         "NVFP4LinearWeight",
+        "IQ2XSLinearWeight",
         "BlockscaledQuery",
         "BlockscaledConfig",
         "FixedBlockscaledQuery",
@@ -60,7 +67,7 @@ META = OpMeta(
         "workspace_size",
     ),
     dtypes=("bf16", "fp16", "fp32", "fp8_e4m3", "fp4_e2m1"),
-    recipes=("nvfp4", "mxfp4", "mxfp8"),
+    recipes=("nvfp4", "mxfp4", "mxfp8", "iq2_xs"),
     archs=("sm103a", "sm120a", "sm121a"),
     requires=("triton",),
     provenance=Provenance(
@@ -76,6 +83,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Weight,
         NVFP4LinearWeight,
+        IQ2XSLinearWeight,
         BlockscaledQuery,
         BlockscaledConfig,
         FixedBlockscaledQuery,

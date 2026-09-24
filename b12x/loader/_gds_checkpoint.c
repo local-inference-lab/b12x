@@ -1,6 +1,6 @@
 /* Included by _gds_reader.c. Payloads enter device memory through strict cuFile. */
 #include <limits.h>
-#include "_pool_api.h"
+#include "_cuda_range.h"
 
 #define CHECKPOINT_CAPSULE "b12x.gds_checkpoint"
 #define CHECKPOINT_SCRATCH (8u << 20)
@@ -45,8 +45,6 @@ struct checkpoint_executor {
     checkpoint_job_t *jobs;
     size_t job_count, next_job;
     CUfunction copy, expand;
-    const b12x_pool_api_t *pool;
-    PyObject *pool_owner;
     failure_t failure;
 };
 
@@ -205,7 +203,6 @@ static void checkpoint_delete(PyObject *capsule) {
     Py_BEGIN_ALLOW_THREADS
     checkpoint_release(e);
     Py_END_ALLOW_THREADS
-    Py_XDECREF(e->pool_owner);
     pthread_mutex_destroy(&e->mutex);
     pthread_cond_destroy(&e->ready); pthread_cond_destroy(&e->done);
     free(e);
@@ -214,19 +211,15 @@ static void checkpoint_delete(PyObject *capsule) {
 static PyObject *checkpoint_create(PyObject *self, PyObject *args) {
     (void)self;
     int device, workers;
-    PyObject *pool_owner;
     unsigned long long copy, expand;
-    if (!PyArg_ParseTuple(args, "iiOKK", &device, &workers, &pool_owner, &copy, &expand)) return NULL;
+    if (!PyArg_ParseTuple(args, "iiKK", &device, &workers, &copy, &expand)) return NULL;
     if (workers < 1 || workers > 16) return PyErr_Format(PyExc_ValueError, "io_threads must be between 1 and 16");
-    const b12x_pool_api_t *pool = PyCapsule_GetPointer(pool_owner, B12X_POOL_API_CAPSULE);
-    if (!pool) return NULL;
     checkpoint_executor_t *e = calloc(1, sizeof(*e));
     if (!e) return PyErr_NoMemory();
-    e->device = device; e->pool = pool;
+    e->device = device;
     e->copy = (CUfunction)(uintptr_t)copy; e->expand = (CUfunction)(uintptr_t)expand;
     pthread_mutex_init(&e->mutex, NULL);
     pthread_cond_init(&e->ready, NULL); pthread_cond_init(&e->done, NULL);
-    e->pool_owner = pool_owner; Py_INCREF(pool_owner);
     failure_t failure = {{0}};
     int previous = device;
     Py_BEGIN_ALLOW_THREADS
@@ -265,7 +258,7 @@ static PyObject *checkpoint_create(PyObject *self, PyObject *args) {
     Py_END_ALLOW_THREADS
     PyObject *capsule = PyCapsule_New(e, CHECKPOINT_CAPSULE, checkpoint_delete);
     if (!capsule) {
-        checkpoint_release(e); Py_DECREF(e->pool_owner);
+        checkpoint_release(e);
         pthread_mutex_destroy(&e->mutex);
         pthread_cond_destroy(&e->ready); pthread_cond_destroy(&e->done);
         free(e); return NULL;
@@ -346,8 +339,8 @@ static PyObject *checkpoint_execute(PyObject *self, PyObject *args) {
             snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency"); goto done;
         }
         uint64_t extent = (rows - 1) * destination_stride + bytes * (1 + expand);
-        if (!e->pool->device_range(pointer, extent, e->device)) {
-            snprintf(failure.message, sizeof(failure.message), "GDS destination is not owned device weight storage"); goto done;
+        if (!device_range(pointer, extent, e->device)) {
+            snprintf(failure.message, sizeof(failure.message), "GDS destination is outside its CUDA device allocation"); goto done;
         }
         checkpoint_file_t *file = NULL;
         if (!host_copy) {

@@ -1,9 +1,9 @@
-"""Torch reference for QSRT trellis MoE execution.
+"""Torch reference for trellis MoE execution.
 
 Builds native-tile trellis payloads from explicit edge symbols and computes
 the decoded weights plus a float32 MoE forward that mirrors the kernel-side
 transforms (H128 incoherence rotations at the activation boundary; optional
-coupled interleaved boundary). Inputs and outputs live in the rotated bases
+intermediate-Hadamard interleaved boundary). Inputs and outputs live in the rotated bases
 the kernels consume and produce, so comparisons need no host-side residual
 transforms. Activation quantization is not emulated: kernel outputs match to
 MXFP8 noise, so acceptance uses cosine and relative-L2 bounds.
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
 from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
@@ -47,7 +47,7 @@ def _pack_native_tiles(edges: torch.Tensor, bits: int) -> torch.Tensor:
 
 
 def _cyclic_states(edges: torch.Tensor, bits: int) -> torch.Tensor:
-    """[W, 256] edge symbols -> [W, 256] L16 states (cyclic history)."""
+    """[W, 256] edge symbols -> [W, 256] 16-bit states (cyclic history)."""
 
     states = torch.zeros_like(edges, dtype=torch.int64)
     for lag in range((16 + bits - 1) // bits):
@@ -97,7 +97,7 @@ def build_trellis_weight(
         experts, k16, n16, 16 * bits
     )
     states = _cyclic_states(edges, bits)
-    direct = sqg_xor_cheb_t12_direct_lut_cpu().to(device)
+    direct = lut_e4m3_direct_table_cpu().to(device)
     rate = _RATE_INDEX[bits] << 16
     values = (
         direct[rate + states.reshape(-1)]
@@ -148,7 +148,7 @@ def _boundary_ordinary(
     return (h.reshape(-1, blocks, 128) @ had).reshape(h.shape)
 
 
-def _boundary_coupled(
+def _boundary_intermediate_hadamard(
     gate: torch.Tensor,
     up: torch.Tensor,
     rotations: torch.Tensor,
@@ -213,7 +213,7 @@ def trellis_moe_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
-    coupled: bool,
+    intermediate_hadamard: bool,
 ) -> torch.Tensor:
     """Float32 MoE forward in the kernels' rotated input/output bases.
 
@@ -236,8 +236,8 @@ def trellis_moe_reference(
     xin = x_rot.float()[token_of]
     gate = torch.einsum("rk,rik->ri", xin, w13_weights[0, flat_ids].float())
     up = torch.einsum("rk,rik->ri", xin, w13_weights[1, flat_ids].float())
-    if coupled:
-        h = _boundary_coupled(
+    if intermediate_hadamard:
+        h = _boundary_intermediate_hadamard(
             gate, up, rotations, flat_ids, intermediate, device
         )
     else:

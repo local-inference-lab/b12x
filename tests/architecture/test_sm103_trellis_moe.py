@@ -14,18 +14,18 @@ from tests.architecture.test_sm103 import B300
 from tests.moe.test_trellis_config import _k3_config, _glm_config
 
 
-def weight_plan(coupled=True, mixed=False, canonical=False, codebook="sqg_e4m3"):
+def weight_plan(intermediate_hadamard=True, mixed=False, canonical=False, codebook="lut_e4m3"):
     config = _glm_config() if mixed else _k3_config()
     if not mixed:
         config["codebook"] = codebook
     config["transform"]["expert"] = (
-        _k3_config()["transform"]["expert"] if coupled else {"kind": "none"}
+        _k3_config()["transform"]["expert"] if intermediate_hadamard else {"kind": "none"}
     )
     result = fused_moe.plan_weights(
         source=fused_moe.TrellisConfig.from_dict(config),
         activation=fused_moe.ActivationSpec(
             mode="a16",
-            nonlinearity="situ" if coupled else "silu",
+            nonlinearity="situ" if intermediate_hadamard else "silu",
             io_dtype=torch.bfloat16,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -35,9 +35,9 @@ def weight_plan(coupled=True, mixed=False, canonical=False, codebook="sqg_e4m3")
     return result if canonical else result._impl
 
 
-def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
+def canonical_execution(capacity, plan, experts, *, intermediate_hadamard, mixed=False):
     public = weight_plan(
-        coupled, mixed=mixed, canonical=True,
+        intermediate_hadamard, mixed=mixed, canonical=True,
         codebook=capacity.weight_plan.trellis_codebook,
     )
     public = replace(
@@ -68,9 +68,9 @@ def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
     return execution, experts
 
 
-def caps(monkeypatch, *, coupled=True, mixed=False, codebook="sqg_e4m3", **kwargs):
+def caps(monkeypatch, *, intermediate_hadamard=True, mixed=False, codebook="lut_e4m3", **kwargs):
     from b12x.moe.fused_moe._sm103 import query_for_weight_plan
-    wp = weight_plan(coupled, mixed=mixed, codebook=codebook)
+    wp = weight_plan(intermediate_hadamard, mixed=mixed, codebook=codebook)
     query = query_for_weight_plan(wp, quant_mode="w4a16", num_tokens=8, num_topk=8,
                                   swiglu_limit=kwargs.get("swiglu_limit"))
     config = TUNING.configure(query, device=B300, search=False).default
@@ -80,9 +80,9 @@ def caps(monkeypatch, *, coupled=True, mixed=False, codebook="sqg_e4m3", **kwarg
 
 
 
-@pytest.mark.parametrize("coupled,limit", [(False, None), (False, 10.0), (True, None)])
-def test_public_scratch_plan_and_policy(coupled, limit, monkeypatch):
-    capacity = caps(monkeypatch, coupled=coupled, swiglu_limit=limit)
+@pytest.mark.parametrize("intermediate_hadamard,limit", [(False, None), (False, 10.0), (True, None)])
+def test_public_scratch_plan_and_policy(intermediate_hadamard, limit, monkeypatch):
+    capacity = caps(monkeypatch, intermediate_hadamard=intermediate_hadamard, swiglu_limit=limit)
     plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
     assert plan.full_rotation
     assert plan.launch_plan.implementation == backend.BACKEND
@@ -119,10 +119,10 @@ def test_public_scratch_plan_and_policy(coupled, limit, monkeypatch):
         plan._backend_plan.prewarm(plan)
 
 
-def test_mixed_plan_is_supported_and_invalid_coupled_geometry_fails():
-    backend.validate_weight_plan(weight_plan(coupled=False, mixed=True))
-    mixed = weight_plan(coupled=True, mixed=True)
-    assert mixed.coupled_hadamard
+def test_mixed_plan_is_supported_and_invalid_intermediate_hadamard_geometry_fails():
+    backend.validate_weight_plan(weight_plan(intermediate_hadamard=False, mixed=True))
+    mixed = weight_plan(intermediate_hadamard=True, mixed=True)
+    assert mixed.intermediate_hadamard
     backend.validate_weight_plan(mixed)
     with pytest.raises(NotImplementedError, match="divisible by 512"):
         backend.validate_weight_plan(replace(weight_plan(), hidden_size=4992))
@@ -156,24 +156,24 @@ def test_v41_clamp_is_retained_by_compiled_intermediate_transform(monkeypatch):
     import cutlass.cute as cute
     from b12x.moe._shared.kernels.sm103.trellis_transforms import IntermediateRotation
 
-    capacity = caps(monkeypatch, coupled=False, swiglu_limit=10.0)
+    capacity = caps(monkeypatch, intermediate_hadamard=False, swiglu_limit=10.0)
     kernels = []
     with patch.object(cute, "compile", side_effect=lambda kernel, *a, **kw: kernels.append(kernel)):
         backend.compile_launches(capacity, offline=True)
     intermediate = [kernel for kernel in kernels if isinstance(kernel, IntermediateRotation)]
     assert len(intermediate) == 1 and intermediate[0].swiglu_limit == 10.0
     with pytest.raises(ValueError, match="situ activation contract"):
-        IntermediateRotation(256, 3, 8, coupled=True, activation="situ", swiglu_limit=10.0)
+        IntermediateRotation(256, 3, 8, intermediate_hadamard=True, activation="situ", swiglu_limit=10.0)
 
 
 @pytest.mark.parametrize(
-    "coupled,split,limit",
+    "intermediate_hadamard,split,limit",
     [(False, None, None), (False, None, 10.0), (True, None, None),
      (True, 64, None), (True, 192, None)],
 )
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 def test_native_binding_retains_capacity_launches_and_checks_aliases(
-    monkeypatch, coupled, split, limit, bits
+    monkeypatch, intermediate_hadamard, split, limit, bits
 ):
     import cutlass.cute as cute
     from b12x.moe._shared.execution import PreparedWeightLayout
@@ -182,9 +182,9 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
         TrellisWeightState,
     )
 
-    codebook = "sqg_fp16" if bits >= 5 else "sqg_e4m3"
+    codebook = "lut_fp16" if bits >= 5 else "lut_e4m3"
     capacity = caps(
-        monkeypatch, coupled=coupled, codebook=codebook, swiglu_limit=limit
+        monkeypatch, intermediate_hadamard=intermediate_hadamard, codebook=codebook, swiglu_limit=limit
     )
     wp = replace(
         capacity.weight_plan,
@@ -229,12 +229,12 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
             codebook=codebook,
             bits=bits,
             gate_suh=scales,
-            up_suh=scales if coupled and split is None else scales.clone(),
+            up_suh=scales if intermediate_hadamard and split is None else scales.clone(),
             down_svh=scales.clone(),
             intermediate_rotations=torch.ones(
-                3, 256 * (6 if coupled else 3), dtype=torch.float16
+                3, 256 * (6 if intermediate_hadamard else 3), dtype=torch.float16
             ),
-            coupled_hadamard=coupled,
+            intermediate_hadamard=intermediate_hadamard,
             input_scale_split=split,
         ),
     )
@@ -262,7 +262,7 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
     weights = torch.empty(8, 2)
     mapping = torch.tensor([0, 1, 2, -1, 0, 1], dtype=torch.int32)
     execution, public_experts = canonical_execution(
-        capacity, plan, experts, coupled=coupled
+        capacity, plan, experts, intermediate_hadamard=intermediate_hadamard
     )
     public_bound = fused_moe.bind(
         execution,
@@ -273,7 +273,7 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
         topk_weights=weights[:1],
     )
     assert len(public_bound._backend_binding.calls) == (
-        7 if coupled and split is None else 8
+        7 if intermediate_hadamard and split is None else 8
     )
     for live in (8, 1, 4, 3):
         for dtype in (torch.int32, torch.int64):
@@ -297,7 +297,7 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
                     fn in launches.values() for fn, _ in bound._backend_binding.calls
                 )
                 assert len(bound._backend_binding.calls) == (
-                    7 if coupled and split is None else 8
+                    7 if intermediate_hadamard and split is None else 8
                 )
                 fc1_name = f"fc1_k{bits}" + ("_dual" if split is not None else "")
                 selected = [

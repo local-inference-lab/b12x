@@ -109,7 +109,7 @@ def test_v41_trellis_pipeline_consumes_canonical_weight_plan():
         ),
     )
     pipeline = TrellisPipeline.from_weight_plan(plan._impl)
-    assert pipeline.coupled_hadamard
+    assert pipeline.intermediate_hadamard
     assert pipeline.reconstruction(projection="w2", bits=3).capacity == 384 * 320 * 144
     assert (
         pipeline.reconstruction(projection="w13", bits=4).capacity

@@ -21,7 +21,7 @@ _OPERANDS = (
 _QWEN_ALIGNED_OPERANDS = frozenset((
     "query_start_loc", "num_accepted_tokens", "num_seqs", "num_tokens", "norm_weight",
 ))
-_KDA_ALIGNED_OPERANDS = frozenset(_OPERANDS) - {"z"}
+_KDA_ALIGNED_OPERANDS = frozenset(_OPERANDS) - {"z", "state_indices"}
 
 
 def aligned_operands(kda):
@@ -54,6 +54,7 @@ class GdnQuery:
     state_indices_dtype: str = "int32"
     kda_strides: tuple[int, ...] | None = None
     pointer_alignments: FrozenMapping | None = None
+    recover_speculative_state: bool = False
 
     def __post_init__(self):
         kda = self.key_heads == self.value_heads
@@ -106,10 +107,10 @@ class GdnConfig:
         )
 
 
-def _backend(query, device):
+def _backend(query: GdnQuery, device: DeviceIdentity | None) -> str:
     if device is not None and device.compute_capability == (10, 3):
         return "cutedsl"
-    return "triton" if query.key_heads == query.value_heads else "cutedsl"
+    return "triton" if query.key_heads == query.value_heads and not query.recover_speculative_state else "cutedsl"
 
 
 def _default_config(
@@ -134,6 +135,12 @@ def _validate_query(query: GdnQuery, _device: DeviceIdentity | None) -> None:
     if query.state_index_columns > 8 or query.max_tokens > query.max_seqs * query.state_index_columns:
         raise ValueError("GDN token capacity must fit at most eight state columns per sequence")
     kda = query.key_heads == query.value_heads
+    if type(query.recover_speculative_state) is not bool:
+        raise TypeError("recover_speculative_state must be boolean")
+    if query.recover_speculative_state and (
+        not kda or query.state_dtype != "float32" or not query.qk_l2norm
+    ):
+        raise ValueError("KDA recovery requires equal heads, FP32 state and Q/K normalization")
     if not kda and query.value_heads != 3 * query.key_heads:
         raise ValueError("Qwen GDN requires three value heads per key head")
     if query.gate_activation not in ("silu", "sigmoid") or (kda and query.gate_activation != "sigmoid"):
@@ -189,6 +196,8 @@ def _validate_config(
 
 
 def _tuning_parameters(query: GdnQuery, device):
+    # Production dispatch is fixed by the architecture and the equal-head KDA /
+    # grouped-head GDN recipe.
     return {"backend": (_backend(query, device),)}
 
 
@@ -203,7 +212,7 @@ def _encode_query(query: GdnQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="attention.gdn",
-    query_schema_version=4,
+    query_schema_version=6,
     config_schema_version=5,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "recurrent_block_v"}),
@@ -217,7 +226,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="recurrent_block_v", values=(16, 32), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     parameters=_tuning_parameters,
 )
 

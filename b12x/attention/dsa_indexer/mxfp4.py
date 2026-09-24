@@ -493,7 +493,11 @@ class _TensorCorePagedScore(_PagedScore):
             page_row_stride,
             pool_stride,
             pool_pages,
-        ).launch(grid=((width + 63) // 64, rows, 1), block=(128, 1, 1), stream=stream)
+        ).launch(
+            grid=(cutlass.min((width - Int32(1)) // Int32(64) + Int32(1), Int32(256)), rows, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
     @cute.kernel
     def kernel(
@@ -517,12 +521,15 @@ class _TensorCorePagedScore(_PagedScore):
     ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
+        grid_cols, _, _ = cute.arch.grid_dim()
         extent = cutlass.min(width, cutlass.min(lengths[row], active[0]))
         if cutlass.const_expr(self.candidates):
             extent = cutlass.min(width, candidate_lengths[row])
             if lengths[row] <= Int32(0) or active[0] <= Int32(0):
                 extent = Int32(0)
-        if Int32(bx) * Int32(64) < extent:
+        extent = cutlass.max(extent, Int32(0))
+        tile_start = Int32(bx) * Int32(64)
+        while tile_start < extent:
             self._score_tile(
                 q,
                 qs,
@@ -540,14 +547,15 @@ class _TensorCorePagedScore(_PagedScore):
                 page_row_stride,
                 pool_stride,
                 pool_pages,
+                tile_start,
             )
-        else:
-            # Public scores require a -inf tail, but invisible tiles need no MMA.
-            column = Int32(bx) * Int32(64) + Int32(tx)
-            if Int32(tx) < Int32(64) and column < width:
-                scores[Int64(row) * Int64(width) + Int64(column)] = BFloat16(
-                    -float("inf")
-                )
+            tile_start += cutlass.min(Int32(grid_cols) * Int32(64), extent - tile_start)
+        # Live tiles own their partial tails; the remaining columns are disjoint.
+        tail_start = (Int64(extent) + Int64(63)) // Int64(64) * Int64(64)
+        column = tail_start + Int64(bx) * Int64(128) + Int64(tx)
+        while column < Int64(width):
+            scores[Int64(row) * Int64(width) + column] = BFloat16(-float("inf"))
+            column += Int64(grid_cols) * Int64(128)
 
     @cute.jit
     def _score_tile(
@@ -568,12 +576,13 @@ class _TensorCorePagedScore(_PagedScore):
         page_row_stride: Int64,
         pool_stride: Int64,
         pool_pages: Int64,
+        tile_start: Int32,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        bx, row, _ = cute.arch.block_idx()
+        _, row, _ = cute.arch.block_idx()
         lane = Int32(tx) % Int32(32)
         col = (
-            Int32(bx) * Int32(64)
+            tile_start
             + (Int32(tx) // Int32(32)) * Int32(16)
             + lane // Int32(4)
         )

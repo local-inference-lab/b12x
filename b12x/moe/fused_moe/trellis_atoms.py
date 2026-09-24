@@ -12,7 +12,7 @@ from .config import RateGranularity
 class PreparedAtomTrellisWeights:
     """Compressed atom rows and group/expert/projection word offsets.
 
-    Canonical FC1/FC2 planes span adjacent N16/K16 tiles. BTX paired planes
+    Canonical FC1/FC2 planes span adjacent N16/K16 tiles. EXL3 paired planes
     contribute one tile to each of two 128-channel records. Each plane contains
     H/16 native t256 tiles; rates use the low nibble for the first plane.
     Offsets describe the compressed payload without a decoded weight copy.
@@ -82,8 +82,8 @@ def normalize_rates(config, rate, *, experts, intermediate_size, device):
     low, high = host & 15, host >> 4
     allowed = {
         "mcg": (2, 3, 4, 5, 6),
-        "sqg_e4m3": (2, 3, 4),
-        "sqg_fp16": (5, 6),
+        "lut_e4m3": (2, 3, 4),
+        "lut_fp16": (5, 6),
     }[config.codebook.value]
     observed = set(low.flatten().tolist()) | set(high.flatten().tolist())
     if not observed.issubset(allowed):
@@ -142,9 +142,9 @@ def prepare_atom_weights(
     group_size = config.rate.group_size or intermediate_size
     if config.rate.group_size is not None and weights.intermediate_offset % group_size:
         raise ValueError("Trellis rank extent must start at a rate-group boundary")
-    atoms = weights.atoms
+    atoms = weights.codes
     offsets, row_stride_words = _atom_offsets(atoms, rates, group_size, hidden_size)
-    coupled, rotations = _expert_transform_rows(
+    intermediate_hadamard, rotations = _expert_transform_rows(
         config,
         weights,
         intermediate,
@@ -153,14 +153,14 @@ def prepare_atom_weights(
     )
     state = TrellisWeightState(
         codebook=config.codebook.value,
-        bits=5 if config.codebook.value == "sqg_fp16" else 3,
+        bits=5 if config.codebook.value == "lut_fp16" else 3,
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=rotations,
         down_svh=down_svh,
-        coupled_hadamard=coupled,
+        intermediate_hadamard=intermediate_hadamard,
         input_scale_split=_input_scale_split(weights, gate_suh, up_suh)
-        if coupled
+        if intermediate_hadamard
         else None,
     )
     return PreparedAtomTrellisWeights(
@@ -182,64 +182,64 @@ def prepare_atom_weights(
     )
 
 
-def prepare_btx_atom_weights(
+def prepare_exl3_atom_weights(
     layer, *, activation, device, params_dtype=torch.float16,
     dummy_scale=None, workspace=None,
 ):
-    """Retain BTX rows while restoring the pair's 128-channel record order."""
-    from .._shared.btx_schema import RATE_CODE_PAIR_KINDS
+    """Retain EXL3 rows while restoring the pair's 128-channel record order."""
+    from .._shared.exl3_schema import RATE_CODE_PAIR_KINDS
     from .._shared.trellis_codebooks import validate_codebook_bits
-    from .._shared.kernels.w4a16.btx import (
-        _extent_rotation_tables, _coupled_rotation_rows, _coupled_input_tables,
+    from .._shared.kernels.w4a16.exl3 import (
+        _extent_rotation_tables, _intermediate_hadamard_rotation_rows, _intermediate_hadamard_input_tables,
     )
 
     manifest = layer.manifest
     manifest.validate_extent(layer.first_slot, layer.slot_count)
     if manifest.rates.structure != "per_expert_pair":
-        raise ValueError("BTX atom preparation requires per-expert-pair records")
+        raise ValueError("EXL3 atom preparation requires per-expert-pair records")
     hidden, width, experts = (
         manifest.geometry.hidden_size,
         layer.local_intermediate_size,
         manifest.geometry.num_experts,
     )
     if hidden % 128 or width % 256:
-        raise ValueError("BTX paired execution requires H divisible by 128 and whole 256-channel pairs")
+        raise ValueError("EXL3 paired execution requires H divisible by 128 and whole 256-channel pairs")
     if activation not in {"silu", "situ"} or (
-        manifest.hadamard.coupled and (activation != "situ" or hidden % 512)
+        manifest.hadamard.intermediate_hadamard and (activation != "situ" or hidden % 512)
     ):
-        raise ValueError("BTX paired execution requires SiLU or SiTU; coupled execution requires SiTU and H divisible by 512")
+        raise ValueError("EXL3 paired execution requires SiLU or SiTU; intermediate-Hadamard execution requires SiTU and H divisible by 512")
     if layer.rotations.dtype != torch.float16 or layer.rotations.shape != (
         layer.slot_count, experts, 3, 32
     ):
-        raise ValueError("BTX paired rotations must be fp16 [slot,expert,3,32]")
+        raise ValueError("EXL3 paired rotations must be fp16 [slot,expert,3,32]")
     side_shape = (experts, hidden) if manifest.hadamard.per_expert_input_rotations else (hidden,)
     for side in (layer.gate_suh, layer.up_suh, layer.down_svh):
         if side.dtype != torch.float16 or side.shape != side_shape:
-            raise ValueError("BTX side tables differ from the manifest's dtype or geometry")
-    if manifest.hadamard.coupled:
-        draws = layer.rotation_draws
+            raise ValueError("EXL3 side tables differ from the manifest's dtype or geometry")
+    if manifest.hadamard.intermediate_hadamard:
+        sign_patterns = layer.sign_pattern
         if (
-            draws is None or draws.dtype != torch.uint8 or draws.shape != (experts,)
-            or torch.any(draws > 7).item()
+            sign_patterns is None or sign_patterns.dtype != torch.uint8 or sign_patterns.shape != (experts,)
+            or torch.any(sign_patterns > 7).item()
         ):
-            raise ValueError("BTX coupled draws must be uint8 [expert] in 0..7")
+            raise ValueError("EXL3 sign patterns must be uint8 [expert] in 0..7")
     groups = width // 256
     tables = []
     for table in (layer.rates_fc1, layer.rates_fc2):
         if table is None or table.dtype != torch.uint8 or table.shape != (groups, experts):
-            raise ValueError("BTX paired rates must be uint8 [pair,expert]")
+            raise ValueError("EXL3 paired rates must be uint8 [pair,expert]")
         for code in table.detach().cpu().unique().tolist():
             kind = RATE_CODE_PAIR_KINDS.get(code)
             if kind is None or kind not in manifest.rates.pair_kinds:
-                raise ValueError("BTX paired rates differ from their declared pair kinds")
+                raise ValueError("EXL3 paired rates differ from their declared pair kinds")
             validate_codebook_bits(manifest.codebook, code >> 4)
             validate_codebook_bits(manifest.codebook, code & 15)
         # The internal atom table stores its low-record rate in the low nibble.
         tables.append(((table >> 4) | (table << 4)).to(device=device))
     rates = torch.stack((tables[0], tables[0], tables[1]), dim=-1).contiguous()
-    atoms = layer.atoms.to(device=device)
+    atoms = layer.codes.to(device=device)
     if atoms.ndim != 2 or atoms.shape[0] != layer.slot_count:
-        raise ValueError("BTX paired atom rows differ from the declared extent")
+        raise ValueError("EXL3 paired atom rows differ from the declared extent")
     offsets, stride = _atom_offsets(atoms, rates, 256, hidden)
     gate, up, down, _ = _extent_rotation_tables(layer, torch.device(device))
     # Every atom contributes N16/K16 to each 128-channel record in its pair.
@@ -251,14 +251,14 @@ def prepare_btx_atom_weights(
         .contiguous()
     )
     split = None
-    if manifest.hadamard.coupled:
-        rotations = _coupled_rotation_rows(layer, rotations, torch.device(device))
-        gate, up, split = _coupled_input_tables(layer, gate, up)
+    if manifest.hadamard.intermediate_hadamard:
+        rotations = _intermediate_hadamard_rotation_rows(layer, rotations, torch.device(device))
+        gate, up, split = _intermediate_hadamard_input_tables(layer, gate, up)
     state = TrellisWeightState(
         codebook=manifest.codebook, bits=3,
         gate_suh=gate, up_suh=up, down_svh=down,
         intermediate_rotations=rotations,
-        coupled_hadamard=manifest.hadamard.coupled,
+        intermediate_hadamard=manifest.hadamard.intermediate_hadamard,
         input_scale_split=split,
     )
     return PreparedAtomTrellisWeights(
@@ -268,5 +268,5 @@ def prepare_btx_atom_weights(
         w13_scale=dummy_scale if dummy_scale is not None else torch.zeros(4, dtype=torch.uint8, device=device),
         w13_global_scale=torch.ones(experts, dtype=torch.float32, device=device),
         workspace=workspace if workspace is not None else torch.empty(0, dtype=torch.int32, device=device),
-        params_dtype=params_dtype, source_format="btx", paired_records=True,
+        params_dtype=params_dtype, source_format="exl3", paired_records=True,
     )

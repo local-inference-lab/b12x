@@ -89,10 +89,10 @@ class SharedReadGroup:
         if self._initialization is not None or self.executor is not None:
             return
         if session._gds is None:
-            raise ValueError("shared checkpoint reads require device weight storage and cuFile")
+            raise ValueError("shared checkpoint reads require cuFile")
         self.native = session._gds
         self._initialization = Future()
-        arguments = (self.device, session.io_threads, session.native.pool_api(),
+        arguments = (self.device, session.io_threads,
                      *(p.function for p in session._copy_programs))
 
         def initialize():
@@ -153,7 +153,7 @@ class SharedReadGroup:
             wire.extend((source_index[identities[fd]], offset, width, pointer - base,
                          expand, rows, source_stride, destination_stride, allocation))
         ranges.sort()
-        if any(previous[1] > following[0] for previous, following in zip(ranges, ranges[1:])):
+        if any(previous[1] > following[0] for previous, following in zip(ranges, ranges[1:], strict=False)):
             raise ValueError("overlapping shared destination envelopes require a rank-local dependency")
         torch.cuda.current_stream(self.device).synchronize()
         local_io = dict(payload_bytes=session.payload_bytes,

@@ -72,6 +72,12 @@ Environment: `B12X_ROCE_HCA` (falls back to `NCCL_IB_HCA`), `B12X_ROCE_GID_INDEX
 (falls back to `NCCL_IB_GID_INDEX`, default 3), `B12X_ROCE_SPIN_LIMIT`,
 `B12X_ROCE_CACHE_DIR` (where the proxy .so is built with the host C compiler).
 
+`B12X_ROCE_TRAFFIC_CLASS` selects the IP DSCP/ECN byte on every RoCE queue pair
+(falls back to `NCCL_IB_TC`, default 0). It accepts integers from 0 to 255;
+invalid values fail setup. For a fabric mapping DSCP 26 to lossless priority 3,
+use 106 (`26 << 2 | 2`, ECN-capable). NIC and switch DSCP mappings, PFC and ECN
+must agree. The value is resolved during setup and logged by rank 0.
+
 Constraints: 2 to 16 ranks, one collective in flight per runtime, integrated
 GPU with unified addressing, active RDMA devices.
 

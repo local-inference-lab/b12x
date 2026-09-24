@@ -9,7 +9,7 @@ import torch
 
 from b12x.moe._shared.trellis_codebooks import (
     MCG,
-    SQG_E4M3,
+    LUT_E4M3,
     normalize_codebook,
     validate_codebook_bits,
 )
@@ -133,7 +133,7 @@ class TrellisWeightState:
 
     ``gate_suh``/``up_suh``/``down_svh`` are the projection-specific input
     incoherence values; ``intermediate_rotations`` holds the
-    intermediate-boundary values, and coupled transforms append the
+    intermediate-boundary values, and intermediate Hadamard transforms append the
     activation-boundary sign rows so each rotation row reads
     ``[gate I, up I, down I, preactivation 2I, postactivation I]``.
     """
@@ -148,9 +148,9 @@ class TrellisWeightState:
     up_suh: torch.Tensor | None = None
     intermediate_rotations: torch.Tensor | None = None
     down_svh: torch.Tensor | None = None
-    coupled_hadamard: bool = False
+    intermediate_hadamard: bool = False
     tile_config: tuple[int, int, int, int] | None = None
-    # Coupled FC1 columns below this local coordinate use gate_suh; columns
+    # Intermediate-Hadamard FC1 columns below this local coordinate use gate_suh; columns
     # at or above it use up_suh in both physical projection slots.
     input_scale_split: int | None = None
 
@@ -159,11 +159,12 @@ class TrellisWeightState:
 class PreparedW4A16MoeWeights:
     """Runtime native-codebook W4A16 expert weights.
 
-    Trellis-coded sources (MCG, SQG-XOR-Cheb-T12, or FP16-D3L codebooks) keep
+    Trellis-coded sources (``mcg``, ``lut_e4m3``, or ``lut_fp16`` codebooks) keep
     native codebook tiles and persistent full-rotation tables, sharing the
     W4A16 host ABI and retaining the tile configuration used at preparation.
     The trellis annex lives in one :class:`TrellisWeightState`; the accessor
-    properties expose its members under the host-ABI names.
+    properties expose its members under the host-ABI names. IQ2_XS keeps
+    descriptor words plus FP16 bases and packed subscales, with no trellis annex.
     """
 
     w13: torch.Tensor
@@ -180,7 +181,7 @@ class PreparedW4A16MoeWeights:
     params_dtype: torch.dtype
     fc1_tile_n: int
     fc2_tile_n: int
-    source_format: str = "btx"
+    source_format: str = "exl3"
     w13_layout: str = "packed"
     weight_layout: str = "trellis_t256"
     scale_format: str = "e4m3_k32"
@@ -231,8 +232,8 @@ class PreparedW4A16MoeWeights:
         return None if self.trellis is None else self.trellis.down_svh
 
     @property
-    def coupled_hadamard(self) -> bool:
-        return self.trellis is not None and self.trellis.coupled_hadamard
+    def intermediate_hadamard(self) -> bool:
+        return self.trellis is not None and self.trellis.intermediate_hadamard
 
     @property
     def tile_config(self) -> tuple[int, int, int, int] | None:
@@ -241,7 +242,7 @@ class PreparedW4A16MoeWeights:
 
 @dataclass(frozen=True)
 class PreparedTrellis256DenseWeight:
-    """Zero-copy native QSRT tensor plus its outer rotations.
+    """Zero-copy native trellis tensor plus its outer rotations.
 
     ``trellis`` is the flattened int32 view of one native
     ``[K/16,N/16,16*bits]i16`` payload. ``suh`` and ``svh`` retain the
@@ -1844,9 +1845,8 @@ def prepare_trellis256_moe_weights(
                 raise TypeError(
                     f"trellis_t256 {name} must be torch.float16, got {scale.dtype}"
                 )
-            # (1, hidden_size) is a broadcast row shared by all experts
-            # (kquant shared-su artifacts); kernels index it with expert
-            # stride 0.
+            # (1, hidden_size) is a broadcast row shared by all experts;
+            # kernels index it with expert stride 0.
             if tuple(scale.shape) not in (
                 (num_experts, hidden_size),
                 (1, hidden_size),
@@ -1975,7 +1975,7 @@ def prepare_trellis256_moe_weights(
         params_dtype=params_dtype,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_n=fc2_tile_n,
-        source_format="btx",
+        source_format="exl3",
         w13_layout=w13_layout,
         weight_layout="trellis_t256",
         scale_format="e4m3_k32",
@@ -1999,8 +1999,8 @@ def _trellis256_marker_codebook(
 ) -> str:
     if mul1_e4m3 is not None:
         raise ValueError(
-            "the MUL1 runtime marker is not supported; use legacy EXL3 MCG or "
-            "the QSRT SQG-XOR-Cheb-T12 codebook"
+            "the MUL1 runtime marker is not supported; use the mcg or "
+            "lut_e4m3 codebook"
         )
     marker_codebook: str | None = None
     if mcg is not None:
@@ -2155,7 +2155,7 @@ def prepare_trellis256_pair_dense_weight(
     rate_axis: str,
     mcg: torch.Tensor | int | None = None,
     mul1_e4m3: torch.Tensor | int | None = None,
-    codebook: str | None = SQG_E4M3,
+    codebook: str | None = LUT_E4M3,
     params_dtype: torch.dtype = torch.float16,
     dummy_scale: torch.Tensor | None = None,
 ) -> PreparedTrellis256DenseWeight:
@@ -2303,7 +2303,7 @@ def _restore_plane_words(
 ) -> torch.Tensor:
     """Assemble low/high record planes into the runtime pair word order.
 
-    ``low``/``high`` are int16 ``[count, atoms, hidden_tiles, 16*bits]``.
+    ``low``/``high`` are int16 ``[count, slots, hidden_tiles, 16*bits]``.
     FC1 places both 128-channel records under each K16 tile; FC2 keeps its
     K-major low-plane/high-plane ordering. Returns ``[count, words]``.
     """
@@ -2343,7 +2343,7 @@ def _finalize_prepared_trellis_weights(
     fc2_pair_kind: str | None,
     fc1_pair_modes: torch.Tensor | None,
     fc2_pair_modes: torch.Tensor | None,
-    coupled_hadamard: bool = False,
+    intermediate_hadamard: bool = False,
     input_scale_split: int | None = None,
 ) -> PreparedW4A16MoeWeights:
     """Shared validation and construction tail of the trellis preparers."""
@@ -2425,7 +2425,7 @@ def _finalize_prepared_trellis_weights(
         params_dtype=params_dtype,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_n=fc2_tile_n,
-        source_format="btx",
+        source_format="exl3",
         w13_layout="trellis_t256_proj",
         weight_layout="trellis_t256",
         scale_format="e4m3_k32",
@@ -2440,29 +2440,29 @@ def _finalize_prepared_trellis_weights(
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
-            coupled_hadamard=coupled_hadamard,
+            intermediate_hadamard=intermediate_hadamard,
             tile_config=tile_config,
             input_scale_split=input_scale_split,
         ),
     )
 
 
-def _coupled_rotation_signs(
+def _intermediate_hadamard_signs(
     length: int,
     *,
-    draw: int,
+    sign_pattern: int,
     axis: int,
 ) -> torch.Tensor:
-    """Reproduce kquant's frozen CPU Rademacher draw exactly."""
+    """Reproduce the frozen CPU sign pattern exactly."""
 
-    if length <= 0 or not 0 <= draw < 8:
-        raise ValueError("QSRT coupled rotation draw is outside its contract")
-    if draw == 0:
+    if length <= 0 or not 0 <= sign_pattern < 8:
+        raise ValueError("intermediate-Hadamard sign pattern is outside its contract")
+    if sign_pattern == 0:
         return torch.ones(length, dtype=torch.float32)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(
         (
-            0x6A09E667F3BCC909 * int(draw)
+            0x6A09E667F3BCC909 * int(sign_pattern)
             + 0xBB67AE8584CAA73B * int(axis)
         )
         & ((1 << 63) - 1)

@@ -212,4 +212,4 @@ def test_production_operand_staging_above_int32_offsets():
 
 @pytest.mark.parametrize("bits", [2, 3, 4])
 def test_dual_input_operand_staging(bits):
-    _check_staging("sqg_e4m3", bits, dual_input=True)
+    _check_staging("lut_e4m3", bits, dual_input=True)

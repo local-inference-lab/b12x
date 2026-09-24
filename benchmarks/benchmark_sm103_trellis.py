@@ -37,7 +37,7 @@ def main():
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
-    from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+    from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
     from b12x.moe._shared.kernels.sm103.launch import pointer
     from b12x.moe._shared.kernels.sm103.trellis import ReconstructTrellisTiles
     from tests._reference.trellis_moe import build_trellis_weight
@@ -53,7 +53,7 @@ def main():
     )
     capacity = packed.numel() // (16 * args.bits)
     out = torch.empty((capacity, 16, 16), device=device, dtype=torch.bfloat16)
-    lut = sqg_xor_cheb_t12_direct_lut_cpu().to(device)
+    lut = lut_e4m3_direct_table_cpu().to(device)
     params = [
         pointer(t, x)
         for t, x in (

@@ -603,11 +603,12 @@ def test_bounded_score_width_reuses_capacity_and_preserves_selection(indexer_ses
         graph.reset()
 
 
-def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(indexer_session):
+@pytest.mark.parametrize("mode,heads", [("decode", 32), ("prefill", 8)])
+def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(indexer_session, mode, heads):
     """A serving-sized output must not retain poisoned or invalid-page scores."""
     torch.manual_seed(4132)
     device = torch.device("cuda")
-    rows, heads, populated, capacity = 3, 32, 32769, 1048576
+    rows, populated, capacity = 3, 32769, 1048576
     q = torch.randn((rows, heads, 128), dtype=torch.bfloat16, device=device) / 4
     keys = torch.randn((populated, 128), dtype=torch.bfloat16, device=device) / 4
     weights = torch.randn((rows, heads), dtype=torch.bfloat16, device=device) / 32
@@ -623,6 +624,7 @@ def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(indexe
             page_size=128,
             cache_format="mxfp4",
             topk=512,
+            mode=mode,
         )
     )
     (spec,) = plan.scratch_specs()
@@ -642,7 +644,10 @@ def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(indexe
         with torch.cuda.graph(graph):
             api.score(binding)
             api.select(binding)
-        for live_lengths in ((0, 129, 32769), (65, 17001, 16417)):
+        for live_lengths in (
+            (0, 129, 32769), (65, 17001, 16417), (63, 64, 65),
+            (16383, 16384, 16385), (32769, 32769, 32769), (0, 0, 0),
+        ):
             lengths.copy_(torch.tensor(live_lengths, dtype=torch.int32, device=device))
             args["scratch"].fill_(0x7F)
             graph.replay()

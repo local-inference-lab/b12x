@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import gc
 from typing import Optional, Tuple
 
 import pytest
@@ -15,6 +16,92 @@ def _require_contiguous_backend() -> torch.device:
     pytest.importorskip("cutlass")
     pytest.importorskip("cuda.bindings.driver")
     return device
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim,value_dim", [(128, 128), (192, 128), (256, 256)])
+def test_varlen_capacity_reuses_program_for_live_lengths(
+    monkeypatch, causal, head_dim, value_dim,
+):
+    """One prepared capacity serves changing rows and batches, including graphs."""
+    from b12x.attention import varlen
+    from b12x.attention._shared.contiguous import api as native
+    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+
+    device = _require_contiguous_backend()
+    torch.manual_seed(441)
+    qcap = torch.empty((257, 3, head_dim), device=device, dtype=torch.bfloat16)
+    device = qcap.device
+    kcap = torch.empty((1025, 3, head_dim), device=device, dtype=torch.bfloat16)
+    vcap = torch.empty((1025, 3, value_dim), device=device, dtype=torch.bfloat16)
+    cucap = torch.zeros(5, device=device, dtype=torch.int32)
+    declaration = varlen.plan(qcap, kcap, vcap, cucap, cucap,
+                              max_seqlen_q=257, max_seqlen_k=1025, causal=causal)
+
+    def prepare(state):
+        spec, = state.scratch_plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        binding = state.bind(scratch=scratch, q=qcap, k=kcap, v=vcap,
+                             cu_seqlens_q=cucap, cu_seqlens_k=cucap)
+        return PreparedCall(run=lambda: state.run(binding), owners=(scratch,))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
+        session.prepare((declaration.request(name="varlen-capacity", prepare_call=prepare),))
+        state = require_prepared(declaration, "attention.varlen", device)
+        program = state.plan.compiled
+        spec, = state.scratch_plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+
+        def no_compile(*args, **kwargs):
+            raise AssertionError("Live lengths must reuse the prepared program")
+
+        monkeypatch.setattr(native, "_compile_varlen_attention", no_compile)
+        for q_lengths, k_lengths in [([1], [7]), ([37, 91], [257, 303]),
+                                      ([0, 129, 128], [13, 501, 511])]:
+            q = torch.randn((sum(q_lengths), 3, head_dim), device=device, dtype=qcap.dtype)
+            k = torch.randn((sum(k_lengths), 3, head_dim), device=device, dtype=qcap.dtype)
+            v = torch.randn((sum(k_lengths), 3, value_dim), device=device, dtype=qcap.dtype)
+            cq = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()],
+                              device=device, dtype=torch.int32)
+            ck = torch.tensor([0, *torch.tensor(k_lengths).cumsum(0).tolist()],
+                              device=device, dtype=torch.int32)
+            binding = varlen.bind(declaration, scratch=scratch, q=q, k=k, v=v,
+                                  cu_seqlens_q=cq, cu_seqlens_k=ck,
+                                  max_seqlen_q=max(q_lengths), max_seqlen_k=max(k_lengths))
+            assert binding.binding.plan.compiled is program
+            for _ in range(3):
+                varlen.run(binding)
+            torch.cuda.synchronize()
+            gc.collect()
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                out, lse = varlen.run(binding)
+            for _ in range(2):
+                q.normal_()
+                v.normal_()
+                out.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                qstart = kstart = 0
+                for qlen, klen in zip(q_lengths, k_lengths):
+                    if qlen:
+                        scores = torch.einsum("qhd,khd->hqk", q[qstart:qstart+qlen].double(),
+                                              k[kstart:kstart+klen].double()) / math.sqrt(head_dim)
+                        if causal:
+                            mask = (torch.arange(klen, device=device)[None, :] >
+                                    torch.arange(qlen, device=device)[:, None] + klen - qlen)
+                            scores.masked_fill_(mask[None], -torch.inf)
+                        truth = torch.einsum("hqk,khd->qhd", scores.softmax(-1),
+                                             v[kstart:kstart+klen].double())
+                        torch.testing.assert_close(out[qstart:qstart+qlen].float(), truth.float(),
+                                                   atol=0.02, rtol=0.01)
+                        torch.testing.assert_close(lse[:, qstart:qstart+qlen].double(),
+                                                   scores.logsumexp(-1), atol=0.003, rtol=0.001)
+                    qstart += qlen
+                    kstart += klen
+                assert torch.isfinite(out).all() and torch.count_nonzero(out)
+            graph.reset()
 
 
 def _run_attention_with_plan(

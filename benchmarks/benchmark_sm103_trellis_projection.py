@@ -28,7 +28,7 @@ from tests._reference.trellis_decode import codebook_tensor, native_weight
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--codebook", choices=("mcg", "sqg_e4m3", "sqg_fp16"), default="mcg")
+    parser.add_argument("--codebook", choices=("mcg", "lut_e4m3", "lut_fp16"), default="mcg")
     parser.add_argument("--bits", type=int, default=3)
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 128])
     parser.add_argument("--capacity", type=int, default=128)

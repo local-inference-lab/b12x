@@ -1,4 +1,4 @@
-"""Global coupled draw coordinates and canonical/BTX rank-extent parity."""
+"""Global sign-pattern coordinates and canonical/EXL3 rank-extent parity."""
 
 from dataclasses import replace
 import hashlib
@@ -9,8 +9,8 @@ import torch
 
 from b12x.moe import fused_moe
 from b12x.moe.fused_moe.trellis import (
-    _coupled_input_scales,
-    _coupled_rows,
+    _intermediate_hadamard_input_scales,
+    _intermediate_hadamard_rows,
     _validate_extent,
 )
 from tests.moe.test_trellis_config import _k3_config
@@ -19,7 +19,7 @@ from tests.moe.test_trellis_config import _k3_config
 def bundle(**metadata):
     scales = fused_moe.ScaleFactors(torch.ones(1))
     return fused_moe.TrellisWeights(
-        atoms=torch.empty(4, 1, dtype=torch.uint8),
+        codes=torch.empty(4, 1, dtype=torch.uint8),
         rate=torch.tensor([0x33], dtype=torch.uint8),
         input_scales=scales,
         intermediate_scales=scales,
@@ -48,7 +48,7 @@ def test_extent_metadata_rejects_ambiguous_coordinates(metadata, error):
 @pytest.mark.parametrize(
     "global_size,offset,width", [(512, 512, 128), (544, 0, 128), (512, 32, 128)]
 )
-def test_coupled_extent_checks_bounds_and_transform_blocks(global_size, offset, width):
+def test_intermediate_hadamard_extent_checks_bounds_and_transform_blocks(global_size, offset, width):
     weights = bundle(global_intermediate_size=global_size, intermediate_offset=offset)
     with pytest.raises(ValueError):
         _validate_extent(
@@ -56,27 +56,27 @@ def test_coupled_extent_checks_bounds_and_transform_blocks(global_size, offset, 
         )
 
 
-def test_frozen_global_draw_bytes_and_extent_slices():
-    from b12x.moe._shared.kernels.w4a16.btx import _coupled_rotation_rows
+def test_frozen_global_sign_pattern_bytes_and_extent_slices():
+    from b12x.moe._shared.kernels.w4a16.exl3 import _intermediate_hadamard_rotation_rows
 
-    draws = torch.arange(8, dtype=torch.uint8)
-    whole = _coupled_rows(
+    sign_patterns = torch.arange(8, dtype=torch.uint8)
+    whole = _intermediate_hadamard_rows(
         torch.zeros(8, 3 * 512, dtype=torch.float16),
-        draws,
+        sign_patterns,
         intermediate_size=512,
         device=torch.device("cpu"),
         global_intermediate_size=512,
     )[:, 3 * 512 :]
     # Frozen encoder rotation_signs bytes: model revision and source hash are
-    # recorded in docs/moe-execution-model.md. The residual draw is always zero.
+    # recorded in docs/moe-execution-model.md. The residual sign pattern is always zero.
     assert hashlib.sha256(whole.numpy().tobytes()).hexdigest() == (
         "1c8d4453d21b51eab567a73606fc4009e939b5d0c544731814498c82f0da09fa"
     )
     for offset in (0, 128, 256, 384):
         values = torch.zeros(8, 3 * 128, dtype=torch.float16)
-        local = _coupled_rows(
+        local = _intermediate_hadamard_rows(
             values,
-            draws,
+            sign_patterns,
             intermediate_size=128,
             device=torch.device("cpu"),
             global_intermediate_size=512,
@@ -94,68 +94,68 @@ def test_frozen_global_draw_bytes_and_extent_slices():
             manifest=SimpleNamespace(
                 hadamard=SimpleNamespace(pre_block=512, post_block=128),
                 geometry=SimpleNamespace(
-                    num_experts=8, intermediate_size=512, atom_channels=32
+                    num_experts=8, intermediate_size=512, slot_channels=32
                 ),
             ),
             local_intermediate_size=128,
             first_slot=offset // 32,
-            rotation_draws=draws,
+            sign_pattern=sign_patterns,
         )
         torch.testing.assert_close(
             local,
-            _coupled_rotation_rows(layer, values, torch.device("cpu")),
+            _intermediate_hadamard_rotation_rows(layer, values, torch.device("cpu")),
             atol=0,
             rtol=0,
         )
 
 
 @pytest.mark.parametrize("offset,which", [(0, 0), (128, 0), (256, 1), (384, 1)])
-def test_coupled_input_scale_selection_uses_global_extent(offset, which):
+def test_intermediate_hadamard_input_scale_selection_uses_global_extent(offset, which):
     gate, up = torch.ones(1, 512), torch.full((1, 512), 2.0)
     weights = bundle(global_intermediate_size=512, intermediate_offset=offset)
-    selected = _coupled_input_scales(weights, gate, up, 128)
+    selected = _intermediate_hadamard_input_scales(weights, gate, up, 128)
     assert all(t.data_ptr() == (gate, up)[which].data_ptr() for t in selected)
     with pytest.raises(ValueError, match="explicit global extent"):
-        _coupled_input_scales(bundle(), gate, up, 128)
-    assert _coupled_input_scales(
+        _intermediate_hadamard_input_scales(bundle(), gate, up, 128)
+    assert _intermediate_hadamard_input_scales(
         bundle(global_intermediate_size=512), gate, up, 512
     ) == (gate, up)
-    assert _coupled_input_scales(
+    assert _intermediate_hadamard_input_scales(
         bundle(global_intermediate_size=512), gate, gate, 512
     ) == (gate, gate)
 
 
-@pytest.mark.parametrize("codebook", ["sqg_e4m3", "mcg"])
+@pytest.mark.parametrize("codebook", ["lut_e4m3", "mcg"])
 @pytest.mark.parametrize(
     "global_width,width,offset",
     [(1024, 256, 0), (1024, 256, 768), (384, 384, 0), (384, 256, 128)],
 )
 @pytest.mark.parametrize("per_expert", [False, True])
-def test_canonical_coupled_extent_matches_btx(
+def test_canonical_intermediate_hadamard_extent_matches_exl3(
     tmp_path, codebook, global_width, width, offset, per_expert
 ):
     if not torch.cuda.is_available():
         pytest.skip("canonical weight preparation requires CUDA")
-    from b12x.moe._shared.kernels.w4a16.btx import (
-        read_btx_layer,
-        prepare_btx_moe_weights,
+    from b12x.moe._shared.kernels.w4a16.exl3 import (
+        read_exl3_layer,
+        prepare_exl3_moe_weights,
     )
-    from b12x.moe._shared.kernels.w4a16.btx_synth import (
-        BtxSynthConfig,
-        write_btx_checkpoint,
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import (
+        Exl3SynthConfig,
+        write_exl3_checkpoint,
     )
     from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
     from tests._reference.trellis_reference import moe_reference
 
     experts, hidden = 8, 512
-    config = BtxSynthConfig(
+    config = Exl3SynthConfig(
         codebook=codebook,
         num_experts=experts,
         hidden_size=hidden,
         intermediate_size=global_width,
         moe_layer_indices=(0,),
         bits=3,
-        coupled=True,
+        intermediate_hadamard=True,
         pre_block=512,
         post_block=128,
         per_expert_input_rotations=per_expert,
@@ -163,12 +163,12 @@ def test_canonical_coupled_extent_matches_btx(
         extent_barriers=(16,) if global_width == 1024 else (),
         seed=39,
     )
-    manifest = write_btx_checkpoint(tmp_path, config)
-    layer = read_btx_layer(
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    layer = read_exl3_layer(
         tmp_path, manifest, 0, first_slot=offset // 32, slot_count=width // 32
     )
-    layer = replace(layer, rotation_draws=torch.arange(experts, dtype=torch.uint8))
-    expected = prepare_btx_moe_weights(layer, activation="situ", device="cuda")
+    layer = replace(layer, sign_pattern=torch.arange(experts, dtype=torch.uint8))
+    expected = prepare_exl3_moe_weights(layer, activation="situ", device="cuda")
 
     declaration = _k3_config()
     declaration["codebook"] = codebook
@@ -189,7 +189,7 @@ def test_canonical_coupled_extent_matches_btx(
         ),
     )
     weights = fused_moe.TrellisWeights(
-        atoms=layer.atoms.cuda(),
+        codes=layer.codes.cuda(),
         rate=torch.tensor([0x33], dtype=torch.uint8, device="cuda"),
         input_scales=fused_moe.ScaleFactors(
             torch.stack(
@@ -200,7 +200,7 @@ def test_canonical_coupled_extent_matches_btx(
             layer.rotations.permute(1, 2, 0, 3).reshape(experts, 3, width).cuda()
         ),
         output_scales=fused_moe.ScaleFactors(layer.down_svh.cuda()),
-        expert_transform_draws=layer.rotation_draws.cuda(),
+        expert_sign_patterns=layer.sign_pattern.cuda(),
         global_intermediate_size=global_width,
         intermediate_offset=offset,
     )
@@ -249,28 +249,28 @@ def test_canonical_coupled_extent_matches_btx(
     )
 
 
-@pytest.mark.parametrize("codebook", ["sqg_e4m3", "mcg"])
-def test_uniform_btx_partial_pair_extent_roundtrip(tmp_path, codebook):
-    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
-    from b12x.moe._shared.kernels.w4a16.btx_synth import (
-        BtxSynthConfig,
-        write_btx_checkpoint,
+@pytest.mark.parametrize("codebook", ["lut_e4m3", "mcg"])
+def test_uniform_exl3_partial_pair_extent_roundtrip(tmp_path, codebook):
+    from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import (
+        Exl3SynthConfig,
+        write_exl3_checkpoint,
     )
 
-    config = BtxSynthConfig(
+    config = Exl3SynthConfig(
         codebook=codebook,
         num_experts=2,
         hidden_size=512,
         intermediate_size=384,
         moe_layer_indices=(0,),
         bits=3,
-        coupled=True,
+        intermediate_hadamard=True,
         pre_block=512,
         post_block=128,
     )
-    manifest = write_btx_checkpoint(tmp_path, config)
-    whole = read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=12)
-    tail = read_btx_layer(tmp_path, manifest, 0, first_slot=4, slot_count=8)
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    whole = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=12)
+    tail = read_exl3_layer(tmp_path, manifest, 0, first_slot=4, slot_count=8)
     assert whole.local_intermediate_size == 384 and tail.local_intermediate_size == 256
-    torch.testing.assert_close(tail.atoms, whole.atoms[4:], atol=0, rtol=0)
+    torch.testing.assert_close(tail.codes, whole.codes[4:], atol=0, rtol=0)
     torch.testing.assert_close(tail.rotations, whole.rotations[4:], atol=0, rtol=0)

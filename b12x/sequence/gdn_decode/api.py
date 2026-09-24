@@ -17,6 +17,7 @@ from ._impl import (
 )
 from ._preparation import plan, invocation_from_tensors
 from ._tuning import GdnConfig, GdnQuery
+from ._commit import KdaCommitBinding, bind_kda_commit, run_kda_commit
 
 
 def is_supported(device=None) -> bool:
@@ -30,13 +31,16 @@ __all__ = [
     "GdnConfig",
     "GdnQuery",
     "KdaBinding",
+    "KdaCommitBinding",
     "Plan",
     "bind",
     "bind_kda",
+    "bind_kda_commit",
     "is_supported",
     "plan",
     "invocation_from_tensors",
     "reference",
     "run",
     "run_kda",
+    "run_kda_commit",
 ]

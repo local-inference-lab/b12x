@@ -1,4 +1,4 @@
-"""Coupled checkpoint extents with two input transforms in one FC1 tile."""
+"""Intermediate-Hadamard checkpoint extents with two input transforms in one FC1 tile."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -25,7 +25,7 @@ class InspectColumnSelection:
 
     def __init__(self):
         self.projection = RoutedTrellisGemm(
-            384, 512, 3, 8, bits=3, codebook="sqg_e4m3", dual_input=True
+            384, 512, 3, 8, bits=3, codebook="lut_e4m3", dual_input=True
         )
 
     @cute.jit
@@ -52,7 +52,7 @@ class InspectColumnSelection:
                 target[route * 384 + col] = source[(route * 2 + row) * 384 + col]
 
 
-def test_coupled_column_selection_changes_inside_tiles_and_replays():
+def test_intermediate_hadamard_column_selection_changes_inside_tiles_and_replays():
     if not torch.cuda.is_available():
         pytest.skip("portable CUDA epilogue probe requires a GPU")
     torch.manual_seed(212)
@@ -112,9 +112,9 @@ def test_canonical_cross_half_preparation_and_oracle(mixed, bits, width, offset)
         pytest.skip("canonical preparation requires CUDA")
     torch.manual_seed(77)
     kwargs = dict(
-        coupled=True,
+        intermediate_hadamard=True,
         dtype=torch.bfloat16,
-        transform_draw=5,
+        sign_pattern=5,
         global_intermediate_size=384,
         intermediate_offset=offset,
         distinct_input_scales=True,

@@ -836,6 +836,14 @@ def test_bind_rejects_noncontiguous_state_slot_contents() -> None:
         gdn.bind(binding.plan, **tensors)
 
 
+def test_bind_rejects_insufficient_packed_metadata_capacity() -> None:
+    device = require_sm120()
+    binding, tensors = _make_case(device=device, max_tokens=4, max_seqs=2, columns=2)
+    tensors["state_indices"] = tensors["state_indices"][:1]
+    with pytest.raises(ValueError, match=r"4 > 1 \* 2"):
+        gdn.bind(binding.plan, **tensors)
+
+
 def test_bind_rejects_overlapping_state_slots() -> None:
     device = require_sm120()
     binding, tensors = _make_case(device=device)

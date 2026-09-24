@@ -12,7 +12,7 @@ def atom_fixture(
     codebook="mcg",
     group_size=32,
     granularity="per_expert_projection",
-    coupled=False,
+    intermediate_hadamard=False,
     experts=3,
     hidden=512,
     width=256,
@@ -25,7 +25,7 @@ def atom_fixture(
     if group_size is not None:
         config["rate"]["group_size"] = group_size
     config["transform"]["expert"] = (
-        _k3_config()["transform"]["expert"] if coupled else {"kind": "none"}
+        _k3_config()["transform"]["expert"] if intermediate_hadamard else {"kind": "none"}
     )
     for name in config["scale"]:
         config["scale"][name] = {"vectors": "per_expert", "gains": "none"}
@@ -33,8 +33,8 @@ def atom_fixture(
     groups = width // (group_size or width)
     palette = {
         "mcg": (0x42, 0x33, 0x25, 0x64, 0x56),
-        "sqg_e4m3": (0x42, 0x33, 0x24, 0x43),
-        "sqg_fp16": (0x65, 0x55, 0x56, 0x66),
+        "lut_e4m3": (0x42, 0x33, 0x24, 0x43),
+        "lut_fp16": (0x65, 0x55, 0x56, 0x66),
     }[codebook]
     logical = torch.empty(groups, experts, 3, dtype=torch.uint8)
     for group in range(groups):
@@ -111,23 +111,23 @@ def atom_fixture(
         )
 
     weights = fused_moe.TrellisWeights(
-        atoms=atoms.to(device),
+        codes=atoms.to(device),
         rate=selected.to(device),
         input_scales=scales((experts, 2, hidden)),
         intermediate_scales=scales((experts, 3, width)),
         output_scales=scales((experts, hidden)),
-        expert_transform_draws=torch.arange(
+        expert_sign_patterns=torch.arange(
             experts, dtype=torch.uint8, device=device
         ).remainder(8)
-        if coupled
+        if intermediate_hadamard
         else None,
-        global_intermediate_size=width if coupled else None,
+        global_intermediate_size=width if intermediate_hadamard else None,
     )
     plan = fused_moe.plan_weights(
         source=config,
         activation=fused_moe.ActivationSpec(
             mode="a16",
-            nonlinearity="situ" if coupled else "silu",
+            nonlinearity="situ" if intermediate_hadamard else "silu",
             io_dtype=torch.bfloat16,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -137,14 +137,14 @@ def atom_fixture(
     return plan, weights, logical, expected
 
 
-def btx_atom_fixture(
-    path, *, codebook="sqg_e4m3", coupled=False, experts=3,
+def exl3_atom_fixture(
+    path, *, codebook="lut_e4m3", intermediate_hadamard=False, experts=3,
     hidden=512, width=512, global_width=768, first_slot=0,
 ):
     from dataclasses import replace
-    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
-    from b12x.moe._shared.kernels.w4a16.btx_synth import (
-        BtxSynthConfig, synth_layer_payloads, write_btx_checkpoint,
+    from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import (
+        Exl3SynthConfig, synth_layer_payloads, write_exl3_checkpoint,
     )
 
     palette = (0x22, 0x33, 0x24, 0x43, 0x44)
@@ -154,29 +154,29 @@ def btx_atom_fixture(
         for expert in range(experts):
             fc1[pair, expert] = palette[(pair + expert) % len(palette)]
             fc2[pair, expert] = palette[(pair + expert + 3) % len(palette)]
-    config = BtxSynthConfig(
+    config = Exl3SynthConfig(
         codebook=codebook, num_experts=experts, hidden_size=hidden,
         intermediate_size=global_width, moe_layer_indices=(0,),
-        rate_tables={0: (fc1, fc2)}, coupled=coupled,
-        pre_block=512 if coupled else None, post_block=128 if coupled else None,
+        rate_tables={0: (fc1, fc2)}, intermediate_hadamard=intermediate_hadamard,
+        pre_block=512 if intermediate_hadamard else None, post_block=128 if intermediate_hadamard else None,
         per_expert_input_rotations=True, extent_alignment_slots=8, seed=819,
     )
-    manifest = write_btx_checkpoint(path, config)
-    layer = read_btx_layer(path, manifest, 0, first_slot=first_slot, slot_count=width // 32)
+    manifest = write_exl3_checkpoint(path, config)
+    layer = read_exl3_layer(path, manifest, 0, first_slot=first_slot, slot_count=width // 32)
     # Safetensors CPU mappings need not share the CUDA allocator's alignment.
     layer = replace(
-        layer, atoms=layer.atoms.clone(), gate_suh=layer.gate_suh.clone(),
+        layer, codes=layer.codes.clone(), gate_suh=layer.gate_suh.clone(),
         up_suh=layer.up_suh.clone(), down_svh=layer.down_svh.clone(),
     )
     from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
     plan = plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16", source_format="btx",
-        activation="situ" if coupled else "silu", params_dtype=torch.bfloat16,
+        quant_modes="w4a16", source_format="exl3",
+        activation="situ" if intermediate_hadamard else "silu", params_dtype=torch.bfloat16,
         num_experts=experts, hidden_size=hidden, intermediate_size=width,
         trellis_codebook=codebook, trellis_bits=3,
         trellis_rate_granularity="per_expert_pair",
-        trellis_pair_kinds=manifest.rates.pair_kinds, coupled_hadamard=coupled,
-        coupled_hadamard_blocks=(512, 128) if coupled else None,
+        trellis_pair_kinds=manifest.rates.pair_kinds, intermediate_hadamard=intermediate_hadamard,
+        intermediate_hadamard_blocks=(512, 128) if intermediate_hadamard else None,
     )
     payloads = synth_layer_payloads(config, 0)
     expected = {}

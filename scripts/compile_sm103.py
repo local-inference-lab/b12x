@@ -963,17 +963,17 @@ def compile_trellis(out):
 
     # One V4.1 FC2 family in the checkpoint's K16/N16 tile ordering.
     capacity = 384 * (5120 // 16) * (2304 // 16)
-    for codebook, rates in (("mcg", (2, 3, 4, 5, 6)), ("sqg_e4m3", (2, 3, 4)), ("sqg_fp16", (5, 6))):
+    for codebook, rates in (("mcg", (2, 3, 4, 5, 6)), ("lut_e4m3", (2, 3, 4)), ("lut_fp16", (5, 6))):
         for bits in rates:
             for dtype in (cutlass.Float16, cutlass.BFloat16):
                 name = f"trellis_{codebook}_k{bits}_{dtype.__name__}"
-                if codebook == "sqg_e4m3" and dtype == cutlass.BFloat16:
+                if codebook == "lut_e4m3" and dtype == cutlass.BFloat16:
                     name = f"trellis_k{bits}"
                 args = [pointer(t) for t in (cutlass.Uint32, cutlass.Uint8, dtype)]
                 args += [cutlass.Int32(1), cuda.CUstream(0)]
                 compile_case(name, ReconstructTrellisTiles(bits, capacity, codebook=codebook), args)
             geometries = [("tail", 144, 80)]
-            if bits == 3 and codebook in {"mcg", "sqg_e4m3"}:
+            if bits == 3 and codebook in {"mcg", "lut_e4m3"}:
                 geometries += [("gate", 2304, 5120), ("down", 5120, 2304)]
             for stage, n, k in geometries:
                 for id_dtype in (cutlass.Int32, cutlass.Int64):
@@ -983,39 +983,39 @@ def compile_trellis(out):
                     compile_case(name, RoutedTrellisGemm(n, k, 384, 128, bits=bits, codebook=codebook), args)
     from b12x.moe.fused_moe._sm103_trellis import compile_launches as compile_moe
     import torch
-    for label, codebook, bits, coupled, activation, dtype in (
-        ("v41", "sqg_e4m3", 3, True, "situ", torch.float16),
+    for label, codebook, bits, intermediate_hadamard, activation, dtype in (
+        ("v41", "lut_e4m3", 3, True, "situ", torch.float16),
         ("mcg", "mcg", 3, False, "silu", torch.bfloat16),
-        ("btx_mcg_coupled", "mcg", 3, True, "situ", torch.bfloat16),
-        ("sqg", "sqg_e4m3", 4, False, "situ", torch.float16),
-        ("sqg_fp16", "sqg_fp16", 5, False, "silu", torch.bfloat16),
-        ("canonical_sqg_fp16", "sqg_fp16", 5, False, "silu", torch.bfloat16),
-        ("canonical_sqg_fp16_coupled", "sqg_fp16", 5, True, "situ", torch.bfloat16),
+        ("exl3_mcg_intermediate_hadamard", "mcg", 3, True, "situ", torch.bfloat16),
+        ("lut_e4m3", "lut_e4m3", 4, False, "situ", torch.float16),
+        ("lut_fp16", "lut_fp16", 5, False, "silu", torch.bfloat16),
+        ("canonical_lut_fp16", "lut_fp16", 5, False, "silu", torch.bfloat16),
+        ("canonical_lut_fp16_intermediate_hadamard", "lut_fp16", 5, True, "situ", torch.bfloat16),
     ):
         caps = SimpleNamespace(
             k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
             route_num_experts=768, dtype=dtype, activation=activation,
-            weight_plan=SimpleNamespace(coupled_hadamard=coupled, source_format="b12x_trellis" if codebook == "sqg_e4m3" or label.startswith("canonical_") else "btx",
+            weight_plan=SimpleNamespace(intermediate_hadamard=intermediate_hadamard, source_format="b12x_trellis" if codebook == "lut_e4m3" or label.startswith("canonical_") else "exl3",
                                         trellis_bits=bits, trellis_codebook=codebook),
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix="trellis_moe_" + label + "_")
         launches.update({"trellis_moe_" + label + "_" + key: fn for key, fn in compiled.items()})
-    for local_bits, experts, dtype, activation, coupled in (
+    for local_bits, experts, dtype, activation, intermediate_hadamard in (
         (8, 5, torch.float16, "situ", False),
         (24, 384, torch.bfloat16, "silu", False),
         (8, 5, torch.float16, "situ", True),
         (24, 384, torch.bfloat16, "situ", True),
     ):
-        label = f"trellis_mixed_d{local_bits}_" + ("coupled_" if coupled else "")
+        label = f"trellis_mixed_d{local_bits}_" + ("intermediate_hadamard_" if intermediate_hadamard else "")
         caps = SimpleNamespace(
             k=5120, n=2304, weight_E=experts, max_tokens=128, num_topk=min(experts, 6),
             route_num_experts=2 * experts, dtype=dtype, activation=activation,
-            weight_plan=SimpleNamespace(coupled_hadamard=coupled, source_format="b12x_trellis",
+            weight_plan=SimpleNamespace(intermediate_hadamard=intermediate_hadamard, source_format="b12x_trellis",
                                         trellis_bits=3, trellis_codebook="mcg"),
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
         launches.update({label + key: fn for key, fn in compiled.items()})
-        if coupled:
+        if intermediate_hadamard:
             continue
         for id_dtype in (cutlass.Int32, cutlass.Int64):
             args = [pointer(t) for t in (cutlass.Float16, cutlass.Uint32, cutlass.Uint8, id_dtype, cutlass.Int32, cutlass.Float16)]
@@ -1024,33 +1024,33 @@ def compile_trellis(out):
                      cutlass.Int32(1), cutlass.Int64(80), cutlass.Int64(144), cuda.CUstream(0)]
             compile_case(label + "tail_" + id_dtype.__name__,
                          RoutedMixedTrellisGemm(144, 80, experts, 128, descriptor_local_bits=local_bits), args)
-    for codebook, group_size, coupled in (
+    for codebook, group_size, intermediate_hadamard in (
         ("mcg", 32, False), ("mcg", 256, True),
-        ("sqg_e4m3", 32, False), ("sqg_e4m3", 256, True),
-        ("sqg_fp16", 32, False), ("sqg_fp16", 256, True),
+        ("lut_e4m3", 32, False), ("lut_e4m3", 256, True),
+        ("lut_fp16", 32, False), ("lut_fp16", 256, True),
     ):
-        label = f"trellis_atoms_{codebook}_g{group_size}_" + ("coupled_" if coupled else "")
+        label = f"trellis_atoms_{codebook}_g{group_size}_" + ("intermediate_hadamard_" if intermediate_hadamard else "")
         caps = SimpleNamespace(
             k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
             route_num_experts=768, dtype=torch.bfloat16,
-            activation="situ" if coupled else "silu",
+            activation="situ" if intermediate_hadamard else "silu",
             weight_plan=SimpleNamespace(
-                coupled_hadamard=coupled, source_format="b12x_trellis",
-                trellis_bits=5 if codebook == "sqg_fp16" else 3, trellis_codebook=codebook,
+                intermediate_hadamard=intermediate_hadamard, source_format="b12x_trellis",
+                trellis_bits=5 if codebook == "lut_fp16" else 3, trellis_codebook=codebook,
                 trellis_group_size=group_size,
             ),
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
         launches.update({label + key: fn for key, fn in compiled.items()})
-    for codebook in ("mcg", "sqg_e4m3"):
-        for coupled in (False, True):
-            label = f"trellis_btx_pairs_{codebook}_" + ("coupled_" if coupled else "")
+    for codebook in ("mcg", "lut_e4m3"):
+        for intermediate_hadamard in (False, True):
+            label = f"trellis_exl3_pairs_{codebook}_" + ("intermediate_hadamard_" if intermediate_hadamard else "")
             caps = SimpleNamespace(
                 k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
                 route_num_experts=768, dtype=torch.bfloat16,
-                activation="situ" if coupled else "silu",
+                activation="situ" if intermediate_hadamard else "silu",
                 weight_plan=SimpleNamespace(
-                    coupled_hadamard=coupled, source_format="btx",
+                    intermediate_hadamard=intermediate_hadamard, source_format="exl3",
                     trellis_bits=3, trellis_codebook=codebook,
                     trellis_rate_granularity="per_expert_pair",
                 ),
@@ -1074,7 +1074,7 @@ def compile_trellis_clamped(out):
             route_num_experts=384, dtype=torch.bfloat16, activation="silu",
             swiglu_limit=10.0,
             weight_plan=SimpleNamespace(
-                coupled_hadamard=False, source_format="btx",
+                intermediate_hadamard=False, source_format="exl3",
                 trellis_bits=3, trellis_codebook="mcg",
             ),
         )

@@ -36,14 +36,15 @@ class BlockscaledQuery:
 @dataclass(frozen=True, kw_only=True)
 class BlockscaledConfig:
     mode: str
+    tile_m: int | None = None
     tile_n: int | None = None
     tile_k: int | None = None
     split_k: int | None = None
 
     @classmethod
     def from_config(cls, payload):
-        if set(payload) != {"mode", "tile_n", "tile_k", "split_k"}:
-            raise ValueError("packed precision config requires mode and the three nullable A16 knobs")
+        if set(payload) != {"mode", "tile_m", "tile_n", "tile_k", "split_k"}:
+            raise ValueError("packed precision config requires mode and four nullable A16 knobs")
         return cls(**dict(payload))
 
     def to_dict(self):
@@ -51,8 +52,8 @@ class BlockscaledConfig:
 
 
 def _validate_query(query, device):
-    if not isinstance(query, BlockscaledQuery) or query.recipe not in ("nvfp4", "mxfp8"):
-        raise ValueError("packed BF16 execution requires NVFP4 or MXFP8 weights")
+    if not isinstance(query, BlockscaledQuery) or query.recipe not in ("nvfp4", "mxfp8", "iq2_xs"):
+        raise ValueError("packed BF16 execution requires NVFP4, MXFP8, or IQ2_XS weights")
     if query.input_dtype not in ("bfloat16", "float16") or (query.input_dtype == "float16" and query.recipe != "mxfp8"):
         raise ValueError("packed FP16 activations require quantized MXFP8 weights")
     if any(type(value) is not int or value <= 0 for value in (
@@ -63,6 +64,11 @@ def _validate_query(query, device):
         raise ValueError("packed logical K must be aligned and fit its stored K")
     if query.padded_in_features % (16 if query.recipe == "nvfp4" else 32):
         raise ValueError("stored K must match the weight scale group")
+    if query.recipe == "iq2_xs":
+        if query.in_features != query.padded_in_features or query.in_features % 256:
+            raise ValueError("IQ2_XS requires unpadded K divisible by 256")
+        if query.activation_mode == "quantized" or query.activation_scale_available:
+            raise ValueError("IQ2_XS requires BF16 activations without activation scaling")
     if query.activation_mode not in ("auto", "a16", "quantized"):
         raise ValueError("activation mode must be auto, a16, or quantized")
     if query.output_mode not in ("functional", "provided") or query.workspace_form not in ("provided", "owned"):
@@ -96,7 +102,7 @@ def _default_config(query, device):
         return BlockscaledConfig(mode="quantized")
     if _automatic_a16(query, device):
         return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
-    if query.activation_mode == "a16":
+    if query.activation_mode == "a16" or query.recipe == "iq2_xs":
         return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
     return BlockscaledConfig(mode="quantized")
 
@@ -115,12 +121,23 @@ def _validate_config(query, config, device):
         raise ValueError("invalid packed precision configuration")
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
+    if query.recipe == "iq2_xs" and config.mode != "a16":
+        raise ValueError("IQ2_XS supports only A16 execution")
     if config.mode == "a16":
         if query.input_dtype != "bfloat16":
             raise ValueError("A16 requires BF16 activations")
-        if (type(config.tile_n) is not int or config.tile_n not in (64, 128)
-                or type(config.tile_k) is not int or config.tile_k not in (64, 128)
-                or type(config.split_k) is not int or config.split_k not in (1, 2, 4, 8)):
+        simt = query.recipe == "iq2_xs" and config.tile_n == 4
+        row_tiles = (1, 2, 4, 8) if simt else (8, 16, 32, 64) if query.recipe == "iq2_xs" else (16, 32, 64)
+        if ((simt and config.tile_m is None) or config.tile_m is not None
+                and (type(config.tile_m) is not int or config.tile_m not in row_tiles)):
+            raise ValueError("invalid A16 row tile")
+        if query.recipe == "mxfp8" and config.tile_m not in (None, 16):
+            raise ValueError("MXFP8 A16 requires a 16-row tile")
+        if not simt and config.tile_m == 8 and config.split_k != 1:
+            raise ValueError("transposed IQ2_XS does not support split-K")
+        if (type(config.tile_n) is not int or config.tile_n not in ((4,) if simt else (64, 128))
+                or type(config.tile_k) is not int or config.tile_k not in ((256,) if simt else (64, 128, 256) if query.recipe in ("iq2_xs", "nvfp4") else (64, 128))
+                or type(config.split_k) is not int or config.split_k not in ((1,) if simt else (1, 2, 4, 8))):
             raise ValueError("invalid A16 launch geometry")
         if query.padded_in_features % 32 or query.out_features % 8:
             raise ValueError("A16 requires stored K32 and N8")
@@ -134,7 +151,7 @@ def _validate_config(query, config, device):
             if query.workspace_nbytes < needed:
                 raise ValueError("caller workspace is too small for A16 split-K")
     else:
-        if any(value is not None for value in (config.tile_n, config.tile_k, config.split_k)):
+        if any(value is not None for value in (config.tile_m, config.tile_n, config.tile_k, config.split_k)):
             raise ValueError("quantized execution has no A16 launch knobs")
         if query.padded_in_features % 128:
             raise ValueError("quantized execution requires stored K128")
@@ -157,18 +174,26 @@ def _validate_config(query, config, device):
 
 def _tuning_parameters(query, device):
     del device
+    def eligible(parameters):
+        if parameters["mode"] != "a16":
+            return True
+        if parameters["tile_n"] == 4:
+            return (query.recipe == "iq2_xs" and query.num_tokens <= 8
+                    and parameters["tile_m"] in (1, 2, 4, 8)
+                    and parameters["tile_k"] == 256 and parameters["split_k"] == 1)
+        if parameters["tile_m"] == 8:
+            return (query.recipe == "iq2_xs" and parameters["split_k"] == 1
+                    and (parameters["tile_n"] == 64 or query.out_features > 64))
+        return (parameters["tile_m"] in (16, 32, 64)
+                and parameters["tile_k"] in ((64, 128, 256) if query.recipe in ("iq2_xs", "nvfp4") else (64, 128))
+                and (parameters["tile_m"] == 16 or
+                     query.recipe != "mxfp8" and parameters["tile_m"] <= query.num_tokens)
+                and (parameters["tile_n"] == 64 or query.out_features > 64))
+
     return ParameterSpace.create(
         TUNING.knobs,
-        values={"mode": ("a16", "quantized") if query.activation_mode == "auto" else (query.activation_mode,)},
-        predicates=(
-            # N at or below 64 is a single N tile for either tile width, and the
-            # 128-wide tile issues twice the MMA work over the same columns.
-            lambda parameters: (
-                parameters["mode"] != "a16"
-                or parameters["tile_n"] == 64
-                or query.out_features > 64
-            ),
-        ),
+        values={"mode": ("a16",) if query.recipe == "iq2_xs" else ("a16", "quantized") if query.activation_mode == "auto" else (query.activation_mode,)},
+        predicates=(eligible,),
     )
 
 
@@ -176,21 +201,22 @@ def _equivalence(query, device, config):
     if config.mode == "quantized":
         return {"mode": "quantized"}
     n, k, split = effective_a16_config(query, config)
-    return {"mode": "a16", "tile_n": n, "tile_k": k, "split_k": split}
+    return {"mode": "a16", "tile_m": config.tile_m or 16, "tile_n": n, "tile_k": k, "split_k": split}
 
 
 TUNING = TuningContract(
-    component_id="gemm.blockscaled_precision", query_schema_version=5, config_schema_version=2,
+    component_id="gemm.blockscaled_precision", query_schema_version=6, config_schema_version=4,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
     encode_config=BlockscaledConfig.to_dict, decode_config=BlockscaledConfig.from_config,
     validate_query=_validate_query, validate_config=_validate_config, default_config=_default_config,
-    candidate_contract_version=6,
+    candidate_contract_version=18,
     knobs=(
         Knob(name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE),
-        Knob(name="tile_n", values=(64, 128), when=FrozenMapping({"mode": "a16"})),
-        Knob(name="tile_k", values=(64, 128), when=FrozenMapping({"mode": "a16"})),
+        Knob(name="tile_m", values=(1, 2, 4, 8, 16, 32, 64), when=FrozenMapping({"mode": "a16"})),
+        Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
+        Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(name="split_k", values=(1, 2, 4, 8), when=FrozenMapping({"mode": "a16"})),
     ),
     parameters=_tuning_parameters,
@@ -200,6 +226,8 @@ TUNING = TuningContract(
 
 @dataclass(frozen=True, kw_only=True)
 class FixedBlockscaledQuery:
+    """Fixed kernel recipe; serialized block-FP8 accepts dynamic M with expected_m=None."""
+
     recipe: str
     call_kind: str
     max_rows: int
@@ -208,7 +236,7 @@ class FixedBlockscaledQuery:
     out_features: int
     input_dtype: str
     output_dtype: str
-    expected_m: int
+    expected_m: int | None
     alpha_mode: str | None = None
     source_scale_form: str | None = None
     codegen: FrozenMapping | None = None
@@ -238,11 +266,14 @@ def _validate_fixed_query(query, device):
         raise ValueError("bounded fixed workspace requires an FP8 recipe")
     if not query.fp8_workspace and (query.output_mode != "functional" or query.workspace_form != "owned"):
         raise ValueError("caller-owned fixed output/workspace requires the FP8 workspace route")
-    if (min(query.max_rows, query.in_features, query.out_features, query.expected_m) <= 0
+    if (min(query.max_rows, query.in_features, query.out_features) <= 0
+            or (query.expected_m is not None and query.expected_m <= 0)
             or query.padded_in_features < query.in_features
             or query.output_dtype not in ("bfloat16", "float16")
             or query.alpha_mode not in ("unit", "tensor")):
         raise ValueError("invalid fixed blockscaled metadata")
+    if query.expected_m is None and (query.call_kind, query.recipe) != ("serialized", "block_fp8"):
+        raise ValueError("dynamic fixed blockscaled rows require serialized block-FP8")
     if query.call_kind == "serialized":
         if (query.recipe not in ("nvfp4", "mxfp4", "block_fp8")
                 or query.in_features != query.padded_in_features
@@ -277,5 +308,5 @@ def _validate_fixed_query(query, device):
 
 FIXED_TUNING = replace(
     make_fixed_contract(component_id="gemm.blockscaled.fixed", query_type=FixedBlockscaledQuery, backend="cutedsl"),
-    query_schema_version=3, validate_query=_validate_fixed_query,
+    query_schema_version=4, validate_query=_validate_fixed_query,
 )

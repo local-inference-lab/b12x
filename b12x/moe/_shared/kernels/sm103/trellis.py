@@ -20,18 +20,18 @@ class TrellisPipeline:
     intermediate: int
     experts: int
     codebook: str
-    coupled_hadamard: bool
+    intermediate_hadamard: bool
 
     @classmethod
     def from_weight_plan(cls, plan):
-        if plan.source_format not in {"b12x_trellis", "btx"}:
+        if plan.source_format not in {"b12x_trellis", "exl3"}:
             raise ValueError("Trellis pipeline requires a Trellis weight plan")
         return cls(
             plan.hidden_size,
             plan.intermediate_size,
             plan.num_experts,
             plan.trellis_codebook or "mcg",
-            plan.coupled_hadamard,
+            plan.intermediate_hadamard,
         )
 
     def reconstruction(self, *, projection: str, bits: int):
@@ -63,7 +63,7 @@ class ReconstructTrellisTiles:
     sizes pointer layouts; live_tiles changes only the launch grid.
     """
 
-    def __init__(self, bits: int, capacity: int, *, codebook: str = "sqg_e4m3"):
+    def __init__(self, bits: int, capacity: int, *, codebook: str = "lut_e4m3"):
         self.codebook = decoder_contract(bits, codebook)
         if capacity <= 0:
             raise ValueError("tile reconstruction requires positive capacity")

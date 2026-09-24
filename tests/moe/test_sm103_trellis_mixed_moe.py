@@ -20,15 +20,15 @@ def prepare_mixed(
     device="cuda",
     dtype=torch.bfloat16,
     activation="silu",
-    coupled=False,
+    intermediate_hadamard=False,
     per_expert_scales=False,
-    transform_draw=0,
+    sign_pattern=0,
     global_intermediate_size=None,
     intermediate_offset=0,
     distinct_input_scales=False,
 ):
     config = _glm_config()
-    if coupled:
+    if intermediate_hadamard:
         config["transform"]["expert"] = _k3_config()["transform"]["expert"]
     if per_expert_scales:
         for name in ("input_scales", "output_scales"):
@@ -64,7 +64,7 @@ def prepare_mixed(
         ),
     )
     weights = fused_moe.TrellisWeights(
-        atoms=atoms,
+        codes=atoms,
         rate=torch.tensor(rates, device=device, dtype=torch.uint8) * 17,
         input_scales=fused_moe.ScaleFactors(
             (
@@ -90,9 +90,9 @@ def prepare_mixed(
                 )
             ).half()
         ),
-        expert_transform_draws=(
-            torch.full((experts,), transform_draw, device=device, dtype=torch.uint8)
-            if coupled
+        expert_sign_patterns=(
+            torch.full((experts,), sign_pattern, device=device, dtype=torch.uint8)
+            if intermediate_hadamard
             else None
         ),
         global_intermediate_size=global_intermediate_size,
@@ -101,22 +101,22 @@ def prepare_mixed(
     return fused_moe.prepare_weights(plan=plan, weights=weights), native, rates
 
 
-def test_mixed_coupled_nonzero_draws_require_global_extent():
+def test_mixed_intermediate_hadamard_nonzero_sign_patterns_require_global_extent():
     if not torch.cuda.is_available():
         pytest.skip("canonical preparation requires a GPU")
     with pytest.raises(ValueError, match="require global_intermediate_size"):
-        prepare_mixed(coupled=True, hidden=512, activation="situ", transform_draw=1)
+        prepare_mixed(intermediate_hadamard=True, hidden=512, activation="situ", sign_pattern=1)
 
 
-def test_mixed_coupled_draws_reject_unknown_family():
+def test_mixed_intermediate_hadamard_sign_patterns_reject_unknown_family():
     if not torch.cuda.is_available():
         pytest.skip("canonical preparation requires a GPU")
     with pytest.raises(ValueError, match="values must be in 0..7"):
         prepare_mixed(
-            coupled=True,
+            intermediate_hadamard=True,
             hidden=512,
             activation="situ",
-            transform_draw=8,
+            sign_pattern=8,
             global_intermediate_size=128,
         )
 
@@ -124,20 +124,20 @@ def test_mixed_coupled_draws_reject_unknown_family():
 @pytest.mark.parametrize(
     "experts,uniform", [(5, False), (5, True), (384, False), (384, True)]
 )
-@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize("intermediate_hadamard", [False, True])
 def test_mixed_preparation_preserves_records_and_large_namespace(
-    experts, uniform, coupled
+    experts, uniform, intermediate_hadamard
 ):
     if not torch.cuda.is_available():
         pytest.skip("canonical preparation requires a GPU")
     from types import SimpleNamespace
 
     torch.manual_seed(73)
-    hidden, activation = (512, "situ") if coupled else (256, "silu")
+    hidden, activation = (512, "situ") if intermediate_hadamard else (256, "silu")
     weights, native, rates = prepare_mixed(
         experts=experts,
         uniform=uniform,
-        coupled=coupled,
+        intermediate_hadamard=intermediate_hadamard,
         hidden=hidden,
         activation=activation,
         per_expert_scales=not uniform,
@@ -148,9 +148,9 @@ def test_mixed_preparation_preserves_records_and_large_namespace(
         SimpleNamespace(weight_E=experts, k=hidden, n=128, device=weights.device),
         prepared,
     )
-    assert state.coupled_hadamard is coupled
-    assert state.intermediate_rotations.shape == (experts, 768 if coupled else 384)
-    if coupled:
+    assert state.intermediate_hadamard is intermediate_hadamard
+    assert state.intermediate_rotations.shape == (experts, 768 if intermediate_hadamard else 384)
+    if intermediate_hadamard:
         assert (
             prepared.rotations.gate_suh.data_ptr()
             == prepared.rotations.up_suh.data_ptr()
@@ -187,13 +187,13 @@ def test_mixed_preparation_preserves_records_and_large_namespace(
     assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
     if uniform:
         # An all-K3 descriptor table must preserve the uniform record contract,
-        # including the coupled transform flag and FP16 rounding boundaries.
+        # including the intermediate-Hadamard transform flag and FP16 rounding boundaries.
         uniform_expected = moe_reference(
             source, prepared.tiers[0], ids, router, activation_kind=activation
         )
         torch.testing.assert_close(expected, uniform_expected, atol=0, rtol=0)
-    if coupled and torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
-        with pytest.raises(NotImplementedError, match="silu|coupled"):
+    if intermediate_hadamard and torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
+        with pytest.raises(NotImplementedError, match="silu|intermediate_hadamard"):
             fused_moe.plan_execution(
                 experts=weights,
                 capacity=fused_moe.ExecutionCapacity(max_tokens=8, top_k=2),
@@ -239,7 +239,7 @@ def _run_native_mixed(
     hidden=256,
     width=128,
     top_k=2,
-    coupled=False,
+    intermediate_hadamard=False,
     cross_half=False,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
@@ -254,13 +254,13 @@ def _run_native_mixed(
         activation=activation,
         hidden=hidden,
         width=width,
-        coupled=coupled,
+        intermediate_hadamard=intermediate_hadamard,
         per_expert_scales=not uniform,
-        transform_draw=3 if coupled else 0,
+        sign_pattern=3 if intermediate_hadamard else 0,
         global_intermediate_size=(width if cross_half else 4 * width)
-        if coupled
+        if intermediate_hadamard
         else None,
-        intermediate_offset=width if coupled and not cross_half else 0,
+        intermediate_offset=width if intermediate_hadamard and not cross_half else 0,
         distinct_input_scales=cross_half,
     )
     payload = weights._impl.representation_for("w4a16")
@@ -278,7 +278,7 @@ def _run_native_mixed(
     states = require_prepared(plan, "moe.decode").variants
     assert all(v.config.backend == "tcgen05_trellis" for v in states.values())
     launches = tuple(id(fn) for fn in require_prepared(plan, "moe.decode").variants[8].scratch._backend_plan.launches.values())
-    assert len(launches) == (16 if coupled else 15)
+    assert len(launches) == (16 if intermediate_hadamard else 15)
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
@@ -339,7 +339,7 @@ def _run_native_mixed(
                 external.fill_(float("nan"))
                 bound = bind(live, target)
                 assert len(bound._backend_binding.calls) == (
-                    8 if coupled and not cross_half else 9
+                    8 if intermediate_hadamard and not cross_half else 9
                 )
                 check(fused_moe.run(binding=bound), references[live])
                 if target is not None:
@@ -417,18 +417,18 @@ def test_native_mixed_moe_v41_geometry():
 
 @pytest.mark.parametrize("experts,uniform", [(5, False), (384, False), (384, True)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_native_coupled_mixed_moe_graph_and_capacity(experts, uniform, dtype):
+def test_native_intermediate_hadamard_mixed_moe_graph_and_capacity(experts, uniform, dtype):
     _run_native_mixed(
         experts=experts,
         uniform=uniform,
         dtype=dtype,
         activation="situ",
         hidden=512,
-        coupled=True,
+        intermediate_hadamard=True,
     )
 
 
-def test_native_coupled_mixed_moe_v41_geometry():
+def test_native_intermediate_hadamard_mixed_moe_v41_geometry():
     _run_native_mixed(
         experts=384,
         uniform=False,
@@ -437,12 +437,12 @@ def test_native_coupled_mixed_moe_v41_geometry():
         hidden=5120,
         width=2304,
         top_k=6,
-        coupled=True,
+        intermediate_hadamard=True,
     )
 
 
 @pytest.mark.parametrize("experts,uniform", [(5, False), (384, True)])
-def test_native_mixed_coupled_cross_half_moe(experts, uniform):
+def test_native_mixed_intermediate_hadamard_cross_half_moe(experts, uniform):
     _run_native_mixed(
         experts=experts,
         uniform=uniform,
@@ -450,6 +450,6 @@ def test_native_mixed_coupled_cross_half_moe(experts, uniform):
         activation="situ",
         hidden=512,
         width=384,
-        coupled=True,
+        intermediate_hadamard=True,
         cross_half=True,
     )

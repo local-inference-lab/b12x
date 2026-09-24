@@ -13,6 +13,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
     fmax_f32,
     ld_global_v4_u32,
@@ -1956,7 +1957,7 @@ def _get_compiled_lse_reduce_scatter(
         )
 
     _PREPARED_LSE_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _gather_launcher_key(
@@ -2066,7 +2067,7 @@ def _get_compiled_all_gather_heads(
         )
 
     _PREPARED_GATHER_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _pair_launcher_key(
@@ -2198,7 +2199,7 @@ def _get_compiled_all_gather_pair(
         )
 
     _PREPARED_PAIR_LAUNCHERS.add(key)
-    return run
+    return attach_programs(run, raw)
 
 
 def is_kimi_topk16_prepared(threads: int = 256) -> bool:
@@ -2251,7 +2252,7 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
         )
 
     _PREPARED_KIMI_TOPK_LAUNCHERS.add(normalized_threads)
-    return run
+    return attach_programs(run, raw)
 
 
 def lse_reduce_scatter(

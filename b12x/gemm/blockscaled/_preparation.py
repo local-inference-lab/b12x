@@ -17,6 +17,8 @@ from ._tuning import (
     functional_mxfp8_quantization,
 )
 
+_MXFP8_PREFILL_MIN_ROWS = 2048
+
 
 def _decode_query(payload):
     values = dict(payload)
@@ -24,7 +26,7 @@ def _decode_query(payload):
     return BlockscaledQuery(**values)
 
 
-def _dense_lowering(query, config, device):
+def _lower_dense_with_hint(query, config, device, expected_m):
     from b12x.gemm._preparation import _default_lowering
     from b12x.gemm._tuning import DenseGemmQuery
     functional = functional_mxfp8_quantization(query, config)
@@ -34,12 +36,33 @@ def _dense_lowering(query, config, device):
         in_features=query.padded_in_features, out_features=query.out_features,
         output_mode="functional" if functional else "provided",
         alpha_mode="unit" if functional else "tensor",
-        expected_m=query.expected_m,
+        expected_m=expected_m,
     )
     return _default_lowering(inner, device.identity)
 
 
-def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_count, capability):
+def _has_mxfp8_prefill_regime(query):
+    return (
+        query.recipe == "mxfp8" and query.expected_m is None
+        and query.num_tokens >= _MXFP8_PREFILL_MIN_ROWS
+    )
+
+
+def _dense_lowering(query, config, device):
+    # Both programs are compiled for the declared capacity. The large-row hint
+    # must not force underfilled short prefills onto a large M tile.
+    expected_m = query.num_tokens if _has_mxfp8_prefill_regime(query) else query.expected_m
+    return _lower_dense_with_hint(query, config, device, expected_m)
+
+
+def _short_dense_lowering(query, config, device):
+    if not _has_mxfp8_prefill_regime(query):
+        return None
+    return _lower_dense_with_hint(query, config, device, None)
+
+
+def compile_packed(query_payload, config_payload, dense_payload, short_dense_payload,
+                   ordinal, sm_count, capability):
     import cutlass
     from b12x._lib import dense_gemm as dense
     from . import _quantize, _reduce
@@ -49,14 +72,18 @@ def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_cou
     fp4 = query.recipe == "nvfp4"
     with torch.cuda.device(ordinal):
         if config.mode == "a16":
+            if config.tile_n == 4:
+                from ._iq2_xs_gemv import compile_gemv
+                return {"gemm": compile_gemv(ordinal, query.out_features, query.in_features, config.tile_m)}
             bn, bk, slices = effective_a16_config(query, config)
             gemm = dense._get_compiled_dense_gemm(
                 query.out_features, query.padded_in_features, 1, slices,
                 "k", "k", "n", cutlass.BFloat16, cutlass.Uint8,
                 cutlass.Float32 if slices > 1 else cutlass.BFloat16, cutlass.Float32,
-                16 if fp4 else 32, 16, bk, (16, bn), (1, 1),
+                16 if fp4 else 32, 16, bk, (config.tile_m or 16, bn), (1, 1),
                 dense._DenseGemmPolicy(True, True, False, slices, False, False),
-                sm_count, f"sm_{capability[0]}{capability[1]}a", "tma", False, False, False,
+                sm_count, f"sm_{capability[0]}{capability[1]}a", "tma",
+                query.recipe == "iq2_xs" and config.tile_m == 8, False, False,
                 alpha_is_one=not fp4, target_occupancy_override=1,
                 weight_only=query.recipe, alpha_reciprocal=query.global_scale_kind == "reciprocal",
                 input_k=query.in_features, device_ordinal=ordinal,
@@ -66,6 +93,11 @@ def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_cou
                 programs["reduce"] = _reduce.compile_reduce(query.out_features, slices, ordinal)
             return programs
         programs = dense._compile_dense_lowering(dense_payload, ordinal)
+        if short_dense_payload is not None:
+            programs.update({
+                "short_" + name: program
+                for name, program in dense._compile_dense_lowering(short_dense_payload, ordinal).items()
+            })
         if functional_mxfp8_quantization(query, config):
             from b12x._lib.quant import mxfp8_rows
             rows = query.num_tokens if query.expected_m is None else query.expected_m
@@ -129,6 +161,8 @@ class _PackedExecutionState:
     required_workspace: int
     workspace: torch.Tensor | None = None
     mxfp8_bases: tuple | None = None
+    short_dense: object | None = None
+    iq2_lut: torch.Tensor | None = None
 
     @property
     def owned_nbytes(self) -> int:
@@ -152,6 +186,7 @@ class _PackedExecutionState:
         from ._linear import _source_2d, _pad_k
         q, config = self.query, self.config
         fp4 = q.recipe == "nvfp4"
+        iq2 = q.recipe == "iq2_xs"
         if source.device != self.device or source.dtype != getattr(torch, q.input_dtype):
             raise ValueError("packed source differs from prepared dtype/device")
         if source.ndim < 2 or source.shape[-1] != q.in_features:
@@ -177,20 +212,30 @@ class _PackedExecutionState:
             workspace = self.workspace
         if (activation_scale is not None) != q.activation_scale_available:
             raise ValueError("activation-scale presence differs from preparation")
-        stored_k = q.padded_in_features // 2 if fp4 else q.padded_in_features
-        _check_tensor("weight", values, self.device, torch.uint8 if fp4 else torch.float8_e4m3fn)
+        stored_k = q.padded_in_features // (4 if iq2 else 2 if fp4 else 1)
+        _check_tensor("weight", values, self.device, torch.uint8 if fp4 or iq2 else torch.float8_e4m3fn)
         if values.shape != (q.out_features, stored_k):
             raise ValueError("packed weight geometry differs from preparation")
-        scale_bytes = scale_storage(scales, q.out_features, q.padded_in_features, 16 if fp4 else 32)
+        if iq2:
+            if tuple(scales.shape) != ((q.out_features + 127) // 128, q.in_features // 256, 1280):
+                raise ValueError("IQ2_XS metadata geometry differs from preparation")
+            scale_bytes = scales
+        else:
+            scale_bytes = scale_storage(scales, q.out_features, q.padded_in_features, 16 if fp4 else 32)
         _check_tensor("weight scale", scale_bytes, self.device, torch.uint8)
         if fp4:
             _check_tensor("weight global scale", global_scale, self.device, torch.float32)
             if global_scale.numel() != 1:
                 raise ValueError("weight global scale must be scalar")
         elif global_scale is not None:
-            raise ValueError("MXFP8 has no weight global scale")
+            raise ValueError("this weight recipe has no global scale")
         if m == 0:
             return _validate_output(source, out, q.out_features, dtype=getattr(torch, q.input_dtype))
+        core = (
+            self.short_dense
+            if self.short_dense is not None and m < _MXFP8_PREFILL_MIN_ROWS
+            else self.dense
+        )
         with torch.cuda.device(self.device), _stream_context(stream, self.device):
             if m == 0:
                 return _validate_output(source, out, q.out_features, dtype=getattr(torch, q.input_dtype))
@@ -199,7 +244,7 @@ class _PackedExecutionState:
                 _check_tensor("quantizer source", contiguous, self.device, getattr(torch, q.input_dtype))
                 packed = self._mxfp8_rows(m)
                 self.programs["quantize"](contiguous, packed.values, packed.scale_rows, packed.scale_mma)
-                result = self.dense.run(
+                result = core.run(
                     (packed.values.view(m, stored_k, 1), packed.scale_mma),
                     (values.view(q.out_features, stored_k, 1), scales.view(torch.float8_e8m0fnu)),
                     stream=stream,
@@ -208,6 +253,8 @@ class _PackedExecutionState:
             _check_tensor("source", source, self.device, getattr(torch, q.input_dtype))
             out = _validate_output(source, out, q.out_features, dtype=getattr(torch, q.input_dtype))
             reads = (source, values, scale_bytes) + ((global_scale,) if fp4 else ())
+            if iq2:
+                reads += (self.iq2_lut,)
             if any(_overlap(out, tensor) for tensor in reads):
                 raise ValueError("output must not overlap packed inputs")
             if workspace is not None:
@@ -222,7 +269,7 @@ class _PackedExecutionState:
                 _, _, slices = effective_a16_config(q, config)
                 target = out if slices == 1 else workspace[:self.required_workspace].view(torch.float32)
                 self.programs["gemm"](
-                    source.view(m, q.in_features), values, scale_bytes, scale_bytes, target,
+                    source.view(m, q.in_features), values, self.iq2_lut if iq2 else scale_bytes, scale_bytes, target,
                     global_scale if fp4 else self.alpha_one, cuda_stream_to_int(stream),
                 )
                 if slices > 1:
@@ -252,7 +299,7 @@ class _PackedExecutionState:
             )
             from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
             scale_view = (as_grouped_scale_view if fp4 else as_grouped_scale_view_mx)(packed_scales.view(1, -1), m, q.padded_in_features)
-            self.dense.run(
+            core.run(
                 (packed_values.view(m, stored_k, 1), scale_view),
                 (values.view(q.out_features, stored_k, 1), scales),
                 out=out.view(m, q.out_features, 1), alpha=alpha, stream=stream, split_k_workspace=partials,
@@ -271,14 +318,18 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def inner(config, device):
         key = (config, device.identity)
         if key not in lowerings:
-            lowerings[key] = None if config.mode == "a16" else _dense_lowering(query, config, device)
+            lowerings[key] = (None, None) if config.mode == "a16" else (
+                _dense_lowering(query, config, device),
+                _short_dense_lowering(query, config, device),
+            )
         return lowerings[key]
 
     def compile_jobs(config, device):
-        p = inner(config, device)
+        p, short = inner(config, device)
         return (CompileJob.create(
             "b12x.gemm.blockscaled._preparation:compile_packed",
             TUNING.encode_query(query), config.to_dict(), None if p is None else p.to_dict(),
+            None if short is None else short.to_dict(),
             device.ordinal, device.identity.sm_count, device.identity.compute_capability,
         ),)
 
@@ -293,19 +344,31 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             existing = current_prepared_state()
             resident = 0 if existing is None else min(owned, existing.owned_nbytes)
             persistent.append(PersistentMemory(("blockscaled.owned", current_plan()), owned, resident))
-        if query.recipe == "mxfp8" and (config.mode == "a16" or functional_mxfp8_quantization(query, config)):
+        if query.recipe in ("mxfp8", "iq2_xs") and (config.mode == "a16" or functional_mxfp8_quantization(query, config)):
             resident = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
             persistent.append(PersistentMemory(("dense.alpha_one", device.ordinal), 4, 0 if resident is None else resident.numel() * resident.element_size()))
+        if query.recipe == "iq2_xs":
+            from b12x._lib.quant.iq2_xs import _DEVICE_TABLES
+            resident = _DEVICE_TABLES.get(("cuda", device.ordinal))
+            persistent.append(PersistentMemory(("iq2_xs.execution_lut", device.ordinal), 8192, 0 if resident is None else resident.numel() * resident.element_size()))
         return MemoryRequirements(scratch, tuple(persistent))
 
     def materialize(selection, device):
         from b12x._lib import dense_gemm as dense
         from ._a16 import _layout
         config = selection.config
-        p = inner(config, device)
-        programs = compile_packed(TUNING.encode_query(query), config.to_dict(), None if p is None else p.to_dict(), device.ordinal, device.identity.sm_count, device.identity.compute_capability)
+        p, short = inner(config, device)
+        programs = compile_packed(TUNING.encode_query(query), config.to_dict(),
+                                  None if p is None else p.to_dict(),
+                                  None if short is None else short.to_dict(),
+                                  device.ordinal, device.identity.sm_count,
+                                  device.identity.compute_capability)
         resolved_device = torch.device("cuda", device.ordinal)
         core = None if p is None else dense._DenseExecutionState(p, resolved_device, programs["gemm"], programs.get("reduce"), dense._cached_alpha_one(resolved_device) if p.alpha_is_one else None)
+        short_core = None if short is None else dense._DenseExecutionState(
+            short, resolved_device, programs["short_gemm"], programs.get("short_reduce"),
+            dense._cached_alpha_one(resolved_device) if short.alpha_is_one else None,
+        )
         offsets = None if config.mode == "a16" or functional_mxfp8_quantization(query, config) else _layout(query.num_tokens, query.out_features, query.padded_in_features, query.recipe == "nvfp4", (64, 64, 1))
         needed = _workspace_bytes(query, config)
         workspace = bases = None
@@ -328,10 +391,14 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                         query.num_tokens, query.padded_in_features, num_groups=1,
                         device=resolved_device, initialize_scales=False,
                     )
+        lut = None
+        if query.recipe == "iq2_xs":
+            from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
+            lut = iq2_xs_execution_lut(resolved_device, prepare=True)
         return _PackedExecutionState(
             query, config, resolved_device, programs, core,
-            dense._cached_alpha_one(resolved_device) if query.recipe == "mxfp8" and config.mode == "a16" else None,
-            offsets, needed, workspace, bases,
+            dense._cached_alpha_one(resolved_device) if query.recipe in ("mxfp8", "iq2_xs") and config.mode == "a16" else None,
+            offsets, needed, workspace, bases, short_core, lut,
         )
 
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, shared=True,
@@ -341,6 +408,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
 def _query_bf16_from_call(source, weight, *, activation_mode="auto", activation_global_scale=None,
                     out=None, workspace=None, expected_m=None):
     from ._a16 import _weight_parts
+    from ._iq2_xs import IQ2XSLinearWeight
     values, _, _, fp4 = _weight_parts(weight)
     if source.ndim < 2 or source.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("packed queries require BF16 or FP16 activations with at least two dimensions")
@@ -353,7 +421,7 @@ def _query_bf16_from_call(source, weight, *, activation_mode="auto", activation_
     ):
         raise ValueError("packed workspace must be contiguous uint8 storage on the source device")
     return BlockscaledQuery(
-        recipe="nvfp4" if fp4 else "mxfp8", num_tokens=source.numel() // weight.in_features,
+        recipe="iq2_xs" if isinstance(weight, IQ2XSLinearWeight) else "nvfp4" if fp4 else "mxfp8", num_tokens=source.numel() // weight.in_features,
         in_features=weight.in_features, padded_in_features=weight.padded_in_features,
         out_features=weight.out_features, activation_mode=activation_mode,
         input_dtype=str(source.dtype).removeprefix("torch."),
@@ -431,7 +499,9 @@ class _FixedExecutionState:
         if source.ndim != 2 or source.device != self.device or source.dtype != getattr(torch, q.input_dtype):
             raise ValueError("fixed source layout/dtype/device differs from preparation")
         expected_k = q.in_features // 2 if serialized and q.recipe in ("nvfp4", "mxfp4") else q.in_features
-        if source.shape[1] != expected_k or source.shape[0] not in (0, q.max_rows):
+        if source.shape[1] != expected_k or source.shape[0] > q.max_rows:
+            raise ValueError("fixed execution exceeds its planned M capacity or logical K")
+        if q.expected_m is not None and source.shape[0] not in (0, q.max_rows):
             raise ValueError("fixed execution requires its exact planned nonempty M and logical K")
         weight_k = q.padded_in_features // 2 if serialized and q.recipe in ("nvfp4", "mxfp4") else q.padded_in_features
         if weight.device != self.device or weight.shape != (q.out_features, weight_k):
@@ -675,9 +745,10 @@ def plan_regimes(
 def query_from_call(source, weight, *, activation_mode="auto", activation_global_scale=None,
                     out=None, workspace=None, expected_m=None, out_dtype=None, alpha=None, **options):
     from ._a16 import NVFP4LinearWeight
+    from ._iq2_xs import IQ2XSLinearWeight
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
     from ._tuning import FixedBlockscaledQuery
-    if isinstance(weight, NVFP4LinearWeight) or (
+    if isinstance(weight, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
         isinstance(weight, MXFP8LinearWeight) and isinstance(source, torch.Tensor) and source.dtype in (torch.bfloat16, torch.float16)
     ):
         if options or alpha is not None or out_dtype not in (None, source.dtype):

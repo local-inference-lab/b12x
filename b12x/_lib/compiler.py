@@ -21,6 +21,7 @@ from contextvars import ContextVar
 from threading import RLock
 from types import SimpleNamespace
 from typing import Any
+from .cache_integrity import _mkdir_durable, atomic_write_bytes, valid_object
 
 from .compile_plan import _RETAINED_PROGRAMS
 from .runtime_patches import apply_cutlass_runtime_patches
@@ -2479,39 +2480,22 @@ def _write_compile_manifest(
     object_bytes: bytes,
     compiled: Any = None,
 ) -> None:
-    manifest_path = _cache_manifest_path(cache_key)
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest = _build_compile_manifest(
         cache_key, cache_payload, func, object_bytes, compiled=compiled
     )
     if compiled is not None:
         compiled._b12x_launch_metadata = manifest["launch_metadata"]
-    tmp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=manifest_path.parent,
-            prefix=f".{manifest_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp_file:
-            tmp_name = tmp_file.name
-            json.dump(
-                manifest,
-                tmp_file,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                allow_nan=False,
-            )
-            tmp_file.write("\n")
-        os.replace(tmp_name, manifest_path)
-        tmp_name = None
-    finally:
-        if tmp_name is not None:
-            with suppress(OSError):
-                os.unlink(tmp_name)
+    data = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False,
+    ) + "\n"
+    atomic_write_bytes(_cache_manifest_path(cache_key), data.encode("utf-8"))
+
+
+def _valid_cute_compile_cache(cache_key: str) -> bool:
+    return valid_object(
+        _cache_object_path(cache_key), _cache_manifest_path(cache_key), cache_key,
+    )
 
 
 def _ensure_cute_compile_manifest(
@@ -2535,7 +2519,7 @@ def _disk_cache_key_lock(cache_key: str):
         return
 
     lock_path = _cache_lock_path(cache_key)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(lock_path.parent)
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
@@ -2559,30 +2543,29 @@ def _load_cute_compile_from_disk(cache_key: str):
         ) as raw_stage:
             staged_object = Path(raw_stage) / object_path.name
             shutil.copy2(object_path, staged_object)
+            # Validate the bytes actually handed to CUTLASS. Its loader can
+            # modify this private copy; it must never modify the cached object.
             manifest_path = _cache_manifest_path(cache_key)
-            launch_metadata = None
-            if manifest_path.exists():
-                manifest = json.loads(manifest_path.read_text())
-                object_hash = hashlib.sha256(staged_object.read_bytes()).hexdigest()
-                if manifest.get("object_sha256") != object_hash:
-                    raise ValueError("CuTe cache object does not match its manifest")
-                launch_metadata = manifest.get("launch_metadata")
-                evidence = {
-                    "cache_key": cache_key,
-                    "object_sha256": object_hash,
-                    "launch_metadata": launch_metadata,
-                }
-                evidence_hash = hashlib.sha256(
-                    json.dumps(
-                        evidence,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=True,
-                        allow_nan=False,
-                    ).encode("utf-8")
-                ).hexdigest()
-                if manifest.get("artifact_evidence_sha256") != evidence_hash:
-                    raise ValueError("CuTe cache launch metadata does not match its digest")
+            if not valid_object(staged_object, manifest_path, cache_key):
+                return None
+            manifest = json.loads(manifest_path.read_text())
+            launch_metadata = manifest.get("launch_metadata")
+            evidence = {
+                "cache_key": cache_key,
+                "object_sha256": manifest["object_sha256"],
+                "launch_metadata": launch_metadata,
+            }
+            evidence_hash = hashlib.sha256(
+                json.dumps(
+                    evidence,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if manifest.get("artifact_evidence_sha256") != evidence_hash:
+                return None
             module = ExternalBinaryModule(str(staged_object))
             compiled = getattr(module, _cache_prefix(cache_key))
             if launch_metadata is not None:
@@ -2603,12 +2586,8 @@ def _store_cute_compile_to_disk(
         return
 
     object_path = _cache_object_path(cache_key)
-    object_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = object_path.with_suffix(".tmp")
     object_bytes = compiled.dump_to_object(_cache_prefix(cache_key))
-    with open(tmp_path, "wb") as f:
-        f.write(object_bytes)
-    os.replace(tmp_path, object_path)
+    atomic_write_bytes(object_path, object_bytes)
     if cache_payload is not None and func is not None:
         _write_compile_manifest(
             cache_key, cache_payload, func, object_bytes, compiled=compiled

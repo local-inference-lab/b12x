@@ -183,11 +183,14 @@ def w8a16(
 
 def _weight_parts(weight):
     from ._linear import MXFP8LinearWeight
+    from ._iq2_xs import IQ2XSLinearWeight
+    if isinstance(weight, IQ2XSLinearWeight):
+        return weight.values, weight.metadata, None, False
     if isinstance(weight, NVFP4LinearWeight):
         return weight.values, weight.scale_mma, weight.global_scale, True
     if isinstance(weight, MXFP8LinearWeight):
         return weight.weight.values, weight.weight.scale_mma, None, False
-    raise TypeError("BF16 blockscaled linear requires NVFP4 or MXFP8 weights")
+    raise TypeError("BF16 blockscaled linear requires NVFP4, MXFP8, or IQ2_XS weights")
 
 
 def _layout(m, n, k, fp4, config=None):

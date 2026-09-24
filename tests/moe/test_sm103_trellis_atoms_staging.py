@@ -14,7 +14,7 @@ from b12x._lib.architecture import architecture_for
 from b12x.moe import fused_moe
 from b12x.moe._shared.kernels.sm103.launch import pointer
 from b12x.moe._shared.kernels.sm103.trellis_atoms_gemm import RoutedAtomTrellisGemm
-from tests._reference.trellis_atoms import atom_fixture, btx_atom_fixture
+from tests._reference.trellis_atoms import atom_fixture, exl3_atom_fixture
 from tests.moe.test_sm103_trellis_mixed_staging import _require_gpu
 
 
@@ -173,7 +173,7 @@ def compile_probe(payload, source, ids, output, *, fc1, dual_input=False):
     return fn, args, scalars, stream, (lut, alternate)
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3", "lut_fp16"])
 @pytest.mark.parametrize(
     "group_size,fc1,dual_input",
     [
@@ -190,29 +190,29 @@ def test_grouped_atom_planes_boundaries_graph_and_mutation(
     _run_atom_staging(codebook, group_size, fc1, dual_input)
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3"])
 @pytest.mark.parametrize("fc1,dual_input", [(True, False), (True, True), (False, False)])
-def test_btx_pair_planes_boundaries_graph_and_mutation(tmp_path, codebook, fc1, dual_input):
-    _run_atom_staging(codebook, 256, fc1, dual_input, btx_path=tmp_path)
+def test_exl3_pair_planes_boundaries_graph_and_mutation(tmp_path, codebook, fc1, dual_input):
+    _run_atom_staging(codebook, 256, fc1, dual_input, exl3_path=tmp_path)
 
 
-def _run_atom_staging(codebook, group_size, fc1, dual_input, *, btx_path=None):
+def _run_atom_staging(codebook, group_size, fc1, dual_input, *, exl3_path=None):
     _require_gpu()
-    if btx_path is None:
+    if exl3_path is None:
         public, bundle, logical, matrices = atom_fixture(
             codebook=codebook, group_size=group_size, device="cuda"
         )
         prepared = fused_moe.prepare_weights(plan=public, weights=bundle)
         payload = prepared._impl.representation_for("w4a16")
-        assert payload.w13.data_ptr() == bundle.atoms.data_ptr()
+        assert payload.w13.data_ptr() == bundle.codes.data_ptr()
         torch.testing.assert_close(payload.rates.cpu(), logical, atol=0, rtol=0)
     else:
-        public, layer, matrices = btx_atom_fixture(btx_path, codebook=codebook)
+        public, layer, matrices = exl3_atom_fixture(exl3_path, codebook=codebook)
         # Only layout selection is counterfactual; the real GPU executes the
         # production operand staging below using its own compilation target.
         with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
             prepared = fused_moe.prepare_weights(
-                plan=public, btx_layer=layer, btx_device="cuda", params_dtype=torch.bfloat16,
+                plan=public, exl3_layer=layer, exl3_device="cuda", params_dtype=torch.bfloat16,
             )
         payload = prepared.representation_for("w4a16")
         assert payload.paired_records
@@ -301,7 +301,7 @@ def _run_atom_staging(codebook, group_size, fc1, dual_input, *, btx_path=None):
         invalid_rates = (0x13, 0x37, 0xFF)
         if payload.paired_records:
             invalid_rates += (0x23, 0x32, 0x24, 0x43, 0x55, 0x66)
-        if codebook == "sqg_fp16":
+        if codebook == "lut_fp16":
             invalid_rates += (0x45, 0x54, 0x75, 0x57)
         for code in invalid_rates:
             payload.rates.fill_(code)
@@ -322,8 +322,8 @@ def _run_atom_staging(codebook, group_size, fc1, dual_input, *, btx_path=None):
                 assert torch.count_nonzero(output) == 0
 
 
-@pytest.mark.parametrize("btx", [False, True])
-def test_atom_row_offsets_cross_int32_word_boundary(tmp_path, btx):
+@pytest.mark.parametrize("exl3", [False, True])
+def test_atom_row_offsets_cross_int32_word_boundary(tmp_path, exl3):
     _require_gpu()
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
@@ -331,11 +331,11 @@ def test_atom_row_offsets_cross_int32_word_boundary(tmp_path, btx):
     total = 8 * stride
     if free < total * 4 + 2**30:
         pytest.skip("17 GiB of free GPU memory required for high atom row offsets")
-    if btx:
-        public, layer, matrices = btx_atom_fixture(tmp_path, experts=1, width=256)
+    if exl3:
+        public, layer, matrices = exl3_atom_fixture(tmp_path, experts=1, width=256)
         with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
             prepared = fused_moe.prepare_weights(
-                plan=public, btx_layer=layer, btx_device="cuda", params_dtype=torch.bfloat16,
+                plan=public, exl3_layer=layer, exl3_device="cuda", params_dtype=torch.bfloat16,
             )
         payload = prepared.representation_for("w4a16")
     else:
@@ -344,7 +344,7 @@ def test_atom_row_offsets_cross_int32_word_boundary(tmp_path, btx):
         payload = prepared._impl.representation_for("w4a16")
     pool = torch.empty(total, dtype=torch.int32, device="cuda")
     rows = payload.w13.view(8, -1)
-    for row in range(0 if btx else 4, 8):
+    for row in range(0 if exl3 else 4, 8):
         pool[row * stride : row * stride + rows.shape[1]].copy_(rows[row])
     payload = replace(payload, w13=pool, row_stride_words=stride)
     assert 4 * stride > 2**31

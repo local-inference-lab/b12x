@@ -89,10 +89,10 @@ def validate_query(query):
     if query.pair_kind != pair_kind.upper() or query.rate_axis != rate_axis:
         raise ValueError("Trellis pair layout and explicit pair/rate metadata differ")
     size = query.in_features if rate_axis == "k" else query.out_features
-    if query.bits != 3 or size != 256 or query.codebook not in ("mcg", "sqg_e4m3"):
+    if query.bits != 3 or size != 256 or query.codebook not in ("mcg", "lut_e4m3"):
         raise ValueError(
             "compact Trellis pairs require three stored bits per weight, a 256-channel "
-            "rate axis, and MCG or SQG E4M3"
+            "rate axis, and the mcg or lut_e4m3 codebook"
         )
 
 
@@ -169,7 +169,7 @@ def launch_options(query, config):
 
 def _tuning_parameters(query, device):
     # These axes are the native override domain; validate_config checks the
-    # coupled CTA-thread, register, shared-memory and packed-layout constraints.
+    # interdependent CTA-thread, register, shared-memory and packed-layout constraints.
     return {
         "tile_n": (256,) if query.weight_layout.endswith("_n") else (64, 128, 256),
     }

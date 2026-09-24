@@ -12,9 +12,10 @@ META = OpMeta(
     entry_points=(
         "CacheRequirements", "Caps", "DraftSelectionPlan",
         "DraftSelectionReuse", "DraftSelectionState", "Plan", "Binding",
+        "LocalSelection",
         "QsaConfig", "QsaQuery", "cache_requirements", "draft_selection_plan",
         "invocation_from_descriptors", "invocation_from_tensors",
-        "plan", "bind", "run", "is_supported",
+        "plan", "bind", "run", "select", "attend", "attend_reuse", "is_supported",
     ),
     dtypes=("bf16",),
     recipes=("grouped_selector_sparse_gqa",),
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
         Binding, CacheRequirements, Caps, DraftSelectionPlan, DraftSelectionReuse,
         DraftSelectionState, Plan, QsaConfig, QsaQuery, bind, cache_requirements,
         draft_selection_plan, invocation_from_descriptors, invocation_from_tensors,
-        is_supported, plan, run,
+        LocalSelection, attend, attend_reuse, is_supported, plan, run, select,
     )
 
 install_lazy_api(globals(), META)

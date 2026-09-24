@@ -158,12 +158,15 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
 
 
 @pytest.mark.parametrize("phase", ["pre", "post_pre"])
+@pytest.mark.parametrize("partials_per_cta", [4, 9, 13, 25])
 def test_mhc_lagged_parallel_decode_frozen_live_graph(
-    phase: str, mhc_session
+    phase: str, partials_per_cta: int, mhc_session, monkeypatch
 ) -> None:
     """Lagged decode consumes freshly produced BF16 collapse statistics on replay."""
-    device = require_blackwell()
-    hidden, capacity = 5120, 8
+    monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
+    device = require_sm120()
+    hidden, capacity = 5120, 16
+    live_counts = (1, 2, 4, 6, 8, 16)
     residual, x, fn, scale, bias = _make_inputs(
         tokens=capacity, hidden_size=hidden, seed=923_101, device=device
     )
@@ -186,7 +189,8 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
     options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
                    rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
     args = (residual, fn, scale, bias) if phase == "pre" else (x, residual, prev_post, prev_comb, fn, scale, bias)
-    plan = prepare(mhc_session, phase, args, options)
+    plan = prepare(mhc_session, phase, args, options,
+                   lagged_prepare=True, partials_per_cta=partials_per_cta)
     binding = bind(plan, pre_out=pre_out)
 
     def run(live: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -203,13 +207,13 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
         )
 
     # One prepared capacity accepts every live decode count.
-    for live in (1, 2, 4, 8):
+    for live in live_counts:
         _poison(binding)
         run(live)
     torch.cuda.synchronize(device)
     mhc_session.freeze()
 
-    for live in (1, 2, 4, 8):
+    for live in live_counts:
         _poison(binding)
         binding.pre_out.fill_(float("nan"))
         post_before = prev_post.clone()

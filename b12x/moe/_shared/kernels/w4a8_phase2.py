@@ -120,8 +120,8 @@ class W4A8MaterializedPhase2Kernel:
         self.w4a8_trellis = trellis_bits is not None
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
         # Direct-LUT decode gathers each byte from the rate-indexed 192 KiB
-        # global state table instead of hashing into a 4 KiB shared T12
-        # staircase; the shared region is then not allocated.
+        # global table instead of reading a 4 KiB shared value table; the
+        # shared region is then not allocated.
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         if self.w4a8_trellis:
             self.trellis_lut_offset = self.shared_bytes

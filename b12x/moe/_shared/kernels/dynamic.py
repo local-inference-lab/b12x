@@ -814,7 +814,7 @@ class MoEDynamicKernelBackend:
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
         trellis_bits: int | None = None,
-        trellis_coupled: bool = False,
+        trellis_intermediate_hadamard: bool = False,
         trellis_direct_lut: bool = False,
     ):
         activation = normalize_moe_activation(activation)
@@ -908,7 +908,7 @@ class MoEDynamicKernelBackend:
         self.mxfp6_fmt_b = mxfp6_fmt_b
         self.is_w4a8 = quant_recipe in ("w4a8_mx", "w4a8_nvfp4", "w4a8_trellis")
         self.w4a8_residual = quant_recipe == "w4a8_nvfp4"
-        # w4a8_trellis: QSRT SQG-XOR-Cheb-T12 trellis payload decoded to
+        # w4a8_trellis: ``lut_e4m3`` trellis payload decoded to
         # fully-scaled E4M3 in the MMA warps (identity UE8M0 SFB). It rides
         # the repacked W4A8 pipeline shape: producer-staged B windows, named
         # pipeline, no B TMA; only the B staging, expansion, and MMA operand
@@ -942,9 +942,9 @@ class MoEDynamicKernelBackend:
         elif trellis_bits is not None:
             raise ValueError("trellis_bits is only valid for w4a8_trellis")
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
-        if trellis_coupled and not self.w4a8_trellis:
-            raise ValueError("trellis_coupled requires quant_recipe='w4a8_trellis'")
-        self.trellis_coupled = bool(trellis_coupled)
+        if trellis_intermediate_hadamard and not self.w4a8_trellis:
+            raise ValueError("trellis_intermediate_hadamard requires quant_recipe='w4a8_trellis'")
+        self.trellis_intermediate_hadamard = bool(trellis_intermediate_hadamard)
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         self.w4a8_repacked = bool(w4a8_repacked)
         self.w4a8_n64_repacked = bool(w4a8_n64_repacked)
@@ -1055,8 +1055,8 @@ class MoEDynamicKernelBackend:
                     if self.w4a8_trellis and self.w4a8_split_materialized
                     else None
                 ),
-                trellis_coupled=(
-                    self.trellis_coupled and self.w4a8_split_materialized
+                trellis_intermediate_hadamard=(
+                    self.trellis_intermediate_hadamard and self.w4a8_split_materialized
                 ),
                 trellis_direct_lut=(
                     self.trellis_direct_lut and self.w4a8_split_materialized
@@ -1170,13 +1170,14 @@ class MoEDynamicKernelBackend:
                 "W4A8 MX (materialized execution is M16-only)"
             )
         if self.external_route_plan and not (
-            quant_recipe == "nvfp4"
+            (quant_recipe == "nvfp4"
+             or (quant_recipe == "w4a8_mx" and self.w4a8_n64_repacked))
             and not self.direct_routing
             and work_source
             in {_WORK_SOURCE_MATERIALIZED_QUEUE, _WORK_SOURCE_PERSISTENT_GRID}
         ):
             raise ValueError(
-                "external route planning requires grouped NVFP4 with the "
+                "external route planning requires grouped NVFP4 or compact W4A8 with the "
                 "materialized or persistent work source"
             )
         if self.is_w4a8 and swap_ab:
@@ -1191,10 +1192,11 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
-        # Pair route warps per input token. M16/M32 have three pairs; M64
-        # and M128 have five. Every pair needs an independent rendezvous.
+        # Small NVFP4 tiles and W4A8 split each shared token across two warps.
+        # Only complete pairs participate in the per-token rendezvous.
         self.input_warps_per_token = (
-            2 if self.is_w4a8 and share_input_across_experts else 1
+            2 if share_input_across_experts
+            and (self.is_w4a8 or mma_tiler_mn[0] == 16) else 1
         )
         self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
@@ -1311,9 +1313,8 @@ class MoEDynamicKernelBackend:
             barrier_id=3,
             num_threads=self.threads_per_cta,
         )
-        # Repacked W4A8's token-owned producer assigns a compile-time group of
-        # warps per input token.  Disjoint named barriers let each group
-        # exchange its route cache without serializing the whole CTA.
+        # Disjoint token groups exchange route caches through named barriers
+        # without serializing the whole CTA.
         self.input_pair_barrier_0 = pipeline.NamedBarrier(
             barrier_id=4,
             num_threads=self.input_warps_per_token * self.num_threads_per_warp,
@@ -1445,14 +1446,9 @@ class MoEDynamicKernelBackend:
             # each M warp requires sixteen intermediate rows. FC2 keeps its
             # normal orientation over the 128-wide K contraction.
             #
-            # The token N-role must be a multiple of the fixed sm120 N
-            # permutation atom (8,2,2)=32; a smaller tile (tile_shape_mnk[0] is
-            # 16 here) makes the MMA address phantom N-positions and scrambles
-            # tokens. Round to the permutation atom's 32-column boundary and
-            # mask padding with valid_rows. The 128-row activation atom supplies
-            # the extra slots without retaining unused 64-column accumulators
-            # for M16 and M32 compute tiles.
-            self._fc1_tok_tile = max(32, ((self.tile_shape_mnk[0] + 31) // 32) * 32)
+            # Match the routed token tile so M16 does not retain accumulators
+            # and epilogue addresses for sixteen unused token columns.
+            self._fc1_tok_tile = self.tile_shape_mnk[0]
             self.fc1_tile_shape_mnk = (
                 self._fc1_int_tile,
                 self._fc1_tok_tile,
@@ -1468,6 +1464,10 @@ class MoEDynamicKernelBackend:
                 self.sf_vec_size,
                 False,
             )
+            if self._fc1_tok_tile == 16:
+                # The generic N permutation spans 32 columns. Direct SFB
+                # loads permit a compact N16 layout with two N8 MMA warps.
+                fc1_perm = (fc1_perm[0], cute.make_layout(16), fc1_perm[2])
             self.fc1_tiled_mma = cute.make_tiled_mma(
                 mma_op,
                 cute.make_layout(self.fc1_atom_shape),
@@ -2503,7 +2503,7 @@ class MoEDynamicKernelBackend:
         w13_sfb_rp: cute.Tensor | None = None,  # flat repacked u32 SFB
         down_rp: cute.Tensor | None = None,  # flat repacked u32 B
         down_sfb_rp: cute.Tensor | None = None,  # flat repacked u32 SFB
-        trellis_lut: cute.Tensor | None = None,  # 4 KiB T12 staircase (u8)
+        trellis_lut: cute.Tensor | None = None,  # 4 KiB lut_e4m3 value table (u8)
         trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
     ):
         self.a_dtype = packed_a.element_type
@@ -2730,7 +2730,7 @@ class MoEDynamicKernelBackend:
                 and trellis_lut is not None
             ), (
                 "w4a8_trellis requires the flat trellis payload tensors "
-                "(via w13_rp/down_rp) and the T12 staircase table"
+                "(via w13_rp/down_rp) and the lut_e4m3 value table"
             )
         elif cutlass.const_expr(self.w4a8_repacked):
             assert (
@@ -3244,7 +3244,7 @@ class MoEDynamicKernelBackend:
         sfa_base_addr = ctrl_base_addr + Int32(Storage._offsets["sSFA"])
         reduce_scratch_addr = ctrl_base_addr + Int32(Storage._offsets["reduce_scratch"])
         if cutlass.const_expr(self.w4a8_trellis):
-            # Stage the 4 KiB T12 staircase once; every later decode gathers
+            # Stage the 4 KiB value table once; every later decode gathers
             # from shared memory. The phase-0 grid barrier orders the copy
             # ahead of any consumer decode.
             trellis_lut_smem_base = ctrl_base_addr + Int32(
@@ -3465,7 +3465,7 @@ class MoEDynamicKernelBackend:
 
         # General grouped execution compacts routes by expert.  Tiny direct-
         # routing decode instead gives every routed pair its own physical M tile:
-        # this removes the histogram, serial expert prefix, and two resident-
+        # this removes the histogram, expert prefix, and two resident-
         # grid barriers while retaining the exact same compute/task body.
         # The external route-plan specialization gets the grouped histogram and
         # prefix from an ordered Triton launch and skips the same control phase.
@@ -3491,17 +3491,31 @@ class MoEDynamicKernelBackend:
                 is_cta_leader,
             )
 
-            if flat_tid == Int32(0):
+            # Scan coalesced chunks in one warp, preserving expert order.
+            if Int32(bidz) == Int32(0) and warp_idx == Int32(0):
+                prefix_lane = Int32(tidx) & Int32(31)
                 tile_acc = Int32(0)
-                expert_idx = Int32(0)
-                while expert_idx < num_experts:
-                    expert_tile_base[expert_idx] = tile_acc
-                    rows = row_counts[expert_idx]
-                    tile_acc += (
-                        rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
-                    ) // Int32(self.tile_shape_mnk[0])
-                    expert_idx += Int32(1)
-                expert_tile_base[num_experts] = tile_acc
+                expert_chunk = Int32(0)
+                while expert_chunk < num_experts:
+                    expert_idx = expert_chunk + prefix_lane
+                    tiles = Int32(0)
+                    if expert_idx < num_experts:
+                        tiles = (
+                            row_counts[expert_idx]
+                            + Int32(self.tile_shape_mnk[0]) - Int32(1)
+                        ) // Int32(self.tile_shape_mnk[0])
+                    prefix = tiles
+                    for shift in cutlass.range_constexpr(5):
+                        offset = Int32(1 << shift)
+                        preceding = cute.arch.shuffle_sync(prefix, prefix_lane - offset)
+                        if prefix_lane >= offset:
+                            prefix += preceding
+                    if expert_idx < num_experts:
+                        expert_tile_base[expert_idx] = tile_acc + prefix - tiles
+                    tile_acc += cute.arch.shuffle_sync(prefix, Int32(31))
+                    expert_chunk += Int32(32)
+                if prefix_lane == Int32(0):
+                    expert_tile_base[num_experts] = tile_acc
 
             self._resident_grid_barrier(
                 barrier_count,
@@ -3515,8 +3529,8 @@ class MoEDynamicKernelBackend:
         num_cta_warps = Int32(self.num_route_warps)
         input_active_warps = num_cta_warps
         input_groups_per_cta = num_cta_warps
-        if cutlass.const_expr(self.is_w4a8 and self.share_input_across_experts):
-            # Shared-input A8 assigns a compile-time group of warps to each
+        if cutlass.const_expr(self.share_input_across_experts):
+            # Shared input assigns a compile-time group of warps to each
             # token.  Only complete groups may enter the per-token named
             # barrier; otherwise a tail warp in any future non-divisible CTA
             # role layout would wait forever for a partner that was not
@@ -3551,7 +3565,7 @@ class MoEDynamicKernelBackend:
                 claim_count = producer_batch_pairs
                 if cutlass.const_expr(self.share_input_across_experts):
                     # A compile-time warp group cooperates on each token,
-                    # partitioning both routes and K/32 blocks under A8.
+                    # partitioning both routes and quantization blocks.
                     claim_count = input_groups_per_cta
                 batch_base = atomic_add_global_i32(
                     get_ptr_as_int64(pair_head, Int32(0)),
@@ -3569,7 +3583,7 @@ class MoEDynamicKernelBackend:
                 if cutlass.const_expr(self.share_input_across_experts):
                     token_owner_warp = warp_idx
                     token_partition = Int32(0)
-                    if cutlass.const_expr(self.is_w4a8):
+                    if cutlass.const_expr(self.input_warps_per_token > 1):
                         token_owner_warp = warp_idx // Int32(self.input_warps_per_token)
                         token_partition = warp_idx % Int32(self.input_warps_per_token)
                     token_idx = batch_base + token_owner_warp
@@ -3578,7 +3592,7 @@ class MoEDynamicKernelBackend:
                         if lane_id == Int32(0):
                             topk_slot = Int32(0)
                             topk_step = Int32(1)
-                            if cutlass.const_expr(self.is_w4a8):
+                            if cutlass.const_expr(self.input_warps_per_token > 1):
                                 topk_slot = token_partition
                                 topk_step = Int32(self.input_warps_per_token)
                             while topk_slot < num_topk:
@@ -3620,7 +3634,7 @@ class MoEDynamicKernelBackend:
                                     route_expert_ids_addr + slot * Int32(4), expert_id
                                 )
                                 topk_slot += topk_step
-                        if cutlass.const_expr(self.is_w4a8):
+                        if cutlass.const_expr(self.input_warps_per_token > 1):
                             self._sync_input_warp_pair(token_owner_warp)
                         else:
                             cute.arch.sync_warp()
@@ -3853,7 +3867,7 @@ class MoEDynamicKernelBackend:
                                                 + (sf_row // Int32(32)) * Int32(4)
                                             )
 
-                                    sf_idx = lane_id
+                                    sf_idx = lane_id + token_partition * Int32(32)
                                     while sf_idx < sf_blocks_per_row:
                                         block_start = sf_idx * Int32(16)
                                         values = cute.make_rmem_tensor(
@@ -3900,9 +3914,9 @@ class MoEDynamicKernelBackend:
                                                     route_scale_base[cache_slot]
                                                     + scale_k_base
                                                 ] = scale_byte
-                                        sf_idx += Int32(32)
+                                        sf_idx += Int32(self.input_warps_per_token * 32)
                                 else:
-                                    sf_idx = lane_id
+                                    sf_idx = lane_id + token_partition * Int32(32)
                                     while sf_idx < sf_blocks_per_row:
                                         block_start = sf_idx * Int32(16)
                                         values = cute.make_rmem_tensor(
@@ -3965,7 +3979,7 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 scale_storage[scale_offset] = scale_byte
                                             topk_slot += Int32(1)
-                                        sf_idx += Int32(32)
+                                        sf_idx += Int32(self.input_warps_per_token * 32)
 
                             if cutlass.const_expr(self.work_is_streaming):
                                 cute.arch.sync_warp()
@@ -3973,7 +3987,7 @@ class MoEDynamicKernelBackend:
                                 cute.arch.sync_warp()
 
                                 publish_routes = Int32(1)
-                                if cutlass.const_expr(self.is_w4a8):
+                                if cutlass.const_expr(self.input_warps_per_token > 1):
                                     self._sync_input_warp_pair(token_owner_warp)
                                     publish_routes = Int32(1) - token_partition
 
@@ -4993,7 +5007,7 @@ class MoEDynamicKernelBackend:
             w4a8_resb = ctrl_base_addr + Int32(Storage._offsets["sSFB_up"])
             if cutlass.const_expr(self.w4a8_trellis):
                 # t256 ring geometry depends only on lane and bitrate; the
-                # 4 KiB T12 staircase is read through its global address.
+                # 4 KiB value table is read through its global address.
                 tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
                     Int32(tidx) & Int32(31), self.trellis_bits
                 )
@@ -6306,7 +6320,7 @@ class MoEDynamicKernelBackend:
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
                             if cutlass.const_expr(
-                                self.w4a8_trellis and not self.trellis_coupled
+                                self.w4a8_trellis and not self.trellis_intermediate_hadamard
                             ):
                                 # Trellis activation boundary through sC:
                                 # ig = rot_g * H128(g); then restage up,
@@ -6474,9 +6488,9 @@ class MoEDynamicKernelBackend:
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                             if cutlass.const_expr(
-                                self.w4a8_trellis and self.trellis_coupled
+                                self.w4a8_trellis and self.trellis_intermediate_hadamard
                             ):
-                                # Coupled activation boundary: the slice's raw
+                                # Intermediate-Hadamard activation boundary: the slice's raw
                                 # gate sits in sC[epi_buffer]; restage raw up
                                 # into the next epilogue buffer, then per row
                                 # run the interleaved signed-Hadamard sandwich,
@@ -8646,7 +8660,7 @@ class MoEDynamicKernelBackend:
                                     if cutlass.const_expr(self.w4a8_trellis):
                                         # Trellis payload is projection-major
                                         # [proj][E][K16][N16] window blocks
-                                        # (the prepared QSRT layout); stage
+                                        # (the prepared trellis layout); stage
                                         # the slice's gate tile (and the up
                                         # tile when fused; the second pass of
                                         # the non-fused gated shape stages up

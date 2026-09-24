@@ -2629,7 +2629,7 @@ def compile_unified_decode_launch(
 
     ``run_kwargs`` is deliberately the exact ``run_unified_decode`` invocation
     ABI.  This keeps optional length, sink, tail-head, merge, and final-LSE
-    routes coupled to the metadata that will execute at replay.
+    routes tied to the metadata that will execute at replay.
     """
     if not isinstance(prepared, UnifiedDecodeLaunch):
         raise TypeError("prepared must be a UnifiedDecodeLaunch")

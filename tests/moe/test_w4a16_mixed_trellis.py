@@ -404,7 +404,7 @@ def _serial_tier(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3"])
 def test_mixed_k3_k4_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
     codebook: str,
@@ -709,7 +709,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
 
     assert tiers[0].trellis is not None
     mismatched_tier0 = replace(
-        tiers[0], trellis=replace(tiers[0].trellis, codebook="sqg_e4m3")
+        tiers[0], trellis=replace(tiers[0].trellis, codebook="lut_e4m3")
     )
     with pytest.raises(ValueError, match="launch-plan codebook"):
         bind_mixed_trellis3(
@@ -817,7 +817,7 @@ def test_mixed_k3_k4_k5_partition_reuses_one_compiled_object() -> None:
 @pytest.mark.parametrize(
     ("codebook", "bits", "message"),
     [
-        ("sqg_xor_cheb_t12", (3, 4, 5), "only the MCG codebook"),
+        ("lut_e4m3", (3, 4, 5), "only the MCG codebook"),
         ("mcg", (3, 4, 6), "one K3, one K4, and one K5 tier"),
         ("mcg", (3, 3, 5), "one K3, one K4, and one K5 tier"),
     ],
@@ -1723,37 +1723,37 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("route_ids_dtype,broadcast,coupled", [
+@pytest.mark.parametrize("route_ids_dtype,broadcast,intermediate_hadamard", [
     (torch.int32, False, False),
     (torch.int64, True, False),
     (torch.int64, False, True),
     (torch.int32, True, True),
 ])
-def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_ids_dtype, broadcast, coupled):
+def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_ids_dtype, broadcast, intermediate_hadamard):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe.fused_moe import _impl as impl
-    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
-    from b12x.moe._shared.kernels.w4a16.btx_synth import BtxSynthConfig, write_btx_checkpoint
+    from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import Exl3SynthConfig, write_exl3_checkpoint
 
     device = torch.device("cuda", torch.cuda.current_device())
-    hidden, intermediate, experts, capacity, topk = 512 if coupled else 256, 256, 3, 128, 2
-    codebook = "sqg_e4m3" if coupled else "mcg"
-    manifest = write_btx_checkpoint(tmp_path, BtxSynthConfig(
+    hidden, intermediate, experts, capacity, topk = 512 if intermediate_hadamard else 256, 256, 3, 128, 2
+    codebook = "lut_e4m3" if intermediate_hadamard else "mcg"
+    manifest = write_exl3_checkpoint(tmp_path, Exl3SynthConfig(
         codebook=codebook, num_experts=experts, hidden_size=hidden,
         intermediate_size=intermediate, moe_layer_indices=(0,), bits=3,
-        per_expert_input_rotations=not broadcast, coupled=coupled,
-        pre_block=512 if coupled else None, post_block=128 if coupled else None,
+        per_expert_input_rotations=not broadcast, intermediate_hadamard=intermediate_hadamard,
+        pre_block=512 if intermediate_hadamard else None, post_block=128 if intermediate_hadamard else None,
         extent_alignment_slots=4, seed=5,
     ))
-    layer = read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=intermediate // 32)
+    layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=intermediate // 32)
     weight_plan = impl.plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16", source_format="btx", trellis_codebook=codebook,
+        quant_modes="w4a16", source_format="exl3", trellis_codebook=codebook,
         activation="silu", params_dtype=torch.float16, num_experts=experts,
         hidden_size=hidden, intermediate_size=intermediate, trellis_bits=3,
-        trellis_tile_config=(64, 256, 64, 256), coupled_hadamard=coupled,
+        trellis_tile_config=(64, 256, 64, 256), intermediate_hadamard=intermediate_hadamard,
     )
     weights = impl.prepare_b12x_fp4_moe_weights(
-        plan=weight_plan, params_dtype=torch.float16, btx_layer=layer, btx_device=device,
+        plan=weight_plan, params_dtype=torch.float16, exl3_layer=layer, exl3_device=device,
     )
     plan = impl.plan_tp_moe_scratch(impl.TPMoEScratchCaps(
         max_tokens=capacity, core_token_counts=(capacity,), num_topk=topk,

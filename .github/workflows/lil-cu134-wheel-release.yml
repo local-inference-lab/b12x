@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - integration/beta
+      - integration/karmic-kraken-beta
     tags:
       - b12x-cu134-stable-*
   workflow_dispatch:
@@ -79,7 +80,9 @@ jobs:
     needs: build-beta
     if: >-
       vars.LIL_CONTAINER_DISPATCH_ENABLED == 'true' &&
-      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/integration/beta')
+      (github.ref == 'refs/heads/master' ||
+       github.ref == 'refs/heads/integration/beta' ||
+       github.ref == 'refs/heads/integration/karmic-kraken-beta')
     permissions: {}
     uses: local-inference-lab/blackwell-llm-docker/.github/workflows/component-container-dispatch.yml@7eebe3ba39a1a15e06ffdc6d3df7b00a814a8364
     secrets:

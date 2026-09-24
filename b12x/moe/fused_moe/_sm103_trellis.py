@@ -32,7 +32,7 @@ BACKEND = "tcgen05_trellis"
 
 def paired_records(weight_plan):
     return (
-        weight_plan.source_format == "btx"
+        weight_plan.source_format == "exl3"
         and getattr(weight_plan, "trellis_rate_granularity", None) == "per_expert_pair"
     )
 
@@ -55,18 +55,18 @@ def projection_mixed(weight_plan):
 
 def projection_rates(weight_plan):
     # Canonical rate tensors are loaded after weight planning. Resolve every
-    # uniform SQG rate before capture; binding selects the prepared rate.
+    # uniform LUT rate before capture; binding selects the prepared rate.
     if weight_plan.source_format == "b12x_trellis":
-        if weight_plan.trellis_codebook == "sqg_e4m3":
+        if weight_plan.trellis_codebook == "lut_e4m3":
             return (2, 3, 4)
-        if weight_plan.trellis_codebook == "sqg_fp16":
+        if weight_plan.trellis_codebook == "lut_fp16":
             return (5, 6)
     return (weight_plan.trellis_bits,)
 
 
 def validate_policy(query, config):
     if (
-        query.source_format not in {"btx", "b12x_trellis"}
+        query.source_format not in {"exl3", "b12x_trellis"}
         or not (query.quant_mode == "w4a16" or query.quant_mode == "multi" and "w4a16" in query.quant_modes)
         or query.activation not in {"silu", "situ"}
     ):
@@ -123,16 +123,16 @@ def validate_weight_plan(weight_plan):
         or weight_plan.trellis_rate_granularity not in granularities
     ):
         raise UnsupportedArchitectureError(
-            "SM103 Trellis requires canonical atom rates, BTX paired records or uniform/projection-tiered records"
+            "SM103 Trellis requires canonical atom rates, EXL3 paired records or uniform/projection-tiered records"
         )
     if paired_records(weight_plan) and weight_plan.intermediate_size % 256:
-        raise UnsupportedArchitectureError("BTX paired execution requires whole 256-channel pairs")
+        raise UnsupportedArchitectureError("EXL3 paired execution requires whole 256-channel pairs")
     validate_codebook_bits(weight_plan.trellis_codebook, weight_plan.trellis_bits)
-    if weight_plan.coupled_hadamard and (
+    if weight_plan.intermediate_hadamard and (
         weight_plan.hidden_size % 512 or weight_plan.activation != "situ"
     ):
         raise UnsupportedArchitectureError(
-            "coupled Trellis requires H divisible by 512 and SiTU activation"
+            "intermediate-Hadamard Trellis requires H divisible by 512 and SiTU activation"
         )
 
 
@@ -268,8 +268,8 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     weight_plan = caps.weight_plan
     mixed = projection_mixed(weight_plan)
     atoms = atom_layout(weight_plan)
-    coupled, bits, codebook = (
-        weight_plan.coupled_hadamard,
+    intermediate_hadamard, bits, codebook = (
+        weight_plan.intermediate_hadamard,
         weight_plan.trellis_bits,
         weight_plan.trellis_codebook,
     )
@@ -300,7 +300,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("top_k", caps.num_topk),
             ("bits", getattr(kernel, "bits", bits)),
             ("codebook", codebook),
-            ("coupled", coupled),
+            ("intermediate_hadamard", intermediate_hadamard),
             ("activation", caps.activation),
             ("swiglu_limit", swiglu_limit if name == "intermediate" else None),
             ("io_dtype", str(caps.dtype)),
@@ -343,14 +343,14 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
         )
     compile_case(
         "input",
-        InputRotation(caps.k, caps.weight_E, caps.num_topk, routes, coupled=coupled),
+        InputRotation(caps.k, caps.weight_E, caps.num_topk, routes, intermediate_hadamard=intermediate_hadamard),
         (io_type, c.Int64, c.Float16, c.Float16),
         (c.Int64(caps.k), c.Int32(1)),
     )
     compile_case(
         "intermediate",
         IntermediateRotation(
-            caps.n, caps.weight_E, routes, coupled=coupled,
+            caps.n, caps.weight_E, routes, intermediate_hadamard=intermediate_hadamard,
             activation=caps.activation, swiglu_limit=swiglu_limit,
         ),
         (c.Float16, c.Float16, c.Int64, c.Float16, c.Float16),
@@ -358,7 +358,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     )
     for rate in () if mixed or atoms else projection_rates(weight_plan):
         for name, n, k in (("fc1", caps.n, caps.k), ("fc2", caps.k, caps.n)):
-            for dual in (False, True) if coupled and name == "fc1" else (False,):
+            for dual in (False, True) if intermediate_hadamard and name == "fc1" else (False,):
                 compile_case(
                     name + f"_k{rate}" + ("_dual" if dual else ""),
                     RoutedTrellisGemm(
@@ -378,7 +378,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("fc1_mixed", caps.n, caps.k),
             ("fc2_mixed", caps.k, caps.n),
         ):
-            for dual in (False, True) if coupled and name == "fc1_mixed" else (False,):
+            for dual in (False, True) if intermediate_hadamard and name == "fc1_mixed" else (False,):
                 compile_case(
                     name + ("_dual" if dual else ""),
                     RoutedMixedTrellisGemm(
@@ -406,7 +406,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("fc1_atoms", caps.n, caps.k, True),
             ("fc2_atoms", caps.k, caps.n, False),
         ):
-            for dual in (False, True) if coupled and fc1 else (False,):
+            for dual in (False, True) if intermediate_hadamard and fc1 else (False,):
                 compile_case(
                     name + ("_dual" if dual else ""),
                     RoutedAtomTrellisGemm(
@@ -442,7 +442,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
         compile_case(
             "output_" + dtype.__name__,
             OutputRotation(
-                caps.k, caps.weight_E, caps.num_topk, caps.max_tokens, coupled=coupled
+                caps.k, caps.weight_E, caps.num_topk, caps.max_tokens, intermediate_hadamard=intermediate_hadamard
             ),
             (c.Float16, c.Int64, c.Float16, c.Float32, dtype),
             (c.Int64(caps.k), c.Int32(1)),
@@ -528,7 +528,7 @@ def _mixed_contract(caps, prepared):
         payload = prepared.tiers[tier]
         if payload.trellis_codebook != "mcg" or payload.trellis_bits != bit:
             raise ValueError("mixed Trellis tier order must be MCG K3/K4/K5")
-        if payload.coupled_hadamard != prepared.coupled_hadamard:
+        if payload.intermediate_hadamard != prepared.intermediate_hadamard:
             raise ValueError(
                 "mixed Trellis tier transforms must match the prepared owner"
             )
@@ -581,9 +581,9 @@ def _mixed_contract(caps, prepared):
         up_suh=prefix(rotations.up_suh, caps.k, broadcast=True),
         down_svh=prefix(rotations.down_svh, caps.k, broadcast=True),
         intermediate_rotations=prefix(
-            rotations.intermediate, (6 if prepared.coupled_hadamard else 3) * caps.n
+            rotations.intermediate, (6 if prepared.intermediate_hadamard else 3) * caps.n
         ),
-        coupled_hadamard=prepared.coupled_hadamard,
+        intermediate_hadamard=prepared.intermediate_hadamard,
         input_scale_split=prepared.input_scale_split,
     )
     return state, tuple(tuple(row) for row in offsets), counts
@@ -629,11 +629,11 @@ def _atom_contract(caps, prepared):
 
 
 def lookup_table_nbytes(codebook):
-    if codebook == "sqg_e4m3":
+    if codebook == "lut_e4m3":
         return 3 * (1 << 16)
-    if codebook == "sqg_fp16":
-        from b12x._lib.quant.sqg_fp16_d3l import SQG_FP16_D3L_DESCRIPTOR_BYTES
-        return SQG_FP16_D3L_DESCRIPTOR_BYTES
+    if codebook == "lut_fp16":
+        from b12x._lib.quant.lut_fp16 import LUT_FP16_SEGMENT_TABLE_BYTES
+        return LUT_FP16_SEGMENT_TABLE_BYTES
     return 16
 
 
@@ -654,14 +654,14 @@ class BackendPlan:
                     "SM103 Trellis must be prewarmed before graph capture"
                 )
         codebook = caps.weight_plan.trellis_codebook
-        if codebook == "sqg_e4m3":
-            from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+        if codebook == "lut_e4m3":
+            from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
 
-            lut = sqg_xor_cheb_t12_direct_lut_cpu().to(caps.device)
-        elif codebook == "sqg_fp16":
-            from b12x._lib.quant.sqg_fp16_d3l import sqg_fp16_d3l_descriptors_cpu
+            lut = lut_e4m3_direct_table_cpu().to(caps.device)
+        elif codebook == "lut_fp16":
+            from b12x._lib.quant.lut_fp16 import lut_fp16_segment_table_cpu
 
-            lut = sqg_fp16_d3l_descriptors_cpu().to(caps.device)
+            lut = lut_fp16_segment_table_cpu().to(caps.device)
         else:
             lut = torch.zeros(16, device=caps.device, dtype=torch.uint8)
         return replace(
@@ -709,7 +709,7 @@ class BackendPlan:
             state = _atom_contract(caps, prepared)
             if (
                 state.codebook != caps.weight_plan.trellis_codebook
-                or state.coupled_hadamard != caps.weight_plan.coupled_hadamard
+                or state.intermediate_hadamard != caps.weight_plan.intermediate_hadamard
                 or state.fc1_pair_kind is not None
                 or state.fc2_pair_kind is not None
             ):
@@ -718,7 +718,7 @@ class BackendPlan:
                 )
         elif mixed:
             state, offsets, counts = _mixed_contract(caps, prepared)
-            if state.coupled_hadamard != caps.weight_plan.coupled_hadamard:
+            if state.intermediate_hadamard != caps.weight_plan.intermediate_hadamard:
                 raise ValueError(
                     "prepared mixed Trellis transform differs from the plan"
                 )
@@ -734,7 +734,7 @@ class BackendPlan:
             if (
                 state.bits not in projection_rates(caps.weight_plan)
                 or state.codebook != caps.weight_plan.trellis_codebook
-                or state.coupled_hadamard != caps.weight_plan.coupled_hadamard
+                or state.intermediate_hadamard != caps.weight_plan.intermediate_hadamard
                 or state.fc1_pair_kind is not None
                 or state.fc2_pair_kind is not None
                 or prepared.w13_layout != "trellis_t256_proj"
@@ -793,26 +793,26 @@ class BackendPlan:
         _require_tensor(
             state.intermediate_rotations,
             "intermediate transforms",
-            (caps.weight_E, caps.n * (6 if state.coupled_hadamard else 3)),
+            (caps.weight_E, caps.n * (6 if state.intermediate_hadamard else 3)),
             torch.float16,
             caps.device,
         )
         split = state.input_scale_split
         if split is not None and (
             type(split) is not int
-            or not state.coupled_hadamard
+            or not state.intermediate_hadamard
             or not 0 < split < caps.n
         ):
             raise ValueError(
-                "coupled input-scale split must be an integer inside the local extent"
+                "intermediate-Hadamard input-scale split must be an integer inside the local extent"
             )
         if (
-            state.coupled_hadamard
+            state.intermediate_hadamard
             and split is None
             and state.gate_suh.data_ptr() != state.up_suh.data_ptr()
         ):
             raise ValueError(
-                "coupled Trellis requires the shared input-scale tensor produced by preparation"
+                "intermediate-Hadamard Trellis requires the shared input-scale tensor produced by preparation"
             )
         storage = scratch_tensor(
             scratch, plan.scratch_specs(), owner="SM103 Trellis MoE"
@@ -970,7 +970,7 @@ class BackendPlan:
         io_type = c.BFloat16 if caps.dtype == torch.bfloat16 else c.Float16
         for name, scales in (
             (("input_gate", state.gate_suh),)
-            if state.coupled_hadamard and split is None
+            if state.intermediate_hadamard and split is None
             else (("input_gate", state.gate_suh), ("input_up", state.up_suh))
         ):
             calls.append(
@@ -990,7 +990,7 @@ class BackendPlan:
         calls.append(
             projection_call(
                 1,
-                views["input_gate"] if state.coupled_hadamard else views["input_up"],
+                views["input_gate"] if state.intermediate_hadamard else views["input_up"],
                 views["up"],
             )
         )

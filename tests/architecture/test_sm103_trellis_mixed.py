@@ -43,7 +43,7 @@ def test_projection_descriptor_format_is_explicit(bits):
         )
 
 
-def host_prepared(experts, uniform, coupled=False, split=None):
+def host_prepared(experts, uniform, intermediate_hadamard=False, split=None):
     from b12x.moe.fused_moe.trellis import (
         PreparedProjectionTrellisWeights,
         _coalesce_payloads,
@@ -55,7 +55,7 @@ def host_prepared(experts, uniform, coupled=False, split=None):
     )
     from dataclasses import replace
 
-    hidden, width = 512 if coupled else 256, 128
+    hidden, width = 512 if intermediate_hadamard else 256, 128
     bits = 24 if experts > 256 else 8
     membership = [
         [0 if uniform else (e + p) % 3 for e in range(experts)] for p in range(3)
@@ -92,7 +92,7 @@ def host_prepared(experts, uniform, coupled=False, split=None):
                 trellis=TrellisWeightState(
                     codebook="mcg",
                     bits=rate,
-                    coupled_hadamard=coupled,
+                    intermediate_hadamard=intermediate_hadamard,
                     input_scale_split=split,
                 ),
             )
@@ -109,10 +109,10 @@ def host_prepared(experts, uniform, coupled=False, split=None):
         descriptor_map=descriptors,
         rotations=MixedTrellisRotations(
             intermediate=torch.ones(
-                3 * experts, (6 if coupled else 3) * width, dtype=torch.float16
+                3 * experts, (6 if intermediate_hadamard else 3) * width, dtype=torch.float16
             ),
             gate_suh=gate,
-            up_suh=gate if coupled and split is None else gate.clone(),
+            up_suh=gate if intermediate_hadamard and split is None else gate.clone(),
             down_svh=torch.ones(1, hidden, dtype=torch.float16),
         ),
         gate_counts=counts[0],
@@ -130,15 +130,15 @@ def host_prepared(experts, uniform, coupled=False, split=None):
         num_experts=experts,
         params_dtype=torch.bfloat16,
         descriptor_local_bits=bits,
-        coupled_hadamard=coupled,
+        intermediate_hadamard=intermediate_hadamard,
         input_scale_split=split,
     )
 
 
 @pytest.mark.parametrize("experts", [5, 384])
-@pytest.mark.parametrize("coupled,split", [(False, None), (True, None), (True, 64)])
+@pytest.mark.parametrize("intermediate_hadamard,split", [(False, None), (True, None), (True, 64)])
 def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
-    monkeypatch, experts, coupled, split
+    monkeypatch, experts, intermediate_hadamard, split
 ):
     from dataclasses import replace
     from unittest.mock import patch
@@ -148,8 +148,8 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
     from b12x.moe._shared.execution import PreparedWeightLayout
     from tests.architecture.test_sm103_trellis_moe import caps, canonical_execution
 
-    hidden = 512 if coupled else 256
-    capacity = caps(monkeypatch, coupled=coupled, mixed=True)
+    hidden = 512 if intermediate_hadamard else 256
+    capacity = caps(monkeypatch, intermediate_hadamard=intermediate_hadamard, mixed=True)
     capacity = replace(
         capacity,
         num_topk=2,
@@ -164,10 +164,10 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
     plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
     with patch.object(cute, "compile", side_effect=lambda *a, **kw: object()):
         launches = backend.compile_launches(capacity, offline=True)
-    assert len(launches) == (16 if coupled else 15)
+    assert len(launches) == (16 if intermediate_hadamard else 15)
     assert {k for k in launches if k.startswith("fc")} == (
         {"fc1_mixed", "fc2_mixed", "fc1_mixed_dual"}
-        if coupled
+        if intermediate_hadamard
         else {"fc1_mixed", "fc2_mixed"}
     )
     plan = replace(
@@ -184,9 +184,9 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
     source, router = torch.empty(8, hidden, dtype=torch.bfloat16), torch.empty(8, 2)
     observed_counts = []
     for uniform in (False, True):
-        payload = host_prepared(experts, uniform, coupled, split)
+        payload = host_prepared(experts, uniform, intermediate_hadamard, split)
         state, offsets, counts = backend._mixed_contract(capacity, payload)
-        assert state.coupled_hadamard is coupled
+        assert state.intermediate_hadamard is intermediate_hadamard
         assert (
             state.intermediate_rotations.data_ptr()
             == payload.rotations.intermediate.data_ptr()
@@ -221,7 +221,7 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
                     )
                     calls = bound._backend_binding.calls
                     assert len(calls) == (
-                        8 if coupled and split is None else 9
+                        8 if intermediate_hadamard and split is None else 9
                     ) and all(fn in launches.values() for fn, _ in calls)
                     projection_calls = [
                         (fn, args)
@@ -250,7 +250,7 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
                     )
         observed_counts.append(counts)
         execution, public_experts = canonical_execution(
-            capacity, plan, weights, coupled=coupled, mixed=True
+            capacity, plan, weights, intermediate_hadamard=intermediate_hadamard, mixed=True
         )
         public_bound = fused_moe.bind(
             execution,
@@ -261,11 +261,11 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
             topk_weights=router[:1],
         )
         assert len(public_bound._backend_binding.calls) == (
-            8 if coupled and split is None else 9
+            8 if intermediate_hadamard and split is None else 9
         )
-        if coupled and split is None:
+        if intermediate_hadamard and split is None:
             for corrupted, error in (
-                (replace(payload, coupled_hadamard=False), "tier transforms"),
+                (replace(payload, intermediate_hadamard=False), "tier transforms"),
                 (
                     replace(
                         payload,

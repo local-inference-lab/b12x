@@ -70,19 +70,19 @@ CANDIDATES = {
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m2 auto'): (17, 17),
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m4 auto'): (17, 17),
     ('gemm.blockscaled_precision', 'mxfp8 n8192 k2560:2560 m8 auto'): (17, 17),
-    ('gemm.blockscaled_precision', 'nvfp4 n1152 k4304:4320 m65536 a16'): (12, 12),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m1 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m128 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m2 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m4 a16'): (16, 16),
-    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m8 a16'): (16, 16),
+    ('gemm.blockscaled_precision', 'nvfp4 n1152 k4304:4320 m65536 a16'): (12, 54),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m1 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m128 a16'): (16, 72),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m2 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m4 a16'): (16, 24),
+    ('gemm.blockscaled_precision', 'nvfp4 n124160 k2560:2560 m8 a16'): (16, 24),
     # moe.decode
     ('moe.decode', 'nvfp4 rows10'): (195, 13),
     ('moe.decode', 'nvfp4 rows1250'): (4, 4),
     ('moe.decode', 'nvfp4 rows1280'): (4, 4),
     ('moe.decode', 'nvfp4 rows20'): (195, 14),
-    ('moe.decode', 'nvfp4 rows40'): (194, 14),
-    ('moe.decode', 'nvfp4 rows80'): (194, 15),
+    ('moe.decode', 'nvfp4 rows40'): (194, 15),
+    ('moe.decode', 'nvfp4 rows80'): (194, 17),
     ('moe.decode', 'w4a16 rows10'): (2, 2),
     ('moe.decode', 'w4a16 rows1250'): (1, 1),
     ('moe.decode', 'w4a16 rows1280'): (1, 1),
@@ -280,6 +280,7 @@ def test_mhc_predicates_remove_inactive_work_without_rejecting_useful_tails():
     choice = dict(
         backend="tf32_tma",
         lagged_prepare=False,
+        partials_per_cta=4,
         projection_tile_n=8,
         projection_tile_k=64,
         projection_num_stages=2,
@@ -347,7 +348,7 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
         rms_eps=1e-20, smem_limit=100 << 10,
     )
     choice = dict(
-        backend="tf32_tma", lagged_prepare=False, projection_tile_n=8,
+        backend="tf32_tma", lagged_prepare=False, partials_per_cta=4, projection_tile_n=8,
         projection_tile_k=tile_k, projection_num_stages=3,
         projection_num_m_warps=1, projection_num_n_warps=1,
         projection_k_splits=2,
@@ -365,6 +366,80 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
             k_splits=2, split_fp32_fn=True,
         )
     space.validate({**choice, "projection_tile_k": 32})
+
+
+@pytest.mark.parametrize("partials", [None, "13", "25", "0"])
+def test_mhc_prepared_post_pre_honors_partial_group_control(partials):
+    """The fused lagged producer must not silently ignore its grouping control."""
+    from types import SimpleNamespace
+
+    from b12x.norm.mhc import _preparation, _tuning
+
+    query = _tuning.MhcQuery(
+        dtype="bfloat16", max_tokens=8, hidden_size=5120, split_k=80,
+        operation="post_pre", has_norm_weight=True, lagged_mix=True,
+        rms_eps=1e-20, norm_eps=1e-20,
+        controls=FrozenMapping({} if partials is None else {
+            "B12X_MHC_PARTIALS_PER_CTA": partials,
+        }),
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        "nvidia", (12, 1), 48, "NVIDIA GB10",
+    ))
+    if partials == "0":
+        with pytest.raises(ValueError, match="partials_per_cta"):
+            _tuning.TUNING.configure(query, device=device.identity, search=False)
+    else:
+        config = _tuning.TUNING.configure(query, device=device.identity, search=False).default
+        assert config.lagged_prepare
+        launch = _preparation._lower_native(query, config, device)
+        assert launch.partials_per_cta == (4 if partials is None else int(partials))
+
+
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+def test_mhc_races_grouping_only_for_fused_lagged_producers(operation):
+    """Grouping changes the producer geometry without duplicating inactive routes."""
+    from types import SimpleNamespace
+
+    from b12x.norm.mhc import _preparation, _tuning
+
+    query = _tuning.MhcQuery(
+        dtype="bfloat16", max_tokens=8, hidden_size=5120, split_k=80,
+        operation=operation, has_norm_weight=True, lagged_mix=True,
+        expanded_residual=operation == "pre", rms_eps=1e-20, norm_eps=1e-20,
+        controls=FrozenMapping({"B12X_MHC_PREFILL_TF32_MMA": "0"}),
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    choices = list(_tuning.TUNING.parameter_space(query, device).configurations())
+    assert {(p["lagged_prepare"], p["partials_per_cta"]) for p in choices} == {
+        (False, 4), (True, 4), (True, 9), (True, 13), (True, 25),
+    }
+    assert len(choices) == 5
+    for choice in choices:
+        config = _tuning.TUNING.lower(query, device, choice)
+        launch = _preparation._lower_native(query, config, SimpleNamespace(identity=device))
+        assert launch.partials_per_cta == choice["partials_per_cta"]
+    pinned = replace(query, controls=FrozenMapping({
+        **query.controls, "B12X_MHC_PARTIALS_PER_CTA": "13",
+    }))
+    choices = list(_tuning.TUNING.parameter_space(pinned, device).configurations())
+    assert {(p["lagged_prepare"], p["partials_per_cta"]) for p in choices} == {
+        (False, 4), (True, 13),
+    }
+
+
+@pytest.mark.parametrize("tokens,partials", [(2, 4), (4, 9), (8, 25)])
+def test_mhc_grouping_preserves_spark_pre_defaults(tokens, partials):
+    from b12x.norm.mhc import _tuning
+
+    query = _tuning.MhcQuery(
+        dtype="bfloat16", max_tokens=tokens, hidden_size=4096, split_k=64,
+        operation="pre", lagged_mix=True, expanded_residual=True,
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    config = _tuning.TUNING.configure(query, device=device, search=False).default
+    assert config.lagged_prepare
+    assert config.partials_per_cta == partials
 
 
 def _thawed(value):
@@ -456,6 +531,8 @@ def test_recorded_selections_stay_eligible(key):
     if key[0] == "moe.decode":
         # The recorded programs use unshared input and monolithic NVFP4 execution.
         values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False)
+    if key[0] == "gemm.blockscaled_precision":
+        values["tile_m"] = 16 if values["mode"] == "a16" else None
     assignment = FrozenMapping(values)
     contract.parameter_space(query, IDENTITY).validate(assignment)
     contract.lower(query, IDENTITY, assignment)
@@ -563,12 +640,68 @@ def test_compact_w4a8_races_runtime_grids_for_both_backends():
             None, 1, 2, 4, 8, 16, 24, 32, 36, 48,
         }
         assignments = [component.TUNING.encode_config(config) for config in configs]
-        assert len({configuration.space.compile_assignment(a) for a in assignments}) == 1
+        assert len({configuration.space.compile_assignment(a) for a in assignments}) == (
+            2 if backend == "dynamic" else 1
+        )
         with pytest.raises(ValueError, match="resident SM count"):
             component.TUNING.configure(
                 query, device=device, override=replace(configs[0], max_active_clusters=49)
             )
-    assert len(candidates) == 20
+    assert len(candidates) == 30
+    external = next(config for _, config in candidates if config.route_planner == "triton")
+    for outside in (
+        replace(query, num_tokens=43, routed_rows=258),
+        replace(query, deterministic_output=True),
+        replace(query, intermediate_size=640),
+        replace(query, controls=FrozenMapping({"dynamic_work_source": "ready_queue"})),
+    ):
+        with pytest.raises(ValueError, match="Triton route planner"):
+            component.TUNING.configure(outside, device=device, override=external)
+
+
+@pytest.mark.parametrize("sms", (48, 188))
+def test_repacked_w4a8_decode_races_physical_resident_grids(sms):
+    from b12x.moe.fused_moe import _tuning as component
+
+    _, original = _contract_and_query(
+        "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
+    )
+    query = replace(
+        original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32", num_experts=256, hidden_size=4096,
+        intermediate_size=1024, top_k=6, num_tokens=6, routed_rows=36,
+        route_num_experts=None, route_logits_dtype=None,
+        w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
+    )
+    device = DeviceIdentity("nvidia", (12, 0), sms, "Synthetic SM120")
+    configuration = component.TUNING.configure(query, device=device)
+    candidates = [config for _, config in component.TUNING.iterate(configuration)]
+    for tile in (16, 32):
+        configs = [config for config in candidates
+                   if config.backend == "dynamic" and config.dynamic_tile_m == tile
+                   and config.dynamic_route_mode == "grouped"]
+        grids = {config.max_active_clusters for config in configs}
+        assert {None, 1, sms, 2 * sms} <= grids
+        assert all(grid is None or 0 < grid <= 2 * sms for grid in grids)
+        if sms == 188:
+            assert 128 in grids
+        assignments = [component.TUNING.encode_config(config) for config in configs]
+        assert len({configuration.space.compile_assignment(a) for a in assignments}) == 1
+        with pytest.raises(ValueError, match="two-CTA-per-SM"):
+            component.TUNING.configure(
+                query, device=device,
+                override=replace(configs[0], max_active_clusters=2 * sms + 1),
+            )
+    for config in candidates:
+        if config.backend != "dynamic" or config.dynamic_tile_m not in (16, 32):
+            assert config.max_active_clusters is None
+    for outside in (
+        replace(query, num_tokens=11, routed_rows=66),
+        replace(query, deterministic_output=True),
+        replace(query, source_format="trellis"),
+        replace(query, controls=FrozenMapping({"dynamic_work_source": "ready_queue"})),
+    ):
+        assert not component._repacked_w4a8_decode_query(outside)
 
 
 def test_a16_wide_tile_needs_more_than_one_n_tile():
@@ -579,12 +712,42 @@ def test_a16_wide_tile_needs_more_than_one_n_tile():
         out_features=48,
     )
     space = TUNING.parameter_space(narrow, IDENTITY)
-    assignment = dict(mode="a16", tile_n=64, tile_k=64, split_k=1)
+    assignment = dict(mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1)
     space.validate(assignment)
     with pytest.raises(ValueError, match="predicates"):
         space.validate({**assignment, "tile_n": 128})
     wide = TUNING.parameter_space(replace(narrow, out_features=128), IDENTITY)
     wide.validate({**assignment, "tile_n": 128})
+
+
+def test_iq2_transposed_tiles_are_raced_without_split_k():
+    from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledConfig, BlockscaledQuery
+
+    query = BlockscaledQuery(recipe="iq2_xs", num_tokens=8, in_features=768,
+                             padded_in_features=768, out_features=136)
+    assignment = dict(mode="a16", tile_m=8, tile_n=128, tile_k=256, split_k=1)
+    TUNING.parameter_space(query, IDENTITY).validate(assignment)
+    TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
+    with pytest.raises(ValueError, match="split-K"):
+        TUNING.validate_config(query, BlockscaledConfig(**{**assignment, "split_k": 2}), IDENTITY)
+    for recipe in ("nvfp4", "mxfp8"):
+        with pytest.raises(ValueError, match="predicates"):
+            TUNING.parameter_space(replace(query, recipe=recipe), IDENTITY).validate(
+                {**assignment, "tile_k": 128})
+
+
+def test_nvfp4_a16_races_k256_tiles():
+    from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledConfig, BlockscaledQuery
+
+    query = BlockscaledQuery(recipe="nvfp4", num_tokens=64, in_features=800,
+                             padded_in_features=800, out_features=136, activation_mode="a16")
+    for tile_m in (16, 32, 64):
+        assignment = dict(mode="a16", tile_m=tile_m, tile_n=128, tile_k=256, split_k=4)
+        TUNING.parameter_space(query, IDENTITY).validate(assignment)
+        TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
+    with pytest.raises(ValueError, match="predicates"):
+        TUNING.parameter_space(replace(query, recipe="mxfp8", global_scale_kind="none"), IDENTITY).validate(
+            {**assignment, "tile_m": 16})
 
 
 def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
@@ -597,3 +760,22 @@ def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
     space = TUNING.parameter_space(query, IDENTITY)
     blocks = {assignment["pointwise_block"] for assignment in space.configurations()}
     assert blocks == {32, 64, 128, 256, 512, 1024, 2048, 4096}
+
+
+@pytest.mark.parametrize("sms,capability", [(48, (12, 1)), (188, (12, 0))])
+def test_nvfp4_partial_resident_grids_share_the_compiled_kernel(sms, capability):
+    from b12x.moe.fused_moe import _tuning as component
+
+    _, query = _contract_and_query("moe.decode", DECLARED[("moe.decode", "nvfp4 rows40")])
+    device = DeviceIdentity("nvidia", capability, sms, "Blackwell")
+    eligible = component.TUNING.eligible_plan(query, device)
+    configs = [config for _, config in eligible.candidates
+               if config.route_planner == "triton"]
+    grids = {config.max_active_clusters for config in configs}
+    expected = ({None, 1, 2, 4, 8, 16, 24, 32, 36, 48} if sms == 48 else
+                {None, 1, 2, 4, 8, 16, 32, 64, 94, 126})
+    assert grids == expected
+    assert len({eligible.space.compile_assignment(config.to_dict()) for config in configs}) == 1
+    with pytest.raises(ValueError, match="resident SM count"):
+        component.TUNING.configure(query, device=device,
+            override=replace(configs[0], max_active_clusters=sms + 1))

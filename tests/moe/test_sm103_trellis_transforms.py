@@ -18,7 +18,7 @@ def _require_gpu():
 
 
 @pytest.mark.parametrize(
-    "coupled,kind,prepared_mixed,swiglu_limit",
+    "intermediate_hadamard,kind,prepared_mixed,swiglu_limit",
     [
         (False, "silu", False, None),
         (False, "situ", False, None),
@@ -30,7 +30,7 @@ def _require_gpu():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("broadcast", [False, True])
 def test_transform_oracles_live_counts_and_graph(
-    coupled, kind, prepared_mixed, swiglu_limit, dtype, broadcast
+    intermediate_hadamard, kind, prepared_mixed, swiglu_limit, dtype, broadcast
 ):
     _require_gpu()
     import cuda.bindings.driver as cuda
@@ -59,8 +59,8 @@ def test_transform_oracles_live_counts_and_graph(
         scales((1 if broadcast else experts, hidden)),
         scales((1 if broadcast else experts, hidden)),
     )
-    rotations = scales((experts, width * (6 if coupled else 3)))
-    if coupled:
+    rotations = scales((experts, width * (6 if intermediate_hadamard else 3)))
+    if intermediate_hadamard:
         rotations[:, 3 * width :] = (
             torch.randint(0, 2, (experts, 3 * width), device=device).mul_(2).sub_(1)
         )
@@ -73,11 +73,11 @@ def test_transform_oracles_live_counts_and_graph(
             experts=experts,
             hidden=hidden,
             width=width,
-            coupled=True,
+            intermediate_hadamard=True,
             activation=kind,
             dtype=dtype,
             per_expert_scales=not broadcast,
-            transform_draw=5,
+            sign_pattern=5,
             global_intermediate_size=4 * width,
             intermediate_offset=width,
         )
@@ -85,7 +85,7 @@ def test_transform_oracles_live_counts_and_graph(
             SimpleNamespace(weight_E=experts, k=hidden, n=width, device=device),
             prepared._impl.representation_for("w4a16"),
         )
-        assert state.coupled_hadamard
+        assert state.intermediate_hadamard
         assert state.gate_suh.data_ptr() == state.up_suh.data_ptr()
         suh, svh, rotations = (
             state.gate_suh,
@@ -131,7 +131,7 @@ def test_transform_oracles_live_counts_and_graph(
         )
     ) + (c.Int64(0 if broadcast else hidden),)
     fi = cute.compile(
-        InputRotation(hidden, experts, top_k, routes, coupled=coupled),
+        InputRotation(hidden, experts, top_k, routes, intermediate_hadamard=intermediate_hadamard),
         *input_args,
         c.Int32(routes),
         stream,
@@ -139,7 +139,7 @@ def test_transform_oracles_live_counts_and_graph(
     )
     fm = cute.compile(
         IntermediateRotation(
-            width, experts, routes, coupled=coupled, activation=kind,
+            width, experts, routes, intermediate_hadamard=intermediate_hadamard, activation=kind,
             swiglu_limit=swiglu_limit,
         ),
         *middle_args,
@@ -148,7 +148,7 @@ def test_transform_oracles_live_counts_and_graph(
         options=f"--gpu-arch={target}",
     )
     fo = cute.compile(
-        OutputRotation(hidden, experts, top_k, tokens, coupled=coupled),
+        OutputRotation(hidden, experts, top_k, tokens, intermediate_hadamard=intermediate_hadamard),
         *output_args,
         c.Int32(tokens),
         stream,
@@ -157,17 +157,17 @@ def test_transform_oracles_live_counts_and_graph(
 
     def expected():
         return (
-            reference.input_rotation(source, ids, suh, top_k, coupled),
+            reference.input_rotation(source, ids, suh, top_k, intermediate_hadamard),
             reference.intermediate_rotation(
-                gate, up, ids, rotations, coupled, kind, swiglu_limit
+                gate, up, ids, rotations, intermediate_hadamard, kind, swiglu_limit
             ),
-            reference.output_rotation(down, ids, svh, weights, coupled),
+            reference.output_rotation(down, ids, svh, weights, intermediate_hadamard),
         )
 
     expected_a, expected_h, expected_out = expected()
     if swiglu_limit is not None:
         unclamped = reference.intermediate_rotation(
-            gate, up, ids, rotations, coupled, kind
+            gate, up, ids, rotations, intermediate_hadamard, kind
         )
         assert torch.linalg.vector_norm(expected_h - unclamped) > expected_h.norm()
     with patch.object(
@@ -325,7 +325,7 @@ def test_large_expert_scale_offsets():
         fn(*args)
 
     launch(
-        InputRotation(hidden, experts, 1, 1, coupled=False),
+        InputRotation(hidden, experts, 1, 1, intermediate_hadamard=False),
         [
             (c.Float16, source),
             (c.Int64, ids),
@@ -335,7 +335,7 @@ def test_large_expert_scale_offsets():
         [c.Int64(hidden), c.Int32(1)],
     )
     launch(
-        IntermediateRotation(width, experts, 1, coupled=False, activation="silu"),
+        IntermediateRotation(width, experts, 1, intermediate_hadamard=False, activation="silu"),
         [
             (c.Float16, gate),
             (c.Float16, up),
@@ -346,7 +346,7 @@ def test_large_expert_scale_offsets():
         [c.Int32(1)],
     )
     launch(
-        OutputRotation(hidden, experts, 1, 1, coupled=False),
+        OutputRotation(hidden, experts, 1, 1, intermediate_hadamard=False),
         [
             (c.Float16, source),
             (c.Int64, ids),

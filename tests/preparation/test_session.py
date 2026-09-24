@@ -20,7 +20,7 @@ from .test_defaults import Config, Query, contract
 
 def session(tmp_path, **kwargs):
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
-    value._cache = SelectionCache(tmp_path, {"schema_version": 5, "tuning_cache_version": 1})
+    value._cache = SelectionCache(tmp_path, {"schema_version": 6, "tuning_cache_version": 1})
     return value
 
 
@@ -953,6 +953,27 @@ def test_gpu_steps_share_a_bounded_advance_without_changing_order(tmp_path, monk
         assert job.advance().done
         assert seen == list(range(10))
         job.result()
+
+
+def test_tuning_contribution_preserves_rejected_candidate_count():
+    from b12x.preparation import TuningRequirement
+
+    winner = TuningRequirement("query", (0, 1), {"width": 2}, 1.0, 0)
+    empty = TuningRequirement("query", (0, 1), None, None, None, rejected_count=2)
+    consolidated = replace(winner, rejected_count=empty.rejected_count + 1)
+    assert winner.rejected_count == 0
+    assert consolidated.rejected_count == 3
+    assert consolidated.assignment == winner.assignment
+    assert consolidated.latency_us == winner.latency_us
+    assert consolidated.candidate_index == winner.candidate_index
+
+
+@pytest.mark.parametrize("count", (-1, True, 1.5, "2"))
+def test_tuning_contribution_rejects_invalid_rejection_counts(count):
+    from b12x.preparation import TuningRequirement
+
+    with pytest.raises(ValueError, match="rejected candidate count"):
+        TuningRequirement("query", (0, 1), None, None, None, rejected_count=count)
 
 
 @pytest.mark.parametrize("boundary", ("compile", "collective", "tuning", "cache"))

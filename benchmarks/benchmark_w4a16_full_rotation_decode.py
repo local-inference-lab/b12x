@@ -150,7 +150,7 @@ def main() -> None:
     for tile_config in tile_configs:
         weight_plan = plan_b12x_fp4_moe_weights(
             quant_modes="w4a16",
-            source_format="btx",
+            source_format="exl3",
             activation="situ",
             params_dtype=torch.bfloat16,
             num_experts=experts,

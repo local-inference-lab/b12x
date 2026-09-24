@@ -15,7 +15,8 @@ from b12x.preparation.types import plan_from_handle, require_prepared
         "state_index_columns",
         "stride_indices_request",
         "stride_indices_column",
-    ]
+    ],
+    do_not_specialize_on_alignment=["state_indices"],
 )
 def _packed_sequential_kda_decode_kernel(
     mixed_qkv,

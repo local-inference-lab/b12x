@@ -9,19 +9,19 @@ from tests._reference.trellis_reference import (
 
 
 def codebook_tensor(codebook: str, device) -> torch.Tensor:
-    if codebook == "sqg_e4m3":
-        from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+    if codebook == "lut_e4m3":
+        from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
 
-        return sqg_xor_cheb_t12_direct_lut_cpu().to(device)
-    if codebook == "sqg_fp16":
-        from b12x._lib.quant.sqg_fp16_d3l import sqg_fp16_d3l_descriptors_cpu
+        return lut_e4m3_direct_table_cpu().to(device)
+    if codebook == "lut_fp16":
+        from b12x._lib.quant.lut_fp16 import lut_fp16_segment_table_cpu
 
-        return sqg_fp16_d3l_descriptors_cpu().to(device)
+        return lut_fp16_segment_table_cpu().to(device)
     return torch.zeros(16, dtype=torch.uint8, device=device)
 
 
 CODEBOOK_RATES = (
     [("mcg", b) for b in (2, 3, 4, 5, 6)]
-    + [("sqg_e4m3", b) for b in (2, 3, 4)]
-    + [("sqg_fp16", b) for b in (5, 6)]
+    + [("lut_e4m3", b) for b in (2, 3, 4)]
+    + [("lut_fp16", b) for b in (5, 6)]
 )

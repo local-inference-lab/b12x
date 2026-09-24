@@ -10,10 +10,7 @@ from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import api
 from b12x.preparation import PreparedCall, PreparationSession
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
-from b12x._lib.quant.sqg_e4m3 import (
-    sqg_cheb_normal_e4m3_direct_lut_cpu,
-    sqg_xor_cheb_t12_direct_lut_cpu,
-)
+from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
@@ -75,39 +72,21 @@ def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
 
 
 @lru_cache(maxsize=None)
-def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
+def _lut_e4m3_table(bits: int) -> np.ndarray:
     if bits not in (2, 3, 4):
-        raise ValueError(f"unsupported SQG-Cheb test rate K{bits}")
+        raise ValueError(f"unsupported lut_e4m3 test rate K{bits}")
     rate_index = bits - 2
-    labels = sqg_cheb_normal_e4m3_direct_lut_cpu()[
+    labels = lut_e4m3_direct_table_cpu()[
         rate_index << 16 : (rate_index + 1) << 16
     ]
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_cheb_normal_e4m3_fp16(
+def _decode_lut_e4m3_fp16(
     window: np.ndarray, bits: int
 ) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
-    return _sqg_cheb_normal_e4m3_table(bits)[indices]
-
-
-@lru_cache(maxsize=None)
-def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
-    if bits not in (2, 3, 4):
-        raise ValueError(f"unsupported SQG-XOR-Cheb-T12 test rate K{bits}")
-    rate_index = bits - 2
-    labels = sqg_xor_cheb_t12_direct_lut_cpu()[
-        rate_index << 16 : (rate_index + 1) << 16
-    ]
-    return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
-
-
-def _decode_sqg_xor_cheb_t12_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
-    indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
-    return _sqg_xor_cheb_t12_table(bits)[indices]
+    return _lut_e4m3_table(bits)[indices]
 
 
 def _decode_lane(
@@ -135,10 +114,8 @@ def _decode_lane(
             values.append(_decode_3inst_fp16(window))
         elif codebook == "mul1-e4m3":
             values.append(_decode_mul1_e4m3_fp16(window))
-        elif codebook == "sqg-cheb-normal-e4m3":
-            values.append(_decode_sqg_cheb_normal_e4m3_fp16(window, bits))
-        elif codebook == "sqg_e4m3":
-            values.append(_decode_sqg_xor_cheb_t12_fp16(window, bits))
+        elif codebook == "lut_e4m3":
+            values.append(_decode_lut_e4m3_fp16(window, bits))
         else:
             raise ValueError(f"unsupported test codebook {codebook!r}")
     return np.stack(values, axis=-1).astype(np.float16)
@@ -408,8 +385,8 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
-    """Close the runtime SQG labels through the W4A16 GEMM fragment path."""
+def test_dense_lut_e4m3_matches_reference(bits: int) -> None:
+    """Close the runtime lut_e4m3 labels through the W4A16 GEMM fragment path."""
 
     torch.manual_seed(0x535147 + bits)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -427,12 +404,12 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
         trellis,
         scale,
         scale.clone(),
-        codebook="sqg_e4m3",
+        codebook="lut_e4m3",
         params_dtype=torch.float16,
     )
-    assert weight.trellis_codebook == "sqg_e4m3"
+    assert weight.trellis_codebook == "lut_e4m3"
     reference_weight = _reconstruct_native(
-        trellis, codebook="sqg_e4m3"
+        trellis, codebook="lut_e4m3"
     ).to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
@@ -476,7 +453,7 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
     [16, 224],
     ids=["square-proof", "wide-axis"],
 )
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "lut_e4m3"])
 def test_dense_pair_matches_independent_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],

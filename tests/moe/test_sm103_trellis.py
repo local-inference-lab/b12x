@@ -22,7 +22,7 @@ def test_native_trellis_tile_reconstruction(bits):
     import cutlass
     import cutlass.cute as cute
     from b12x._lib.architecture import architecture_for
-    from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+    from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
     from b12x.moe._shared.kernels.sm103.launch import pointer
     from b12x.moe._shared.kernels.sm103.trellis import ReconstructTrellisTiles
     from tests._reference.trellis_moe import build_trellis_weight
@@ -33,7 +33,7 @@ def test_native_trellis_tile_reconstruction(bits):
     )
     tiles = packed.numel() // (16 * bits)
     out = torch.full((tiles, 16, 16), float("nan"), device=device, dtype=torch.bfloat16)
-    lut = sqg_xor_cheb_t12_direct_lut_cpu().to(device)
+    lut = lut_e4m3_direct_table_cpu().to(device)
     args = [
         pointer(t, x)
         for t, x in (

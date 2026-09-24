@@ -181,11 +181,11 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "trellis_group_size": plan.trellis_group_size,
         "trellis_bits": plan.trellis_bits,
         "trellis_tile_config": plan.trellis_tile_config,
-        "coupled_hadamard": plan.coupled_hadamard,
+        "intermediate_hadamard": plan.intermediate_hadamard,
         "trellis_codebook": plan.trellis_codebook,
         "trellis_rate_granularity": plan.trellis_rate_granularity,
         "trellis_pair_kinds": None if plan.trellis_pair_kinds is None else tuple(plan.trellis_pair_kinds),
-        "coupled_hadamard_blocks": plan.coupled_hadamard_blocks,
+        "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
     }
 
 
@@ -351,7 +351,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     tokens = int(scratch.launch_plan.max_tokens_per_launch)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
-    if weight_layout not in {"packed", "modelopt"}:
+    if weight_layout not in {"packed", "modelopt", "iq2_xs"}:
         raise ValueError(f"unsupported standard W4A16 weight layout {weight_layout!r}")
     element_dtype = "bf16" if core.dtype == torch.bfloat16 else "fp16"
     w13_layout = caps.w13_layout if weight_layout == "modelopt" else "packed"
@@ -387,7 +387,19 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
         )
         direct = direct_mapped = None
-        if weight_layout == "packed":
+        if weight_layout == "iq2_xs":
+            if (tokens <= 8 and core.activation in {"silu", "relu2"} and not caps.deterministic_output
+                    and not caps.collect_activation_amax and not caps.apply_router_weight_on_input):
+                decode_args = {**compiler_args, "moe_block_size": 8}
+                direct = compile_w4a16_fused_moe(
+                    **decode_args, zero_fc2_output=False, max_m_blocks=tokens * core.num_topk,
+                    direct_topk_routes=True, tc_decode_fused_sum=True,
+                )
+                direct_mapped = compile_w4a16_fused_moe(
+                    **decode_args, zero_fc2_output=False, max_m_blocks=tokens * core.num_topk,
+                    direct_topk_routes=True, use_expert_map=True, tc_decode_fused_sum=True,
+                )
+        elif weight_layout == "packed":
             if tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
                 direct = compile_w4a16_fused_moe(
                     **compiler_args, zero_fc2_output=False,
@@ -469,6 +481,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             planned_tile_m=tile_m,
             dynamic_route_mode="direct" if direct_routing else "grouped",
             deterministic_output=plan.deterministic_output,
+            w4a8_n64_repacked=n64_repacked,
         )
         and _impl._env_flag(
             _impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV,
@@ -618,7 +631,7 @@ def _program_carriers(
                         swiglu_beta=plan.swiglu_beta,
                         weight_layout=weight_layout,
                         trellis_bits=caps.weight_plan.trellis_bits or 0,
-                        trellis_coupled=caps.weight_plan.coupled_hadamard,
+                        trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                     )
                     launches.append(launch)
     elif plan.implementation == "dynamic":
@@ -638,7 +651,7 @@ def _program_carriers(
                 deterministic_output=plan.deterministic_output,
                 swiglu_limit=plan.swiglu_limit, swiglu_alpha=plan.swiglu_alpha,
                 swiglu_beta=plan.swiglu_beta, trellis_bits=caps.weight_plan.trellis_bits or 0,
-                trellis_coupled=caps.weight_plan.coupled_hadamard,
+                trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
             )
             launches.append(launch)
@@ -940,6 +953,8 @@ def compile_dynamic_route_plan(payload, ordinal):
             MockTensor(ids_dtype, (rows,)),
             MockTensor(torch.int32, (num_experts,)),
             MockTensor(torch.int32, (num_experts + 1,)),
+            MockTensor(torch.int32, (1,)),
+            MockTensor(torch.int32, (1,)),
             rows,
             NUM_EXPERTS=num_experts,
             TILE_M=tile_m,
@@ -1078,6 +1093,8 @@ def plan_fc2(experts: PreparedExperts, invocation: FC2Invocation, *, override=No
              declaration_invocation: FrozenMapping = FrozenMapping()) -> Plan:
     if not isinstance(experts, PreparedExperts):
         raise TypeError("FC2 preparation requires canonical PreparedExperts")
+    if experts.plan._impl.source_format == "iq2_xs":
+        raise NotImplementedError("standalone IQ2_XS FC2 is unsupported; use fused MoE")
     if not isinstance(invocation, FC2Invocation):
         raise TypeError("FC2 preparation requires FC2Invocation")
     from ._tuning import MoeFC2Query

@@ -166,7 +166,7 @@ def main(argv=None):
         "excluded": [
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
-            "frozen QSRT coupled high-rate conversion",
+            "frozen QSRT intermediate-Hadamard high-rate conversion",
             "Grace memory",
             "Station RDMA",
             "FlashInfer/vLLM plugin installation",
