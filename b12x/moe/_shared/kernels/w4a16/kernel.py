@@ -73,6 +73,7 @@ from b12x._lib.intrinsics import (
     packed_decode_lut_fp16_to_half2x4,
     packed_decode_lut_e4m3_to_e4m3x8,
     ld_global_nc_v4_u32,
+    ld_global_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
     red_add_global_bf16x2,
@@ -90,6 +91,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_f32,
     st_shared_v4_u32,
     threadfence,
+    u32_as_f32,
     trellis_align_stream_u32x2,
     warp_reduce,
 )
@@ -207,6 +209,27 @@ _TC_DECODE_PACK_COLLIDING_PAIRS = 3
 _TC_DECODE_PACK_SM_COVERAGE_CAP = 64
 _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR = 7
 _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR = 8
+
+
+@dsl_user_op
+def _pack_f32x2_to_bf16x2_rn(
+    x0: cutlass.Float32, x1: cutlass.Float32, *, loc=None, ip=None
+) -> Uint32:
+    """Pack two float32 values as bf16x2 (x0 in the low half), RN, unsaturated."""
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [
+            cutlass.Float32(x0).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(x1).ir_value(loc=loc, ip=ip),
+        ],
+        "cvt.rn.bf16x2.f32 $0, $2, $1;",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    ))
 
 
 @dsl_user_op
@@ -8255,6 +8278,98 @@ class W4A16FusedMoeKernel:
         return x * self._sigmoid_f32(x)
 
     @cute.jit
+    def _gated_activation_elem(self, gate: cutlass.Float32, up: cutlass.Float32):
+        # Per-element math of the scalar gated loop in _run_activation.
+        gate, up = self._clamp_swiglu_inputs(gate, up)
+        sigmoid_arg = gate
+        up_term = up
+        if cutlass.const_expr(self.activation_is_swigluoai):
+            sigmoid_arg = cutlass.Float32(self.swiglu_alpha) * gate
+            up_term = up + cutlass.Float32(self.swiglu_beta)
+        if cutlass.const_expr(self.fast_math):
+            exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
+        else:
+            exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
+        sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
+        silu = gate * sigmoid
+        if cutlass.const_expr(self.activation_is_situ):
+            beta = cutlass.Float32(SITU_DEFAULT_BETA)
+            linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+            situ_gate = (
+                beta
+                * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                * sigmoid
+            )
+            situ_up = linear_beta * cute.math.tanh(
+                up / linear_beta,
+                fastmath=self.fast_math,
+            )
+            result = self._cast_elem(situ_gate * situ_up)
+        elif cutlass.const_expr(self.activation_is_swigluoai):
+            result = self._cast_elem(silu * up_term)
+        else:
+            result = self._cast_elem(
+                self._cast_elem(silu) * self._cast_elem(up_term)
+            )
+        return result
+
+    @cute.jit
+    def _gated_activation_bf16x2(self, gate2: Uint32, up2: Uint32) -> Uint32:
+        hi_mask = Uint32(0xFFFF0000)
+        lo = self._gated_activation_elem(
+            u32_as_f32(gate2 << Uint32(16)), u32_as_f32(up2 << Uint32(16))
+        )
+        hi = self._gated_activation_elem(
+            u32_as_f32(gate2 & hi_mask), u32_as_f32(up2 & hi_mask)
+        )
+        return _pack_f32x2_to_bf16x2_rn(
+            lo.to(cutlass.Float32), hi.to(cutlass.Float32)
+        )
+
+    @cute.jit
+    def _run_activation_gated_x8(
+        self,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        # The scalar gated loop with 16-byte gate/up loads and output stores:
+        # each thread handles 8 consecutive intermediate columns of one row.
+        vec_per_row = Int32(self.intermediate_size // 8)
+        vidx = cta * Int32(self.cta_threads) + tid
+        stride = grid_x * Int32(self.cta_threads)
+        total = active_m * Int32(self.top_k) * vec_per_row
+        while vidx < total:
+            row = vidx // vec_per_row
+            col = (vidx - row * vec_per_row) * Int32(8)
+            gate_off = row * Int32(self.fc1_cols) + col
+            g0, g1, g2, g3 = ld_global_v4_u32(
+                get_ptr_as_int64(fc1_bf16_flat, gate_off)
+            )
+            u0, u1, u2, u3 = ld_global_v4_u32(
+                get_ptr_as_int64(
+                    fc1_bf16_flat, gate_off + Int32(self.intermediate_size)
+                )
+            )
+            o0 = self._gated_activation_bf16x2(g0, u0)
+            o1 = self._gated_activation_bf16x2(g1, u1)
+            o2 = self._gated_activation_bf16x2(g2, u2)
+            o3 = self._gated_activation_bf16x2(g3, u3)
+            st_global_v4_u32(
+                get_ptr_as_int64(
+                    activated_bf16_flat, row * Int32(self.intermediate_size) + col
+                ),
+                o0,
+                o1,
+                o2,
+                o3,
+            )
+            vidx += stride
+
+    @cute.jit
     def _run_activation(
         self,
         fc1_bf16_flat: cute.Tensor,
@@ -8340,6 +8455,16 @@ class W4A16FusedMoeKernel:
                 activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
                 activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
                 unit += gw_stride
+            return
+        if cutlass.const_expr(
+            self.activation_is_gated
+            and not self.is_fp16
+            and self.intermediate_size % 8 == 0
+            and self.fc1_cols % 8 == 0
+        ):
+            self._run_activation_gated_x8(
+                fc1_bf16_flat, activated_bf16_flat, tid, cta, grid_x, active_m
+            )
             return
         idx = cta * Int32(self.cta_threads) + tid
         stride = grid_x * Int32(self.cta_threads)
