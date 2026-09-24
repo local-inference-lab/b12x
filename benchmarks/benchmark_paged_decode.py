@@ -113,6 +113,13 @@ def main():
                     with PreparationSession(device=torch.device("cuda"), autotune=False) as session:
                         result = session.prepare((plan.request(name="bench", prepare_call=prepare_call),))
                         binding = paged_decode.bind(plan, scratch=scratch, output=out, **inputs)
+                        out.fill_(float("nan"))
+                        paged_decode.run(binding)
+                        torch.cuda.synchronize()
+                        if not bool(torch.isfinite(out).all()) or not float(out.abs().amax()) > 0:
+                            raise RuntimeError(
+                                f"paged_decode output invalid: {family} ctx={context} "
+                                f"B={batch} q={q_len}")
                         us = _kernel_us(lambda: paged_decode.run(binding))
                         result.close()
                     print(f"{family:7s} {'fp8' if args.fp8 else 'bf16':5s} {context:7d} {batch:3d} "
