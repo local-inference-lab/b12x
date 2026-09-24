@@ -83,7 +83,7 @@ class BlockscaledGemm:
         self.num_tmem_alloc_cols = 512
 
         self.num_acc_stage = 1
-        self.num_ab_stage = 2
+        self.num_ab_stage = 4
 
     @cute.jit
     def _launch(
