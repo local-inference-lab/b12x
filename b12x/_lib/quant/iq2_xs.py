@@ -1,4 +1,4 @@
-"""Public IQ2_XS codebook and W4A16 execution table.
+"""Shared IQ2 codebooks and weight-only execution tables.
 
 IQ2_XS encodes each group of eight weights as a 16-bit descriptor.  Bits
 0..8 select one of 512 magnitude vectors and bits 9..15 select one of 128
@@ -12,6 +12,8 @@ from __future__ import annotations
 import functools
 
 import torch
+
+from .block_codec import IQ2_CODECS, block_codec
 
 
 IQ2_XS_BLOCK_SIZE = 256
@@ -58,6 +60,26 @@ _IQ2_XS_GRID_2BIT = bytes.fromhex(
     "95a465a698a60aa820a822a828a8a0a8a8a804a984a986a928aa2aaa91aaaaaa"
 )
 
+# GGML 64302f42eb959556633c89ae651915d8157dcd63, iq2xxs_grid (MIT).
+_IQ2_XXS_GRID_2BIT = bytes.fromhex(
+    "00000200050008000a00110014002000220028002a0041004400500058006100"
+    "6400800082008a00a20001010401100115014001840198010002020222028202"
+    "010404041004210424044004420448046004810484049004a404000502050805"
+    "200546056905800591050906100640068406a406000805080808140828084108"
+    "440850085208880804094009020a140a01100410101021104010601084109010"
+    "951000110811201150115a118011241245120014081420142514491480141815"
+    "6215001616160118041810184018811800190519a019511a002002200a204420"
+    "6120802082202921482100220222012404241024402456240025412564259026"
+    "082820289428442a014004401040184021402440404048405640604081408440"
+    "9040004120416141804185410142104248425642684200440844204480449944"
+    "124524450046014804481048404845480049584961498249454a904a00500850"
+    "1150195020508050885004514251a4519152905492540a550156545600581158"
+    "195864584059085a046010604060686000615561186260620064056410651265"
+    "84654268008002800a8041808280048118814081118201840484108415844084"
+    "608400854685948509864086608602880489118a0490109024904090a1901691"
+    "8091459200942294449451958198209902a050a085a009a100a218a450a804a9"
+)
+
 _IQ2_XS_SIGN_MASKS = bytes.fromhex(
     "008182038405068788090a8b0c8d8e0f"
     "901112931495961718999a1b9c1d1e9f"
@@ -71,13 +93,16 @@ _IQ2_XS_SIGN_MASKS = bytes.fromhex(
 
 
 @functools.cache
-def iq2_xs_grid_cpu() -> torch.Tensor:
-    """Return the exact public 512x8 IQ2_XS magnitude grid as uint8."""
+def iq2_xs_grid_cpu(codec: str = "iq2_xs") -> torch.Tensor:
+    """Return the codec's exact public magnitude grid as uint8."""
 
-    packed = torch.tensor(list(_IQ2_XS_GRID_2BIT), dtype=torch.uint8)
+    if codec not in IQ2_CODECS:
+        raise ValueError(f"{codec!r} has no IQ2 magnitude grid")
+    spec = block_codec(codec)
+    packed = torch.tensor(list(_IQ2_XS_GRID_2BIT if codec == "iq2_xs" else _IQ2_XXS_GRID_2BIT), dtype=torch.uint8)
     codes = torch.stack(tuple((packed >> shift) & 3 for shift in (0, 2, 4, 6)), 1)
     magnitudes = torch.tensor((8, 25, 43, 0), dtype=torch.uint8)
-    return magnitudes[codes.long()].reshape(512, 8).contiguous()
+    return magnitudes[codes.long()].reshape(spec.grid_entries, 8).contiguous()
 
 
 @functools.cache
@@ -92,39 +117,41 @@ def iq2_xs_execution_lut_cpu() -> torch.Tensor:
 
 
 @functools.cache
-def iq2_xs_pair_selectors_cpu() -> torch.Tensor:
+def iq2_xs_pair_selectors_cpu(codec: str = "iq2_xs") -> torch.Tensor:
     """Return byte selectors for pairs from three scaled BF16 magnitudes."""
 
-    grid = iq2_xs_grid_cpu()
+    grid = iq2_xs_grid_cpu(codec)
     codes = (grid == 25).to(torch.int32) + 2 * (grid == 43).to(torch.int32)
     lo, hi = 2 * codes[:, 0::2], 2 * codes[:, 1::2]
     return (lo | ((lo + 1) << 4) | (hi << 8) | ((hi + 1) << 12)).to(torch.int16).contiguous()
 
 
-_DEVICE_TABLES: dict[tuple[str, int | None, bool], torch.Tensor] = {}
+_DEVICE_TABLES: dict[tuple[str, int | None, bool, str], torch.Tensor] = {}
 
 
 def _iq2_xs_execution_lut_device(
-    device_type: str, device_index: int | None, selectors: bool
+    device_type: str, device_index: int | None, selectors: bool, codec: str
 ) -> torch.Tensor:
     table = (
-        iq2_xs_pair_selectors_cpu()
+        iq2_xs_pair_selectors_cpu(codec)
         if selectors
-        else iq2_xs_grid_cpu().to(dtype=torch.bfloat16)
+        else iq2_xs_grid_cpu(codec).to(dtype=torch.bfloat16)
     )
     return table.to(device=torch.device(device_type, device_index)).contiguous()
 
 
 def iq2_xs_execution_lut(
-    device: torch.device | str, *, prepare: bool = False, selectors: bool = False
+    device: torch.device | str, *, prepare: bool = False, selectors: bool = False,
+    codec: str = "iq2_xs"
 ) -> torch.Tensor:
-    """Return the prepared 8 KiB magnitude or 4 KiB byte-selector table."""
+    """Return the codec-specific magnitude or byte-selector table."""
 
     resolved = torch.device(device)
     index = resolved.index
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
-    key = (resolved.type, index, bool(selectors))
+    block_codec(codec)
+    key = (resolved.type, index, bool(selectors), codec)
     if key not in _DEVICE_TABLES:
         if not prepare:
             raise RuntimeError(

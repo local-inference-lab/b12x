@@ -24,10 +24,11 @@ from tests.moe.test_iq2_xs import blocks
 
 
 @pytest.mark.parametrize("tile_k,tile_n", [(64, 128), (128, 128), (256, 64), (64, 256)])
-def test_stage_records_with_alternate_tiles(tile_k, tile_n):
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "q8_0"])
+def test_stage_records_with_alternate_tiles(tile_k, tile_n, codec):
     device = require_b12x()
     layer = IQ2XSLayer(
-        moe.IQ2XSWeights(blocks(e=8, n=1280, k=1024), blocks(e=8, n=1024, k=1280)),
+        moe.BlockQuantWeights(blocks(e=8, n=1280, k=1024, codec=codec), blocks(e=8, n=1024, k=1280, codec=codec), codec=codec),
         1024, 1280, 8, 2, tuple(range(8)), Path("synthetic-iq2-xs"), 0, 1, 0,
     )
     experts, _ = prepare_experts(layer, device, activation="relu2")
@@ -51,7 +52,7 @@ def test_stage_records_with_alternate_tiles(tile_k, tile_n):
             zero_fc2_output=False, moe_block_size=8, max_m_blocks=16,
             element_dtype="bf16", sms=props.multi_processor_count,
             max_shared_mem=props.shared_memory_per_block_optin,
-            weight_layout="iq2_xs", scale_format="iq2_xs", w13_layout="packed",
+            weight_layout=codec, scale_format=codec, w13_layout="packed",
             direct_topk_routes=True, tc_decode_fused_sum=True,
             force_tile_config=(tile_k, tile_n, tile_k, tile_n),
         )

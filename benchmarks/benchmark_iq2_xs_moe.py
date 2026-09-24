@@ -117,7 +117,7 @@ def check(actual, expected) -> dict[str, float]:
 
 def prepare_experts(layer: IQ2XSLayer, device, *, activation="silu"):
     plan = moe.plan_weights(
-        source=moe.PackedSource(format="iq2_xs", w13_layout="w31"),
+        source=moe.PackedSource(format=layer.weights.codec, w13_layout="w31"),
         activation=moe.ActivationSpec(
             mode="a16", nonlinearity=activation, io_dtype=torch.bfloat16
         ),
@@ -127,7 +127,7 @@ def prepare_experts(layer: IQ2XSLayer, device, *, activation="silu"):
             intermediate_size=layer.intermediate_size,
         ),
     )
-    source = moe.IQ2XSWeights(layer.weights.w13.to(device), layer.weights.w2.to(device))
+    source = moe.BlockQuantWeights(layer.weights.w13.to(device), layer.weights.w2.to(device), codec=layer.weights.codec)
     experts = moe.prepare_weights(plan=plan, weights=source)
     prepared = experts._impl.representation.value
     payload = sum(
@@ -151,6 +151,8 @@ def qualify_capacity(
     patterns=("balanced", "hot", "imbalanced"),
     repeats=20,
     launches=50,
+    config=None,
+    autotune=False,
 ):
     """Exercise several live counts with compilation and kernel resolution frozen."""
     from b12x._lib import compiler
@@ -167,7 +169,7 @@ def qualify_capacity(
             route_num_experts=layer.route_num_experts,
         ),
         routing=moe.RoutingSpec(deterministic_output=deterministic),
-        override=moe.MoeDecodeConfig(
+        override=None if autotune else config or moe.MoeDecodeConfig(
             backend="w4a16",
             route_planner="internal",
             max_active_clusters=None,
@@ -175,6 +177,8 @@ def qualify_capacity(
         ),
     )
     warmup = make_inputs(layer, capacity, experts.device, mapped=mapped)
+    expected_warmup = reference(layer, warmup, activation=activation) if autotune else None
+    activation_source = warmup.x.clone() if autotune else None
 
     def factory(state):
         scratch = tuple(
@@ -189,8 +193,17 @@ def qualify_capacity(
             output=warmup.output,
             route_expert_map=warmup.expert_map,
         )
+        if autotune:
+            # Qualify every candidate on the real weights before the session
+            # measures it. The selected plan also passes the frozen-resolution,
+            # mutation, poison and graph-replay checks below.
+            warmup.output.fill_(float("nan"))
+            bound.run()
+            check(warmup.output, expected_warmup)
         return PreparedCall(
-            run=bound.run, output=warmup.output, owners=(scratch, bound, warmup)
+            run=bound.run, output=warmup.output,
+            produce=(lambda: warmup.x.copy_(activation_source)) if autotune else None,
+            owners=(scratch, bound, warmup, activation_source),
         )
 
     request = request_for_capacity(
@@ -306,6 +319,7 @@ def qualify_capacity(
                             "deterministic": deterministic,
                             "pattern": pattern,
                             "mapped": mapped,
+                            "config": state.config.to_dict(),
                             "graph_us": samples,
                             **metrics,
                         }
@@ -332,6 +346,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--launches", type=int, default=50)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tune", action="store_true", help="Race production MoE candidates, then qualify the selected plans")
     args = parser.parse_args()
     if min(*args.counts, args.repeats, args.launches) <= 0:
         parser.error("counts, repeats and launches must be positive")
@@ -340,8 +355,8 @@ def main():
         parser.error("qualification requires an assigned CUDA device")
     torch.cuda.set_device(device)
     props = torch.cuda.get_device_properties(device)
-    if (props.major, props.minor) != (12, 0):
-        parser.error("IQ2_XS qualification targets SM120")
+    if (props.major, props.minor) not in ((12, 0), (12, 1)):
+        parser.error("IQ2_XS qualification targets SM120/SM121")
     torch.backends.cuda.matmul.allow_tf32 = False
     root = Path(__file__).resolve().parents[1]
     source_files = sorted(
@@ -349,6 +364,13 @@ def main():
             *root.glob("b12x/moe/**/*.py"),
             root / "b12x/_lib/intrinsics.py",
             root / "b12x/_lib/quant/iq2_xs.py",
+            root / "b12x/_lib/quant/block_codec.py",
+            root / "b12x/testing/iq2_xxs_reference.py",
+            root / "b12x/testing/iq2_xs_reference.py",
+            root / "b12x/testing/q8_0_reference.py",
+            root / "benchmarks/benchmark_iq2_xs_moe.py",
+            root / "benchmarks/iq2_xs_checkpoint.py",
+            root / "benchmarks/moe_preparation.py",
         ]
     )
     provenance = {
@@ -382,13 +404,13 @@ def main():
                         if args.expert_ids is None
                         else tuple(args.expert_ids),
                     )
-                    experts, payload = prepare_experts(loaded, device)
+                    experts, payload = prepare_experts(loaded, device, activation=loaded.activation)
                     source_digest = hashlib.sha256(
                         loaded.weights.w13.numpy().tobytes()
                         + loaded.weights.w2.numpy().tobytes()
                     ).hexdigest()
                     with PreparationSession(
-                        device=device, autotune=False, compile_workers=1
+                        device=device, autotune=args.tune, compile_workers=1
                     ) as session:
                         cases = [
                             (max(args.counts), tuple(args.counts), "packed", False),
@@ -397,6 +419,9 @@ def main():
                         cases += [
                             (m, (m,), "direct", False) for m in args.counts if m <= 8
                         ]
+                        if args.tune:
+                            cases = [(m, tuple(n for n in args.counts if n <= m), "auto", False)
+                                     for m in sorted({max(args.counts), *(m for m in args.counts if m <= 8)})]
                         for capacity, counts, route_mode, deterministic in cases:
                             results = qualify_capacity(
                                 loaded,
@@ -408,6 +433,8 @@ def main():
                                 deterministic=deterministic,
                                 repeats=args.repeats,
                                 launches=args.launches,
+                                activation=loaded.activation,
+                                autotune=args.tune,
                             )
                             for result in results:
                                 row = {
@@ -436,6 +463,7 @@ def main():
                                                 "cosine",
                                                 "relative_l2",
                                                 "graph_us",
+                                                "config",
                                             )
                                         }
                                     ),
@@ -444,4 +472,7 @@ def main():
 
 
 if __name__ == "__main__":
+    from b12x.testing.memory import absorb_small_page_fragments
+
+    absorb_small_page_fragments()
     main()

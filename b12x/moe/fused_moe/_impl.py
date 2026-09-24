@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 import os
 import logging
 import time
@@ -146,6 +148,8 @@ _TRELLIS_SOURCE_FORMATS = frozenset(_EXECUTION_TRELLIS_SOURCE_FORMATS)
 _PROJECTION_MIXED_TRELLIS_MAX_ROUTE_BLOCK_SIZE = 48
 _W4A16_SCALE_FORMATS = {
     "iq2_xs": "iq2_xs",
+    "iq2_xxs": "iq2_xxs",
+    "q8_0": "q8_0",
     "e4m3_k16": "e4m3_k16",
     "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
@@ -1528,8 +1532,8 @@ def _normalize_w4a16_scale_format(scale_format: str) -> str:
 
 def _w4a16_scale_format_for_source(source_format: str) -> str:
     source_format = _normalize_fp4_source_format(source_format)
-    if source_format == "iq2_xs":
-        return "iq2_xs"
+    if source_format in BLOCK_CODECS:
+        return source_format
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "e4m3_k32"
     return "e8m0_k32" if source_format == "fp4_e8m0_k32" else "e4m3_k16"
@@ -1542,8 +1546,8 @@ def _w4a16_weight_layout_for_source(
 ) -> str:
     """Return the default W4A16 layout selected by weight preparation."""
     source_format = _normalize_fp4_source_format(source_format)
-    if source_format == "iq2_xs":
-        return "iq2_xs"
+    if source_format in BLOCK_CODECS:
+        return source_format
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
     if (
@@ -1555,7 +1559,7 @@ def _w4a16_weight_layout_for_source(
     return "packed"
 
 
-_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256", "iq2_xs"}
+_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256", "iq2_xs", "iq2_xxs", "q8_0"}
 
 
 def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
@@ -2593,7 +2597,7 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
             intermediate_size=query.intermediate_size,
         )
     )
-    if weight_layout == "iq2_xs":
+    if weight_layout in BLOCK_CODECS:
         from b12x.moe._shared.kernels.w4a16.kernel import (
             _TC_DECODE_MAX_M,
         )
@@ -2641,7 +2645,7 @@ def _heuristic_w4a16_route_mode(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> str:
-    if query.source_format == "iq2_xs":
+    if query.source_format in BLOCK_CODECS:
         return "packed"
     if not _w4a16_direct_routing_supported(query):
         return "packed"
@@ -3438,11 +3442,11 @@ def _plan_core_workspace(
         topk = max(int(num_topk), 1)
         token_capacity = (routed_capacity + topk - 1) // topk
         direct_route_slots_by_block: dict[int, int] = {}
-        if weight_layout in {"packed", "iq2_xs"}:
+        if weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}:
             direct_m_cap = _MAX_DIRECT_TOPK_ROUTE_M
             if dtype == torch.bfloat16 and (
                 is_gated_moe_activation(activation)
-                or (weight_layout == "iq2_xs" and activation == "relu2")
+                or (weight_layout in BLOCK_CODECS and activation == "relu2")
             ):
                 direct_m_cap = _TC_DECODE_MAX_M
             for direct_m in range(1, min(token_capacity, direct_m_cap) + 1):
@@ -3507,7 +3511,7 @@ def _plan_core_workspace(
         # route geometry here as well.
         direct_decode_capacity = routed_capacity // max(int(num_topk), 1)
         if (
-            weight_layout in {"packed", "iq2_xs"}
+            weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}
             and dtype == torch.bfloat16
             and is_gated_moe_activation(activation)
             and direct_decode_capacity >= 1
@@ -6721,7 +6725,7 @@ def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
     value = prepare_iq2_xs_moe_weights(
         weights.w13, weights.w2, hidden_size=plan.hidden_size,
         intermediate_size=plan.intermediate_size, num_experts=plan.num_experts,
-        activation=plan.activation, w13_layout=plan.w13_layout,
+        activation=plan.activation, w13_layout=plan.w13_layout, codec=weights.codec,
     )
     unit = torch.ones((), dtype=torch.float32, device=value.w13.device)
     return B12XFP4ExpertWeights(
@@ -6730,7 +6734,7 @@ def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
         w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
         w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
         representation=_PreparedWeightRepresentation(
-            quant_mode="w4a16", layout=PreparedWeightLayout.IQ2_XS_COMPACT, value=value,
+            quant_mode="w4a16", layout=PreparedWeightLayout(weights.codec + "_compact"), value=value,
         ),
     )
 
@@ -7552,7 +7556,7 @@ def _w4a16_preplanned_launches(
     if (
         not collect_activation_amax
         and route_mode != "packed"
-        and weight_layout in {"packed", "iq2_xs"}
+        and weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}
         and is_gated_moe_activation(workspace.activation)
         and token_count <= _TC_DECODE_MAX_M
         and prefer_tc_decode
@@ -7563,7 +7567,7 @@ def _w4a16_preplanned_launches(
     if (
         not collect_activation_amax
         and route_mode == "direct"
-        and weight_layout in {"packed", "iq2_xs"}
+        and weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}
     ):
         direct = workspace.planned_direct_topk_launches.get(token_count)
         if direct is not None:
@@ -8766,7 +8770,7 @@ def _prewarm_w4a16_planned_launches(
         # can dispatch to it instead of the general fused launch.
         build_tc_decode = bool(
             not collect_activation_amax
-            and weight_layout in {"packed", "iq2_xs"}
+            and weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}
             and element_dtype == "bf16"
             and is_gated_moe_activation(workspace.activation)
         )
@@ -8945,7 +8949,7 @@ def _prewarm_w4a16_planned_launches(
                     )
         mapped_tc_decode = bool(
             not full_rotation
-            and weight_layout in {"packed", "iq2_xs"}
+            and weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}
             and element_dtype == "bf16"
             and is_gated_moe_activation(workspace.activation)
         )
@@ -9057,7 +9061,7 @@ def _prewarm_w4a16_planned_launches(
 
         build_direct_topk = bool(
             not collect_activation_amax
-            and weight_layout in {"packed", "iq2_xs"}
+            and weight_layout in {"packed", "iq2_xs", "iq2_xxs", "q8_0"}
             and not is_gated_moe_activation(workspace.activation)
         )
         if build_direct_topk:

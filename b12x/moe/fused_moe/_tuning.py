@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
+
 from dataclasses import dataclass, replace
 
 from b12x.preparation import (
@@ -90,6 +92,9 @@ class MoeDecodeConfig:
     w4a16_route_mode: str | None = None
     nvfp4_share_input: bool = False
     nvfp4_materialize_intermediate: bool = False
+    w4a16_tile_config: tuple[int, int, int, int] | None = None
+    w4a16_block_size_m: int | None = None
+    w4a16_pipeline_stages: int | None = None
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "MoeDecodeConfig":
@@ -102,6 +107,9 @@ class MoeDecodeConfig:
             "w4a16_route_mode",
             "nvfp4_share_input",
             "nvfp4_materialize_intermediate",
+            "w4a16_tile_config",
+            "w4a16_block_size_m",
+            "w4a16_pipeline_stages",
         }
         if set(payload) != expected:
             raise ValueError(
@@ -133,6 +141,15 @@ class MoeDecodeConfig:
             "nvfp4_share_input", "nvfp4_materialize_intermediate",
         )):
             raise TypeError("NVFP4 lowering controls must be boolean")
+        for name in ("w4a16_block_size_m", "w4a16_pipeline_stages"):
+            if payload[name] is not None and type(payload[name]) is not int:
+                raise TypeError(f"{name} must be an integer or null")
+        tiles = payload["w4a16_tile_config"]
+        if tiles is not None and (
+            not isinstance(tiles, tuple) or len(tiles) != 4
+            or any(type(value) is not int for value in tiles)
+        ):
+            raise TypeError("w4a16_tile_config must contain FC1 K/N and FC2 K/N integers")
         return cls(
             backend=backend,
             route_planner=route_planner,
@@ -142,6 +159,9 @@ class MoeDecodeConfig:
             w4a16_route_mode=w4a16_route_mode,
             nvfp4_share_input=payload["nvfp4_share_input"],
             nvfp4_materialize_intermediate=payload["nvfp4_materialize_intermediate"],
+            w4a16_tile_config=tiles,
+            w4a16_block_size_m=payload["w4a16_block_size_m"],
+            w4a16_pipeline_stages=payload["w4a16_pipeline_stages"],
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -154,7 +174,58 @@ class MoeDecodeConfig:
             "w4a16_route_mode": self.w4a16_route_mode,
             "nvfp4_share_input": self.nvfp4_share_input,
             "nvfp4_materialize_intermediate": self.nvfp4_materialize_intermediate,
+            "w4a16_tile_config": self.w4a16_tile_config,
+            "w4a16_block_size_m": self.w4a16_block_size_m,
+            "w4a16_pipeline_stages": self.w4a16_pipeline_stages,
         }
+
+
+# Each pair is (K, N). Both fused phases share a CTA, hence their thread
+# counts must match; their tile shapes may differ. These are existing kernel
+# geometries, independent of the codec's packed storage and live token count.
+_BLOCK_MOE_TILES = ((128, 64), (64, 128), (128, 128), (64, 256))
+
+
+def _validate_block_moe_launch(query, config):
+    knobs = (config.w4a16_tile_config, config.w4a16_block_size_m,
+             config.w4a16_pipeline_stages)
+    if all(value is None for value in knobs):
+        return
+    if config.backend != "w4a16" or query.source_format not in BLOCK_CODECS:
+        raise ValueError("W4A16 tile tuning requires a block-codec W4A16 query")
+    if any(value is None for value in knobs):
+        raise ValueError("W4A16 tile, route-block and pipeline choices must be specified together")
+    tiles, block, stages = knobs
+    if not isinstance(tiles, tuple) or len(tiles) != 4 or any(type(v) is not int for v in tiles):
+        raise ValueError("W4A16 tile config must contain four integers")
+    if type(block) is not int or block not in (8, 16, 32, 48, 64):
+        raise ValueError("unsupported W4A16 route-block size")
+    if type(stages) is not int or stages not in (2, 3, 4, 5):
+        raise ValueError("unsupported W4A16 pipeline depth")
+    if query.w4a16_block_size_m is not None and block != query.w4a16_block_size_m:
+        raise ValueError("W4A16 tuning conflicts with the declared route-block size")
+    if config.w4a16_route_mode == "direct" and block != 8:
+        raise ValueError("direct block-codec routing requires an M8 route block")
+    if tiles[:2] not in _BLOCK_MOE_TILES or tiles[2:] not in _BLOCK_MOE_TILES:
+        raise ValueError("unsupported W4A16 tile geometry")
+    if tiles[0] * tiles[1] != tiles[2] * tiles[3]:
+        raise ValueError("fused W4A16 FC1/FC2 thread counts must match")
+    from b12x.moe._shared.kernels.w4a16.kernel import (
+        _candidate_tile_fits, _DEFAULT_MAX_SHARED_MEM,
+    )
+    fc1_n = query.intermediate_size * (2 if query.activation == "silu" else 1)
+    for n, k, tile_k, tile_n in (
+        (fc1_n, query.hidden_size, *tiles[:2]),
+        (query.hidden_size, query.intermediate_size, *tiles[2:]),
+    ):
+        if not _candidate_tile_fits(
+            problem_n=n, problem_k=k, cta_m_blocks=(block + 15) // 16,
+            tile_n=tile_n, tile_k=tile_k, cta_threads=tile_n * tile_k // 64,
+            max_shared_mem=_DEFAULT_MAX_SHARED_MEM - 512,
+            weight_layout=query.source_format, uses_m_block_8=block == 8,
+            pipeline_stages=stages,
+        ):
+            raise ValueError("W4A16 tile/pipeline exceeds geometry or shared-memory limits")
 
 
 def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> None:
@@ -225,10 +296,11 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if query.source_format == "iq2_xs":
+    _validate_block_moe_launch(query, config)
+    if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
             raise ValueError("IQ2_XS requires BF16 W4A16 execution")
-        if query.activation not in {"silu", "relu2"} or query.hidden_size % 256 or query.intermediate_size % 256:
+        if query.activation not in {"silu", "relu2"} or query.hidden_size % max(128, block_codec(query.source_format).block_weights) or query.intermediate_size % max(128, block_codec(query.source_format).block_weights):
             raise ValueError("IQ2_XS requires aligned SiLU or ReLU² geometry")
         if config.w4a16_route_mode == "direct":
             from ._impl import _w4a16_direct_routing_supported
@@ -425,6 +497,19 @@ def _materialize_tuning(query, device, choice):
 def _tuning_parameters(query, device):
     if device is None or device.sm_count <= 0:
         raise ValueError("MoE launch tuning requires the device SM count")
+    if query.source_format in BLOCK_CODECS:
+        from itertools import product
+
+        tiles = tuple(a + b for a, b in product(_BLOCK_MOE_TILES, repeat=2)
+                      if a[0] * a[1] == b[0] * b[1])
+        blocks = ((query.w4a16_block_size_m,) if query.w4a16_block_size_m is not None
+                  else (8, 16, 32, 48, 64))
+        return {
+            "max_active_clusters": (None,),
+            "w4a16_tile_config": (None, *tiles),
+            "w4a16_block_size_m": (None, *blocks),
+            "w4a16_pipeline_stages": (None, 2, 3, 4, 5),
+        }
     if _compact_w4a8_query(query):
         # FC1 and FC2 expose different task counts. Retain the full SM ladder
         # for both, plus half/three-quarter grids and the original uncapped path.
@@ -549,8 +634,8 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=9,
-    config_schema_version=7,
+    query_schema_version=11,
+    config_schema_version=8,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -559,7 +644,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=14,
+    candidate_contract_version=17,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),
@@ -570,6 +655,9 @@ TUNING = TuningContract(
         Knob(name="nvfp4_share_input", values=(False, True), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "dynamic"}), otherwise=False),
         Knob(name="nvfp4_materialize_intermediate", values=(False, True), binding=ParameterBinding.COMPILE, when=FrozenMapping({"nvfp4_share_input": True}), otherwise=False),
         Knob(name="w4a16_route_mode", values=("direct", "packed"), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
+        Knob(name="w4a16_tile_config", values=(None,), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
+        Knob(name="w4a16_block_size_m", values=(None,), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
+        Knob(name="w4a16_pipeline_stages", values=(None,), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
     ),
     materialize=_materialize_tuning,
     parameters=_tuning_parameters,

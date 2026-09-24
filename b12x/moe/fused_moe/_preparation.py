@@ -1,6 +1,8 @@
 """Preparation declarations for canonical fused tensor-parallel MoE."""
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -240,7 +242,9 @@ def _lower_caps(
         deterministic_output=query.deterministic_output,
         swiglu_limit=_decode_scalar(query.swiglu_limit),
         swiglu_alpha=_decode_scalar(query.swiglu_alpha),
-        w4a16_block_size_m=query.w4a16_block_size_m,
+        w4a16_block_size_m=(config.w4a16_block_size_m
+                            if config.w4a16_block_size_m is not None
+                            else query.w4a16_block_size_m),
         w4a16_fast_math=query.fast_math,
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
@@ -350,7 +354,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     tokens = int(scratch.launch_plan.max_tokens_per_launch)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
-    if weight_layout not in {"packed", "modelopt", "iq2_xs"}:
+    if weight_layout not in {"packed", "modelopt", "iq2_xs", "iq2_xxs", "q8_0"}:
         raise ValueError(f"unsupported standard W4A16 weight layout {weight_layout!r}")
     element_dtype = "bf16" if core.dtype == torch.bfloat16 else "fp16"
     w13_layout = caps.w13_layout if weight_layout == "modelopt" else "packed"
@@ -378,6 +382,8 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             swiglu_limit=core.swiglu_limit, swiglu_alpha=core.swiglu_alpha,
             swiglu_beta=core.swiglu_beta, weight_layout=weight_layout,
             scale_format=scale_format, w13_layout=w13_layout,
+            force_tile_config=caps.decode_config.w4a16_tile_config,
+            pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,
@@ -386,8 +392,9 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
         )
         direct = direct_mapped = None
-        if weight_layout == "iq2_xs":
-            if (tokens <= 8 and core.activation in {"silu", "relu2"} and not caps.deterministic_output
+        if weight_layout in BLOCK_CODECS:
+            if (caps.decode_config.w4a16_route_mode != "packed"
+                    and tokens <= 8 and core.activation in {"silu", "relu2"} and not caps.deterministic_output
                     and not caps.collect_activation_amax and not caps.apply_router_weight_on_input):
                 decode_args = {**compiler_args, "moe_block_size": 8}
                 direct = compile_w4a16_fused_moe(
@@ -1072,7 +1079,7 @@ def plan_fc2(experts: PreparedExperts, invocation: FC2Invocation, *, override=No
              declaration_invocation: FrozenMapping = FrozenMapping()) -> Plan:
     if not isinstance(experts, PreparedExperts):
         raise TypeError("FC2 preparation requires canonical PreparedExperts")
-    if experts.plan._impl.source_format == "iq2_xs":
+    if experts.plan._impl.source_format in BLOCK_CODECS:
         raise NotImplementedError("standalone IQ2_XS FC2 is unsupported; use fused MoE")
     if not isinstance(invocation, FC2Invocation):
         raise TypeError("FC2 preparation requires FC2Invocation")

@@ -8,6 +8,8 @@ outside timing. The timed operation uses the production prepared dense API.
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
+
 from collections import defaultdict
 import hashlib
 import importlib.metadata
@@ -44,21 +46,22 @@ def checkpoint_cases(model: Path):
             continue
         recipe = recipes.get(name.removesuffix(".weight"), {})
         algorithm = recipe.get("quant_algo")
-        if algorithm not in ("IQ2_XS", "W4A16_NVFP4"):
+        if algorithm not in ("IQ2_XS", "IQ2_XXS", "Q8_0", "W4A16_NVFP4"):
             continue
         with safe_open(model / index[name], framework="pt", device="cpu") as handle:
             shape = tuple(handle.get_slice(name).get_shape())
-        if algorithm == "IQ2_XS":
+        if algorithm.lower() in BLOCK_CODECS:
+            spec = block_codec(algorithm.lower())
             if (
                 recipe.get("packing") != "ggml"
-                or recipe.get("group_size") != 256
-                or recipe.get("block_payload_bytes") != 74
+                or recipe.get("group_size") != spec.block_weights
+                or recipe.get("block_payload_bytes") != spec.block_bytes
                 or len(shape) != 3
-                or shape[-1] != 74
+                or shape[-1] != spec.block_bytes
             ):
                 raise ValueError(f"unsupported IQ2_XS payload: {name}")
             n, blocks, _ = shape
-            k = blocks * 256
+            k = blocks * spec.block_weights
         else:
             if recipe.get("group_size") != 16 or len(shape) != 2:
                 raise ValueError(f"unsupported NVFP4 payload: {name}")
@@ -71,7 +74,7 @@ def checkpoint_cases(model: Path):
     return index, [
         dict(
             role=role,
-            recipe="iq2_xs" if algo == "IQ2_XS" else "nvfp4",
+            recipe=algo.lower() if algo.lower() in BLOCK_CODECS else "nvfp4",
             n=n,
             k=k,
             weight=names[0],
@@ -89,8 +92,8 @@ def load_weight(model, index, case):
     name = case["weight"]
     raw = read(name)
     hashes = {name: hashlib.sha256(raw.view(torch.uint8).numpy().tobytes()).hexdigest()}
-    if case["recipe"] == "iq2_xs":
-        weight = blockscaled.pack_weight(raw.cuda(), recipe="iq2_xs")
+    if case["recipe"] in BLOCK_CODECS:
+        weight = blockscaled.pack_weight(raw.cuda(), recipe=case["recipe"])
         decoded = dequantize_blocks(raw).bfloat16().cuda()
         return weight, decoded, 1.0, hashes
     scale_name = name.removesuffix(".weight") + ".weight_scale"
@@ -155,6 +158,8 @@ def source_manifest():
         root / "b12x/_lib/dense_gemm.py",
         root / "b12x/_lib/intrinsics.py",
         root / "b12x/_lib/quant/iq2_xs.py",
+        root / "b12x/_lib/quant/block_codec.py",
+        root / "b12x/testing/iq2_xxs_reference.py",
         root / "b12x/testing/iq2_xs_reference.py",
         root / "benchmarks/benchmark_dense_gemm.py",
         Path(__file__).resolve(),
@@ -243,8 +248,8 @@ def run(args):
         for case in cases:
             weight, decoded, multiplier, hashes = load_weight(model, index, case)
             values = weight.values
-            scales = weight.metadata if case["recipe"] == "iq2_xs" else weight.scale_mma
-            global_scale = None if case["recipe"] == "iq2_xs" else weight.global_scale
+            scales = weight.metadata if case["recipe"] in BLOCK_CODECS else weight.scale_mma
+            global_scale = None if case["recipe"] in BLOCK_CODECS else weight.global_scale
             for m in counts:
                 source = torch.empty(
                     (m, case["k"]), device="cuda", dtype=torch.bfloat16

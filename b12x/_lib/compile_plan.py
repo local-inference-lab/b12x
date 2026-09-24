@@ -136,8 +136,8 @@ def compiled_program_available(program: ProgramKey) -> bool:
     if program in _RESIDENT_PROGRAMS:
         return True
     if program.dialect == "cute":
-        from .compiler import _cache_object_path
-        return _cache_object_path(program.key).is_file()
+        from .compiler import _valid_cute_compile_cache
+        return _valid_cute_compile_cache(program.key)
     if program.dialect == "triton":
         from triton.compiler.compiler import get_cache_manager
         if not program.name:

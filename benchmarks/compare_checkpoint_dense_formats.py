@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import IQ2_CODECS
+
 import argparse
 import hashlib
 import importlib.metadata
@@ -57,12 +59,14 @@ def requantize_nvfp4(decoded):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--recipe", choices=IQ2_CODECS, default="iq2_xs")
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
+    codec = args.recipe
     if args.warmup < 20 or args.iters < 100 or min(args.batch_sizes) <= 0:
         raise ValueError("comparison requires positive rows, 20 warmups, and 100 trials")
     if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
@@ -70,12 +74,12 @@ def main():
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     index, cases = checkpoint_cases(args.model_path)
-    cases = [case for case in cases if case["recipe"] == "iq2_xs"]
+    cases = [case for case in cases if case["recipe"] == codec]
     if not cases:
-        raise ValueError("checkpoint has no IQ2_XS dense matrices")
+        raise ValueError(f"checkpoint has no {codec.upper()} dense matrices")
     flush = make_l2_flush_fn(enabled=True)
     args.evidence.parent.mkdir(parents=True, exist_ok=True)
-    medians = {recipe: [] for recipe in ("iq2_xs", "nvfp4")}
+    medians = {recipe: [] for recipe in (codec, "nvfp4")}
     with args.evidence.open("x") as evidence:
         def record(row):
             evidence.write(json.dumps(row) + "\n")
@@ -91,11 +95,11 @@ def main():
                     tuning_cache_version=os.environ.get("B12X_TUNING_CACHE_VERSION", "1"),
                     counts=args.batch_sizes, warmup=args.warmup, trials=args.iters,
                     metric="cold-L2 single-op graph microseconds; minimize",
-                    ratio="NVFP4 latency / IQ2_XS latency; greater than one favors IQ2_XS",
-                    nvfp4_source="requantized independently decoded BF16 IQ2_XS checkpoint weights"))
+                    ratio=f"NVFP4 latency / {codec.upper()} latency; greater than one favors {codec.upper()}",
+                    nvfp4_source=f"requantized independently decoded BF16 {codec.upper()} checkpoint weights"))
         for case in cases:
             iq2 = load_weight(args.model_path, index, case)
-            operands = {"iq2_xs": iq2, "nvfp4": requantize_nvfp4(iq2[1])}
+            operands = {codec: iq2, "nvfp4": requantize_nvfp4(iq2[1])}
             for m in args.batch_sizes:
                 source = torch.empty((m, case["k"]), device="cuda", dtype=torch.bfloat16)
                 plans, requests = {}, []
@@ -108,8 +112,8 @@ def main():
                     )
                     plan = blockscaled.plan(query)
                     plans[recipe] = plan
-                    scales = weight.metadata if recipe == "iq2_xs" else weight.scale_mma
-                    global_scale = None if recipe == "iq2_xs" else weight.global_scale
+                    scales = weight.metadata if recipe in IQ2_CODECS else weight.scale_mma
+                    global_scale = None if recipe in IQ2_CODECS else weight.global_scale
 
                     def prepare(state, weight=weight, scales=scales, global_scale=global_scale):
                         scratch = (torch.empty(state.required_workspace, device="cuda", dtype=torch.uint8)
@@ -144,7 +148,7 @@ def main():
                         programs = {name: state.programs["gemm"] for name, state in states.items()}
                         buffers = {
                             name: (source, item[0].values,
-                                   item[0].metadata if name == "iq2_xs" else item[0].scale_mma,
+                                   item[0].metadata if name in IQ2_CODECS else item[0].scale_mma,
                                    outputs[name], workspaces[name])
                             for name, item in operands.items()
                         }
@@ -178,19 +182,22 @@ def main():
                                 configs={name: state.config.to_dict() for name, state in states.items()},
                                 payload_sha256={name: item[3] for name, item in operands.items()},
                                 packed_weight_bytes={name: item[0].values.numel() +
-                                    (item[0].metadata.numel() if name == "iq2_xs" else item[0].scale_mma.numel())
+                                    (item[0].metadata.numel() if name in IQ2_CODECS else item[0].scale_mma.numel())
                                     for name, item in operands.items()},
                                 stable_callable=True, stable_addresses=True, zero_replay_allocation=True,
                                 device_before=before, device_after=after))
-                    print(f"{case['role']} M={m}: IQ2_XS {latency['iq2_xs']:.3f} us; "
+                    print(f"{case['role']} M={m}: {codec.upper()} {latency[codec]:.3f} us; "
                           f"NVFP4 {latency['nvfp4']:.3f} us; "
-                          f"NVFP4/IQ2_XS {latency['nvfp4']/latency['iq2_xs']:.3f}x", flush=True)
+                          f"NVFP4/{codec.upper()} {latency['nvfp4']/latency[codec]:.3f}x", flush=True)
                     del graphs, outputs, workspaces, expected, states, buffers
             del operands, iq2
         means = {name: math.exp(sum(map(math.log, values)) / len(values)) for name, values in medians.items()}
-        record(dict(kind="summary", geomean_us=means, nvfp4_over_iq2_xs=means["nvfp4"] / means["iq2_xs"]))
-        print(f"geo mean: {means}; NVFP4/IQ2_XS {means['nvfp4']/means['iq2_xs']:.3f}x", flush=True)
+        record(dict(kind="summary", geomean_us=means, **{f"nvfp4_over_{codec}": means["nvfp4"] / means[codec]}))
+        print(f"geo mean: {means}; NVFP4/{codec.upper()} {means['nvfp4']/means[codec]:.3f}x", flush=True)
 
 
 if __name__ == "__main__":
+    from b12x.testing.memory import absorb_small_page_fragments
+
+    absorb_small_page_fragments()
     main()

@@ -7077,6 +7077,42 @@ def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
     return Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip))
 
 
+@cute.jit
+def iq2_xxs_descriptor_pair(grids: Uint32, signs_scale: Uint32, half: Int32):
+    """Normalize one K16 half in registers, retaining native K32 storage."""
+    grids = grids >> (half * Int32(16))
+    signs = signs_scale >> (half * Int32(14))
+    lo = (grids & Uint32(255)) | ((signs & Uint32(127)) << 9)
+    hi = ((grids >> 8) & Uint32(255)) | (((signs >> 7) & Uint32(127)) << 9)
+    return lo | (hi << 16)
+
+
+@dsl_user_op
+def q8_0_pair_to_bf16x2(packed, base, *, loc=None, ip=None):
+    """Multiply signed INT8 values by the FP16 block scale, rounding once."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [Uint32(packed).ir_value(loc=loc, ip=ip), Uint32(base).ir_value(loc=loc, ip=ip)],
+        """{
+            .reg .b16 dh;
+            .reg .s32 q0, q1;
+            .reg .f32 d, lo, hi;
+            cvt.u16.u32 dh, $2;
+            cvt.f32.f16 d, dh;
+            bfe.s32 q0, $1, 0, 8;
+            bfe.s32 q1, $1, 8, 8;
+            cvt.rn.f32.s32 lo, q0;
+            cvt.rn.f32.s32 hi, q1;
+            mul.f32 lo, lo, d;
+            mul.f32 hi, hi, d;
+            cvt.rn.bf16x2.f32 $0, hi, lo;
+        }""",
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return Uint32(result)
+
+
 @dsl_user_op
 def iq2_xs_pair_to_bf16x2(descriptor, base, subscale, lut_addr, pair_offset, *,
                          shared_lut=False, loc=None, ip=None):

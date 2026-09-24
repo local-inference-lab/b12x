@@ -1,10 +1,12 @@
-"""Qualify safetensors IQ2_XS shared-expert weights through the dense API.
+"""Qualify safetensors packed shared-expert weights through the dense API.
 
 Run from the repository root with --model-path DIR --evidence FILE.jsonl.
 This checks numerical and graph contracts; it does not measure performance.
 """
 
 from __future__ import annotations
+
+from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
 import argparse
 import hashlib
@@ -55,13 +57,16 @@ def main():
     recipes = json.loads(quant_path.read_text())["quantization"]["quantized_layers"]
     names = sorted(name for name in weight_map if ".shared_experts." in name
                    and name.endswith(".weight")
-                   and recipes.get(name.removesuffix(".weight"), {}).get("quant_algo") == "IQ2_XS")
+                   and recipes.get(name.removesuffix(".weight"), {}).get("quant_algo", "").lower() in BLOCK_CODECS)
     if not names:
         raise ValueError("checkpoint contains no IQ2_XS shared-expert weights")
     root = Path(__file__).resolve().parents[2]
     paths = [*sorted((root / "b12x/gemm/blockscaled").glob("*.py")),
              root / "b12x/_lib/dense_gemm.py", root / "b12x/_lib/intrinsics.py",
-             root / "b12x/_lib/quant/iq2_xs.py", root / "b12x/testing/iq2_xs_reference.py",
+             root / "b12x/_lib/quant/iq2_xs.py",
+             root / "b12x/_lib/quant/block_codec.py",
+             root / "b12x/testing/iq2_xxs_reference.py", root / "b12x/testing/iq2_xs_reference.py",
+             root / "b12x/testing/q8_0_reference.py",
              Path(__file__).resolve()]
     props = torch.cuda.get_device_properties(device)
     args.evidence.parent.mkdir(parents=True, exist_ok=True)
@@ -79,12 +84,14 @@ def main():
                     performance_measured=False))
         for position, name in enumerate(names):
             recipe = recipes[name.removesuffix(".weight")]
-            if recipe.get("group_size") != 256 or recipe.get("block_payload_bytes") != 74 or recipe.get("packing") != "ggml":
+            codec = recipe["quant_algo"].lower()
+            spec = block_codec(codec)
+            if recipe.get("group_size") != spec.block_weights or recipe.get("block_payload_bytes") != spec.block_bytes or recipe.get("packing") != "ggml":
                 raise ValueError(f"unsupported IQ2_XS payload metadata: {name}")
             with safe_open(model / weight_map[name], framework="pt", device="cpu") as handle:
                 raw = handle.get_tensor(name)
             payload_hash = hashlib.sha256(raw.numpy().tobytes()).hexdigest()
-            weight = blockscaled.pack_weight(raw.to(device), recipe="iq2_xs")
+            weight = blockscaled.pack_weight(raw.to(device), recipe=codec)
             reference_weight = dequantize_blocks(raw).bfloat16().to(device).float()
             torch.manual_seed(position)
             source = torch.randn((max(args.rows), weight.in_features), device=device, dtype=torch.bfloat16)

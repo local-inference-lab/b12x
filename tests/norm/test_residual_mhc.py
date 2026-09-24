@@ -81,14 +81,19 @@ def test_mhc_prepared_projection_splits_share_projection_and_keep_finalizers_dis
             requests.append(declaration.request(name=name, prepare_call=lambda state, values=(x, residual, previous_post, previous_comb, fn, scale, bias, norm): _bound_call(state, x=values[0], residual=values[1], previous_post=values[2], previous_comb=values[3], fn=values[4], scale=values[5], bias=values[6], norm=values[7], rms_eps=1e-6)))
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         result = session.prepare(requests)
-        projection, finalizers = set(), set()
-        for plan in result.plans.values():
+        projection, finalizers = {}, set()
+        for name, plan in result.plans.items():
+            splits = name.rsplit("-s", 1)[1]
             for program in require_prepared(plan, "norm.mhc").launchers["partial"].__b12x_programs__:
                 if "mhc_prefill_tf32_project_tma_" in program.name:
-                    projection.add(program)
+                    projection.setdefault(splits, set()).add(program)
                 if "mhc_finalize_gram_" in program.name:
                     finalizers.add(program)
-        assert len(projection) == 1
+        # The TF32 projection specializes on its configured K-split count; each
+        # count shares one projection across both planned capacities.
+        assert sorted(projection) == ["1", "16"]
+        assert all(len(programs) == 1 for programs in projection.values())
+        assert projection["1"].isdisjoint(projection["16"])
         assert len(finalizers) == 2
 
 
