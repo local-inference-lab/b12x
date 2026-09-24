@@ -270,6 +270,35 @@ def test_paged_decode_reads_pages_past_the_int32_element_range(fp8):
     _check(out, ref)
 
 
+
+def test_bf16_plan_rejects_a_uint8_cache():
+    """Only FP8 plans take the uint8 cache alias: a BF16 plan would address it
+    as 2-byte elements with 1-byte strides."""
+    require_b12x()
+    hkv, dqk, dvo = 2, 192, 128
+    packed = torch.zeros((4, 2, hkv, PAGE, dqk + dvo), dtype=torch.uint8, device="cuda")
+    view = packed[:, 1].transpose(1, 2)
+    k_cache, v_cache = view[..., :dqk], view[..., dqk:]
+    caps = paged_decode.Caps(device="cuda", num_q_heads=16, num_kv_heads=hkv,
+                             head_dim_qk=dqk, head_dim_vo=dvo, page_size=PAGE,
+                             max_batch=1, max_q_per_req=8, kv_dtype=torch.bfloat16)
+    declaration = paged_decode.plan(caps)
+    inputs = dict(q=torch.zeros((8, 16, dqk), dtype=torch.bfloat16, device="cuda"),
+                  k_cache=k_cache, v_cache=v_cache,
+                  page_table=torch.zeros((1, 1), dtype=torch.int32, device="cuda"),
+                  cache_seqlens=torch.full((1,), 8, dtype=torch.int32, device="cuda"),
+                  cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32, device="cuda"),
+                  attention_sink_bias=None, k_descale=None, v_descale=None)
+    with pytest.raises(ValueError, match="differs from"):
+        paged_decode.bind(declaration, scratch=_scratch(declaration), output=_output(inputs),
+                          **inputs)
+    with pytest.raises(ValueError, match="differs from"):
+        paged_decode.write_kv(declaration,
+                              key=torch.zeros((4, hkv, dqk), dtype=torch.bfloat16, device="cuda"),
+                              value=torch.zeros((4, hkv, dvo), dtype=torch.bfloat16, device="cuda"),
+                              k_cache=k_cache, v_cache=v_cache,
+                              slot_mapping=torch.arange(4, dtype=torch.int64, device="cuda"))
+
 @pytest.mark.parametrize("fp8", [False, True])
 def test_paged_decode_write_kv_appends_rows_exactly(fp8):
     """write_kv puts each token's K/V rows at its slot, bit-exact, and nothing else.

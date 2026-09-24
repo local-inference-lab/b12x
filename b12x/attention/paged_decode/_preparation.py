@@ -294,7 +294,8 @@ class PreparedPagedDecode:
                 raise ValueError(
                     f"{name} must be [pages, {query.page_size}, {query.num_kv_heads}, {dim}]"
                 )
-            if cache.dtype not in (kv_dtype, torch.uint8):
+            allowed = (kv_dtype, torch.uint8) if query.kv_dtype == "float8_e4m3fn" else (kv_dtype,)
+            if cache.dtype not in allowed:
                 raise ValueError(f"{name} dtype {cache.dtype} differs from {kv_dtype}")
         if query.kv_dtype == "float8_e4m3fn":
             k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
@@ -380,7 +381,7 @@ class PreparedPagedDecode:
                 raise ValueError(
                     f"{name} must be [pages, {query.page_size}, {heads}, {dim}]"
                 )
-            if cache.dtype not in (kv_dtype, torch.uint8):
+            if cache.dtype not in ((kv_dtype, torch.uint8) if fp8 else (kv_dtype,)):
                 raise ValueError(f"{name} dtype {cache.dtype} differs from {kv_dtype}")
             elem = 1 if fp8 else 2
             if cache.stride(-1) != 1 or cache.data_ptr() % 16 or any(
