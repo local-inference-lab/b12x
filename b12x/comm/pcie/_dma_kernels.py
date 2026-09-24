@@ -1357,7 +1357,7 @@ class DmaLaunchers:
 def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
     """Resolve the primitive programs reachable by declaration metadata."""
 
-    if int(world_size) not in (2, 4, 6, 8, 10):
+    if int(world_size) not in (2, 3, 4, 6, 8, 10):
         raise ValueError(f"unsupported DMA world size {world_size}")
     mode = str(wire_mode)
     codec = "i8" if mode.startswith("i8") else "mx" if mode.startswith("mx") else "e4m3"
