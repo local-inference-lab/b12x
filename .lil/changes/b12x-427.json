@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-427",
+  "category": "feature",
+  "summary": "PCIe one-shot and DMA all-reduce at world size 3; PDL flags take effect",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Three-GPU deployments (GLM-5.3-Flash TP3) use the B12X one-shot and DMA all-reduce instead of the NCCL fallback.",
+    "B12X_PCIE_ONESHOT_PDL and B12X_MHC_PDL, already set by the GLM profile, now let the mHC kernel overlap the all-reduce it consumes."
+  ],
+  "pull_requests": [427],
+  "evidence": ["https://github.com/local-inference-lab/b12x/pull/427"]
+}
