@@ -1086,7 +1086,10 @@ def _quantize_write_index_k_mxfp4(
 
 def _check_pool(pool, page_bytes, device):
     if pool.ndim != 2 or pool.shape[1] != page_bytes or pool.dtype != torch.uint8:
-        raise ValueError(f"index_k_cache must be uint8 (pages,{page_bytes})")
+        raise ValueError(
+            f"index_k_cache must be uint8 (pages,{page_bytes}); got {pool.dtype} "
+            f"shape {tuple(pool.shape)} stride {tuple(pool.stride())}"
+        )
     if (
         pool.device != device
         or pool.stride(1) != 1
