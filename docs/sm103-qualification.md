@@ -61,3 +61,47 @@ records the exclusion.
 
 Triton-built support kernels need Python headers, and Engram disk lookup needs
 `liburing-dev` and `pkg-config`.
+
+## GB300 results
+
+One NVIDIA GB300 (compute capability 10.3, 152 SMs, verified coherent Grace
+memory) with driver 595.91.07, CUDA 13.2, Compute Sanitizer 2026.1, Python
+3.12, Torch 2.13.0+cu130, CUTLASS DSL 4.6.2 and Triton 3.7.1. All stages ran
+from one frozen snapshot of `f22d325e` with a clean worktree.
+
+| Stage | Result |
+| --- | --- |
+| `compile_sm103.py --component all` | 1,163 callables cross-compiled |
+| `compile_sm103_prepared.py` | 83 declarations, 230 distinct programs (223 CuTe, 7 Triton), no failures |
+| Host tests, `tests/architecture tests/preparation` | 941 passed, 43 skipped; one checkout-identity test needs a `.git` directory and passes in a checkout |
+| `qualify_sm103.py --execute` | 27 components, 1,262 tests, no failures, errors or skips |
+| Memcheck, every component | 1,256 tests; every summary reports 0 errors |
+| Synccheck, every component | 1,256 tests; every summary reports 0 errors |
+| Racecheck, `blockscaled` | 104 tests, 0 hazards |
+
+Sanitizer runs exclude the six `device_trap` tests and leave cuBLAS `nvjet`
+kernels uninstrumented, as described above.
+
+Physical execution found these defects, fixed here:
+
+- An MXFP4 dense GEMM with K=128 had one scale-factor K atom, smaller than
+  its TMA box, and trapped. The K tile is clamped to the reduction extent.
+- A composite MoE plan dispatching a smaller prepared capacity variant
+  rejected an output sized for the plan capacity; the variant now receives
+  the live rows.
+- The prepared FP6 serving op lowered only the SM12x GEMM. It now prepares
+  the native SM103 quantizer and GEMM; output matches the eager SM103 path
+  bit for bit.
+- `blockscaled.quantize_mxfp4` was imported but not exported.
+
+The block-scaled GEMM keeps four TMA stages in flight. Against two stages, the
+dense 4096³ GEMM falls from 202.9 to 179.6 μs (NVFP4), 199.3 to 177.2 μs
+(MXFP4) and 285.7 to 206.0 μs (MXFP8), with bitwise-identical outputs.
+
+## Limits
+
+Operator qualification covers one GB300. Complete-model serving, B300
+performance and the vLLM integration are not qualified here. IQ2_XS linear
+execution has no SM103 kernel and is rejected at planning; IQ2_XS MoE is
+rejected by the SM103 MoE backend. Intermediate-Hadamard Trellis extents that
+cross the FC1 halves execute only on SM103; SM12x rejects them.
