@@ -65,6 +65,10 @@ def _validate_query(query, device):
     if query.padded_in_features % (16 if query.recipe == "nvfp4" else 32):
         raise ValueError("stored K must match the weight scale group")
     if query.recipe == "iq2_xs":
+        if device is not None and device.compute_capability == (10, 3):
+            from b12x._lib.architecture import UnsupportedArchitectureError
+
+            raise UnsupportedArchitectureError("IQ2_XS linear execution is not implemented on SM103")
         if query.in_features != query.padded_in_features or query.in_features % 256:
             raise ValueError("IQ2_XS requires unpadded K divisible by 256")
         if query.activation_mode == "quantized" or query.activation_scale_available:

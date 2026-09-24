@@ -27,6 +27,12 @@ def test_sm103_precision_capacity_default_is_unmeasured(recipe):
     assert TUNING.configure(query, device=unknown).default.mode == "quantized"
 
 
+def test_sm103_rejects_iq2_xs_before_preparation():
+    query = BlockscaledQuery(recipe="iq2_xs", num_tokens=4, in_features=512,
+                             padded_in_features=512, out_features=136)
+    with pytest.raises(UnsupportedArchitectureError, match="IQ2_XS"):
+        TUNING.configure(query, device=B300)
+
 def test_compiler_admits_only_portable_a16_and_native_dense_entry_types():
     for module in ("b12x.gemm.blockscaled._a16_cute", "b12x.gemm.blockscaled._sm103", "b12x.gemm.blockscaled._fp8_cute"):
         require_kernel_architecture(module, (10, 3))
