@@ -349,7 +349,9 @@ def test_lagged_post_pre_tf32_small_projection_tile(
     if geometry:
         from b12x.norm.mhc._tuning import TUNING
         choice = config.to_dict()
-        del choice["projection_tile_m"]
+        # Derived fields are not tuning knobs: tile M follows the M warps and
+        # the FP32 split follows the device.
+        del choice["projection_tile_m"], choice["projection_split_fp32"]
         TUNING.parameter_space(plan.query, None).validate(choice)
     args = (x, residual, prev_post, prev_comb, fn, scale, bias)
     prepare(mhc_session, "post_pre", args, options, plan=plan)

@@ -1738,9 +1738,12 @@ def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_
     device = torch.device("cuda", torch.cuda.current_device())
     hidden, intermediate, experts, capacity, topk = 512 if intermediate_hadamard else 256, 256, 3, 128, 2
     codebook = "lut_e4m3" if intermediate_hadamard else "mcg"
+    # An intermediate-Hadamard extent must lie within one FC1 half on SM12x;
+    # read the first half of a twice-as-wide checkpoint.
+    global_intermediate = 2 * intermediate if intermediate_hadamard else intermediate
     manifest = write_exl3_checkpoint(tmp_path, Exl3SynthConfig(
         codebook=codebook, num_experts=experts, hidden_size=hidden,
-        intermediate_size=intermediate, moe_layer_indices=(0,), bits=3,
+        intermediate_size=global_intermediate, moe_layer_indices=(0,), bits=3,
         per_expert_input_rotations=not broadcast, intermediate_hadamard=intermediate_hadamard,
         pre_block=512 if intermediate_hadamard else None, post_block=128 if intermediate_hadamard else None,
         extent_alignment_slots=4, seed=5,
@@ -1801,3 +1804,46 @@ def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_
         assert tuple(tensor.data_ptr() for tensor in (*scratch, output)) == addresses
     finally:
         graph.reset()
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_sm12x_rejects_intermediate_hadamard_extent_across_fc1_halves(tmp_path):
+    """Distinct gate/up input tables across one extent need the SM103 split path."""
+    from b12x.moe.fused_moe import _impl as impl
+    from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import Exl3SynthConfig, write_exl3_checkpoint
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden, intermediate, experts = 512, 512, 3
+    manifest = write_exl3_checkpoint(tmp_path, Exl3SynthConfig(
+        codebook="lut_e4m3", num_experts=experts, hidden_size=hidden,
+        intermediate_size=intermediate, moe_layer_indices=(0,), bits=3,
+        per_expert_input_rotations=True, intermediate_hadamard=True,
+        pre_block=512, post_block=128, extent_alignment_slots=4, seed=5,
+    ))
+    layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=intermediate // 32)
+    assert not torch.equal(layer.gate_suh, layer.up_suh)
+    weight_plan = impl.plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16", source_format="exl3", trellis_codebook="lut_e4m3",
+        activation="silu", params_dtype=torch.float16, num_experts=experts,
+        hidden_size=hidden, intermediate_size=intermediate, trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256), intermediate_hadamard=True,
+    )
+    weights = impl.prepare_b12x_fp4_moe_weights(
+        plan=weight_plan, params_dtype=torch.float16, exl3_layer=layer, exl3_device=device,
+    )
+    assert weights.representation_for("w4a16").trellis.input_scale_split == intermediate // 2
+    plan = impl.plan_tp_moe_scratch(impl.TPMoEScratchCaps(
+        max_tokens=4, core_token_counts=(4,), num_topk=2, route_num_experts=experts,
+        device=device, weight_plan=weight_plan, quant_mode="w4a16", w4a16_block_size_m=64,
+        decode_config=impl.MoeDecodeConfig(backend="w4a16", route_planner="internal", max_active_clusters=None, w4a16_route_mode="packed"),
+    ))
+    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in plan.scratch_specs())
+    expert_map = torch.arange(experts, device=device, dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="distinct input-scale halves"):
+        plan.bind(
+            scratch=scratch, a=torch.zeros(4, hidden, device=device, dtype=torch.float16), experts=weights,
+            topk_weights=torch.full((4, 2), 0.5, device=device), topk_ids=torch.zeros(4, 2, device=device, dtype=torch.int32),
+            output=torch.empty(4, hidden, device=device, dtype=torch.float16),
+            route_expert_map=expert_map, output_expert_map=expert_map,
+        )
