@@ -55,11 +55,34 @@ def _tensor_from_pointer(
     )
 
 
+_COHERENT_HOST: dict[int, bool] = {}
+
+
+def _coherent_host(device: torch.device) -> bool:
+    """Whether the GPU reads host memory through a coherent Grace link."""
+    index = int(device.index)
+    if index not in _COHERENT_HOST:
+        from b12x._lib.platform import probe_platform
+
+        _COHERENT_HOST[index] = probe_platform(device).grace_coherent
+    return _COHERENT_HOST[index]
+
+
 class MappedHostAllocation:
-    """Own a mapped page-locked allocation and its CPU/CUDA tensor aliases."""
+    """Own a mapped page-locked allocation and its CPU/CUDA tensor aliases.
+
+    ``write_combined`` defaults to true except on Grace-coherent GPUs: there,
+    GPU reads of write-combined pages over NVLink-C2C are uncached and reach
+    about a quarter of the cacheable bandwidth (91 vs 388 GB/s on GB300).
+    """
 
     def __init__(
-        self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        *,
+        write_combined: bool | None = None,
     ) -> None:
         from cuda.bindings import runtime as cudart
 
@@ -76,10 +99,14 @@ class MappedHostAllocation:
             )
         self.device = device
         self.nbytes = nbytes
+        if write_combined is None:
+            write_combined = not _coherent_host(device)
+        self.write_combined = bool(write_combined)
+        flags = cudart.cudaHostAllocMapped
+        if self.write_combined:
+            flags |= cudart.cudaHostAllocWriteCombined
         with torch.cuda.device(device):
-            error, pointer = cudart.cudaHostAlloc(
-                nbytes, cudart.cudaHostAllocMapped | cudart.cudaHostAllocWriteCombined
-            )
+            error, pointer = cudart.cudaHostAlloc(nbytes, flags)
             _check_cuda(error, "cudaHostAlloc")
             self._host_pointer = int(pointer)
             self._closed = False

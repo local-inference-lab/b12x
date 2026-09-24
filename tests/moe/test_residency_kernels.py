@@ -193,3 +193,21 @@ def test_exact_size_mapped_host_owner_is_readable_by_native_finalizer():
         torch.testing.assert_close(out.cpu().flatten(), owner.host_view, rtol=0, atol=0)
     finally:
         owner.close()
+
+
+@pytest.mark.parametrize("override", [None, True, False])
+def test_mapped_host_storage_is_cacheable_on_grace_coherent_gpus(override):
+    if not torch.cuda.is_available():
+        pytest.skip("mapped host storage requires CUDA")
+    from b12x._lib.platform import probe_platform
+    from b12x.sequence._shared.disk_table import MappedHostAllocation
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    owner = MappedHostAllocation((256,), torch.uint8, device, write_combined=override)
+    try:
+        expected = not probe_platform(device).grace_coherent if override is None else override
+        assert owner.write_combined is expected
+        owner.host_view.fill_(3)
+        assert int(owner.device_view.sum()) == 3 * 256
+    finally:
+        owner.close()
