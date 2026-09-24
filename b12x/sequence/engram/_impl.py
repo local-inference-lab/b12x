@@ -116,3 +116,37 @@ def run_lookup(binding,token_count=None,*,clear_tail=True):
    table._cache.read_rows(binding.hash_ids,prepared*24)
    lookup_op(binding.plan.handle,binding.weight,binding.scale_bytes,binding.hash_ids,binding.num_tokens,binding.out,prepared,clear_tail)
  return binding.out
+_READ_POOL=None
+def run_lookups(bindings,token_counts,*,clear_tail=True):
+ """Run several lookups; disk tables read their rows concurrently.
+
+ Each disk table owns an io_uring reader and its read releases the GIL, so the
+ host reads for different tables overlap instead of running back to back.
+ Stream order and results match calling run_lookup for each binding in turn.
+ """
+ global _READ_POOL
+ bindings=tuple(bindings); counts=tuple(operator.index(n) for n in token_counts)
+ if len(bindings)!=len(counts): raise ValueError("one token count per lookup binding")
+ for b,n in zip(bindings,counts):
+  if not isinstance(b,LookupBinding): raise TypeError("lookup run requires an Engram lookup binding")
+  if not 0<=n<=b.hash_ids.shape[0]: raise ValueError("token count exceeds capacity")
+ disk=[i for i,b in enumerate(bindings) if b.disk_table is not None]
+ if len(disk)<2: return tuple(run_lookup(b,n,clear_tail=clear_tail) for b,n in zip(bindings,counts))
+ from concurrent.futures import ThreadPoolExecutor
+ from contextlib import ExitStack
+ from ._kernels import lookup_op
+ if _READ_POOL is None: _READ_POOL=ThreadPoolExecutor(max_workers=3,thread_name_prefix="b12x-engram-read")
+ with ExitStack() as stack:
+  caches={}
+  for i in disk:
+   bindings[i].disk_table._require_open()
+   caches[i]=stack.enter_context(bindings[i].disk_table._cache.transaction())
+   caches[i]._stage_ids(bindings[i].hash_ids,counts[i]*24)
+  futures=[_READ_POOL.submit(caches[i]._read_staged,counts[i]*24) for i in disk[1:]]
+  try: caches[disk[0]]._read_staged(counts[disk[0]]*24)
+  finally: errors=[f.exception() for f in futures]
+  for error in errors:
+   if error is not None: raise error
+  for b,n in zip(bindings,counts):
+   lookup_op(b.plan.handle,b.weight,b.scale_bytes,b.hash_ids,b.num_tokens,b.out,n,clear_tail)
+ return tuple(b.out for b in bindings)

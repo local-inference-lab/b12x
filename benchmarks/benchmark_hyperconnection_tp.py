@@ -541,5 +541,8 @@ def main():
 
 
 if __name__ == "__main__":
+    from b12x.testing.memory import absorb_small_page_fragments
+
+    absorb_small_page_fragments()
     with torch.inference_mode():
         main()

@@ -210,6 +210,62 @@ def test_prepared_lookup_accepts_e8m0_bytes_and_exact_row_shards():
         result.close(); session.close()
 
 
+def test_run_lookups_overlaps_disk_reads_and_matches_sequential(tmp_path):
+    """Batched lookups over two disk tables equal the tables read one by one."""
+    from contextlib import ExitStack
+
+    device = require_sm103_or_sm12x()
+    plan = _declaration(device, tokens=3, rank=1, tp=3,
+                        invocation={"operation": "lookup", "compact_rows": True,
+                                    "resident_scales": False})
+    rows = plan.query.table_rows
+    tables_data = []
+    for k in range(2):
+        weights = torch.arange(rows * 256, dtype=torch.float32).add(k * 5).remainder(15).sub(7)
+        weights = weights.reshape(rows, 256).to(torch.float8_e4m3fn)
+        scales = torch.arange(rows * 8).add(k).remainder(5).add(125).to(torch.uint8).reshape(rows, 8)
+        paths = [tmp_path / f"weights{k}.bin", tmp_path / f"scales{k}.bin"]
+        for path, data in zip(paths, (weights, scales)):
+            path.write_bytes(bytes(4093) + data.view(torch.uint8).numpy().tobytes())
+        tables_data.append((weights, scales, paths))
+    ids = [torch.full((3, 24), -1, dtype=torch.int64, device=device) for _ in range(2)]
+    count = torch.tensor([3], dtype=torch.int32, device=device)
+    outs = [torch.full((3, 6144), 73, dtype=torch.bfloat16, device=device) for _ in range(2)]
+    states = []
+    with ExitStack() as resources:
+        session = resources.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+        def prepare_call(state):
+            states.append(state)
+            return PreparedCall(run=lambda: None)
+        resources.enter_context(session.prepare((plan.request(name="engram-disk-batch", prepare_call=prepare_call),)))
+        tables = []
+        for weights, scales, paths in tables_data:
+            table = engram.DiskTable(states[-1], queue_depth=4)
+            resources.callback(table.close)
+            for scale, path in zip((False, True), paths):
+                table.add_shard(0, str(path), 4093, scale=scale)
+            tables.append(table)
+        bindings = [engram.bind_lookup(plan, disk_table=t, hash_ids=i, num_tokens=count, out=o)
+                    for t, i, o in zip(tables, ids, outs)]
+        start, end = tables[0].state.shard_start, min(tables[0].state.shard_end, rows)
+        cases = torch.tensor([start, end - 1, start, start - 1, end, -1, start + 3, start + 17],
+                             device=device).repeat(9).reshape(3, 24)
+        for live in (3, 1, 2):
+            for k in range(2):
+                ids[k].copy_(cases.roll(k + live, dims=1))
+                outs[k].fill_(73)
+            count.fill_(live)
+            engram.run_lookups(bindings, [live, live])
+            torch.cuda.synchronize(device)
+            for k, (weights, scales, _) in enumerate(tables_data):
+                expected = torch.zeros((3, 24, 256), dtype=torch.bfloat16)
+                cpu_ids = ids[k].cpu()
+                valid = (cpu_ids[:live] >= start) & (cpu_ids[:live] < end)
+                selected = cpu_ids[:live][valid]
+                expected[:live][valid] = (weights.float()[selected] * scales[selected].view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=1)).to(torch.bfloat16)
+                torch.testing.assert_close(outs[k].cpu(), expected.flatten(1), rtol=0, atol=0)
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize("resident_scales", [False, True])
 def test_disk_lookup_matches_varied_rows_with_graph_replay_and_stream_reuse(
