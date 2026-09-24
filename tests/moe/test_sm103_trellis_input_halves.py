@@ -167,8 +167,30 @@ def test_canonical_cross_half_preparation_and_oracle(mixed, bits, width, offset)
         > 0.01
     )
     if torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
-        with pytest.raises(NotImplementedError, match="distinct input-scale halves"):
-            fused_moe.plan_execution(
-                experts=owner,
-                capacity=fused_moe.ExecutionCapacity(max_tokens=4, top_k=2),
+        # Declarations are device-free. SM12x never executes a split extent:
+        # binding rejects the split, and planning already rejects geometries
+        # and activations its kernels do not implement.
+        from b12x.moe.fused_moe import _impl as impl
+
+        rejected = (
+            "distinct input-scale halves|integral number of CTA N tiles|requires silu"
+        )
+        with pytest.raises((NotImplementedError, ValueError), match=rejected):
+            plan = impl.plan_tp_moe_scratch(impl.TPMoEScratchCaps(
+                max_tokens=4, core_token_counts=(4,), num_topk=2, route_num_experts=3,
+                device=source.device, weight_plan=owner._impl.plan, quant_mode="w4a16",
+                w4a16_block_size_m=64,
+                decode_config=impl.MoeDecodeConfig(
+                    backend="w4a16", route_planner="internal", max_active_clusters=None,
+                    w4a16_route_mode="packed",
+                ),
+            ))
+            scratch = tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=source.device)
+                for spec in plan.scratch_specs()
+            )
+            plan.bind(
+                scratch=scratch, a=source, experts=owner._impl,
+                topk_weights=routing, topk_ids=ids.clamp(min=0).to(torch.int32),
+                output=torch.empty_like(source),
             )

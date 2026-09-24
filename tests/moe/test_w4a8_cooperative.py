@@ -16,17 +16,14 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
 ):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x._lib import cooperative
-    from b12x.moe import fused_moe
     from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
     from b12x.moe.fused_moe import _impl
 
     if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
         pytest.skip("The repacked MXFP4 path requires SM120 or SM121")
-    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", f"{tile_m}x128")
     # Request two CTAs per SM so a one-resident-block specialization must
     # apply the compiled resource bound even on a GPU with many SMs.
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    monkeypatch.setenv("B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS", str(2 * sm_count))
     _impl.clear_tp_moe_caches()
     experts_count, hidden, intermediate, topk = 32, 5120, 2304, 6
     device = torch.device("cuda", torch.cuda.current_device())
@@ -65,7 +62,7 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
                 swiglu_limit=10.0,
             )
         )
-    weight_plan = fused_moe.plan_weights(
+    weight_plan = _impl.plan_b12x_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -74,7 +71,7 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
         hidden_size=hidden,
         intermediate_size=intermediate,
     )
-    experts = fused_moe.prepare_weights(
+    experts = _impl.prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=weights["w13_fp4"],
         w1_blockscale=weights["w13_mx"],
@@ -86,8 +83,8 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
         a2_gscale=weights["input_scale"],
         params_dtype=torch.bfloat16,
     )
-    plan = fused_moe.plan(
-        fused_moe.Caps(
+    plan = _impl.plan_tp_moe_scratch(
+        _impl.TPMoEScratchCaps(
             max_tokens=capacity,
             num_topk=topk,
             device=device,
@@ -96,6 +93,13 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
             core_token_counts=(capacity,),
             route_num_experts=0,
             swiglu_limit=10.0,
+            decode_config=_impl.MoeDecodeConfig(
+                backend="dynamic",
+                route_planner="internal",
+                max_active_clusters=2 * sm_count,
+                dynamic_tile_m=tile_m,
+                dynamic_route_mode="grouped",
+            ),
         )
     )
     assert plan.launch_plan.implementation == "dynamic"
@@ -107,8 +111,7 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
     output = torch.empty_like(x)
 
     def bind(rows):
-        return fused_moe.bind(
-            plan,
+        return plan.bind(
             scratch=scratch,
             a=x[:rows],
             experts=experts,
@@ -131,7 +134,7 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
         norm_ratio = actual.float().norm() / reference[:rows].float().norm()
         assert 0.95 < norm_ratio < 1.05, (tile_m, rows, norm_ratio)
 
-    fused_moe.run(binding=bind(capacity))
+    bind(capacity).run()
     torch.cuda.synchronize()
     check(capacity, references[0])
     compiled = tuple(_impl._DYNAMIC_KERNEL_CACHE.values())
@@ -154,14 +157,14 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
         ids.copy_(changed_ids)
         for rows in (1, 2, capacity - 1, capacity):
             binding = bind(rows)
-            fused_moe.run(binding=binding)
+            binding.run()
             torch.cuda.synchronize()
             check(rows, references[1])
             graph = torch.cuda.CUDAGraph()
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream), torch.cuda.graph(graph):
-                fused_moe.run(binding=binding)
+                binding.run()
             torch.cuda.current_stream().wait_stream(stream)
             torch.cuda.synchronize()
             for sentinel in (float("nan"), 997.0):

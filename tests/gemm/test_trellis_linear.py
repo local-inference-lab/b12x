@@ -237,14 +237,19 @@ def test_prepare_pair_weight_rejects_malformed_descriptor_before_cuda(
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
     seen = {}
 
-    def fake_gate(device, *, requires):
+    def fake_gate(device, *, requires, archs):
         seen["device"] = device
         seen["requires"] = requires
+        seen["archs"] = archs
         return True
 
     monkeypatch.setattr(api, "default_is_supported", fake_gate)
     assert trellis_linear.is_supported("cuda:3")
-    assert seen == {"device": "cuda:3", "requires": trellis_linear.META.requires}
+    assert seen == {
+        "device": "cuda:3",
+        "requires": trellis_linear.META.requires,
+        "archs": trellis_linear.META.archs,
+    }
 
 
 @pytest.mark.parametrize(
