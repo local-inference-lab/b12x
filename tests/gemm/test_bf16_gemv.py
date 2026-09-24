@@ -549,19 +549,37 @@ def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
 
 
 @cuda_required
-def test_tensor_core_gemv_replays_live_rows(projection_session):
-    """One capture at eight rows serves fewer live rows without touching the rest."""
+def test_tensor_core_gemv_replays_live_rows():
+    """One tc plan prepared at eight rows serves CUDA-graph replays with fewer live
+    rows: each replay matches FP64, leaves rows past the live count untouched and
+    allocates nothing."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import require_prepared
+
     torch.manual_seed(7)
     k, n = 2048, 4096
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
     x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
     out = torch.full((8, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-    plan = _prepare_projection(projection_session, x, weight, out=out,
-                               override=bf16_gemv.GemvConfig(backend="tc"))
-    out.fill_(float("nan"))  # preparation ran the plan at full capacity
-    live = x[:3]
-    bf16_gemv.mm(live, weight, out=out[:3], plan=plan)
-    torch.cuda.synchronize()
-    expected = live.double() @ weight.double().T
-    torch.testing.assert_close(out[:3].double(), expected, rtol=1e-2, atol=1e-2)
-    assert torch.isnan(out[3:]).all()
+    with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+        plan = _prepare_projection(session, x, weight, out=out,
+                                   override=bf16_gemv.GemvConfig(backend="tc"))
+        session.freeze()
+        state = require_prepared(plan, "gemm.bf16_gemv", x.device)
+        launcher = state.launcher
+        with kernel_resolution_guard("prepared tc GEMV"):
+            for rows in (1, 3, 8):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    bf16_gemv.mm(x[:rows], weight, out=out[:rows], plan=plan)
+                x.neg_()
+                out.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                expected = x[:rows].double() @ weight.double().T
+                torch.testing.assert_close(out[:rows].double(), expected, rtol=1e-2, atol=1e-2)
+                assert torch.isnan(out[rows:]).all()
+                assert state.launcher is launcher
+                graph.reset()
