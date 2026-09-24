@@ -2,8 +2,9 @@
 
 Status: **implemented host contracts and policy** in `b12x.moe.residency`.
 The SM103 MXFP4 HBM/Grace adapter is the implemented execution backend. Portable
-tests exercise its fixed-address exchange protocol and captured metadata path;
-physical B300 execution and adaptive performance remain **unqualified**.
+tests exercise its fixed-address exchange protocol and captured metadata path,
+and the adapter is qualified on a physical GB300. Adaptive performance remains
+**unqualified**.
 
 The shared subsystem represents canonical expert identity, physical placement,
 cumulative routing observations and recent-frequency exchange decisions. It

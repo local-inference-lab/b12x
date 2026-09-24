@@ -1,11 +1,11 @@
 # Automatic SM103 expert residency
 
-Status: **implemented orchestration prototype**. Automatic residency discovers a
+Status: **implemented orchestration**. Automatic residency discovers a
 workload-specific static placement and prepares it through the existing
-`PreparationSession` API. Portable GPU tests qualify the counter operation,
-including replay and lifecycle hooks. They do not qualify SM103 expert execution,
-Grace-backed TMA, model quality or B300 performance. See the
-[engineering ledger](expert-residency-ledger.md) for source-bound results.
+`PreparationSession` API. Portable GPU tests cover the counter operation,
+including replay and lifecycle hooks. The residency operator it prepares is
+qualified on a physical GB300 ([hierarchical expert residency](expert-residency.md));
+model quality and B300 performance are not.
 
 The engine opts in once, supplies its checkpoint identity and memory reservations,
 and connects the worker hooks to routing and its control loop. Users do not need
@@ -54,7 +54,7 @@ prevent exact balance. No synthetic selection counts are recorded. Joint byte
 feasibility takes precedence over this prior. Learned placement remains free
 to allocate HBM unequally from real routing evidence. The physical hierarchical
 backend must already work for calibration to serve requests. Profiling does not provide a fallback
-around unqualified Grace TMA or an unsupported source format.
+for an unsupported source format.
 
 After convergence, `auto` reports `restart_required`; `profile` always reports
 `profile_saved`. A sufficiently sampled but unconverged hard-limit result is
@@ -85,6 +85,8 @@ The public types are exported by `b12x.moe.fused_moe`.
 Modes:
 
 - `off`: no discovery and no counter plan or graph node.
+- `static`: reuse a valid profile (a pinned path must be valid); otherwise
+  prepare the balanced placement. No counters, calibration or restart.
 - `profile`: collect counters and save an artifact; never activate it.
 - `auto`: reuse a valid artifact; otherwise calibrate and request restart.
 - `monitor`: require a valid static artifact and report drift; never re-place
@@ -305,9 +307,8 @@ and preparation lifecycle.
 
 The maintained companion preparation branch already uses `PreparationSession`;
 the older SM103 companion does not. Neither wires automatic residency into its
-loader and serving loop. The [integration audit](expert-residency-integration.md)
-identifies the concrete engine hooks and CPU checkpoint ownership needed for a
-model larger than HBM. No old API is restored and no `sitecustomize` or production
+loader and serving loop. Serving a model larger than HBM also needs engine
+hooks and CPU-side checkpoint ownership during loading. No old API is restored and no `sitecustomize` or production
 monkeypatch is installed.
 
 ## Counter and phase semantics
@@ -449,8 +450,6 @@ One sequential arena would save 2,022,209,280 bytes, about 1.88 GiB. These are
 layout calculations, not measured HBM savings. A shared arena requires explicit
 lane, stream, captured-graph and output-lifetime ownership. Concurrent lanes need
 separate arenas; silent cross-plan aliasing is unsupported.
-The [integration and ownership audit](expert-residency-integration.md#workspace-ownership)
-defines the conditions required before an arena can change admission accounting.
 
 Portable counter validation and overhead diagnostics:
 
@@ -478,5 +477,4 @@ source hash, UUID, toolchain and GPU state. Its ratio is profiled/off latency;
 values above one are slower. It is neither a top-k arithmetic benchmark nor a
 full-MoE/C1/verifier-throughput measurement. Nsight and full-operator profiling
 on B300 must establish that distinction before router fusion or monitor defaults
-are changed. The legality and performance of TMA on coherent Grace expert slabs
-remain independent physical gates.
+are changed.

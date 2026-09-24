@@ -1,14 +1,20 @@
 # Hierarchical expert residency
 
+Expert residency runs an SM103 MoE layer with only some of its experts in HBM.
+Frequently routed experts live in HBM; the rest stay in coherent Grace memory,
+which the GPU reads directly. One prepared operator call serves both tiers and
+matches an all-HBM placement bitwise.
+
 The [shared residency subsystem](expert-residency-subsystem.md) owns canonical
 placement and optional host cache policy. This guide specifies its SM103
 HBM/Grace execution adapter and preparation contracts.
 
-
-Status: **implemented prototype**. Host contracts, portable Blackwell metadata and
-quantization kernels, mapped-host reads, and SM103 cross-compilation are qualified.
-The SM103 expert GEMMs, Grace-backed TMA operands, complete operator arithmetic,
-and physical performance are **not hardware-qualified**.
+Status: **operator qualified on one physical GB300**. HBM, Grace and mixed
+placements, quiescent slot exchange and the native cache control match an
+all-HBM placement bitwise and pass the independent oracle under memcheck,
+synccheck and racecheck. Grace-served routes are not performance-qualified
+([measurements](#gb300-measurements)). DeepSeek-V4.1-Flash serves end to end
+through the Karmic vLLM integration; its throughput is measured, not qualified.
 
 `b12x.moe.fused_moe` prepares a static expert placement within the existing
 `plan_weights -> plan_execution -> PreparationSession -> bind -> run` lifecycle.
@@ -221,11 +227,43 @@ default; bounded experiments are saved separately from accepted profiles. `read_
 from either artifact schema; automatic reuse performs the complete validation
 specified in the [automatic guide](expert-residency-automatic.md).
 
+## GB300 measurements
+
+One GB300 (152 SMs, driver 595.91.07, CUDA 13.2), DeepSeek-V4.1-Flash geometry
+(hidden 5120, intermediate 2304, 384 experts, top-6, SwiGLU limit 10), CUDA-graph
+replay medians of one layer:
+
+| Placement | 1 token | 8 tokens |
+| --- | ---: | ---: |
+| All experts in HBM | 93.4 us | 421.1 us |
+| All experts in Grace, cacheable mapped pages | 449.8 us | 3,409 us |
+| All experts in Grace, write-combined pages (previous default) | 1,357.8 us | 10,697.9 us |
+
+A route costs about 15 us from HBM and about 60 us from Grace. GPU reads of
+cacheable Grace pages run at 370-388 GB/s over NVLink-C2C; write-combined pages
+run at 91 GB/s, so mapped host memory is no longer write-combined on
+Grace-coherent GPUs.
+
+Complete-model serving through the Karmic vLLM integration (static balanced
+placement, 11,479 of 15,360 routed experts in HBM, catid's decode recipe of
+8,192 input and 1,024 output tokens at temperature 0):
+
+| Workload | Result |
+| --- | ---: |
+| Decode, 1 concurrent request | 58.1 tok/s (17.2 ms per token) |
+| Decode, 8 concurrent requests | 131.0 tok/s aggregate |
+| Prefill, 16K tokens, 1,024-token chunks | 346 tok/s |
+
+Decode is dominated by the residency operator itself: the TRTLLM MXFP4 x MXFP8
+kernel runs the same all-HBM layer in 36.8 us at 1 token and 149.8 us at 8. Prefill
+is limited by the routed GEMM giving every route its own 128-row tile and by
+reading the Grace tier once per chunk. Grouped per-expert tiles, larger chunks
+through a shared scratch arena, and copy-engine staging of the Grace tier are the
+next steps; none is part of this release.
+
 ## Qualification commands
 
-See [the engineering ledger](expert-residency-ledger.md) for completed evidence
-and rejected experiments. Raw compiler and service receipts belong outside the
-repository.
+Raw compiler and service receipts belong outside the repository.
 
 ```bash
 python -m pytest tests/moe/test_expert_residency.py
@@ -237,14 +275,16 @@ python scripts/compile_sm103.py --component residency \
   --output-dir /evidence/residency-compile
 ```
 
-On physical B300/GB300 with verified coherent Grace memory:
+On physical B300/GB300 with verified coherent Grace memory, run the
+`residency` launcher component (HBM, Grace and mixed parity, slot exchange and
+cache control) plainly and under each sanitizer, then the benchmark:
 
 ```bash
-python -m pytest tests/moe/test_sm103_residency.py -v
-compute-sanitizer --tool memcheck --error-exitcode 99 \
-  python -m pytest tests/moe/test_sm103_residency.py -v
-compute-sanitizer --tool synccheck --error-exitcode 99 \
-  python -m pytest tests/moe/test_sm103_residency.py -v
+python scripts/qualify_sm103.py --execute --device-uuid "$UUID" --component residency \
+  --compile-manifest /evidence/native/manifest.json --output-dir /evidence/residency-runtime
+python scripts/qualify_sm103.py --execute --device-uuid "$UUID" --component residency \
+  --compile-manifest /evidence/native/manifest.json --sanitizer "$COMPUTE_SANITIZER" \
+  --sanitizer-tool racecheck --output-dir /evidence/residency-racecheck
 python benchmarks/moe/expert_residency.py --output /evidence/residency.json \
   --hidden 5120 --intermediate 2304 --experts 384 --hot-experts 295 \
   --top-k 6 --swiglu-limit 10 --tokens 1 2 4 8 16 32 64 128 \
@@ -274,14 +314,13 @@ workload benchmark. `--weights` accepts a CPU `PackedWeights` tensor bundle with
 `--checkpoint-sha256`; `--profile` additionally checks its model/layer identity.
 This is an operator probe, not an end-to-end checkpoint loader or quality harness.
 Explicit worker hooks are provided in
-`b12x.integration.vllm.expert_residency`; the companion vLLM serving port and engine
-wiring remain required. Greedy checkpoint requests, layer probes, C2C
+`b12x.integration.vllm.expert_residency`; the Karmic vLLM integration wires them
+for static placement. Greedy checkpoint requests, layer probes, C2C
 traffic, achieved occupancy, tensor/TMA utilization, HBM throughput, stalls, power,
-and overlap are deferred to physical qualification. No performance benefit is
-claimed from compilation or portable tests.
+and overlap still need profiling. No performance benefit is claimed from
+compilation or portable tests.
 
-The [serving integration and workspace audit](expert-residency-integration.md)
-identifies the maintained companion PreparationSession hooks, CPU checkpoint
-ownership required for greater-than-HBM loading, and execution-lane conditions
-for future scratch sharing. Those integrations and shared arenas are not
-implemented by the orchestration API; private scratch remains fully charged.
+Serving a checkpoint larger than HBM also needs the engine's PreparationSession
+hooks and CPU-side checkpoint ownership during loading; the Karmic vLLM
+integration provides both. Shared scratch arenas are not implemented; private
+scratch remains fully charged.

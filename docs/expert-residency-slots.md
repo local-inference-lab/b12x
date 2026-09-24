@@ -1,9 +1,9 @@
 # Quiescent expert slot exchange on SM103
 
-Status: **implemented opt-in control-plane prototype**. Portable SM120 tests
-validate fixed-address replacement, mapped-host byte access, rollback and reuse
-of the same CUDA graph. Physical SM103 expert execution and Grace-backed TMA
-remain **unqualified**. The separate [experimental policy](expert-residency-cache.md)
+Status: **implemented opt-in control plane**. Portable SM120 tests validate
+fixed-address replacement, mapped-host byte access, rollback and reuse of the
+same CUDA graph. On a physical GB300, exchange with the native SM103 expert
+GEMMs replays the captured graph with exact all-HBM parity. The separate [experimental policy](expert-residency-cache.md)
 can propose exchanges from existing counters. No serving-engine integration is
 installed by either feature.
 
@@ -216,8 +216,7 @@ a CuTe byte reader for all fields. It tests all-HBM, all-mapped-host and mixed
 slabs, int32/int64 IDs, duplicates/sentinels, repeated exchanges, stream draining,
 publication rollback, unchanged pointers, frozen resolution and zero allocator
 counter changes during replay. The byte reader is a test oracle, not an SM120
-fallback for the SM103 expert GEMM. Source-bound results and failures are in the
-[ledger](expert-residency-ledger.md#quiescent-slot-exchange-evidence).
+fallback for the SM103 expert GEMM.
 
 On physical B300, first run the static baseline, then the real expert-operator
 same-graph comparison against a freshly prepared equivalent static placement:

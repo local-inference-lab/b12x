@@ -5,9 +5,9 @@ existing prepared routing counters and journaled slot exchange.
 Its host contracts and decisions live in the shared
 [`b12x.moe.residency` subsystem](expert-residency-subsystem.md); the
 `fused_moe.ResidencyCacheController` entry point supplies the SM103 adapter. Portable tests
-prove observation, decision, exchange and reuse of the same captured graph.
-Native SM103 execution, Grace-backed TMA and adaptive performance remain
-**unqualified**. This is not an installed vLLM cache or a concurrent replacement
+prove observation, decision, exchange and reuse of the same captured graph,
+and the native SM103 variant passes on a physical GB300. Adaptive performance
+remains **unqualified**. This is not an installed vLLM cache or a concurrent replacement
 protocol.
 
 A cold selection executes from its existing Grace row during the observation
