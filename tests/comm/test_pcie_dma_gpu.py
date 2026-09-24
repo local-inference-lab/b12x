@@ -7,6 +7,7 @@ from math import gcd
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
 from b12x.comm.pcie._dma_kernels import DmaKernels, compile_launchers
 from b12x.comm.pcie._dma_preparation import (
