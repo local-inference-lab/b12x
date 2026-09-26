@@ -6795,17 +6795,20 @@ def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
 def prepare_b12x_trellis_v2_weights(
     *,
     plan: MoEWeightPreparationPlan,
-    config: object,
+    source: object,
     weights: object,
+    device: torch.device | str | None = None,
+    staging: object | None = None,
+    rotation_dtype: torch.dtype | None = None,
 ) -> B12XFP4ExpertWeights:
     """Prepare canonical v2 trellis tensors into the normal expert owner."""
 
-    from b12x.moe.fused_moe.config import TrellisConfig
+    from b12x.moe.fused_moe.source import TrellisSource
     from b12x.moe.fused_moe.trellis import prepare_trellis_weights
     from b12x.moe.fused_moe.weights import TrellisWeights
 
-    if not isinstance(config, TrellisConfig):
-        raise TypeError("config must be a TrellisConfig")
+    if not isinstance(source, TrellisSource):
+        raise TypeError("source must be a TrellisSource")
     if not isinstance(weights, TrellisWeights):
         raise TypeError("trellis preparation requires TrellisWeights")
     params_dtype = {
@@ -6815,13 +6818,16 @@ def prepare_b12x_trellis_v2_weights(
     if params_dtype is None:
         raise TypeError(f"unsupported trellis activation dtype {plan.io_dtype!r}")
     value = prepare_trellis_weights(
-        config,
+        source,
         weights,
         activation=plan.activation,
-        params_dtype=params_dtype,
+        params_dtype=rotation_dtype or params_dtype,
         num_experts=plan.num_experts,
         hidden_size=plan.hidden_size,
         intermediate_size=plan.intermediate_size,
+        device=device,
+        staging=staging,
+        tile_config=plan.trellis_tile_config,
     )
     representation = _PreparedWeightRepresentation(
         quant_mode="w4a16",

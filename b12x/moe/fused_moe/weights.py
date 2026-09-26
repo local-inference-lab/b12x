@@ -11,7 +11,6 @@ import torch
 from b12x._lib.quant.block_codec import block_codec
 
 if TYPE_CHECKING:
-    from .._shared.kernels.w4a16.exl3 import Exl3Layer
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -88,11 +87,15 @@ class ScaleFactors:
 
 @dataclass(frozen=True)
 class TrellisWeights:
-    """Layer-local views of the canonical ``b12x_trellis`` tensors.
+    """Container-independent layer-local trellis tensors.
 
-    ``codes`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
+    ``codes`` is the rank-local ``[I_local/32, payload_bytes]`` uint8 payload.
+    Its physical row stride may include padding outside the logical columns.
     ``rate`` is a view selected from the single model-level uint8 rate tensor;
     it is never copied merely to give each layer its own rate parameter.
+    CPU payloads may be prepared onto an explicitly selected CUDA device.
+    Row padding is removed and checked by the checkpoint adapter, not by the
+    execution planner. All scale vectors and gains retain FP16 storage.
     """
 
     codes: torch.Tensor
@@ -120,31 +123,6 @@ class TrellisWeights:
             raise TypeError(
                 "TrellisWeights.expert_sign_patterns must be a tensor or None"
             )
-
-
-@dataclass(frozen=True, kw_only=True)
-class Exl3Weights:
-    """One validated CPU slot extent and its destination CUDA device.
-
-    Preparation stages bounded expert batches. The complete source payload
-    need not reside on the GPU beside its prepared representation.
-    """
-
-    layer: "Exl3Layer"
-    device: torch.device
-
-    def __post_init__(self) -> None:
-        from .._shared.kernels.w4a16.exl3 import Exl3Layer
-
-        if not isinstance(self.layer, Exl3Layer):
-            raise TypeError("Exl3Weights.layer must be a Exl3Layer")
-        device = torch.device(self.device)
-        if device.type != "cuda":
-            raise ValueError("Exl3Weights.device must identify a CUDA device")
-        object.__setattr__(self, "device", device)
-        self.layer.manifest.validate_extent(
-            self.layer.first_slot, self.layer.slot_count
-        )
 
 
 @dataclass(frozen=True)
@@ -246,7 +224,6 @@ class PreparedExperts:
 
 
 __all__ = [
-    "Exl3Weights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
