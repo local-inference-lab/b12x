@@ -145,7 +145,7 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
     ):
         assert tensor.data_ptr() == original.data_ptr()
     originals = [tensor.clone() for tensor in raw]
-    counts = (1, 2, 4, 8)
+    counts = (1, 2, 4, 7, 8)
     x = torch.randn(8, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.25
     ids = torch.stack([torch.randperm(num_experts, device="cuda")[:topk] for _ in range(8)])
     probabilities = torch.softmax(torch.randn(8, topk, device="cuda"), dim=-1)

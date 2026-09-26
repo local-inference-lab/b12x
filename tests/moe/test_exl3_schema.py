@@ -83,6 +83,59 @@ def test_uniform_manifest_parses() -> None:
     assert manifest.layout.extent_barriers == (8,)
 
 
+@pytest.mark.parametrize("bits", [2, 3])
+def test_canonical_weight_plan_preserves_exl3_transform_and_rate(bits: int) -> None:
+    from b12x.moe import fused_moe
+    from tests.moe.test_trellis_adapter import _layer
+    from b12x.moe.checkpoints.exl3 import trellis_from_exl3
+
+    source, _ = trellis_from_exl3(_layer(first=8, slots=4, bits=bits))
+    plan = fused_moe.plan_weights(
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16,
+            rotation_dtype=torch.float16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=3, hidden_size=512, intermediate_size=128
+        ),
+    )
+    assert plan.prepared_format.weights is fused_moe.WeightEncoding.TRELLIS
+    assert plan.prepared_format.packing is fused_moe.WeightPacking.TRELLIS_NATIVE
+    assert plan._impl.trellis_bits == bits
+    assert plan._impl.intermediate_hadamard_blocks == (512, 128)
+    assert plan.geometry.intermediate_size == 128
+    assert plan.source.extent.global_intermediate_size == 3072
+    assert plan._impl.source_format == "b12x_trellis"
+
+
+@pytest.mark.parametrize(
+    ("mode", "experts", "intermediate", "message"),
+    [
+        ("a8", 8, 256, "A16 activations"),
+        ("a16", 8, 1024, "extent width differs"),
+    ],
+)
+def test_canonical_exl3_plan_rejects_incompatible_contract(
+    mode: str, experts: int, intermediate: int, message: str
+) -> None:
+    from b12x.moe import fused_moe
+    from tests.moe.test_trellis_adapter import _layer
+    from b12x.moe.checkpoints.exl3 import trellis_from_exl3
+
+    source, _ = trellis_from_exl3(_layer(first=0, slots=8, experts=8))
+    with pytest.raises(ValueError, match=message):
+        fused_moe.plan_weights(
+            source=source,
+            activation=fused_moe.ActivationSpec(
+                mode=mode, nonlinearity="silu", io_dtype=torch.bfloat16
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=experts, hidden_size=512, intermediate_size=intermediate
+            ),
+        )
+
+
 def test_per_expert_manifest_parses() -> None:
     manifest = Exl3Manifest.from_dict(_per_expert_manifest_dict())
     assert manifest.rates.pair_kinds == frozenset({"P33", "P43"})

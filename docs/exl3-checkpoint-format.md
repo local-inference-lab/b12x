@@ -141,8 +141,10 @@ rotation blocks; an intermediate-Hadamard pre-activation transform whose halves 
 split contributes a barrier. The reader enforces the declarations without
 knowing the reasons.
 
-A rank shorter than the serving kernel's minimum local width is padded at
-preparation time, exactly as any other legal extent.
+The serving kernel must also support the rank-local shape. The common trellis
+preparer rejects a width that does not fit its tile/transform contract; it
+does not silently pad expert payloads. See [trellis preparation](trellis-preparation.md)
+for the container-independent loading API and its staging controls.
 
 ## Support status
 

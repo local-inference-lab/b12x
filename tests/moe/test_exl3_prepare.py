@@ -8,19 +8,18 @@ itself; frozen-container equivalence lives in test_exl3_compat.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
 
 from b12x.moe._shared.exl3_schema import (
     EXL3_MANIFEST_FILENAME,
-    matrix_slot_bytes,
     rate_code,
 )
 from b12x.moe._shared.kernels.w4a16.exl3 import (
     prepare_exl3_moe_weights,
     read_exl3_layer,
-    read_exl3_manifest,
 )
 from b12x.moe._shared.kernels.w4a16.exl3_synth import (
     Exl3SynthConfig,
@@ -309,3 +308,198 @@ def test_exl3_uniform_padding_must_be_zero(tmp_path) -> None:
             activation="situ",
             device=_device(),
         )
+
+
+def _uniform_reference(layer, *, activation, device):
+    """Independent word/rotation assembly, bound to the shared compute kernel.
+
+    Neither the checkpoint adapter nor common trellis preparation participates
+    in this oracle. Global sign coordinates and side-table selection are
+    reconstructed from the source extent explicitly.
+    """
+    from tests.moe.test_trellis_adapter import _independent_planes
+
+    geometry = layer.manifest.geometry
+    experts, local = geometry.num_experts, layer.local_intermediate_size
+    w13, w2 = _independent_planes(layer)
+    rotations = torch.stack([
+        torch.cat([layer.rotations[s, e] for s in range(layer.slot_count)], dim=1)
+        for e in range(experts)
+    ]).reshape(experts, 3 * local).to(device)
+    gate, up = layer.gate_suh.to(device), layer.up_suh.to(device)
+    hadamard = layer.manifest.hadamard.intermediate_hadamard
+    if hadamard:
+        gate = up = gate if layer.first_slot < geometry.num_slots // 2 else up
+    tiles = (128, 128, 128, 128) if hadamard and layer.manifest.rates.bits == 2 else (64, 256, 64, 256)
+    result = prepare_trellis256_moe_weights(
+        w13.to(device), w2.to(device), hidden_size=geometry.hidden_size,
+        intermediate_size=local, num_experts=experts, activation=activation,
+        fc1_tile_n=tiles[1], fc2_tile_n=tiles[3], params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj", trellis_bits=layer.manifest.rates.bits,
+        codebook=layer.manifest.codebook, gate_suh=gate, up_suh=up,
+        intermediate_rotations=rotations, down_svh=layer.down_svh.to(device),
+        tile_config=tiles,
+    )
+    if not hadamard:
+        return result
+    signs = []
+    for pattern in layer.sign_pattern.tolist():
+        parts = []
+        for axis, multiplier in ((1, 2), (2, 1)):
+            length = multiplier * geometry.intermediate_size
+            begin = multiplier * 32 * layer.first_slot
+            if pattern == 0:
+                full = torch.ones(length)
+            else:
+                gen = torch.Generator().manual_seed(
+                    (0x6A09E667F3BCC909 * pattern + 0xBB67AE8584CAA73B * axis) % (2**63)
+                )
+                full = torch.randint(2, (length,), generator=gen) * 2 - 1
+            parts.append(full[begin:begin + multiplier * local])
+        signs.append(torch.cat(parts))
+    return replace(result, trellis=replace(
+        result.trellis, intermediate_hadamard=True,
+        intermediate_rotations=torch.cat((rotations, torch.stack(signs).half().to(device)), dim=1),
+    ))
+
+
+@requires_cuda
+@pytest.mark.parametrize("first_slot, slots", [(0, 8), (8, 4), (48, 12), (60, 8)])
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+@pytest.mark.parametrize("capacity", [1, 8, 129])
+def test_canonical_exl3_preparation_preserves_source_extent(
+    tmp_path, first_slot, slots, activation, capacity
+):
+    """Uneven TP extents preserve rotations in preparation, execution and graphs."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe import fused_moe
+    from b12x.moe.checkpoints.exl3 import trellis_from_exl3
+    from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import write_exl3_checkpoint
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
+    from tests.moe.test_w4a16_mixed_trellis import _serial_tier
+
+    config = Exl3SynthConfig(
+        codebook="lut_e4m3",
+        num_experts=2,
+        hidden_size=512,
+        intermediate_size=3072,
+        moe_layer_indices=(1,),
+        bits=2,
+        intermediate_hadamard=True,
+        pre_block=512,
+        post_block=128,
+        per_expert_input_rotations=True,
+        extent_alignment_slots=4,
+        extent_barriers=(48,),
+        seed=53,
+    )
+    manifest = write_exl3_checkpoint(tmp_path, config)
+    layer = read_exl3_layer(
+        tmp_path, manifest, 1, first_slot=first_slot, slot_count=slots
+    )
+    layer.sign_pattern.copy_(torch.tensor([0, 6], dtype=torch.uint8))
+    expected = _uniform_reference(layer, activation=activation, device=_device())
+    source_metadata, source_weights = trellis_from_exl3(layer)
+    plan = fused_moe.plan_weights(
+        source=source_metadata,
+        activation=fused_moe.ActivationSpec(
+            mode="a16", nonlinearity=activation, io_dtype=torch.bfloat16,
+            rotation_dtype=torch.float16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=2, hidden_size=512, intermediate_size=slots * 32
+        ),
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=plan, weights=source_weights, device=_device(),
+    )
+    actual = prepared._impl.representation.value
+    assert actual.params_dtype == expected.params_dtype == torch.float16
+    assert actual.tile_config == expected.tile_config
+    for name in (
+        "w13",
+        "w2",
+        "intermediate_rotations",
+        "gate_suh",
+        "up_suh",
+        "down_svh",
+    ):
+        torch.testing.assert_close(
+            getattr(actual, name), getattr(expected, name), rtol=0, atol=0
+        )
+    assert actual.intermediate_hadamard
+    assert actual.gate_suh.data_ptr() == actual.up_suh.data_ptr()
+
+    topk = 2
+    torch.manual_seed(617)
+    source = (torch.randn(capacity, 512, device=_device()) * 0.01).bfloat16()
+    route_ids = torch.tensor([0, 1], device=_device(), dtype=torch.int32)
+    route_ids = route_ids.repeat(capacity, 1)
+    route_weights = torch.softmax(torch.randn(capacity, topk, device=_device()), -1)
+    expert_map = torch.arange(2, device=_device(), dtype=torch.int32)
+    output = torch.empty_like(source)
+    execution = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
+        routing=fused_moe.RoutingSpec(),
+    )
+
+    def allocate(state):
+        return tuple(torch.empty(s.shape, dtype=s.dtype, device=s.device)
+                     for s in state.scratch.scratch_specs())
+
+    def bind(state, scratch, rows):
+        return state.bind(
+            scratch=scratch, a=source[:rows], experts=prepared,
+            topk_weights=route_weights[:rows], topk_ids=route_ids[:rows],
+            output=output[:rows],
+        )
+
+    def primer(state):
+        scratch = allocate(state)
+        binding = bind(state, scratch, capacity)
+        return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+
+    def oracle(rows):
+        return _serial_tier(
+            source[:rows], expected, route_weights[:rows], route_ids[:rows],
+            expert_map, block_size_m=8, activation=activation,
+        ).to(output.dtype)
+
+    with PreparationSession(device=source.device, autotune=False) as session:
+        request = execution.request(name="exl3-source-extent", prepare_call=primer)
+        session.prepare((request,))
+        state = require_prepared(request.plan, "moe.decode")
+        scratch = allocate(state)
+        pointers = tuple(t.data_ptr() for t in (*scratch, output))
+        for rows in sorted({1, min(8, capacity), capacity, min(17, capacity)}):
+            reference = oracle(rows)
+            with kernel_resolution_guard("EXL3 source extent"):
+                binding = bind(state, scratch, rows)
+                result = state.run(binding)
+            assert result.data_ptr() == output.data_ptr()
+            assert torch.isfinite(result).all() and torch.count_nonzero(result)
+            torch.testing.assert_close(result, reference, rtol=2e-3, atol=2e-3)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                # Bind initializes synchronization scalars in caller scratch;
+                # capture those writes together with the consuming kernels.
+                captured = state.run(bind(state, scratch, min(17, capacity)))
+            for factor in (-0.5, 2.0):
+                source.mul_(factor)
+                route_weights.copy_(route_weights.flip(-1))
+                reference = oracle(min(17, capacity))
+                for tensor in scratch:
+                    tensor.fill_(255)
+                before = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == before
+                assert pointers == tuple(t.data_ptr() for t in (*scratch, output))
+                assert torch.isfinite(captured).all() and torch.count_nonzero(captured)
+                torch.testing.assert_close(captured, reference, rtol=2e-3, atol=2e-3)
+        finally:
+            graph.reset()

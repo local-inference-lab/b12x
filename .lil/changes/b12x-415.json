@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-415",
+  "category": "feature",
+  "summary": "Prepare EXL3 expert extents and bounded W4A16 prefill workspaces",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Uses an exact codeword lookup table for eligible two-bit EXL3 kernels.",
+    "Preserves IQ2_XS, IQ2_XXS and Q8_0 epilogues and pipeline tuning."
+  ],
+  "pull_requests": [
+    415
+  ],
+  "requires": []
+}

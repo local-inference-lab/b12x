@@ -26,6 +26,7 @@ from ._preparation import (
     RouteTopKInvocation,
     plan_fc2 as _plan_fc2,
     plan_route_topk as _plan_route_topk,
+    variant_for,
 )
 from .execution import ExecutionCapacity, RoutingSpec, plan_execution as _plan_execution
 from .planning import (
@@ -37,7 +38,8 @@ from .planning import (
     plan_weights as _plan_weights,
     prepare_weights as _prepare_weights,
 )
-from .source import PackedSource, PackedSourceFormat, W13Layout, WeightSource
+from .source import PackedSource, PackedSourceFormat, TrellisExtent, TrellisSource, W13Layout, WeightSource
+from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
     IQ2XSWeights,
@@ -70,10 +72,12 @@ def plan_weights(
 
 
 def prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights
+    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    device: torch.device | str | None = None,
+    staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
-    return _prepare_weights(plan=plan, weights=weights)
+    return _prepare_weights(plan=plan, weights=weights, device=device, staging=staging)
 
 
 def plan_execution(
@@ -190,6 +194,9 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "TrellisExtent",
+    "TrellisSource",
+    "TrellisStaging",
     "ActivationMode",
     "ActivationSpec",
     "Binding",
@@ -233,4 +240,3 @@ __all__ = [
     "run_sparse",
     "run",
 ]
-

@@ -1,240 +1,34 @@
-"""EXL3 container reading and W4A16 MoE weight preparation.
+"""Low-level EXL3 compatibility and asymmetric-pair preparation.
 
-One metadata-driven load path serves every declared configuration of the
-`exl3-v1` container: the manifest and rate tables locate every byte,
-the extent rules come from the manifest's layout section, and preparation
-reuses the shared trellis machinery (`prepare_trellis256_moe_weights`
-for uniform rate structures, the pair finalizer for per-expert ones).
-Nothing in this module depends on a specific model geometry, profile
-name, or rate-placement convention.
+Uniform extents forward through the public checkpoint adapter and common
+trellis preparation. Pair extents retain their distinct record addressing;
+they are not coerced into the canonical uniform-rate API.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import pathlib
-from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 
 from b12x.moe._shared.exl3_schema import (
     SLOTS_PER_PAIR,
-    EXL3_MANIFEST_FILENAME,
-    EXL3_SCHEMA,
-    Exl3Manifest,
     RATE_CODE_PAIR_KINDS,
-    RATE_STRUCTURE_PER_EXPERT_PAIR,
     RATE_STRUCTURE_UNIFORM,
     matrix_slot_bytes,
     rate_code,
     rate_code_bits,
 )
-from b12x.moe._shared.kernels.w4a16.prepare import (
-    PreparedW4A16MoeWeights,
-    _finalize_prepared_trellis_weights,
-    _intermediate_hadamard_signs,
-    _restore_plane_words,
-    prepare_trellis256_moe_weights,
+
+if TYPE_CHECKING:
+    from b12x.moe._shared.kernels.w4a16.prepare import PreparedW4A16MoeWeights
+
+from b12x.moe.checkpoints.exl3 import (
+    Exl3Layer,
+    read_exl3_layer as read_exl3_layer,
+    read_exl3_manifest as read_exl3_manifest,
+    trellis_from_exl3,
 )
-
-_EXPERT_CHUNK = 64
-
-
-@dataclass(frozen=True)
-class Exl3Layer:
-    """One layer's extent-sliced content, validated against the manifest."""
-
-    manifest: Exl3Manifest
-    layer_index: int
-    first_slot: int
-    slot_count: int
-    codes: torch.Tensor
-    rotations: torch.Tensor
-    gate_suh: torch.Tensor
-    up_suh: torch.Tensor
-    down_svh: torch.Tensor
-    rates_fc1: torch.Tensor | None
-    rates_fc2: torch.Tensor | None
-    sign_pattern: torch.Tensor | None
-
-    @property
-    def local_intermediate_size(self) -> int:
-        return self.slot_count * self.manifest.geometry.slot_channels
-
-
-def read_exl3_manifest(root: str | pathlib.Path) -> Exl3Manifest:
-    root = pathlib.Path(root)
-    data = json.loads((root / EXL3_MANIFEST_FILENAME).read_text())
-    return Exl3Manifest.from_dict(data)
-
-
-def read_exl3_layer(
-    root: str | pathlib.Path,
-    manifest: Exl3Manifest,
-    layer_index: int,
-    *,
-    first_slot: int,
-    slot_count: int,
-    verify_sha: bool = False,
-) -> Exl3Layer:
-    """Load one rank extent of one layer as CPU tensors.
-
-    The extent is validated against the manifest's layout declarations and
-    the safetensors metadata is cross-checked against the manifest before
-    any tensor is interpreted.
-    """
-
-    from safetensors import safe_open
-
-    root = pathlib.Path(root)
-    manifest.validate_extent(first_slot, slot_count)
-    if layer_index not in manifest.layers:
-        raise ValueError(f"EXL3 manifest does not declare layer {layer_index}")
-    ref = manifest.layers[layer_index]
-    path = root / ref.file
-    if verify_sha:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != ref.sha256:
-            raise ValueError(
-                f"EXL3 layer {layer_index} sha256 mismatch: manifest "
-                f"{ref.sha256}, file {digest}"
-            )
-
-    geometry = manifest.geometry
-    per_expert = manifest.rates.structure == RATE_STRUCTURE_PER_EXPERT_PAIR
-    with safe_open(str(path), framework="pt") as handle:
-        metadata = handle.metadata() or {}
-        expected = {
-            "schema": EXL3_SCHEMA,
-            "codebook": manifest.codebook,
-            "layer": str(int(layer_index)),
-            "num_experts": str(geometry.num_experts),
-            "hidden_size": str(geometry.hidden_size),
-            "intermediate_size": str(geometry.intermediate_size),
-            "slot_channels": str(geometry.slot_channels),
-        }
-        for key, value in expected.items():
-            if metadata.get(key) != value:
-                raise ValueError(
-                    f"EXL3 layer {layer_index} metadata {key!r} is "
-                    f"{metadata.get(key)!r}; the manifest declares {value!r}"
-                )
-        names = set(handle.keys())
-        required = {"codes", "rotations", "gate_suh", "up_suh", "down_svh"}
-        if per_expert:
-            required |= {"rates_fc1", "rates_fc2"}
-        if manifest.hadamard.intermediate_hadamard:
-            required |= {"sign_pattern"}
-        if names != required:
-            raise ValueError(
-                f"EXL3 layer {layer_index} tensors {sorted(names)} do not "
-                f"match the declared set {sorted(required)}"
-            )
-
-        codes_slice = handle.get_slice("codes")
-        codes_shape = codes_slice.get_shape()
-        if (
-            len(codes_shape) != 2
-            or codes_shape[0] != geometry.num_slots
-            or codes_shape[1] % manifest.layout.row_alignment
-        ):
-            raise ValueError(
-                f"EXL3 layer {layer_index} codes shape {codes_shape} violates "
-                "the declared geometry or row alignment"
-            )
-        codes = codes_slice[first_slot : first_slot + slot_count]
-
-        rotations_slice = handle.get_slice("rotations")
-        if tuple(rotations_slice.get_shape()) != (
-            geometry.num_slots,
-            geometry.num_experts,
-            3,
-            geometry.slot_channels,
-        ):
-            raise ValueError(
-                f"EXL3 layer {layer_index} rotations shape is not "
-                "[num_slots, num_experts, 3, slot_channels]"
-            )
-        rotations = rotations_slice[first_slot : first_slot + slot_count]
-
-        h_shapes = (
-            (geometry.num_experts, geometry.hidden_size)
-            if manifest.hadamard.per_expert_input_rotations
-            else (geometry.hidden_size,)
-        )
-        sides = {}
-        for name in ("gate_suh", "up_suh", "down_svh"):
-            tensor = handle.get_tensor(name)
-            if tuple(tensor.shape) != h_shapes or tensor.dtype != torch.float16:
-                raise ValueError(
-                    f"EXL3 layer {layer_index} {name} must be fp16 {h_shapes}"
-                )
-            sides[name] = tensor
-
-        rates_fc1 = rates_fc2 = None
-        if per_expert:
-            pairs = geometry.num_slots // SLOTS_PER_PAIR
-            first_pair = first_slot // SLOTS_PER_PAIR
-            pair_count = slot_count // SLOTS_PER_PAIR
-            declared = manifest.rates.pair_kinds or frozenset()
-            observed: set[str] = set()
-            tables = {}
-            for name in ("rates_fc1", "rates_fc2"):
-                table_slice = handle.get_slice(name)
-                if tuple(table_slice.get_shape()) != (
-                    pairs,
-                    geometry.num_experts,
-                ):
-                    raise ValueError(
-                        f"EXL3 layer {layer_index} {name} must be "
-                        "[num_slots/8, num_experts]"
-                    )
-                table = table_slice[first_pair : first_pair + pair_count]
-                for code in table.unique().tolist():
-                    kind = RATE_CODE_PAIR_KINDS.get(int(code))
-                    if kind is None:
-                        raise ValueError(
-                            f"EXL3 layer {layer_index} {name} contains "
-                            f"unknown rate code {int(code):#x}"
-                        )
-                    observed.add(kind)
-                tables[name] = table
-            if not observed <= set(declared):
-                raise ValueError(
-                    f"EXL3 layer {layer_index} rate tables use kinds "
-                    f"{sorted(observed)} outside the declared "
-                    f"{sorted(declared)}"
-                )
-            rates_fc1, rates_fc2 = tables["rates_fc1"], tables["rates_fc2"]
-
-        sign_pattern = None
-        if manifest.hadamard.intermediate_hadamard:
-            sign_pattern = handle.get_tensor("sign_pattern")
-            if (
-                tuple(sign_pattern.shape) != (geometry.num_experts,)
-                or sign_pattern.dtype != torch.uint8
-                or bool(torch.any(sign_pattern > 7))
-            ):
-                raise ValueError(
-                    f"EXL3 layer {layer_index} sign_pattern must be "
-                    "uint8[num_experts] in 0..7"
-                )
-
-    return Exl3Layer(
-        manifest=manifest,
-        layer_index=layer_index,
-        first_slot=first_slot,
-        slot_count=slot_count,
-        codes=codes,
-        rotations=rotations,
-        gate_suh=sides["gate_suh"],
-        up_suh=sides["up_suh"],
-        down_svh=sides["down_svh"],
-        rates_fc1=rates_fc1,
-        rates_fc2=rates_fc2,
-        sign_pattern=sign_pattern,
-    )
 
 
 def _extent_rotation_tables(
@@ -265,106 +59,6 @@ def _extent_rotation_tables(
     )
 
 
-def _intermediate_hadamard_rotation_rows(
-    layer: Exl3Layer, intermediate: torch.Tensor, device: torch.device
-) -> torch.Tensor:
-    """Append the intermediate-Hadamard sign rows: [values 3I | pre 2I | post I]."""
-
-    manifest = layer.manifest
-    if (manifest.hadamard.pre_block, manifest.hadamard.post_block) != (
-        512,
-        128,
-    ):
-        raise ValueError(
-            "intermediate-Hadamard EXL3 preparation currently implements pre/post Hadamard "
-            "blocks (512, 128); the manifest declares "
-            f"({manifest.hadamard.pre_block}, {manifest.hadamard.post_block})"
-        )
-    assert layer.sign_pattern is not None
-    experts = manifest.geometry.num_experts
-    global_i = manifest.geometry.intermediate_size
-    local = layer.local_intermediate_size
-    pre_begin = 2 * layer.first_slot * manifest.geometry.slot_channels
-    post_begin = layer.first_slot * manifest.geometry.slot_channels
-    signs = torch.empty((experts, 3 * local), dtype=torch.float16)
-    sign_patterns = layer.sign_pattern
-    for sign_pattern in sorted(set(int(value) for value in sign_patterns.tolist())):
-        rows = torch.nonzero(sign_patterns == sign_pattern, as_tuple=False).flatten()
-        pre = _intermediate_hadamard_signs(2 * global_i, sign_pattern=sign_pattern, axis=1)[
-            pre_begin : pre_begin + 2 * local
-        ]
-        post = _intermediate_hadamard_signs(global_i, sign_pattern=sign_pattern, axis=2)[
-            post_begin : post_begin + local
-        ]
-        signs.index_copy_(
-            0,
-            rows,
-            torch.cat((pre, post)).to(torch.float16).expand(rows.numel(), -1),
-        )
-    return torch.cat(
-        (intermediate, signs.to(device=device)), dim=1
-    ).contiguous()
-
-
-def _uniform_native_tensors(
-    layer: Exl3Layer, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble native trellis_t256 tensors from a uniform-rate extent.
-
-    Returns projection-major FC1 ``[2, E, H/16, I_local/16, 16*bits]`` and
-    FC2 ``[E, I_local/16, H/16, 16*bits]`` int16 tensors.
-    """
-
-    manifest = layer.manifest
-    geometry = manifest.geometry
-    bits = manifest.rates.bits
-    assert bits is not None
-    experts = geometry.num_experts
-    hidden_tiles = geometry.hidden_size // 16
-    slots = layer.slot_count
-    section = matrix_slot_bytes(geometry.hidden_size, bits, bits)
-    payload = experts * 3 * section
-    if layer.codes.shape[1] < payload:
-        raise ValueError("EXL3 codes rows are shorter than their expert bundles")
-    if bool(torch.any(layer.codes[:, payload:] != 0)):
-        raise ValueError("EXL3 codes row padding must be zero")
-
-    w13 = torch.empty(
-        (2, experts, hidden_tiles, 2 * slots, 16 * bits),
-        dtype=torch.int16,
-        device=device,
-    )
-    w2 = torch.empty(
-        (experts, 2 * slots, hidden_tiles, 16 * bits),
-        dtype=torch.int16,
-        device=device,
-    )
-    bundles = layer.codes[:, :payload].reshape(slots, experts, 3 * section)
-    for first in range(0, experts, _EXPERT_CHUNK):
-        count = min(_EXPERT_CHUNK, experts - first)
-        chunk = (
-            bundles[:, first : first + count]
-            .contiguous()
-            .to(device=device)
-            .view(torch.int16)
-            .reshape(slots, count, 3, 2, hidden_tiles, 16 * bits)
-        )
-        for matrix in range(2):
-            # FC1 planes are the slot's two consecutive N16 columns.
-            w13[matrix, first : first + count].copy_(
-                chunk[:, :, matrix].permute(1, 3, 0, 2, 4).reshape(
-                    count, hidden_tiles, 2 * slots, 16 * bits
-                )
-            )
-        # FC2 planes are the slot's two consecutive K16 rows.
-        w2[first : first + count].copy_(
-            chunk[:, :, 2].permute(1, 0, 2, 3, 4).reshape(
-                count, 2 * slots, hidden_tiles, 16 * bits
-            )
-        )
-    return w13, w2
-
-
 def prepare_exl3_moe_weights(
     layer: Exl3Layer,
     *,
@@ -375,79 +69,34 @@ def prepare_exl3_moe_weights(
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
 ) -> PreparedW4A16MoeWeights:
-    """Prepare one EXL3 rank extent for the fused W4A16 serving path."""
+    """Prepare an EXL3 extent; uniform payloads use common trellis preparation."""
 
     manifest = layer.manifest
     device = torch.device(device)
-    gate_suh, up_suh, down_svh, intermediate = _extent_rotation_tables(
-        layer, device
-    )
-    rotations = intermediate
-    if manifest.hadamard.intermediate_hadamard:
-        rotations = _intermediate_hadamard_rotation_rows(layer, intermediate, device)
-        # The intermediate-Hadamard residual transform interleaves gate/up into one
-        # length-2I axis whose two stored halves each carry one input-side
-        # table; both physical FC1 slots of a rank use the half its extent
-        # lies in.
-        pre_half_slots = manifest.geometry.num_slots // 2
-        source_suh = gate_suh if layer.first_slot < pre_half_slots else up_suh
-        gate_suh = source_suh
-        up_suh = source_suh
-
     if manifest.rates.structure == RATE_STRUCTURE_UNIFORM:
-        assert manifest.rates.bits is not None
-        w13, w2 = _uniform_native_tensors(layer, device)
-        if tile_config is None:
-            tile_config = (
+        from b12x.moe.fused_moe.trellis import prepare_trellis_weights
+
+        source, weights = trellis_from_exl3(layer)
+        return prepare_trellis_weights(
+            source, weights,
+            activation=activation, params_dtype=params_dtype,
+            num_experts=manifest.geometry.num_experts,
+            hidden_size=manifest.geometry.hidden_size,
+            intermediate_size=layer.local_intermediate_size,
+            device=device,
+            tile_config=tile_config or (
                 (128, 128, 128, 128)
                 if manifest.hadamard.intermediate_hadamard and manifest.rates.bits == 2
                 else (64, 256, 64, 256)
-            )
-        prepared = prepare_trellis256_moe_weights(
-            w13=w13,
-            w2=w2,
-            hidden_size=manifest.geometry.hidden_size,
-            intermediate_size=layer.local_intermediate_size,
-            num_experts=manifest.geometry.num_experts,
-            activation=activation,
-            fc1_tile_n=tile_config[1],
-            fc2_tile_n=tile_config[3],
-            device=device,
-            params_dtype=params_dtype,
-            w13_layout="trellis_t256_proj",
-            trellis_bits=manifest.rates.bits,
-            codebook=manifest.codebook,
-            gate_suh=gate_suh,
-            up_suh=up_suh,
-            intermediate_rotations=intermediate,
-            down_svh=down_svh,
-            tile_config=tile_config,
-            dummy_scale=dummy_scale,
-            workspace=workspace,
-        )
-        if not manifest.hadamard.intermediate_hadamard:
-            return prepared
-        assert prepared.trellis is not None
-        return replace(
-            prepared,
-            trellis=replace(
-                prepared.trellis,
-                intermediate_hadamard=True,
-                intermediate_rotations=rotations,
             ),
+            dummy_scale=dummy_scale, workspace=workspace,
         )
-
+    gate, up, down, rotations = _extent_rotation_tables(layer, device)
     return _prepare_exl3_pair_extent(
-        layer,
-        device=device,
-        gate_suh=gate_suh,
-        up_suh=up_suh,
-        down_svh=down_svh,
-        rotations=rotations,
-        params_dtype=params_dtype,
+        layer, device=device, gate_suh=gate, up_suh=up, down_svh=down,
+        rotations=rotations, params_dtype=params_dtype,
         tile_config=tile_config or (64, 256, 64, 256),
-        dummy_scale=dummy_scale,
-        workspace=workspace,
+        dummy_scale=dummy_scale, workspace=workspace,
     )
 
 
@@ -470,6 +119,11 @@ def _prepare_exl3_pair_extent(
     rank (FC2 pairs lie on the local K axis), so a per-expert-rate extent
     is exactly one pair of slots.
     """
+
+    from b12x.moe._shared.kernels.w4a16.prepare import (
+        _finalize_prepared_trellis_weights,
+        _restore_plane_words,
+    )
 
     manifest = layer.manifest
     geometry = manifest.geometry

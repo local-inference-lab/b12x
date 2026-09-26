@@ -87,11 +87,15 @@ class ScaleFactors:
 
 @dataclass(frozen=True)
 class TrellisWeights:
-    """Layer-local views of the canonical ``b12x_trellis`` tensors.
+    """Container-independent layer-local trellis tensors.
 
-    ``codes`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
+    ``codes`` is the rank-local ``[I_local/32, payload_bytes]`` uint8 payload.
+    Its physical row stride may include padding outside the logical columns.
     ``rate`` is a view selected from the single model-level uint8 rate tensor;
     it is never copied merely to give each layer its own rate parameter.
+    CPU payloads may be prepared onto an explicitly selected CUDA device.
+    Row padding is removed and checked by the checkpoint adapter, not by the
+    execution planner. All scale vectors and gains retain FP16 storage.
     """
 
     codes: torch.Tensor
