@@ -18,10 +18,43 @@ import threading
 _LOCK = threading.Lock()
 
 
+def _strip_json_comments(text):
+    """Drop // and /* */ comments outside strings; NVIDIA ships cufile.json with them."""
+    out, i, n, in_string = [], 0, len(text), False
+    while i < n:
+        char = text[i]
+        if in_string:
+            out.append(char)
+            if char == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            out.append(char)
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        else:
+            out.append(char)
+        i += 1
+    return "".join(out)
+
+
 def _configure_cufile():
     configured = os.environ.get("CUFILE_ENV_PATH_JSON")
     source = Path(configured) if configured else Path("/etc/cufile.json")
-    settings = json.loads(source.read_text()) if configured or source.exists() else {}
+    settings = (
+        json.loads(_strip_json_comments(source.read_text()))
+        if configured or source.exists()
+        else {}
+    )
     properties = settings.setdefault("properties", {})
     if "allow_compat_mode" in properties:
         return
