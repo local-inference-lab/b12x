@@ -154,14 +154,19 @@ def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("capacity", (128, 8192))
+@pytest.mark.parametrize("capacity, bucket_tokens", ((128, True), (129, False), (8192, True)))
 @pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
 @pytest.mark.parametrize("mapped", (False, True))
-def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, ids_dtype, mapped):
+@pytest.mark.parametrize("stable", (False, True))
+def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, bucket_tokens, ids_dtype, mapped, stable):
     launches = route_pack_module.compile_w4a16_route_pack_launches(
         tokens=capacity, topk=2, block_size=8, num_experts=32,
         ordinal=torch.cuda.current_device(),
+        stable_order=stable,
+        bucket_tokens=bucket_tokens,
     )
+    if not bucket_tokens:
+        assert launches.numel_capacity == capacity * 2
     buffers = dict(
         packed_route_indices=torch.empty(launches.max_packed_routes, dtype=torch.int32, device="cuda"),
         block_expert_ids=torch.empty(launches.max_route_blocks, dtype=torch.int32, device="cuda"),
@@ -194,6 +199,10 @@ def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, ids_
         payload = host_routes[host_routes < rows * 2]
         expected_payload = torch.nonzero(valid).flatten()
         torch.testing.assert_close(payload.sort().values, expected_payload, rtol=0, atol=0)
+        if launches.stable_order:
+            for expert in range(32):
+                expert_routes = payload[expected_ids[payload] == expert]
+                assert torch.equal(expert_routes, expert_routes.sort().values)
         for block, expert in enumerate(expected_blocks.tolist()):
             block_routes = host_routes[block * 8:(block + 1) * 8]
             block_payload = block_routes[block_routes < rows * 2]

@@ -83,6 +83,54 @@ def test_uniform_manifest_parses() -> None:
     assert manifest.layout.extent_barriers == (8,)
 
 
+@pytest.mark.parametrize("bits", [2, 3])
+def test_canonical_weight_plan_preserves_exl3_transform_and_rate(bits: int) -> None:
+    from b12x.moe import fused_moe
+
+    manifest = Exl3Manifest.from_dict(_uniform_manifest_dict(bits=bits, intermediate_hadamard=True))
+    plan = fused_moe.plan_weights(
+        source=fused_moe.Exl3Source(manifest=manifest),
+        activation=fused_moe.ActivationSpec(
+            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=8, hidden_size=512, intermediate_size=256
+        ),
+    )
+    assert plan.prepared_format.weights is fused_moe.WeightEncoding.TRELLIS
+    assert plan.prepared_format.packing is fused_moe.WeightPacking.TRELLIS_NATIVE
+    assert plan._impl.trellis_bits == bits
+    assert plan._impl.intermediate_hadamard_blocks == (512, 128)
+    assert plan.geometry.intermediate_size == 256
+    assert plan.source.manifest.geometry.intermediate_size == 512
+
+
+@pytest.mark.parametrize(
+    ("mode", "experts", "intermediate", "message"),
+    [
+        ("a8", 8, 256, "A16 activations"),
+        ("a16", 9, 256, "must match the manifest"),
+        ("a16", 8, 1024, "exceeds the source width"),
+    ],
+)
+def test_canonical_exl3_plan_rejects_incompatible_contract(
+    mode: str, experts: int, intermediate: int, message: str
+) -> None:
+    from b12x.moe import fused_moe
+
+    manifest = Exl3Manifest.from_dict(_uniform_manifest_dict(intermediate_hadamard=True))
+    with pytest.raises(ValueError, match=message):
+        fused_moe.plan_weights(
+            source=fused_moe.Exl3Source(manifest=manifest),
+            activation=fused_moe.ActivationSpec(
+                mode=mode, nonlinearity="silu", io_dtype=torch.bfloat16
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=experts, hidden_size=512, intermediate_size=intermediate
+            ),
+        )
+
+
 def test_per_expert_manifest_parses() -> None:
     manifest = Exl3Manifest.from_dict(_per_expert_manifest_dict())
     assert manifest.rates.pair_kinds == frozenset({"P33", "P43"})

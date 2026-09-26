@@ -11,6 +11,7 @@ import torch
 from b12x._lib.quant.block_codec import block_codec
 
 if TYPE_CHECKING:
+    from .._shared.kernels.w4a16.exl3 import Exl3Layer
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -121,6 +122,31 @@ class TrellisWeights:
             )
 
 
+@dataclass(frozen=True, kw_only=True)
+class Exl3Weights:
+    """One validated CPU slot extent and its destination CUDA device.
+
+    Preparation stages bounded expert batches. The complete source payload
+    need not reside on the GPU beside its prepared representation.
+    """
+
+    layer: "Exl3Layer"
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        from .._shared.kernels.w4a16.exl3 import Exl3Layer
+
+        if not isinstance(self.layer, Exl3Layer):
+            raise TypeError("Exl3Weights.layer must be a Exl3Layer")
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            raise ValueError("Exl3Weights.device must identify a CUDA device")
+        object.__setattr__(self, "device", device)
+        self.layer.manifest.validate_extent(
+            self.layer.first_slot, self.layer.slot_count
+        )
+
+
 @dataclass(frozen=True)
 class BlockQuantWeights:
     """Raw uint8[E,N,K/block_weights,block_bytes] checkpoint blocks.
@@ -220,6 +246,7 @@ class PreparedExperts:
 
 
 __all__ = [
+    "Exl3Weights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
