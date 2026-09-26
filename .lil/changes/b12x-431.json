@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-431",
+  "category": "fix",
+  "summary": "--load-format b12x starts in NGC-based images whose /etc/cufile.json has comments",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The b12x loader now strips // and /* */ comments from cufile.json before parsing it."
+  ],
+  "pull_requests": [
+    431
+  ]
+}

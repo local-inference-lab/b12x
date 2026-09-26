@@ -12032,14 +12032,18 @@ def _launch_dynamic_topk_sum(
     )
 
     element_dtype = _w4a16_element_dtype(route_output.dtype)
-    compile_w4a16_topk_sum(
+    # Dynamic kernels write router-weighted routes: an unweighted sum.
+    launcher = compile_w4a16_topk_sum(
         m=m,
         topk=num_topk,
         hidden_size=k,
         element_dtype=element_dtype,
         float32_output=output.dtype == torch.float32,
+        apply_topk_weights=False,
     )
-    torch.ops.b12x.w4a16_topk_sum_launch(
+    from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
+
+    _w4a16_topk_sum_launch_flat(
         route_output,
         output,
         m,
@@ -12047,6 +12051,7 @@ def _launch_dynamic_topk_sum(
         k,
         element_dtype,
         int(stream),
+        launcher=launcher,
     )
 
 

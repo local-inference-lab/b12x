@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-423",
+  "category": "feature",
+  "summary": "Optional FP32 router weights in the W4A16 MoE top-k combine",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "B12X_W4A16_FP32_TOPK_WEIGHTS=1 applies router weights in the FP32 top-k sum instead of rounding them into BF16 FC2 outputs. Default unchanged."
+  ],
+  "pull_requests": [
+    423
+  ]
+}

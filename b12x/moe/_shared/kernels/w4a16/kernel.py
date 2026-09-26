@@ -73,6 +73,7 @@ from b12x._lib.intrinsics import (
     packed_decode_lut_fp16_to_half2x4,
     packed_decode_lut_e4m3_to_e4m3x8,
     ld_global_nc_v4_u32,
+    ld_global_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
     red_add_global_bf16x2,
@@ -90,6 +91,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_f32,
     st_shared_v4_u32,
     threadfence,
+    u32_as_f32,
     trellis_align_stream_u32x2,
     warp_reduce,
 )
@@ -200,6 +202,15 @@ _SCALE_FORMATS = {
 }
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
+
+# Router-weight precision of the top-k combine.  By default FC2 multiplies each
+# routed row by its router weight in the epilogue *after* the BF16 store
+# (weight rounded to BF16, product rounded to BF16).  With
+# B12X_W4A16_FP32_TOPK_WEIGHTS=1, FC2 stores the unweighted BF16 expert output
+# and the top-k sum applies the FP32 router weight in its FP32 accumulation:
+# out = bf16(sum_k w_k * bf16(y_k)), the reference MoE combine (for example
+# HF ``index_add_(expert_output * w)`` into an FP32 buffer, one final cast).
+_FP32_TOPK_WEIGHTS = os.environ.get("B12X_W4A16_FP32_TOPK_WEIGHTS", "0") == "1"
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
@@ -207,6 +218,27 @@ _TC_DECODE_PACK_COLLIDING_PAIRS = 3
 _TC_DECODE_PACK_SM_COVERAGE_CAP = 64
 _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR = 7
 _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR = 8
+
+
+@dsl_user_op
+def _pack_f32x2_to_bf16x2_rn(
+    x0: cutlass.Float32, x1: cutlass.Float32, *, loc=None, ip=None
+) -> Uint32:
+    """Pack two float32 values as bf16x2 (x0 in the low half), RN, unsaturated."""
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [
+            cutlass.Float32(x0).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(x1).ir_value(loc=loc, ip=ip),
+        ],
+        "cvt.rn.bf16x2.f32 $0, $2, $1;",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    ))
 
 
 @dsl_user_op
@@ -829,6 +861,7 @@ class W4A16TopKSumCompileResult:
     route_ids_dtype: torch.dtype = torch.int32
     use_expert_map: bool = False
     broadcast_svh: bool = False
+    apply_topk_weights: bool = False
 
 
 @dataclass(frozen=True)
@@ -6486,6 +6519,15 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
         )
+        if (
+            _FP32_TOPK_WEIGHTS
+            and bool(apply_router_weight_on_input)
+            and not self.full_rotation
+        ):
+            raise ValueError(
+                "B12X_W4A16_FP32_TOPK_WEIGHTS does not support "
+                "apply_router_weight_on_input"
+            )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
             size_n=hidden_size,
@@ -6493,7 +6535,11 @@ class W4A16FusedMoeKernel:
             num_experts=num_experts,
             top_k=1,
             mul_topk_weights=(
-                not bool(apply_router_weight_on_input) and not self.full_rotation
+                not bool(apply_router_weight_on_input)
+                and not self.full_rotation
+                # The top-k sum applies FP32 weights instead (the fused-sum
+                # decode epilogue has no separate sum and keeps its multiply).
+                and not (_FP32_TOPK_WEIGHTS and not self.tc_decode_fused_sum)
             ),
             tile_n=fc2_tile_n,
             tile_k=fc2_tile_k,
@@ -8255,6 +8301,98 @@ class W4A16FusedMoeKernel:
         return x * self._sigmoid_f32(x)
 
     @cute.jit
+    def _gated_activation_elem(self, gate: cutlass.Float32, up: cutlass.Float32):
+        # Per-element math of the scalar gated loop in _run_activation.
+        gate, up = self._clamp_swiglu_inputs(gate, up)
+        sigmoid_arg = gate
+        up_term = up
+        if cutlass.const_expr(self.activation_is_swigluoai):
+            sigmoid_arg = cutlass.Float32(self.swiglu_alpha) * gate
+            up_term = up + cutlass.Float32(self.swiglu_beta)
+        if cutlass.const_expr(self.fast_math):
+            exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
+        else:
+            exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
+        sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
+        silu = gate * sigmoid
+        if cutlass.const_expr(self.activation_is_situ):
+            beta = cutlass.Float32(SITU_DEFAULT_BETA)
+            linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+            situ_gate = (
+                beta
+                * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                * sigmoid
+            )
+            situ_up = linear_beta * cute.math.tanh(
+                up / linear_beta,
+                fastmath=self.fast_math,
+            )
+            result = self._cast_elem(situ_gate * situ_up)
+        elif cutlass.const_expr(self.activation_is_swigluoai):
+            result = self._cast_elem(silu * up_term)
+        else:
+            result = self._cast_elem(
+                self._cast_elem(silu) * self._cast_elem(up_term)
+            )
+        return result
+
+    @cute.jit
+    def _gated_activation_bf16x2(self, gate2: Uint32, up2: Uint32) -> Uint32:
+        hi_mask = Uint32(0xFFFF0000)
+        lo = self._gated_activation_elem(
+            u32_as_f32(gate2 << Uint32(16)), u32_as_f32(up2 << Uint32(16))
+        )
+        hi = self._gated_activation_elem(
+            u32_as_f32(gate2 & hi_mask), u32_as_f32(up2 & hi_mask)
+        )
+        return _pack_f32x2_to_bf16x2_rn(
+            lo.to(cutlass.Float32), hi.to(cutlass.Float32)
+        )
+
+    @cute.jit
+    def _run_activation_gated_x8(
+        self,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        # The scalar gated loop with 16-byte gate/up loads and output stores:
+        # each thread handles 8 consecutive intermediate columns of one row.
+        vec_per_row = Int32(self.intermediate_size // 8)
+        vidx = cta * Int32(self.cta_threads) + tid
+        stride = grid_x * Int32(self.cta_threads)
+        total = active_m * Int32(self.top_k) * vec_per_row
+        while vidx < total:
+            row = vidx // vec_per_row
+            col = (vidx - row * vec_per_row) * Int32(8)
+            gate_off = row * Int32(self.fc1_cols) + col
+            g0, g1, g2, g3 = ld_global_v4_u32(
+                get_ptr_as_int64(fc1_bf16_flat, gate_off)
+            )
+            u0, u1, u2, u3 = ld_global_v4_u32(
+                get_ptr_as_int64(
+                    fc1_bf16_flat, gate_off + Int32(self.intermediate_size)
+                )
+            )
+            o0 = self._gated_activation_bf16x2(g0, u0)
+            o1 = self._gated_activation_bf16x2(g1, u1)
+            o2 = self._gated_activation_bf16x2(g2, u2)
+            o3 = self._gated_activation_bf16x2(g3, u3)
+            st_global_v4_u32(
+                get_ptr_as_int64(
+                    activated_bf16_flat, row * Int32(self.intermediate_size) + col
+                ),
+                o0,
+                o1,
+                o2,
+                o3,
+            )
+            vidx += stride
+
+    @cute.jit
     def _run_activation(
         self,
         fc1_bf16_flat: cute.Tensor,
@@ -8340,6 +8478,16 @@ class W4A16FusedMoeKernel:
                 activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
                 activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
                 unit += gw_stride
+            return
+        if cutlass.const_expr(
+            self.activation_is_gated
+            and not self.is_fp16
+            and self.intermediate_size % 8 == 0
+            and self.fc1_cols % 8 == 0
+        ):
+            self._run_activation_gated_x8(
+                fc1_bf16_flat, activated_bf16_flat, tid, cta, grid_x, active_m
+            )
             return
         idx = cta * Int32(self.cta_threads) + tid
         stride = grid_x * Int32(self.cta_threads)
@@ -8562,11 +8710,17 @@ class W4A16TopKSumKernel:
         use_expert_map: bool = False,
         broadcast_svh: bool = False,
         float32_output: bool = False,
+        apply_topk_weights: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if topk <= 0 or hidden_size <= 0:
             raise ValueError("topk and hidden_size must be positive")
+        if apply_topk_weights and full_rotation:
+            raise ValueError("full-rotation top-k sum already applies router weights")
+        # Plain path: multiply each route by its FP32 router weight (FC2 then
+        # stores unweighted outputs; see _FP32_TOPK_WEIGHTS).
+        self.apply_topk_weights = bool(apply_topk_weights)
         self.topk = int(topk)
         self.hidden_size = int(hidden_size)
         self.element_dtype = element_dtype
@@ -9033,7 +9187,12 @@ class W4A16TopKSumKernel:
                     route_value = fc2_flat[Int64(row) * Int64(self.hidden_size) + Int64(col)].to(
                         cutlass.Float32
                     )
-                    acc += _materialize_w4a16_topk_route_f32(route_value)
+                    if cutlass.const_expr(self.apply_topk_weights):
+                        acc += _materialize_w4a16_topk_route_f32(route_value) * topk_weights_flat[
+                            row
+                        ].to(cutlass.Float32)
+                    else:
+                        acc += _materialize_w4a16_topk_route_f32(route_value)
             output_flat[idx] = self._cast_elem(acc)
 
     @cute.jit
@@ -10497,10 +10656,14 @@ def compile_w4a16_topk_sum(
     use_expert_map: bool = False,
     broadcast_svh: bool = False,
     float32_output: bool = False,
+    apply_topk_weights: bool | None = None,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("top-k route expert ids must be int32 or int64")
+    if apply_topk_weights is None:
+        apply_topk_weights = _FP32_TOPK_WEIGHTS and not full_rotation
+    apply_topk_weights = bool(apply_topk_weights)
     route_cutlass_dtype = (
         cutlass.Int32 if route_ids_dtype == torch.int32 else cutlass.Int64
     )
@@ -10517,6 +10680,7 @@ def compile_w4a16_topk_sum(
         bool(use_expert_map),
         bool(broadcast_svh),
         bool(float32_output),
+        apply_topk_weights,
     )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
@@ -10557,6 +10721,7 @@ def compile_w4a16_topk_sum(
         use_expert_map=use_expert_map,
         broadcast_svh=broadcast_svh,
         float32_output=float32_output,
+        apply_topk_weights=apply_topk_weights,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -10591,6 +10756,7 @@ def compile_w4a16_topk_sum(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=bool(use_expert_map),
         broadcast_svh=bool(broadcast_svh),
+        apply_topk_weights=apply_topk_weights,
     )
     attach_programs(result, compiled)
     _SUM_CACHE[cache_key] = result
@@ -11638,6 +11804,16 @@ def _w4a16_topk_sum_launch_flat(
     )
     if launcher is not None and launcher.broadcast_svh != broadcast_svh:
         raise ValueError("prepared W4A16 output rotation layout differs from the bound table")
+    applies_weights = (
+        bool(getattr(launcher, "apply_topk_weights", False))
+        if launcher is not None
+        else (_FP32_TOPK_WEIGHTS and not full_rotation)
+    )
+    if applies_weights and topk_weights is None:
+        raise RuntimeError(
+            "B12X_W4A16_FP32_TOPK_WEIGHTS: this top-k sum applies router weights "
+            "but none were passed"
+        )
     sum_kernel = launcher or compile_w4a16_topk_sum(
         m=m,
         topk=topk,
@@ -13485,7 +13661,12 @@ def run_w4a16_moe(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
                 f"requested={expected_sum}, planned={actual_sum}"
             )
-    if topk_sum_launch is not None or full_rotation or sum_uses_map:
+    if (
+        topk_sum_launch is not None
+        or full_rotation
+        or sum_uses_map
+        or _FP32_TOPK_WEIGHTS
+    ):
         if full_rotation:
             assert svh_table is not None
         _w4a16_topk_sum_launch_flat(
@@ -13499,7 +13680,9 @@ def run_w4a16_moe(
             full_rotation=full_rotation,
             intermediate_hadamard=intermediate_hadamard,
             num_experts=int(prepared.num_experts),
-            topk_weights=topk_weights if full_rotation else None,
+            topk_weights=(
+                topk_weights if (full_rotation or _FP32_TOPK_WEIGHTS) else None
+            ),
             route_expert_ids=topk_ids,
             expert_map=sum_expert_map if sum_uses_map else None,
             svh_table=svh_table if full_rotation else None,

@@ -485,6 +485,7 @@ class _FixedExecutionState:
     quantizer: object | None
     unit_scale: torch.Tensor | None
     use_block: bool
+    gemv: object | None = None
 
     def _check(self, source, weight, output_dtype, *, serialized=False):
         q = self.query
@@ -525,6 +526,13 @@ class _FixedExecutionState:
                 sfa, sfb = lhs_scale_storage, rhs_scale_storage
                 if sfa.shape != (m, q.in_features // 128) or sfb.shape != (q.out_features // 128, q.in_features // 128):
                     raise ValueError("block-FP8 scale geometry differs from preparation")
+                if self.gemv is not None:
+                    if not (lhs_values.is_contiguous() and rhs_values.is_contiguous()
+                            and sfa.is_contiguous() and sfb.is_contiguous()):
+                        raise ValueError("block-FP8 GEMV operands must be contiguous")
+                    out = torch.empty((m, q.out_features), dtype=torch.bfloat16, device=self.device)
+                    self.gemv(lhs_values, sfa, rhs_values, sfb, out, cuda_stream_to_int(stream))
+                    return out
             else:
                 view = as_grouped_scale_view if q.recipe == "nvfp4" else as_grouped_scale_view_mx
                 sfa = view(scale_storage(lhs_scale_storage, m, q.in_features, sf_vec_size).view(1, -1), m, q.in_features)
@@ -589,10 +597,40 @@ class _FixedExecutionState:
             )[:, :, 0]
 
 
+def _uses_block_fp8_gemv(query) -> bool:
+    """Whether the small-row block-FP8 GEMV serves this fixed plan."""
+    from ._block_fp8_gemv import supports
+    return (query.recipe == "block_fp8" and query.call_kind == "serialized"
+            and query.expected_m is not None and query.output_dtype == "bfloat16"
+            and supports(query.expected_m, query.out_features, query.in_features))
+
+
+def _plan_fixed_block_fp8_gemv(query, *, invocation, override):
+    from ._tuning import FIXED_TUNING
+
+    def materialize(selection, device):
+        from ._block_fp8_gemv import compile_block_fp8_gemv
+        program = compile_block_fp8_gemv(device.ordinal, query.out_features, query.in_features)
+        target = torch.device("cuda", device.ordinal)
+        return _FixedExecutionState(query, target, None, None, None, True, gemv=program)
+
+    return Plan(
+        shared=True, contract=FIXED_TUNING, query=query, invocation=FrozenMapping(invocation), override=override,
+        _compile_jobs=lambda config, device: (CompileJob.create(
+            "b12x.gemm.blockscaled._block_fp8_gemv:compile_block_fp8_gemv",
+            device.ordinal, query.out_features, query.in_features,
+        ),),
+        _memory_requirements=lambda config, device: MemoryRequirements(),
+        _materialize=materialize,
+    )
+
+
 def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
     from ._tuning import FIXED_TUNING
     if invocation:
         raise ValueError("fixed packed semantics belong in FixedBlockscaledQuery")
+    if _uses_block_fp8_gemv(query):
+        return _plan_fixed_block_fp8_gemv(query, invocation=invocation, override=override)
     cache = {}
 
     def lower(device):

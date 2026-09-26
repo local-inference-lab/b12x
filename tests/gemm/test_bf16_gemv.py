@@ -528,3 +528,58 @@ session.close()
         timeout=90,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@cuda_required
+@pytest.mark.parametrize("m", [1, 2, 3, 8])
+@pytest.mark.parametrize("n,k", [(4096, 2048), (2560, 4096), (8192, 4096), (1040, 512)])
+def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
+    """Wide decode projections: one FP32 accumulation and one BF16 rounding."""
+    torch.manual_seed(m * 131 + n + k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    override = bf16_gemv.GemvConfig(backend="tc")
+    first = _mm(x, weight, override=override)
+    again = _mm(x, weight, override=override)
+    expected = x.double() @ weight.double().T
+    ulp = expected.abs().clamp_min(1e-30) * 2.0 ** -7
+    err = (first.double() - expected).abs()
+    assert bool((err <= ulp + 1e-6 * expected.abs().max()).all())
+    assert torch.equal(first, again), "tensor-core GEMV must be deterministic"
+
+
+@cuda_required
+def test_tensor_core_gemv_replays_live_rows():
+    """One tc plan prepared at eight rows serves CUDA-graph replays with fewer live
+    rows: each replay matches FP64, leaves rows past the live count untouched and
+    allocates nothing."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import require_prepared
+
+    torch.manual_seed(7)
+    k, n = 2048, 4096
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
+    out = torch.full((8, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+        plan = _prepare_projection(session, x, weight, out=out,
+                                   override=bf16_gemv.GemvConfig(backend="tc"))
+        session.freeze()
+        state = require_prepared(plan, "gemm.bf16_gemv", x.device)
+        launcher = state.launcher
+        with kernel_resolution_guard("prepared tc GEMV"):
+            for rows in (1, 3, 8):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    bf16_gemv.mm(x[:rows], weight, out=out[:rows], plan=plan)
+                x.neg_()
+                out.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                expected = x[:rows].double() @ weight.double().T
+                torch.testing.assert_close(out[:rows].double(), expected, rtol=1e-2, atol=1e-2)
+                assert torch.isnan(out[rows:]).all()
+                assert state.launcher is launcher
+                graph.reset()
