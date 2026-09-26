@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-424",
+  "category": "performance",
+  "summary": "Vectorize the W4A16 MoE gated-activation pass",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "16-byte loads and stores in the fused FC1-to-FC2 activation pass; outputs are bit-identical."
+  ],
+  "pull_requests": [
+    424
+  ]
+}
