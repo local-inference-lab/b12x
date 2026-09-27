@@ -1,7 +1,7 @@
 """Indexed sparse paged causal GQA for Qwen3.8 Flash Next.
 
-This private stage reads BF16 or globally scaled FP8 E4M3 main-cache K/V at
-caller-selected logical token positions. It never writes either cache. Small
+This private stage reads BF16, globally scaled FP8 E4M3, or self-scaled NVFP4
+record main-cache K/V at caller-selected logical token positions. It never writes either cache. Small
 batches use split CuTe kernels to expose enough parallel work. Large prefill
 batches use the direct selected-position entry of the paged CuTe engine. Every
 unsupported geometry, layout, or device fails closed.
@@ -14,6 +14,8 @@ import math
 import torch
 
 from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
+
+from ..paged._nvfp4_kv import is_nvfp4_cache as _is_nvfp4_cache
 
 from ._sparse_gqa_cute_config import (
     MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
@@ -46,6 +48,7 @@ def _validate_launch(
     softmax_scale: float,
     block_n: int,
     splits: int,
+    kv_format: str | None = None,
 ) -> tuple[int, int, int]:
     if not query.is_cuda:
         raise ValueError("QSA sparse GQA requires CUDA tensors")
@@ -66,16 +69,27 @@ def _validate_launch(
     pages, page_size, kv_heads, cache_dim = map(int, key_cache.shape)
     if pages <= 0 or page_size <= 0 or kv_heads <= 0:
         raise ValueError("key_cache dimensions must be positive")
-    if cache_dim != head_dim:
+    # Prepared launches carry the plan's K/V format; direct launches detect it.
+    nvfp4 = (
+        kv_format == "nvfp4" if kv_format is not None
+        else _is_nvfp4_cache(key_cache, head_dim)
+    )
+    if cache_dim != head_dim and not nvfp4:
         raise ValueError("key_cache head dimension must match query")
     if q_heads % kv_heads:
         raise ValueError("q_heads must be divisible by kv_heads")
-    if key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise TypeError("key_cache must be BF16 or FP8 E4M3FN")
+    if key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn) and not nvfp4:
+        raise TypeError("key_cache must be BF16, FP8 E4M3FN, or uint8 NVFP4 records")
     if value_cache.shape != key_cache.shape or value_cache.dtype != key_cache.dtype:
         raise ValueError("value_cache must match the key_cache shape and dtype")
     _require_unit_inner_stride(key_cache, "key_cache")
     _require_unit_inner_stride(value_cache, "value_cache")
+    if nvfp4 and kv_format is None:
+        # NVFP4 records are read with four-byte loads, as the writer requires.
+        # Prepared launches were checked once when the caches were bound.
+        for name, cache in (("key_cache", key_cache), ("value_cache", value_cache)):
+            if cache.data_ptr() % 4 or any(int(s) % 4 for s in cache.stride()[:3]):
+                raise ValueError(f"{name} NVFP4 record offsets must be four-byte aligned")
     if key_cache.dtype == torch.float8_e4m3fn:
         if k_descale is None or v_descale is None:
             raise ValueError("FP8 QSA caches require k_descale and v_descale")
@@ -270,9 +284,14 @@ def launch_sparse_paged_gqa(
     block_n: int,
     splits: int,
     direct_kv_warps: int = 2,
+    kv_format: str | None = None,
     _prepared: dict[str, object] | None = None,
 ) -> torch.Tensor:
-    """Launch the allocation-free CuTe Qwen sparse GQA into ``output``."""
+    """Launch the allocation-free CuTe Qwen sparse GQA into ``output``.
+
+    ``kv_format`` is the planned main-cache format (``bf16``, ``fp8`` or
+    ``nvfp4``); prepared launches must pass it so no run inspects the caches.
+    """
     if compile_only_launches_enabled():
         from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
 
@@ -316,6 +335,7 @@ def launch_sparse_paged_gqa(
         softmax_scale=softmax_scale,
         block_n=block_n,
         splits=splits,
+        kv_format=kv_format,
     )
     if not _is_qwen_geometry(
         q_heads=int(query.shape[1]),
@@ -334,13 +354,15 @@ def launch_sparse_paged_gqa(
         )
     if _prepared is not None:
         from ..paged._selected_forward import (
-            BFloat16, Float8E4M3FN, Float32, Int32, Int64, _fake_pointer,
-            _pointer, current_cuda_stream, run_compiled,
+            BFloat16, Float32, Int32, Int64, _fake_pointer,
+            _kv_pointer_type, _pointer, current_cuda_stream, run_compiled,
         )
+        if kv_format is None:
+            raise ValueError("prepared sparse GQA launches require the planned kv_format")
         direct = rows > _MAX_SPLIT_ROWS
         raw = _prepared["direct" if direct else "split"]
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
-        kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
+        kv_type = _kv_pointer_type(kv_format)
         run_compiled(raw, (
             _pointer(query, BFloat16), _pointer(key_cache, kv_type),
             _pointer(value_cache, kv_type),

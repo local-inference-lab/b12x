@@ -3229,6 +3229,7 @@ class PagedForwardKernel:
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
         selection_width: int = SELECTION_WIDTH,
+        return_lse: bool = False,
     ):
         """Build the selected-position ABI of the paged forward engine.
 
@@ -3243,8 +3244,9 @@ class PagedForwardKernel:
         return _SelectedPositionPagedForwardKernel(
             q_heads=q_heads,
             kv_heads=kv_heads,
-            kv_is_fp8=kv_is_fp8,
+            kv_format="fp8" if kv_is_fp8 else "bf16",
             direct_output=direct_output,
+            return_lse=return_lse,
             kv_warps=kv_warps,
             page_size=page_size,
             key_strides=key_strides,

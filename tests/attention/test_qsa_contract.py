@@ -109,14 +109,15 @@ def _allocate_binding(
 ) -> qsa.Binding:
     declaration = qsa.plan(caps, invocation=_invocation(caps)) if plan is None else plan
     device = caps.device
+    kv_storage_dtype, kv_row_width = caps.kv_storage
     main_k = torch.empty(
         (
             caps.num_main_cache_pages,
             caps.main_page_size,
             caps.kv_heads,
-            caps.head_dim,
+            kv_row_width,
         ),
-        dtype=caps.kv_dtype,
+        dtype=kv_storage_dtype,
         device=device,
     )
     main_v = torch.empty_like(main_k)
@@ -296,14 +297,15 @@ def _allocate_shared_compressed_raw_binding(
     layout = qsa_contract._scratch_layout(caps)[0]
     scratch = torch.empty((layout.total_nbytes,), dtype=torch.uint8, device=caps.device)
     device = caps.device
+    kv_storage_dtype, kv_row_width = caps.kv_storage
     main_k = torch.empty(
         (
             caps.num_main_cache_pages,
             caps.main_page_size,
             caps.kv_heads,
-            caps.head_dim,
+            kv_row_width,
         ),
-        dtype=caps.kv_dtype,
+        dtype=kv_storage_dtype,
         device=device,
     )
     main_v = torch.empty_like(main_k)
