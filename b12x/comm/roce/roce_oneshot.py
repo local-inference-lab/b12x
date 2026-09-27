@@ -287,10 +287,9 @@ class RoceOneshotAllReduce:
         self._ctrl_words = self._region[
             self._layout.ctrl_off : self._layout.ctrl_off + 4 * CTRL_WORDS
         ].view(torch.int32)
-        # numpy views of the control words and the peer flags: reading them
-        # costs nanoseconds and never touches the GPU, so the health check
-        # before and after every launch stays off the profile and a watchdog
-        # can read them while a kernel is wedged.
+        # NumPy views of the control words and peer flags stay in host memory,
+        # so the health check before and after every launch does not read
+        # device memory, and a watchdog can read them while a kernel is wedged.
         # Sequences are unsigned 32-bit and wrap, so read them as such.
         self._ctrl_np = self._ctrl_words.numpy().view("uint32")
         self._flags_np = (
@@ -681,7 +680,7 @@ class RoceOneshotAllReduce:
             raise RuntimeError(
                 f"RoCE collective on rank {self.rank} timed out waiting for rank "
                 f"{peer}, HCA {hca}, at sequence {failed_seq}; the runtime is "
-                f"poisoned (its epoch stopped at {failed_seq - 1}, later launches "
+                f"poisoned (its epoch stopped at {(failed_seq - 1) & 0xFFFFFFFF}, later launches "
                 "do nothing) and rank data is no longer trustworthy"
             )
 
@@ -932,10 +931,12 @@ class RoceOneshotAllReduce:
         """Protocol state from host memory only, safe while a kernel is wedged.
 
         Unlike ``stats`` it never reads device memory or synchronizes, so a
-        watchdog can call it when the GPU does not return.  ``doorbell`` ahead
-        of ``completed`` means a collective is in flight on this rank (its
-        kernel staged and is waiting for peers); equal means this rank is not
-        inside a RoCE collective.  ``flags[peer]`` is, per slot and HCA, the
+        watchdog can call it when the GPU does not return.  ``doorbell`` is
+        the newest sequence this rank published and ``completed`` the newest it
+        finished; a nonzero unsigned 32-bit difference ``(doorbell - completed)
+        & 0xFFFFFFFF`` means a collective is waiting on its peers here.  Equal
+        rules that out, though a kernel can still be staging its input before
+        it rings the doorbell (a bounded copy).  ``flags[peer]`` is, per slot and HCA, the
         newest sequence that peer's RDMA writes delivered here.
         """
         ctrl = self._ctrl_np.copy()
