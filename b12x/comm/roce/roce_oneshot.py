@@ -31,7 +31,17 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from . import _allgather_cute
-from ._oneshot_cute import PACK_BYTES, get_launcher
+from ._oneshot_cute import (
+    CTRL_COMPLETED,
+    CTRL_ERROR_HCA,
+    CTRL_ERROR_PEER,
+    CTRL_ERROR_SEQ,
+    CTRL_FAILED,
+    CTRL_SEQ,
+    CTRL_WORDS,
+    PACK_BYTES,
+    get_launcher,
+)
 from ._proxy import Layout, Proxy, load as _load_proxy_library
 
 logger = logging.getLogger(__name__)
@@ -271,16 +281,23 @@ class RoceOneshotAllReduce:
         self._flag_base = host_ptr + self._layout.flag_off
         self._send_base = host_ptr + self._layout.send_off
         self._ctrl_base = host_ptr + self._layout.ctrl_off
-        # ctrl record (kernel-written): seq, nbytes, error seq, missing peer,
-        # nbytes per slot (the proxy uses these when it has to catch up), and
-        # the missing HCA index for timeout diagnostics.
+        # ctrl record (kernel-written, CTRL_* in _oneshot_cute): doorbell seq,
+        # nbytes, the timeout's seq/peer/HCA and failed word, nbytes per slot
+        # (the proxy uses these when it has to catch up), and the completed seq.
         self._ctrl_words = self._region[
-            self._layout.ctrl_off : self._layout.ctrl_off + 28
+            self._layout.ctrl_off : self._layout.ctrl_off + 4 * CTRL_WORDS
         ].view(torch.int32)
-        self._error_word = self._ctrl_words[2:3]
-        # numpy view of the control words: reading it costs nanoseconds, so the
-        # health check before and after every launch stays off the profile.
-        self._ctrl_np = self._ctrl_words.numpy()
+        # numpy views of the control words and the peer flags: reading them
+        # costs nanoseconds and never touches the GPU, so the health check
+        # before and after every launch stays off the profile and a watchdog
+        # can read them while a kernel is wedged.
+        # Sequences are unsigned 32-bit and wrap, so read them as such.
+        self._ctrl_np = self._ctrl_words.numpy().view("uint32")
+        self._flags_np = (
+            self._region[self._layout.flag_off : self._layout.send_off]
+            .numpy()
+            .view("uint32")
+        )
         self._epoch_address = self._counters.data_ptr()
         self._poison_address = self._epoch_address + 4 * (1 + 2 * self._counter_classes)
 
@@ -657,10 +674,10 @@ class RoceOneshotAllReduce:
 
         if self._proxy is not None and self._proxy.failed():
             raise RuntimeError(f"RoCE proxy failed: {self._proxy.error()}")
-        failed_seq = int(self._ctrl_np[2])
-        if failed_seq != 0:
-            peer = int(self._ctrl_np[3])
-            hca = int(self._ctrl_np[6])
+        if self._ctrl_np[CTRL_FAILED // 4] != 0:
+            failed_seq = int(self._ctrl_np[CTRL_ERROR_SEQ // 4])
+            peer = int(self._ctrl_np[CTRL_ERROR_PEER // 4])
+            hca = int(self._ctrl_np[CTRL_ERROR_HCA // 4])
             raise RuntimeError(
                 f"RoCE collective on rank {self.rank} timed out waiting for rank "
                 f"{peer}, HCA {hca}, at sequence {failed_seq}; the runtime is "
@@ -673,7 +690,7 @@ class RoceOneshotAllReduce:
         """True once a wait timed out or the proxy failed; the runtime cannot be reused."""
 
         return (self._proxy is not None and self._proxy.failed()) or int(
-            self._ctrl_np[2]
+            self._ctrl_np[CTRL_FAILED // 4]
         ) != 0
 
     # -- all-gather ---------------------------------------------------------------
@@ -898,14 +915,61 @@ class RoceOneshotAllReduce:
             "max_gather_bytes": self.max_gather_bytes,
             "slot_bytes": self._slot_bytes,
             "epoch": int(self._counters[0].item()),
-            "error_seq": int(self._error_word.item()),
-            "error_peer": int(self._ctrl_words[3].item()),
-            "error_hca": int(self._ctrl_words[6].item()),
-            "ctrl_seq": int(self._ctrl_words[0].item()),
+            "error_seq": int(self._ctrl_np[CTRL_ERROR_SEQ // 4]),
+            "error_peer": int(self._ctrl_np[CTRL_ERROR_PEER // 4]),
+            "error_hca": int(self._ctrl_np[CTRL_ERROR_HCA // 4]),
+            "failed": int(self._ctrl_np[CTRL_FAILED // 4]),
+            "ctrl_seq": int(self._ctrl_np[CTRL_SEQ // 4]),
+            "completed_seq": int(self._ctrl_np[CTRL_COMPLETED // 4]),
             "spin_limit": self.spin_limit,
             "stripe_hcas": list(range(len(self.hca_names))),
         }
         if self._proxy is not None:
+            info.update(self._proxy.stats())
+        return info
+
+    def snapshot(self) -> dict[str, Any]:
+        """Protocol state from host memory only, safe while a kernel is wedged.
+
+        Unlike ``stats`` it never reads device memory or synchronizes, so a
+        watchdog can call it when the GPU does not return.  ``doorbell`` ahead
+        of ``completed`` means a collective is in flight on this rank (its
+        kernel staged and is waiting for peers); equal means this rank is not
+        inside a RoCE collective.  ``flags[peer]`` is, per slot and HCA, the
+        newest sequence that peer's RDMA writes delivered here.
+        """
+        ctrl = self._ctrl_np.copy()
+        hcas = len(self.hca_names)
+        stride = self._layout.flag_stride // 4
+        flags = {}
+        for peer in range(self.world_size):
+            if peer == self.rank:
+                continue
+            flags[peer] = [
+                [
+                    int(
+                        self._flags_np[
+                            ((peer * self._layout.slots + slot) * hcas + hca) * stride
+                        ]
+                    )
+                    for hca in range(hcas)
+                ]
+                for slot in range(self._layout.slots)
+            ]
+        info: dict[str, Any] = {
+            "rank": self.rank,
+            "doorbell": int(ctrl[CTRL_SEQ // 4]),
+            "completed": int(ctrl[CTRL_COMPLETED // 4]),
+            "failed": int(ctrl[CTRL_FAILED // 4]),
+            "error_seq": int(ctrl[CTRL_ERROR_SEQ // 4]),
+            "error_peer": int(ctrl[CTRL_ERROR_PEER // 4]),
+            "error_hca": int(ctrl[CTRL_ERROR_HCA // 4]),
+            "flags": flags,
+            "spin_limit": self.spin_limit,
+        }
+        if self._proxy is not None:
+            info["proxy_failed"] = self._proxy.failed()
+            info["proxy_error"] = self._proxy.error()
             info.update(self._proxy.stats())
         return info
 

@@ -10,13 +10,16 @@ One launch performs a complete all-reduce for one message:
    and posts both slots, which is why the byte count lives per slot;
 3. wait: spin on ``flag[peer][seq & 1][hca] == seq`` for every peer and HCA
    (the peer's proxy writes each flag after that HCA's payload stripe on the
-   same reliable QP); a wait that exceeds ``spin_limit`` polls records ``seq``
-   in the control record's error word and the host raises instead of hanging;
+   same reliable QP); a wait that exceeds ``spin_limit`` polls records ``seq``,
+   the peer and the HCA in the control record, sets its failed word, and the
+   host raises instead of hanging;
 4. reduce: sum the local input and every peer slot in fixed rank order, so all
    ranks produce bit-identical output, and store the result;
 5. epoch: the last block to finish reduction advances the device-resident
    epoch, which makes the sequence number a runtime value rather than a launch
-   argument and keeps CUDA-graph replay correct.
+   argument and keeps CUDA-graph replay correct, and mirrors it into the
+   control record's completed word, so the host can tell a collective still in
+   flight (doorbell ahead of completed) from a rank stuck in another kernel.
 
 Staging arrivals and tail arrivals use two separate counters.  A block that
 stages nothing can pass the peer wait (peers do not depend on our doorbell)
@@ -64,6 +67,17 @@ from ._cute_intrinsics import (
 )
 
 PACK_BYTES = 16
+# Control record: one flag stride of pinned host memory per rank.  Byte offsets
+# of its 32-bit words; the proxy (``_roce_proxy.c``) reads SEQ and SLOT_NBYTES.
+CTRL_SEQ = 0  # doorbell: newest staged sequence
+CTRL_NBYTES = 4  # newest message size
+CTRL_ERROR_SEQ = 8  # sequence whose peer wait timed out
+CTRL_ERROR_PEER = 12  # peer that never delivered it
+CTRL_SLOT_NBYTES = 16  # two words: message size per slot, for proxy catch-up
+CTRL_ERROR_HCA = 24  # HCA whose stripe never arrived
+CTRL_FAILED = 28  # 1 once any wait timed out; sequence 0 is a valid wrapped sequence
+CTRL_COMPLETED = 32  # newest sequence this rank finished, a host-visible epoch
+CTRL_WORDS = 9
 _DTYPE_PACK_ELEMS = {"float32": 4, "float16": 8, "bfloat16": 8}
 _PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
 
@@ -227,7 +241,7 @@ class _RoceOneshotLaunch:
         # the host sees the failure without waiting another spin limit per op.
         # The device poison word (fourth counter) is written by the same waiting
         # threads that write the host error word and only ever goes from 0 to
-        # the failed sequence, so a cheap GPU-scope load is enough here.
+        # 1, so a cheap GPU-scope load is enough here.
         poisoned = ld_relaxed_gpu_u32(poison_ptr)
         if poisoned == Uint32(0):
             # 1. stage the input into the pinned send slot
@@ -251,12 +265,13 @@ class _RoceOneshotLaunch:
                 fence_sc_sys()
                 prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
                 if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
-                    st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
+                    st_relaxed_sys_u32(ctrl_base + Int64(CTRL_NBYTES), Uint32(nbytes))
                     st_relaxed_sys_u32(
-                        ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes)
+                        ctrl_base + Int64(CTRL_SLOT_NBYTES) + slot * Int64(4),
+                        Uint32(nbytes),
                     )
                     fence_sc_sys()
-                    st_relaxed_sys_u32(ctrl_base, seq)
+                    st_relaxed_sys_u32(ctrl_base + Int64(CTRL_SEQ), seq)
 
             # 3. wait for every peer's payload-stripe flags
             if Int32(tidx) < Int32(self._world_size * self._hca_count):
@@ -270,10 +285,15 @@ class _RoceOneshotLaunch:
                     ) * Int64(self._flag_stride)
                     timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
                     if timed_out != Uint32(0):
-                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(peer))
-                        st_relaxed_sys_u32(ctrl_base + Int64(24), Uint32(hca))
-                        st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
-                        st_release_gpu_u32(poison_ptr, seq)
+                        st_relaxed_sys_u32(
+                            ctrl_base + Int64(CTRL_ERROR_PEER), Uint32(peer)
+                        )
+                        st_relaxed_sys_u32(
+                            ctrl_base + Int64(CTRL_ERROR_HCA), Uint32(hca)
+                        )
+                        st_relaxed_sys_u32(ctrl_base + Int64(CTRL_ERROR_SEQ), seq)
+                        st_relaxed_sys_u32(ctrl_base + Int64(CTRL_FAILED), Uint32(1))
+                        st_release_gpu_u32(poison_ptr, Uint32(1))
             cute.arch.sync_threads()
             # A wait that timed out in this block leaves the peer slot unreliable:
             # skip the data phase so nothing derived from it is stored.
@@ -310,8 +330,12 @@ class _RoceOneshotLaunch:
                     # Every block's timeout store precedes its tail arrival, so the
                     # error word is final here.  A failed sequence keeps the epoch,
                     # which makes every later launch a no-op until the host raises.
-                    if ld_relaxed_sys_u32(ctrl_base + Int64(8)) == Uint32(0):
+                    if ld_relaxed_sys_u32(ctrl_base + Int64(CTRL_FAILED)) == Uint32(0):
                         st_release_gpu_u32(epoch_ptr, seq)
+                        # The host's view of the epoch: a watchdog compares it
+                        # with the doorbell to tell an unfinished collective
+                        # from a rank stuck elsewhere, without touching the GPU.
+                        st_relaxed_sys_u32(ctrl_base + Int64(CTRL_COMPLETED), seq)
 
 
 def _dummy(dtype, alignment: int):
@@ -404,7 +428,7 @@ def get_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 5, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 6, cache_key),
     )
 
     def run(

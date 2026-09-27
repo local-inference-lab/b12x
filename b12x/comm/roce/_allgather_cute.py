@@ -47,8 +47,18 @@ from ._cute_intrinsics import (
     st_release_gpu_u32,
     st_relaxed_sys_u32,
 )
+from ._oneshot_cute import (
+    CTRL_COMPLETED,
+    CTRL_ERROR_HCA,
+    CTRL_ERROR_PEER,
+    CTRL_ERROR_SEQ,
+    CTRL_FAILED,
+    CTRL_NBYTES,
+    CTRL_SEQ,
+    CTRL_SLOT_NBYTES,
+    PACK_BYTES,
+)
 
-PACK_BYTES = 16
 _PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
 
 
@@ -158,7 +168,7 @@ class _RoceAllGatherLaunch:
         # the host sees the failure without waiting another spin limit per op.
         # The device poison word (fourth counter) is written by the same waiting
         # threads that write the host error word and only ever goes from 0 to
-        # the failed sequence, so a cheap GPU-scope load is enough here.
+        # 1, so a cheap GPU-scope load is enough here.
         poisoned = ld_relaxed_gpu_u32(poison_ptr)
         if poisoned == Uint32(0):
             # 1. stage the local shard into the pinned send slot
@@ -184,12 +194,13 @@ class _RoceAllGatherLaunch:
                 fence_sc_sys()
                 prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
                 if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
-                    st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
+                    st_relaxed_sys_u32(ctrl_base + Int64(CTRL_NBYTES), Uint32(nbytes))
                     st_relaxed_sys_u32(
-                        ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes)
+                        ctrl_base + Int64(CTRL_SLOT_NBYTES) + slot * Int64(4),
+                        Uint32(nbytes),
                     )
                     fence_sc_sys()
-                    st_relaxed_sys_u32(ctrl_base, seq)
+                    st_relaxed_sys_u32(ctrl_base + Int64(CTRL_SEQ), seq)
 
             # 3. wait for every peer's payload-stripe flags
             if Int32(tidx) < Int32(self._world_size * self._hca_count):
@@ -203,10 +214,15 @@ class _RoceAllGatherLaunch:
                     ) * Int64(self._flag_stride)
                     timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
                     if timed_out != Uint32(0):
-                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(peer))
-                        st_relaxed_sys_u32(ctrl_base + Int64(24), Uint32(hca))
-                        st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
-                        st_release_gpu_u32(poison_ptr, seq)
+                        st_relaxed_sys_u32(
+                            ctrl_base + Int64(CTRL_ERROR_PEER), Uint32(peer)
+                        )
+                        st_relaxed_sys_u32(
+                            ctrl_base + Int64(CTRL_ERROR_HCA), Uint32(hca)
+                        )
+                        st_relaxed_sys_u32(ctrl_base + Int64(CTRL_ERROR_SEQ), seq)
+                        st_relaxed_sys_u32(ctrl_base + Int64(CTRL_FAILED), Uint32(1))
+                        st_release_gpu_u32(poison_ptr, Uint32(1))
             cute.arch.sync_threads()
             # A wait that timed out in this block leaves the peer slot unreliable:
             # skip the data phase so nothing derived from it is stored.
@@ -250,8 +266,12 @@ class _RoceAllGatherLaunch:
                     # Every block's timeout store precedes its tail arrival, so the
                     # error word is final here.  A failed sequence keeps the epoch,
                     # which makes every later launch a no-op until the host raises.
-                    if ld_relaxed_sys_u32(ctrl_base + Int64(8)) == Uint32(0):
+                    if ld_relaxed_sys_u32(ctrl_base + Int64(CTRL_FAILED)) == Uint32(0):
                         st_release_gpu_u32(epoch_ptr, seq)
+                        # The host's view of the epoch: a watchdog compares it
+                        # with the doorbell to tell an unfinished collective
+                        # from a rank stuck elsewhere, without touching the GPU.
+                        st_relaxed_sys_u32(ctrl_base + Int64(CTRL_COMPLETED), seq)
 
 
 def _dummy(dtype, alignment: int):
@@ -333,7 +353,7 @@ def get_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 4, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 5, cache_key),
     )
 
     def run(
