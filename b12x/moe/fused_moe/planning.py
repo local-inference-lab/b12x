@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 from dataclasses import dataclass
 from enum import Enum
 
@@ -12,11 +14,14 @@ from ._impl import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
+    prepare_b12x_iq2_xs_weights,
 )
 from .config import TrellisConfig
-from .source import PackedSource, WeightSource
+from .source import PackedSource, TrellisSource, WeightSource
+from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
+    IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
     ScaleEncoding,
@@ -37,7 +42,12 @@ class ActivationMode(str, Enum):
 
 @dataclass(frozen=True, kw_only=True)
 class ActivationSpec:
-    """Activation precision, nonlinearity, and public I/O dtype."""
+    """Activation precision, nonlinearity, and public I/O dtype.
+
+    ``rotation_dtype`` selects the internal full-rotation trellis arithmetic,
+    independently of BF16/FP16 public inputs. None retains the I/O dtype.
+    Only the FP16 full-rotation implementation is supported explicitly.
+    """
 
     mode: ActivationMode
     nonlinearity: str
@@ -45,12 +55,15 @@ class ActivationSpec:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    rotation_dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", ActivationMode(self.mode))
         object.__setattr__(self, "nonlinearity", str(self.nonlinearity).lower())
         if self.io_dtype not in {torch.bfloat16, torch.float16}:
             raise TypeError("io_dtype must be torch.bfloat16 or torch.float16")
+        if self.rotation_dtype not in (None, torch.float16):
+            raise TypeError("rotation_dtype must be torch.float16 or None")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -117,11 +130,10 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
         ) from exc
 
 
-def _validate_trellis_runtime(source: TrellisConfig) -> None:
-    if source.codebook.value == "sqg_fp16":
+def _validate_trellis_runtime(source: TrellisConfig, *, explicit_uniform: bool = False) -> None:
+    if source.codebook.value == "lut_fp16" and not explicit_uniform:
         raise NotImplementedError(
-            "sqg_fp16 is defined by the checkpoint schema but is not "
-            "implemented by the routed fused MoE runtime"
+            "lut_fp16 preparation requires an explicit uniform_bits declaration"
         )
     if source.rate.group_size is not None:
         raise NotImplementedError(
@@ -135,20 +147,20 @@ def _validate_trellis_runtime(source: TrellisConfig) -> None:
             "fused MoE trellis execution requires scaled_hadamard(128)"
         )
     expert = source.transform.expert
-    if expert.kind == "coupled_hadamard" and (
-        source.codebook.value != "sqg_e4m3"
+    if expert.kind == "intermediate_hadamard" and (
+        source.codebook.value != "lut_e4m3"
         or source.rate.granularity.value != "uniform"
     ):
         raise NotImplementedError(
-            "fused MoE coupled_hadamard execution currently requires the "
-            "sqg_e4m3 codebook with uniform rates"
+            "fused MoE intermediate_hadamard execution currently requires the "
+            "lut_e4m3 codebook with uniform rates"
         )
-    if expert.kind == "coupled_hadamard" and (
+    if expert.kind == "intermediate_hadamard" and (
         expert.pre_block_size,
         expert.post_block_size,
     ) != (512, 128):
         raise NotImplementedError(
-            "fused MoE coupled_hadamard requires block sizes (512, 128)"
+            "fused MoE intermediate_hadamard requires block sizes (512, 128)"
         )
 
 
@@ -172,11 +184,12 @@ def _prepared_format(
             f"required packing {packing.value!r} is not available; "
             f"planner produced {sorted(value.value for value in available)}"
         )
-    if isinstance(source, TrellisConfig):
+    if isinstance(source, TrellisSource):
         weights = WeightEncoding.TRELLIS
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
         weights = (
+            WeightEncoding(source.format.value) if source.format.value in BLOCK_CODECS else
             WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
             else WeightEncoding.FP4_E2M1
@@ -206,6 +219,10 @@ def plan_weights(
     constraints = constraints or WeightPlanConstraints()
     if not isinstance(constraints, WeightPlanConstraints):
         raise TypeError("constraints must be WeightPlanConstraints")
+    if isinstance(source, TrellisConfig):
+        source = TrellisSource(config=source)
+    if activation.rotation_dtype is not None and not isinstance(source, TrellisSource):
+        raise ValueError("rotation_dtype is only valid for trellis weights")
 
     if isinstance(source, PackedSource):
         automatic = activation.mode is ActivationMode.AUTO
@@ -227,6 +244,9 @@ def plan_weights(
             if constraints.required_packing not in {
                 WeightPacking.SOURCE_NATIVE,
                 WeightPacking.MMA_PACKED,
+                WeightPacking.IQ2_XS_COMPACT,
+                WeightPacking.IQ2_XXS_COMPACT,
+                WeightPacking.Q8_0_COMPACT,
             }:
                 raise ValueError(
                     "A16 preparation requires source_native or mma_packed packing"
@@ -243,17 +263,37 @@ def plan_weights(
             w13_layout=source.w13_layout.value,
             w4a16_layout=requested_layout,
         )
-    elif isinstance(source, TrellisConfig):
+    elif isinstance(source, TrellisSource):
+        config = source.config
         if activation.mode is not ActivationMode.A16:
-            raise ValueError("Trellis fused MoE currently requires A16 activations")
-        if constraints.required_packing not in {
-            None,
-            WeightPacking.TRELLIS_NATIVE,
-        }:
+            raise ValueError("Trellis fused MoE requires A16 activations")
+        if constraints.required_packing not in {None, WeightPacking.TRELLIS_NATIVE}:
             raise ValueError("Trellis weights require trellis_native packing")
-        _validate_trellis_runtime(source)
-        expert = source.transform.expert
+        _validate_trellis_runtime(config, explicit_uniform=source.uniform_bits is not None)
+        expert = config.transform.expert
+        if source.extent is not None:
+            if source.extent.intermediate_size != geometry.intermediate_size:
+                raise ValueError("trellis extent width differs from the weight geometry")
+            if expert.kind == "intermediate_hadamard" and (
+                32 * source.extent.first_slot % expert.post_block_size
+                or geometry.intermediate_size % expert.post_block_size
+            ):
+                raise ValueError("trellis extent must contain complete post-Hadamard blocks")
+        if activation.rotation_dtype is not None and (
+            config.codebook.value == "mcg" and source.uniform_bits is None
+        ):
+            raise ValueError("rotation_dtype requires a uniform full-rotation path")
         recipe = "w4a16"
+        bits = source.uniform_bits or 3
+        # Match the native K2 intermediate-Hadamard and projection-tiered
+        # geometries; container identity does not select an execution policy.
+        tile_config = (
+            (128, 128, 128, 128)
+            if expert.kind == "intermediate_hadamard" and bits == 2
+            else (128, 256, 64, 256)
+            if config.codebook.value == "mcg" and source.uniform_bits is None
+            else (64, 256, 64, 256)
+        )
         raw_plan = plan_b12x_fp4_moe_weights(
             quant_modes=recipe,
             source_format="b12x_trellis",
@@ -264,23 +304,18 @@ def plan_weights(
             intermediate_size=geometry.intermediate_size,
             w13_layout="w31",
             w4a16_layout="trellis_native",
-            trellis_bits=3,
-            trellis_tile_config=(
-                (128, 256, 64, 256)
-                if source.codebook.value == "mcg"
-                else (64, 256, 64, 256)
-            ),
-            coupled_hadamard=expert.kind == "coupled_hadamard",
-            trellis_codebook=source.codebook.value,
-            trellis_rate_granularity=source.rate.granularity.value,
-            coupled_hadamard_blocks=(
-                None
-                if expert.kind == "none"
+            trellis_bits=bits,
+            trellis_tile_config=tile_config,
+            intermediate_hadamard=expert.kind == "intermediate_hadamard",
+            trellis_codebook=config.codebook.value,
+            trellis_rate_granularity=config.rate.granularity.value,
+            intermediate_hadamard_blocks=(
+                None if expert.kind == "none"
                 else (expert.pre_block_size, expert.post_block_size)
             ),
         )
     else:
-        raise TypeError("source must be a PackedSource or TrellisConfig")
+        raise TypeError("source must be a PackedSource, TrellisConfig or TrellisSource")
 
     return WeightPlan(
         source=source,
@@ -299,19 +334,30 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    device: torch.device | str | None = None,
+    staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if isinstance(plan.source, TrellisConfig):
+    if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
+        raise ValueError("device and staging are only supported for trellis preparation")
+    if isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
+        if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
+            raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
+        prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
+    elif isinstance(plan.source, TrellisSource):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")
         prepared = prepare_b12x_trellis_v2_weights(
             plan=plan._impl,
-            config=plan.source,
+            source=plan.source,
             weights=weights,
+            device=device,
+            staging=staging,
+            rotation_dtype=plan.activation.rotation_dtype,
         )
     else:
         if not isinstance(weights, PackedWeights):

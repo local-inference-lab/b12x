@@ -157,7 +157,6 @@ static void owner_destruct(PyObject *capsule) {
         fprintf(stderr, "b12x shared reader retained unsafe CUDA resources: %s\n", failure.message);
         return;
     }
-    Py_DECREF(e->files.pool_owner);
     pthread_cond_destroy(&e->ready); pthread_mutex_destroy(&e->mutex);
     free(e);
 }
@@ -165,22 +164,19 @@ static void owner_destruct(PyObject *capsule) {
 static PyObject *owner_create(PyObject *self, PyObject *args) {
     (void)self;
     int device; unsigned threads;
-    PyObject *pool;
     unsigned long long copy, expand;
-    if (!PyArg_ParseTuple(args, "iIOKK", &device, &threads, &pool, &copy, &expand)) return NULL;
+    if (!PyArg_ParseTuple(args, "iIKK", &device, &threads, &copy, &expand)) return NULL;
     if (threads < OWNER_SLOTS || threads > 16 || threads % OWNER_SLOTS || !copy || !expand)
         return PyErr_Format(PyExc_ValueError, "shared reader needs 4, 8, 12 or 16 workers and copy kernels");
-    const b12x_pool_api_t *api = PyCapsule_GetPointer(pool, B12X_POOL_API_CAPSULE);
-    if (!api) return NULL;
     owner_executor_t *e = calloc(1, sizeof(*e));
     if (!e) return PyErr_NoMemory();
-    e->files.device = device; e->files.pool = api; e->files.pool_owner = Py_NewRef(pool);
+    e->files.device = device;
     e->files.copy = (CUfunction)(uintptr_t)copy; e->files.expand = (CUfunction)(uintptr_t)expand;
     e->workers = threads; e->parts = threads / OWNER_SLOTS;
     pthread_mutex_init(&e->mutex, NULL); pthread_cond_init(&e->ready, NULL);
     PyObject *capsule = PyCapsule_New(e, OWNER_CAPSULE, owner_destruct);
     if (!capsule) {
-        Py_DECREF(pool); pthread_cond_destroy(&e->ready); pthread_mutex_destroy(&e->mutex);
+        pthread_cond_destroy(&e->ready); pthread_mutex_destroy(&e->mutex);
         free(e); return NULL;
     }
     failure_t failure = {{0}};
@@ -211,7 +207,7 @@ done:;
 }
 
 static bool owner_destination(owner_executor_t *e, uint64_t pointer, uint64_t bytes) {
-    if (e->files.pool->device_range(pointer, bytes, e->files.device)) return true;
+    if (device_range(pointer, bytes, e->files.device)) return true;
     for (size_t i = 0; i < e->import_count; i++) {
         uintptr_t base = (uintptr_t)e->imports[i].base;
         if (base && pointer >= base && pointer - base <= e->imports[i].bytes &&
@@ -277,11 +273,11 @@ static PyObject *owner_execute(PyObject *self, PyObject *args) {
                 f->rows > (uint64_t)INT_MAX * 1024 / f->bytes ||
                 r[1] + f->source + (f->rows - 1) * f->source_stride + f->bytes > (uint64_t)file->size ||
                 !owner_destination(e, f->destination, (f->rows - 1) * f->destination_stride + f->bytes * (1 + f->expand))) {
-                snprintf(failure.message, sizeof(failure.message), "invalid shared scatter fragment or unowned destination"); goto done;
+                snprintf(failure.message, sizeof(failure.message), "invalid shared scatter fragment or invalid destination"); goto done;
             }
             uint64_t written = f->rows * f->bytes * (1 + f->expand);
             destination_bytes += written;
-            if (!e->files.pool->device_range(f->destination,
+            if (!device_range(f->destination,
                     (f->rows - 1) * f->destination_stride + f->bytes * (1 + f->expand), e->files.device))
                 peer_bytes += written;
         }
@@ -380,13 +376,13 @@ static PyObject *owner_export(PyObject *self, PyObject *args) {
     cudaIpcMemHandle_t handle;
     pthread_mutex_lock(&e->mutex);
     if (e->active || e->closed || e->poisoned || !extent ||
-        !e->files.pool->device_range(pointer, extent, e->files.device))
-        snprintf(failure.message, sizeof(failure.message), "shared IPC export needs an idle reader and owned device weight range");
+        !device_range(pointer, extent, e->files.device))
+        snprintf(failure.message, sizeof(failure.message), "shared IPC export needs an idle reader and valid CUDA device range");
     if (!failure.message[0] &&
         gpu_ok(cudaSetDevice(e->files.device), "set shared export device", &failure) &&
         driver_ok(cuMemGetAddressRange(&base, &bytes, pointer), "query shared allocation extent", &failure)) {
-        if (!e->files.pool->device_range(base, bytes, e->files.device))
-            snprintf(failure.message, sizeof(failure.message), "IPC allocation extent is not owned device weight storage");
+        if (!device_range(base, bytes, e->files.device))
+            snprintf(failure.message, sizeof(failure.message), "IPC allocation extent is outside its CUDA device allocation");
         else gpu_ok(cudaIpcGetMemHandle(&handle, (void *)(uintptr_t)base), "export shared weight allocation", &failure);
     }
     pthread_mutex_unlock(&e->mutex);

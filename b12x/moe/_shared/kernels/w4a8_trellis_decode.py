@@ -1,8 +1,8 @@
-"""Shared QSRT trellis decode primitives for the W4A8 kernel family.
+"""Shared trellis decode primitives for the W4A8 kernel family.
 
 Module-level pieces used by both the monolithic dynamic kernel and the
 materialized phase kernels: the raw-window B stager, the t256 ring window
-extraction and T12-staircase decode, the butterfly pairing into m16n8k32
+extraction and value-table decode, the butterfly pairing into m16n8k32
 operand order, the within-K32 activation permutation that the native B lane
 order requires, and the warp-level normalized H128 used at the activation
 boundary.
@@ -18,8 +18,8 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     get_ptr_as_int64,
     ld_shared_u32,
-    packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
-    packed_decode_trellis_sqg_direct_lut_to_e4m3x8,
+    packed_decode_lut_e4m3_to_e4m3x8,
+    packed_decode_lut_e4m3_direct_to_e4m3x8,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 
@@ -133,7 +133,7 @@ def _w4a8_trellis_lane_geom(lane: Int32, bits: cutlass.Constexpr):
     """t256 ring geometry for this lane, hoistable across the K32 loops.
 
     ``ia``/``ib`` are the two ring word indices covering the lane's
-    overlapping L16 windows and ``s2`` the merge shift; they depend only on
+    overlapping 16-bit windows and ``s2`` the merge shift; they depend only on
     the lane id and the bitrate. The W4A8 kernels always decode the full
     eight-weight span starting at the lane origin.
     """
@@ -162,7 +162,7 @@ def _w4a8_trellis_decode_half(
     win_a = Uint32(merged >> Int64(s2))
     win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
     if cutlass.const_expr(direct_lut):
-        lo, hi = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+        lo, hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
             win_a,
             win_b,
             lut_addr,
@@ -170,12 +170,12 @@ def _w4a8_trellis_decode_half(
             rate_indexed=True,
         )
     else:
-        lo, hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+        lo, hi = packed_decode_lut_e4m3_to_e4m3x8(
             win_a,
             win_b,
             lut_addr,
             int(bits),
-            t12_in_shared=True,
+            value_table_in_shared=True,
         )
     value = lo
     if n_high != Int32(0):
@@ -240,7 +240,7 @@ def _w4a8_trellis_decode_both(
     win_a = Uint32(merged >> Int64(s2))
     win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
     if cutlass.const_expr(direct_lut):
-        lo, hi = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+        lo, hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
             win_a,
             win_b,
             lut_addr,
@@ -248,12 +248,12 @@ def _w4a8_trellis_decode_both(
             rate_indexed=True,
         )
     else:
-        lo, hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+        lo, hi = packed_decode_lut_e4m3_to_e4m3x8(
             win_a,
             win_b,
             lut_addr,
             int(bits),
-            t12_in_shared=bool(lut_in_smem),
+            value_table_in_shared=bool(lut_in_smem),
         )
     return lo, hi
 

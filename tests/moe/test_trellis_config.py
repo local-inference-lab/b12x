@@ -22,7 +22,7 @@ from b12x.moe.fused_moe.weights import ScaleFactors
 def _k3_config() -> dict[str, object]:
     return {
         "version": 2,
-        "codebook": "sqg_e4m3",
+        "codebook": "lut_e4m3",
         "rate": {"granularity": "uniform"},
         "scale": {
             "input_scales": {"vectors": "per_layer", "gains": "per_layer"},
@@ -35,10 +35,10 @@ def _k3_config() -> dict[str, object]:
         "transform": {
             "projection": {"kind": "scaled_hadamard", "block_size": 128},
             "expert": {
-                "kind": "coupled_hadamard",
+                "kind": "intermediate_hadamard",
                 "pre_block_size": 512,
                 "post_block_size": 128,
-                "draw_granularity": "per_expert",
+                "sign_pattern_granularity": "per_expert",
             },
         },
     }
@@ -124,10 +124,10 @@ def test_schema_keeps_codebook_rate_and_transform_orthogonal() -> None:
     value["codebook"] = "mcg"
     value["rate"] = {"granularity": "per_expert", "group_size": 256}
     value["transform"]["expert"] = {
-        "kind": "coupled_hadamard",
+        "kind": "intermediate_hadamard",
         "pre_block_size": 512,
         "post_block_size": 128,
-        "draw_granularity": "per_expert",
+        "sign_pattern_granularity": "per_expert",
     }
 
     assert TrellisConfig.from_dict(value).to_dict() == value
@@ -151,21 +151,21 @@ def test_projection_tier_payloads_share_one_flat_allocation() -> None:
 
 def test_projection_payload_supports_tp4_512_channel_extent() -> None:
     hidden_size = 128
-    atom_slots = 512 // 32
+    num_slots = 512 // 32
     bits = torch.tensor(((3, 4, 5), (4, 3, 5)), dtype=torch.int64)
     offsets = _bundle_offsets(bits, hidden_size)
     row_stride = offsets[-1][-1] + _matrix_section_bytes(
         hidden_size, int(bits[-1, -1])
     )
-    atoms = (
-        torch.arange(atom_slots * row_stride, dtype=torch.int64)
+    codes = (
+        torch.arange(num_slots * row_stride, dtype=torch.int64)
         .remainder(256)
         .to(torch.uint8)
-        .reshape(atom_slots, row_stride)
+        .reshape(num_slots, row_stride)
     )
 
     gate_k3 = _projection_native(
-        atoms,
+        codes,
         experts=[0],
         projection=0,
         bits=3,
@@ -174,7 +174,7 @@ def test_projection_payload_supports_tp4_512_channel_extent() -> None:
         fc1=True,
     )
     down_k5 = _projection_native(
-        atoms,
+        codes,
         experts=[0, 1],
         projection=2,
         bits=5,

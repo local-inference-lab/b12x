@@ -1439,4 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from b12x.testing.memory import absorb_small_page_fragments
+
+    absorb_small_page_fragments()
     raise SystemExit(main())

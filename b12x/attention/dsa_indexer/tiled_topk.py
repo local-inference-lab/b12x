@@ -547,12 +547,6 @@ def _flat_tensor_meta_key(tensor):
     )
 
 
-def _buffers_alias(left, right) -> bool:
-    if hasattr(left, "fake_mode") or hasattr(right, "fake_mode"):
-        return False
-    return left.data_ptr() == right.data_ptr()
-
-
 class DSATiledTopkKernel:
     def __init__(
         self,
@@ -1358,6 +1352,21 @@ def _validate_supported_topk(topk: int, *, caller: str) -> int:
     return topk
 
 
+def _same_data_address(left: torch.Tensor, right: torch.Tensor) -> bool:
+    if (
+        hasattr(left, "fake_mode")
+        or hasattr(right, "fake_mode")
+        or left.is_meta
+        or right.is_meta
+    ):
+        return (
+            torch._C._is_alias_of(left, right)
+            and left.storage_offset() * left.element_size()
+            == right.storage_offset() * right.element_size()
+        )
+    return left.data_ptr() == right.data_ptr()
+
+
 def run_tiled_topk(
     *,
     tile_logits: torch.Tensor,
@@ -1552,9 +1561,9 @@ def run_tiled_topk(
         # carry-IN is read throughout selection; the output (carry-OUT for non-final
         # chunks) is written. They must be physically distinct to avoid an
         # intra-launch read/write race — the orchestrator ping-pongs two buffers.
-        if _buffers_alias(carry_values, topk_values):
+        if _same_data_address(carry_values, topk_values):
             raise ValueError("carry_values must not alias the output values buffer")
-        if _buffers_alias(carry_indices, topk_indices):
+        if _same_data_address(carry_indices, topk_indices):
             raise ValueError("carry_indices must not alias the output indices buffer")
     else:
         # is_first: carry is never read (the read path is constexpr-elided). Reuse the

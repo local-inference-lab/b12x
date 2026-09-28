@@ -17,11 +17,14 @@ import statistics
 import subprocess
 import sys
 import time
+from dataclasses import replace
 
 import torch
 
 from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _a16
+from b12x.gemm.blockscaled._preparation import _workspace_bytes
+from b12x.preparation import PreparationSession, PreparedCall
 from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
 from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
 from b12x._lib.runtime_control import kernel_resolution_guard
@@ -88,19 +91,66 @@ def _capture(fn):
         fn()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with kernel_resolution_guard('precision benchmark capture'):
-        with torch.cuda.graph(graph):
-            fn()
+    with kernel_resolution_guard('precision benchmark capture'), torch.cuda.graph(graph):
+        fn()
     return graph
 
 
-def _paired(graphs, warmup, iters, flush):
+def _prepared_call(session, source, weight, output, config, *, activation_global_scale=None):
+    """Prepare the production public call with fixed caller-owned scratch."""
+    query = blockscaled.query_from_call(
+        source, weight, activation_mode=config.mode, out=output,
+        activation_global_scale=activation_global_scale,
+    )
+    scratch = None
+    if output is not None:
+        query = replace(query, workspace_form="provided")
+        scratch = torch.empty(_workspace_bytes(query, config), device=source.device, dtype=torch.uint8)
+        query = replace(query, workspace_nbytes=scratch.numel())
+    plan = blockscaled.plan(query, override=config)
+    values, scales, global_scale, _ = _a16._weight_parts(weight)
+    session.prepare((plan.request(
+        name=f"precision_{config.mode}",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(source, values, scales, global_scale,
+                                  activation_scale=activation_global_scale,
+                                  out=output, workspace=scratch),
+            owners=(source, values, scales, global_scale, output, scratch),
+        ),
+    ),))
+
+    def call():
+        return blockscaled.mm(source, weight, plan=plan, out=output, workspace=scratch,
+                              activation_global_scale=activation_global_scale)
+
+    return call, scratch
+
+
+def _checked_graph(call, reference, label):
+    _check(call(), reference, label)
+    captured = []
+
+    def invoke():
+        captured[:] = [call()]
+
+    graph = _capture(invoke)
+    # A poisoned captured output proves replay writes real, finite results.
+    captured[0].fill_(float("nan"))
+    graph.replay()
+    correctness = _check(captured[0], reference, label + " replay")
+    return graph, correctness, captured[0]
+
+
+def _warmup(graphs, warmup, flush):
     for _ in range(warmup):
         for graph in graphs.values():
             if flush is not None:
                 flush()
             graph.replay()
     torch.cuda.synchronize()
+
+
+def _paired(graphs, iters, flush):
     pairs = []
     names = list(graphs)
     events = []
@@ -134,7 +184,7 @@ def _ratio_interval(pairs, candidate, baseline):
 
 
 def _clock_checks(before, after):
-    a, b = dict(zip(before["fields"], before["values"])), dict(zip(after["fields"], after["values"]))
+    a, b = (dict(zip(row["fields"], row["values"], strict=True)) for row in (before, after))
     if a["name"] == b["name"] == "NVIDIA GB10":
         checks = {
             "physical_identity": a["uuid"] == b["uuid"],
@@ -172,11 +222,23 @@ def run(args, specs, *, flashinfer_error):
     if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
         raise ValueError("A16 evidence requires SM120/SM121")
     recipe = "nvfp4" if args.dtype == "fp4-a16" else "mxfp8"
+    flashinfer_metadata = None
+    if args.flashinfer_w4a16 is not None:
+        import flashinfer
+        from flashinfer import prepare_bf16_fp4_weights
+        fi_root = pathlib.Path(flashinfer.__file__).parent
+        flashinfer_metadata = dict(
+            version=flashinfer.__version__, path=str(fi_root), backend=args.flashinfer_w4a16,
+            activation_dtype="bfloat16", autotune=False, enable_pdl=True,
+            source_sha256={str(p.relative_to(fi_root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                           for p in sorted(fi_root.rglob("*bf16_fp4*.py"))},
+        )
     counts = args.batch_sizes or COUNTS
     if any(m <= 0 for m in counts):
         raise ValueError("benchmark M must be positive")
     root = pathlib.Path(__file__).resolve().parents[1]
     paths = [*sorted((root / "b12x/gemm/blockscaled").glob("*.py")),
+             root / "benchmarks/benchmark_dense_gemm.py",
              root / "b12x/_lib/dense_gemm.py", root / "b12x/_lib/intrinsics.py", pathlib.Path(__file__).resolve()]
     manifest = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
     args.evidence.parent.mkdir(parents=True, exist_ok=True)
@@ -187,98 +249,131 @@ def run(args, specs, *, flashinfer_error):
         record(dict(kind="manifest", command=sys.argv, cwd=str(pathlib.Path.cwd()),
                     revision=_git("rev-parse", "HEAD"), dirty=_git("status", "--porcelain"),
                     source_sha256=manifest, timestamp=time.time(), recipe=recipe,
+                    profile=args.profile, specs=specs,
                     torch=torch.__version__, triton=importlib.metadata.version("triton"),
                     cutlass=importlib.metadata.version("nvidia-cutlass-dsl"),
                     device=_snapshot(), flashinfer_unavailable=flashinfer_error,
-                    ratio="a16_us / quantized_us; lower is faster", status="research-only"))
+                    flashinfer_w4a16=flashinfer_metadata,
+                    ratio="a16_us / baseline_us; lower is faster for b12x A16", status="research-only"))
         flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
         for name, k, n, _ in specs:
             torch.manual_seed(42)
             weight, local_weight, multiplier = _reference_weight(recipe, n, k)
+            fi_weight = None
+            if args.flashinfer_w4a16 is not None:
+                fi_weight = prepare_bf16_fp4_weights(
+                    weight.values, _a16.scale_storage(weight.scale_mma, n, k, 16),
+                    multiplier, backend=args.flashinfer_w4a16,
+                )
             for m in counts:
-                source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.25
-                options = (dict(activation_global_scale=(2688.0 / source.abs().amax().float()).reshape(1))
-                           if recipe == "nvfp4" else {})
-                reference = (source.float() @ local_weight.to(torch.bfloat16).float().T) * multiplier
-                qout = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-                qscratch = torch.empty(blockscaled.workspace_size(weight, m), device="cuda", dtype=torch.uint8)
-                qcall = lambda: blockscaled.mm(source, weight, out=qout, workspace=qscratch,
-                                                mode="quantized", expected_m=m, **options)
-                qcall()
-                # The quantized path has its own activation oracle.
-                if recipe == "nvfp4":
-                    aq, asc = quantize_grouped_nvfp4_torch(source[None], torch.tensor([m], device="cuda"), options["activation_global_scale"])
-                    qref = dense_gemm((aq, asc), (weight.values[:, :, None], weight.scale_mma),
-                                     ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn", c_dtype="bfloat16",
-                                     sf_vec_size=16, alpha=multiplier / options["activation_global_scale"], expected_m=m)[:, :, 0]
-                else:
-                    aq = quantize_mxfp8_rows_torch(source)
-                    adeq = dequantize_mxfp8_rows_torch(aq.values, aq.scale_rows).float()
-                    qref = adeq @ local_weight.T
-                correctness = {"quantized": _check(qout, qref, "quantized")}
-                graphs = {"quantized": _capture(qcall)}
-                from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
-                fp4 = recipe == "nvfp4"
-                sf_offset, alpha_offset, partial_offset, total = _a16._layout(m, n, k, fp4)
-                storage_k = k // 2 if fp4 else k
-                values = qscratch[:m * storage_k].view(torch.uint8 if fp4 else torch.float8_e4m3fn).view(m, storage_k, 1)
-                sf_size = ((m + 127) // 128) * 128 * (k // (16 if fp4 else 32))
-                scale = (as_grouped_scale_view if fp4 else as_grouped_scale_view_mx)(
-                    qscratch[sf_offset:sf_offset + sf_size].view(1, -1), m, k)
-                alpha = qscratch[alpha_offset:alpha_offset + 4].view(torch.float32)
-                weight_values = weight.values if fp4 else weight.weight.values
-                weight_scale = weight.scale_mma if fp4 else weight.weight.scale_mma
-                gemm_call = lambda: dense_gemm(
-                    (values, scale), (weight_values.view(n, storage_k, 1), weight_scale),
-                    out=qout.view(m, n, 1), alpha=alpha, ab_dtype="float4_e2m1fn" if fp4 else "float8_e4m3fn",
-                    sf_dtype="float8_e4m3fn" if fp4 else "float8_e8m0fnu", c_dtype="bfloat16",
-                    sf_vec_size=16 if fp4 else 32, expected_m=m,
-                    _split_k_workspace=qscratch[partial_offset:total].view(torch.float32))
-                graphs["quantized_gemm_only"] = _capture(gemm_call)
-                outputs = [qout]
-                if recipe == "mxfp8":
-                    from b12x.gemm.blockscaled._linear import _packed_mxfp8_op
-                    def existing():
-                        return _packed_mxfp8_op(source, weight.weight.values, weight.weight.scale_rows,
-                                                weight.weight.scale_mma, k, k, n, m, None)
-                    correctness["existing_quantized"] = _check(existing(), qref, "existing_quantized")
-                    graphs["existing_quantized"] = _capture(existing)
-                    if m <= 8:
-                        fused_out = torch.empty(m, n, 1, device="cuda", dtype=torch.bfloat16)
-                        fused_scratch = torch.empty(2 * m * n, device="cuda", dtype=torch.float32)
-                        fused_call = lambda: dense_gemm_fused_quant_a(source, weight.weight.values[:, :, None],
-                                            weight.weight.scale_mma, out=fused_out, expected_m=m,
-                                            _split_k_workspace=fused_scratch)
-                        fused_call()
-                        correctness["fused_mxfp8"] = _check(fused_out[:, :, 0], qref, "fused_mxfp8")
-                        graphs["fused_mxfp8"] = _capture(fused_call)
-                        outputs.extend((fused_out, fused_scratch))
-                configurations = CONFIGS if args.tune_a16 else ((64, 64, 1),)
-                a16_names = []
-                for config in configurations:
-                    label = "a16_" + "_".join(map(str, config))
-                    output = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-                    scratch = torch.empty(blockscaled.workspace_size(weight, m, _config=config), device="cuda", dtype=torch.uint8)
-                    call = lambda output=output, scratch=scratch, config=config: blockscaled.mm(
-                        source, weight, mode="a16", out=output, workspace=scratch, _config=config)
-                    call()
-                    correctness[label] = _check(output, reference, label)
-                    graphs[label] = _capture(call)
-                    outputs.extend((output, scratch))
-                    a16_names.append(label)
-                before = _snapshot()
-                pairs = _paired(graphs, args.warmup, args.iters, flush)
-                after = _snapshot()
-                medians = {key: statistics.median(p[key] for p in pairs) for key in graphs}
-                winner = min(a16_names, key=medians.get)
-                baselines = [key for key in graphs if key not in a16_names and key != "quantized_gemm_only"]
-                ratios = {key: medians[winner] / medians[key] for key in baselines}
-                intervals = {key: _ratio_interval(pairs, winner, key) for key in baselines}
-                record(dict(kind="measurement", name=name, m=m, n=n, k=k, recipe=recipe,
-                            l2="flushed" if args.flush_l2 else "warm", correctness=correctness,
-                            snapshot_before=before, snapshot_after=after, samples_us=pairs,
-                            medians_us=medians, winning_candidate=winner, ratios=ratios,
-                            ratio_ci95=intervals, clock_validation=_clock_checks(before, after),
-                            compile_state=_compile_state(), requires_independent_confirmation=True))
-                print(f"{recipe} {name} M={m}: {winner} {medians[winner]:.3f} us; ratios={ratios}", flush=True)
-                del graphs, outputs
+                with PreparationSession(device="cuda", autotune=False, compile_workers=2) as session:
+                    _run_case(args, name, recipe, m, n, k, weight, local_weight, multiplier,
+                              fi_weight, session, flush, record)
+
+
+def _run_case(args, name, recipe, m, n, k, weight, local_weight, multiplier,
+              fi_weight, session, flush, record):
+    source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.25
+    options = (dict(activation_global_scale=(2688.0 / source.abs().amax().float()).reshape(1))
+               if recipe == "nvfp4" else {})
+    reference = (source.float() @ local_weight.to(torch.bfloat16).float().T) * multiplier
+    qout = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    qcall, qscratch = _prepared_call(
+        session, source, weight, qout, blockscaled.BlockscaledConfig(mode="quantized"), **options,
+    )
+    qcall()
+    # The quantized path has its own activation oracle.
+    if recipe == "nvfp4":
+        aq, asc = quantize_grouped_nvfp4_torch(source[None], torch.tensor([m], device="cuda"), options["activation_global_scale"])
+        qref = dense_gemm((aq, asc), (weight.values[:, :, None], weight.scale_mma),
+                         ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn", c_dtype="bfloat16",
+                         sf_vec_size=16, alpha=multiplier / options["activation_global_scale"], expected_m=m)[:, :, 0]
+    else:
+        aq = quantize_mxfp8_rows_torch(source)
+        adeq = dequantize_mxfp8_rows_torch(aq.values, aq.scale_rows).float()
+        qref = adeq @ local_weight.T
+    graphs, correctness, outputs = {}, {}, [qscratch]
+
+    def add(label, call, oracle):
+        graph, check, output = _checked_graph(call, oracle, label)
+        graphs[label] = graph
+        correctness[label] = check
+        outputs.append(output)
+
+    add("quantized", qcall, qref)
+    from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
+    fp4 = recipe == "nvfp4"
+    sf_offset, alpha_offset, partial_offset, total = _a16._layout(m, n, k, fp4)
+    storage_k = k // 2 if fp4 else k
+    values = qscratch[:m * storage_k].view(torch.uint8 if fp4 else torch.float8_e4m3fn).view(m, storage_k, 1)
+    sf_size = ((m + 127) // 128) * 128 * (k // (16 if fp4 else 32))
+    scale = (as_grouped_scale_view if fp4 else as_grouped_scale_view_mx)(
+        qscratch[sf_offset:sf_offset + sf_size].view(1, -1), m, k)
+    alpha = qscratch[alpha_offset:alpha_offset + 4].view(torch.float32)
+    weight_values = weight.values if fp4 else weight.weight.values
+    weight_scale = weight.scale_mma if fp4 else weight.weight.scale_mma
+
+    def gemm_call():
+        return dense_gemm(
+            (values, scale), (weight_values.view(n, storage_k, 1), weight_scale),
+            out=qout.view(m, n, 1), alpha=alpha, ab_dtype="float4_e2m1fn" if fp4 else "float8_e4m3fn",
+            sf_dtype="float8_e4m3fn" if fp4 else "float8_e8m0fnu", c_dtype="bfloat16",
+            sf_vec_size=16 if fp4 else 32, expected_m=m,
+            _split_k_workspace=qscratch[partial_offset:total].view(torch.float32))[:, :, 0]
+
+    add("quantized_gemm_only", gemm_call, qref)
+    if recipe == "mxfp8":
+        existing, _ = _prepared_call(
+            session, source, weight, None, blockscaled.BlockscaledConfig(mode="quantized"),
+        )
+        add("existing_quantized", existing, qref)
+        if m <= 8:
+            fused_out = torch.empty(m, n, 1, device="cuda", dtype=torch.bfloat16)
+            fused_scratch = torch.empty(2 * m * n, device="cuda", dtype=torch.float32)
+            def fused_call():
+                return dense_gemm_fused_quant_a(source, weight.weight.values[:, :, None],
+                                    weight.weight.scale_mma, out=fused_out, expected_m=m,
+                                    _split_k_workspace=fused_scratch)[:, :, 0]
+            add("fused_mxfp8", fused_call, qref)
+            outputs.extend((fused_out, fused_scratch))
+    configurations = (CONFIGS if args.tune_a16 else
+                      (tuple(args.a16_config) if args.a16_config is not None
+                       else (64, 64, 1),))
+    a16_names = []
+    for config in configurations:
+        label = "a16_" + "_".join(map(str, config))
+        output = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        call, scratch = _prepared_call(
+            session, source, weight, output,
+            blockscaled.BlockscaledConfig(mode="a16", tile_n=config[0], tile_k=config[1], split_k=config[2]),
+        )
+        add(label, call, reference)
+        outputs.extend((output, scratch))
+        a16_names.append(label)
+    if fi_weight is not None:
+        from flashinfer import mm_bf16_fp4
+        fi_out = torch.empty_like(qout)
+
+        def fi_call():
+            return mm_bf16_fp4(source, *fi_weight, backend=args.flashinfer_w4a16, out=fi_out)
+
+        add("flashinfer_w4a16_" + args.flashinfer_w4a16, fi_call, reference)
+    session.freeze()
+    _warmup(graphs, args.warmup, flush)
+    before = _snapshot()
+    pairs = _paired(graphs, args.iters, flush)
+    after = _snapshot()
+    medians = {key: statistics.median(p[key] for p in pairs) for key in graphs}
+    winner = min(a16_names, key=medians.get)
+    baselines = [key for key in graphs if key not in a16_names and key != "quantized_gemm_only"]
+    ratios = {key: medians[winner] / medians[key] for key in baselines}
+    intervals = {key: _ratio_interval(pairs, winner, key) for key in baselines}
+    record(dict(kind="measurement", name=name, m=m, n=n, k=k, recipe=recipe,
+                l2="flushed" if args.flush_l2 else "warm", correctness=correctness,
+                snapshot_before=before, snapshot_after=after, samples_us=pairs,
+                medians_us=medians, winning_candidate=winner, ratios=ratios,
+                ratio_ci95=intervals, clock_validation=_clock_checks(before, after),
+                compile_state=_compile_state(), requires_independent_confirmation=True))
+    print(f"{recipe} {name} M={m}: {winner} {medians[winner]:.3f} us; ratios={ratios}", flush=True)
+    graphs.clear()
+    outputs.clear()

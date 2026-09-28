@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-408",
+  "category": "feature",
+  "summary": "Provide native FP32 KDA state recovery for speculative GLM decoding.",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Prepared CuTe kernels verify proposed tokens from one recurrent checkpoint and commit only accepted updates.",
+    "Recurrent state and correction records stay FP32; no additional state quantization is introduced.",
+    "The vLLM integration selects this path and coordinates atomic LMCache checkpoint export."
+  ],
+  "pull_requests": [408],
+  "evidence": [
+    "https://github.com/local-inference-lab/rtx6kpro/blob/master/benchmarks/glm53-kda-recovery-lmcache.md"
+  ]
+}

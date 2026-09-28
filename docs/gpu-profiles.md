@@ -80,6 +80,17 @@ pins, fixed choices and partial races are never saved as measured winners.
 Malformed matching cache data fails closed. Compiler artifact availability is
 checked independently of selection-cache presence.
 
+`B12X_COMPILE_WORKERS` limits compiler processes per preparation session
+(default: 8). An explicit `compile_workers` argument takes precedence. Lower
+this on unified-memory systems where compiler processes share RAM with model
+weights and KV caches. This changes compilation concurrency, not autotuning.
+`session.configure_compile_workers()` can change the budget between jobs
+without releasing prepared plans. vLLM's `B12X_WEIGHTS_COMPILE_WORKERS` and
+`B12X_STATE_COMPILE_WORKERS` override the common budget for their respective
+preparation stages. State tuning uses disposable pools with the final KV layout
+before allocating serving KV. `B12X_BIND_COMPILE_WORKERS` controls final binding
+and priming. The Spark TP2 launchers default to 16, 16, and 4 respectively.
+
 `autotune=False` uses a serial warmup through the same session's materialize,
 prime and resource-ownership hooks. It skips selection-cache lookup, candidate
 enumeration, compilation planning, compiler worker processes and measurement
@@ -97,7 +108,7 @@ propagation and complete-world completion. Incomplete races are not cached.
 `cache_only=True` refuses search and compilation. A complete cached restart
 loads and primes process-local state without starting compiler workers.
 
-The decision cache uses schema 5 and an explicit positive integer version,
+The decision cache uses schema 6 and an explicit positive integer version,
 `B12X_TUNING_CACHE_VERSION`, which defaults to `1`. Set the same version on
 every rank. Increment it before launch to discard prior tuning decisions:
 
@@ -113,7 +124,9 @@ keys; the tuning-cache version is excluded from the compiler environment key.
 A cached decision still validates its assignment and configuration, then
 compiles any missing artifacts for that selected configuration. Increment the
 decision version when implementation or toolchain changes warrant retuning.
-Schema-4 files are left intact and are not read by schema 5.
+Schema-4 and schema-5 files are left intact and are not read by schema 6.
+The schema bump invalidates prior decisions even when the environment version
+is explicitly set, so kernels are retuned for ordinary CUDA weight storage.
 
 A selection key digests the component, the contract versions, the encoded
 query, the invocation, the pin and the dependencies. GDN decode, GDN and KDA
@@ -141,7 +154,14 @@ set). Preparation that performs no race does not build it.
 
 Each candidate is primed once. A batch times two representative samples
 per candidate by default, with L2 eviction and activation production before
-each timed invocation. The first scored invocation also sizes a 256-microsecond
+each timed invocation. A caller may supply `PreparedCall.benchmark_producers`
+to describe a fixed workload mix over the same binding. Each scored repetition
+visits every producer, with its own eviction, reset, and timed invocation;
+the score is the arithmetic mean across the complete mix. Candidates must
+declare the same workload count. Priming and restoration use `produce`.
+The invocation identity must version the corpus so old selections are not
+reused after a distribution change.
+The first scored invocation also sizes a 256-microsecond
 kernel-time budget per round; there are no unscored calibration replays.
 Every sample queues a CUDA stream memory wait before its start event and
 releases the wait through mapped host memory after its end event is queued.
@@ -175,6 +195,21 @@ performance bound on omitted configurations; selection quality requires
 measured comparisons. Changing a space bumps the family's
 `candidate_contract_version`, which invalidates its cached selections.
 
+For NVFP4 SiLU decode with Triton routing, the runtime `max_active_clusters`
+ladder includes powers of two, half and three-quarter SM-count grids, and the
+SM/task clamp. These choices share a compiled kernel. The default remains a
+candidate, and explicit grids cannot exceed the resident SM count.
+
+The swapped M16 FC1 uses a compact N16 token permutation and direct scale loads.
+It retains accumulators only for its sixteen routed rows; the generic N32
+permutation would double those accumulators and the associated epilogue state.
+
+For uniform immutable NVFP4 input scales, `nvfp4_share_input` races one
+quantization per token against per-route quantization. M16 shares each token
+between two producer warps, splitting route metadata and quantization blocks;
+the unused tail warp stays outside the per-token barrier. Packed activations
+are still written to each routed expert row.
+
 Dense GEMM, mHC, KDA/GDN prefill, dense MLA, the DSA indexer, contiguous attention and paged GQA
 separate correctness constraints from efficiency predicates. `B12X_AUTOTUNE_EXHAUSTIVE=1`, set
 before declaration, bypasses the efficiency group while retaining TMA alignment,
@@ -189,6 +224,11 @@ row tiles, restricts MXFP8 decode swapping to N<=K/2, and omits wide NVFP4
 K512 prefill tiles outside short-K or narrow-output cases. MXFP8 retains
 16-row tiles through M128 and the legal BK64 row-tile exception. Explicit
 launch constraints bypass these search heuristics.
+
+Native lagged mHC races 4, 9, 13 and 25 partials per CTA when its fused
+producer is active. This compile-time parameter is inactive for other routes,
+so it does not multiply their candidate counts. `B12X_MHC_PARTIALS_PER_CTA`
+pins the grouping, while preparation without tuning retains the existing defaults.
 
 mHC prefill at M>=384 couples M warp groups, single N warps and 128–256
 buffered K elements. At M>=2048 it keeps N tiles covering all 24 projections
@@ -296,7 +336,17 @@ slice. An in-flight step finishes before the deadline is checked. Pending
 compilation, collective readiness and winner exchange return control
 immediately, so a driver can coordinate ranks before admitting dependent work.
 `configure_tuning_shard(rank, ranks)` assigns the process a disjoint share of
-every race; ranks exchange their local winners through `TuningRequirement`
+every race. Before its first distributed preparation, the session yields a
+`TuningCacheRequirement` in `progress.ready_cache`. The driver gathers one
+snapshot from each participant in rank order and passes that tuple back with
+`job.advance(cache=snapshots)`. b12x validates matching cache identities and
+completed records, then uses the first available record in rank order for
+each key. This session-local agreement handles missing and conflicting cache
+entries without copying executable artifacts or modifying another rank's
+disk cache. Each rank still compiles and primes its selected kernels locally.
+Queries missing from all snapshots are autotuned normally.
+
+Ranks exchange their local winners through `TuningRequirement`
 and install the global winner. Collective declarations are never raced; their
 priming is preceded by a `CollectiveRequirement` barrier that a distributed
 driver authorizes only when every participant is ready. `cancel_tuning()` is

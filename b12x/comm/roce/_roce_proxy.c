@@ -41,7 +41,7 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 256
-#define ROCE_ABI_VERSION 3
+#define ROCE_ABI_VERSION 4
 // Model graphs leave sub-millisecond gaps between collectives.  Keep the
 // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
 // every collective on the graph's critical path.
@@ -75,6 +75,7 @@ typedef struct {
     int rank;
     int n_hca;
     int gid_index;
+    int traffic_class;
     roce_hca_t hca[ROCE_MAX_HCAS];
     uint8_t *region;
     size_t region_bytes;
@@ -230,11 +231,12 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
 }
 
 roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n_hca,
-                        int gid_index, void *region, uint64_t region_bytes,
+                        int gid_index, int traffic_class, void *region, uint64_t region_bytes,
                         uint64_t slot_bytes, char *err, uint64_t err_len) {
     uint64_t layout[7];
     if (roce_layout(world, slot_bytes, layout) != 0 || layout[4] > region_bytes ||
-        rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS) {
+        rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS ||
+        traffic_class < 0 || traffic_class > 255) {
         snprintf(err, err_len, "invalid roce runtime geometry");
         return NULL;
     }
@@ -247,6 +249,7 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
     c->rank = rank;
     c->n_hca = n_hca;
     c->gid_index = gid_index;
+    c->traffic_class = traffic_class;
     c->region = region;
     c->region_bytes = region_bytes;
     c->slot_bytes = slot_bytes;
@@ -302,7 +305,7 @@ static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer) {
     memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[h], 16);
     rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index;
     rtr.ah_attr.grh.hop_limit = 64;
-    rtr.ah_attr.grh.traffic_class = 0;
+    rtr.ah_attr.grh.traffic_class = (uint8_t)c->traffic_class;
     rtr.ah_attr.grh.flow_label = 0;
     int rc = ibv_modify_qp(hca->qp[p], &rtr,
                            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |

@@ -54,6 +54,7 @@ class Caps:
     gate_activation: GateActivation = "silu"
     qk_l2norm: bool = True
     null_state_index: int | None = None
+    recover_speculative_state: bool = False
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -84,6 +85,12 @@ class Caps:
             )
         if self.value_heads % self.key_heads:
             raise ValueError("value_heads must be divisible by key_heads")
+        if self.recover_speculative_state and (
+            self.key_heads != self.value_heads
+            or self.state_dtype != torch.float32
+            or not self.qk_l2norm
+        ):
+            raise ValueError("KDA recovery requires equal heads, FP32 state and Q/K normalization")
         if self.model_dtype != torch.bfloat16:
             raise TypeError(
                 f"model_dtype must be torch.bfloat16, got {self.model_dtype}"
@@ -208,6 +215,8 @@ class KdaBinding:
     num_tokens: torch.Tensor
     output: torch.Tensor
     plan: Plan | None = None
+    correction_cache: torch.Tensor | None = None
+    kg_cache: torch.Tensor | None = None
 
 
 def _scratch_layout(caps: Caps, *, config: GdnConfig) -> _GdnLayout:
@@ -336,6 +345,19 @@ def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
     left_start, left_end = _byte_interval(left)
     right_start, right_end = _byte_interval(right)
     return left_start < right_end and right_start < left_end
+
+
+def _paged_overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Recognize disjoint state/record fields in one interleaved page pool."""
+    if not _overlaps(left, right):
+        return False
+    step = left.stride(0) * left.element_size()
+    if left.shape[0] != right.shape[0] or step != right.stride(0) * right.element_size():
+        return True
+    left_bytes = math.prod(left.shape[1:]) * left.element_size()
+    right_bytes = math.prod(right.shape[1:]) * right.element_size()
+    delta = (right.data_ptr() - left.data_ptr()) % step
+    return delta < left_bytes or step - delta < right_bytes
 
 
 def _bind(
@@ -571,6 +593,8 @@ def _bind_kda(
     num_seqs: torch.Tensor,
     num_tokens: torch.Tensor,
     output: torch.Tensor,
+    correction_cache: torch.Tensor | None = None,
+    kg_cache: torch.Tensor | None = None,
 ) -> KdaBinding:
     """Bind lower-bounded KDA tensors to a GDN decode plan.
 
@@ -627,10 +651,11 @@ def _bind_kda(
             f"state_indices column capacity {state_index_columns} exceeds "
             f"planned capacity {caps.state_index_columns}"
         )
-    if token_capacity > sequence_capacity * state_index_columns:
+    query_columns = caps.state_index_columns if caps.recover_speculative_state else state_index_columns
+    if token_capacity > sequence_capacity * query_columns:
         raise ValueError(
             "token capacity must fit the bound packed metadata geometry, got "
-            f"{token_capacity} > {sequence_capacity} * {state_index_columns}"
+            f"{token_capacity} > {sequence_capacity} * {query_columns}"
         )
     _require_row_contiguous(
         "mixed_qkv",
@@ -735,6 +760,25 @@ def _bind_kda(
         ("recurrent_state", recurrent_state),
         ("output", output),
     )
+    if caps.recover_speculative_state:
+        for name, tensor, dtype, dim in (
+            ("correction_cache", correction_cache, torch.float32, 128),
+            ("kg_cache", kg_cache, caps.model_dtype, 256),
+        ):
+            if tensor is None:
+                raise ValueError(f"KDA recovery requires {name}")
+            _require_tensor(
+                name, tensor,
+                shape=(caps.max_state_slots, caps.value_heads, caps.state_index_columns, dim),
+                device=caps.device, dtypes=(dtype,), contiguous=False,
+            )
+            if tensor.stride()[1:] != (caps.state_index_columns * dim, dim, 1):
+                raise ValueError(f"{name} requires contiguous per-slot records")
+            if tensor.stride(0) < caps.value_heads * caps.state_index_columns * dim:
+                raise ValueError(f"{name} slots must not overlap")
+            mutable += ((name, tensor),)
+    elif correction_cache is not None or kg_cache is not None:
+        raise ValueError("recovery records require recover_speculative_state=True")
     read_only = (
         ("mixed_qkv", mixed_qkv),
         ("raw_g", raw_g),
@@ -749,9 +793,11 @@ def _bind_kda(
         ("num_seqs", num_seqs),
         ("num_tokens", num_tokens),
     )
+    paged_names = {"recurrent_state", "correction_cache", "kg_cache"}
     for index, (left_name, left) in enumerate(mutable):
         for right_name, right in mutable[index + 1 :]:
-            if _overlaps(left, right):
+            overlap = _paged_overlaps if {left_name, right_name} <= paged_names else _overlaps
+            if overlap(left, right):
                 raise ValueError(
                     f"mutable buffers {left_name} and {right_name} must not overlap"
                 )
@@ -779,6 +825,8 @@ def _bind_kda(
         num_seqs=num_seqs,
         num_tokens=num_tokens,
         output=output,
+        correction_cache=correction_cache,
+        kg_cache=kg_cache,
     )
 
 
@@ -845,6 +893,7 @@ def run_kda(
     lower_bound: float = -5.0,
     eps: float = 1e-6,
     scale: float | None = None,
+    apply_output_norm: bool = True,
 ) -> torch.Tensor:
     """Run packed lower-bounded KDA decode into caller-owned buffers."""
     if not isinstance(binding, KdaBinding):
@@ -859,6 +908,12 @@ def run_kda(
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
     if binding.plan is None:
         raise TypeError("KDA run requires a session-prepared binding")
+    if binding._state.caps.recover_speculative_state:
+        state = require_prepared(binding.plan, "attention.gdn")
+        return state.run(binding, eps=eps_value, scale=scale, lower_bound=lower_bound_value,
+                         apply_output_norm=apply_output_norm)
+    if not apply_output_norm:
+        raise ValueError("raw output is supported only by KDA state recovery")
     caps = binding._state.caps
     scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale_value) or scale_value <= 0.0:

@@ -29,7 +29,7 @@ from .device import DetectedDevice, detect_device
 from .types import (
     CollectiveRequirement, FrozenMapping, MemoryRequirements, Plan,
     PreparationProgress, PreparationRequest, PreparationResult, PreparedCall,
-    Selection, TuningRequirement, _CompositePlan, _Prepared, _close_all,
+    Selection, TuningCacheRequirement, TuningRequirement, _CompositePlan, _Prepared, _close_all,
     _plan_scope, _prime, _set_lazy_preparer, call_scope,
 )
 
@@ -222,9 +222,11 @@ def _plans_of(request):
 class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
-        compile_workers=8, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
+        compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
         race_batch=32, race_budget=None,
     ):
+        if compile_workers is None:
+            compile_workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
         for name, value in (
             ("compile_workers", compile_workers), ("rounds", rounds), ("samples", samples),
             ("race_batch", race_batch),
@@ -254,7 +256,19 @@ class PreparationSession:
         self._guard = None
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
+        self._tuning_cache_synchronized = False
         self.state = "OPEN"
+
+    def configure_compile_workers(self, workers: int | None = None) -> None:
+        """Change compiler concurrency between preparation jobs."""
+        self._check_thread()
+        if self._job is not None or self._pool is not None:
+            raise RuntimeError("compiler concurrency can only change between jobs")
+        if workers is None:
+            workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
+        if type(workers) is not int or workers < 0:
+            raise ValueError("compile_workers must be an integer of at least 0")
+        self.compile_workers = workers
 
     def configure_tuning_shard(self, rank: int, ranks: tuple[int, ...]) -> None:
         """Assign this process a disjoint share of non-collective candidates."""
@@ -275,6 +289,7 @@ class PreparationSession:
             )
         self._tuning_rank = rank
         self._tuning_ranks = ranks
+        self._tuning_cache_synchronized = False
 
     def _check_thread(self):
         if threading.get_ident() != self._thread:
@@ -348,14 +363,20 @@ class PreparationSession:
         if coordinator is None and any(request.collective is not None for request in requests):
             raise ValueError("collective preparation requires a coordinator")
         job = self.begin(requests, autotune=autotune)
-        authorization = None
+        authorization = {}
         while True:
-            state = job.advance(collective_key=authorization)
+            state = job.advance(**authorization)
             if progress is not None:
                 progress(state)
             if state.done:
                 return job.result()
-            authorization = coordinator(state) if coordinator is not None else None
+            if state.ready_cache is not None or state.ready_tuning:
+                if coordinator is None:
+                    raise ValueError("sharded preparation requires a coordinator")
+                key = "cache" if state.ready_cache is not None else "tuning"
+                authorization = {key: coordinator(state)}
+            else:
+                authorization = {"collective_key": coordinator(state) if coordinator is not None else None}
             if state.pending_compilation and self._pool is not None:
                 self._pool.wait_for_progress()
 
@@ -583,6 +604,7 @@ class PreparationJob:
         ready_collectives,
         done,
         ready_tuning=(),
+        ready_cache=None,
     ):
         active_compilations = 0
         if self.session._pool is not None:
@@ -590,7 +612,7 @@ class PreparationJob:
             self._compilations = summary.cute_compilations + summary.triton_compilations
             active_compilations = self.session._pool.active_compilations
         phase = (
-            "ready" if done else "waiting for ranks" if ready_collectives or ready_tuning
+            "ready" if done else "waiting for ranks" if ready_collectives or ready_tuning or ready_cache
             else "compiling" if pending_compilation else self._phase
         )
         request = self._active_request
@@ -606,21 +628,22 @@ class PreparationJob:
             latest_round_us=self._latest_round_us, cache_hits=self._cache_hits,
             compilations=self._compilations, active_compilations=active_compilations,
             elapsed_seconds=time.monotonic() - self._started,
-            tuning_stopped=self._warmup_only,
+            tuning_stopped=self._warmup_only and self.session._stop.is_set(),
             ready_tuning=tuple(ready_tuning),
             candidate_sharded=self._candidate_sharded,
             batch_index=self._batch_index, batch_candidates=self._batch_candidates,
             tuning_rank=self.session._tuning_rank,
             total_candidates=self._total_candidates, global_candidate_count=self._global_candidate_count,
             selection_counts=tuple(sorted(self._selection_counts.items())),
+            ready_cache=ready_cache,
         )
 
-    def advance(self, *, collective_key=None, tuning=None):
+    def advance(self, *, collective_key=None, tuning=None, cache=None):
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
         try:
-            return self._advance(collective_key=collective_key, tuning=tuning)
+            return self._advance(collective_key=collective_key, tuning=tuning, cache=cache)
         finally:
             self._timing.add("advance", time.perf_counter() - started)
             self._timing.record(
@@ -632,7 +655,7 @@ class PreparationJob:
             )
             self._last_advance_end = time.perf_counter()
 
-    def _advance(self, *, collective_key=None, tuning=None):
+    def _advance(self, *, collective_key=None, tuning=None, cache=None):
         self.session._check_thread()
         if self._error is not None:
             raise self._error
@@ -645,7 +668,22 @@ class PreparationJob:
             pool.cancel_optional()
             pool.close(terminate=True)
         send_value = None
-        if isinstance(self._blocked, CollectiveRequirement):
+        if isinstance(self._blocked, TuningCacheRequirement):
+            if cache is None:
+                return self._progress(False, False, (), False, ready_cache=self._blocked)
+            snapshots = tuple(cache)
+            if not snapshots and self.session._stop.is_set():
+                pass
+            elif len(snapshots) != len(self._blocked.ranks) or any(
+                not isinstance(item, TuningCacheRequirement) or item.ranks != self._blocked.ranks
+                for item in snapshots
+            ):
+                raise ValueError("tuning cache agreement does not match participating ranks")
+            self._blocked = None
+            send_value = snapshots
+        elif cache is not None:
+            raise ValueError("tuning cache agreement does not match ready work")
+        elif isinstance(self._blocked, CollectiveRequirement):
             if collective_key != self._blocked.key:
                 return self._progress(False, False, (self._blocked,), False)
             self._blocked = None
@@ -691,6 +729,9 @@ class PreparationJob:
                 finally:
                     self._timing.add(self._phase, time.perf_counter() - started)
                 send_value = None
+                if isinstance(signal, TuningCacheRequirement):
+                    self._blocked = signal
+                    return self._progress(False, False, (), False, ready_cache=signal)
                 if isinstance(signal, CollectiveRequirement):
                     self._blocked = signal
                     return self._progress(False, False, (signal,), False)
@@ -1403,6 +1444,16 @@ class PreparationJob:
     def _run(self):
         if not self.requests:
             return PreparationResult(plans={})
+        if (self.session.state != "FROZEN" and not self._warmup_only
+                and len(self.session._tuning_ranks) > 1
+                and not self.session._tuning_cache_synchronized):
+            cache = self.session._selection_cache()
+            snapshots = yield TuningCacheRequirement(
+                self.session._tuning_ranks, cache.identity, cache.records,
+            )
+            if snapshots:
+                cache.reconcile(snapshots)
+                self.session._tuning_cache_synchronized = True
         if self.session.state == "FROZEN":
             requests, composites = self._expand()
             groups = _coalesce_requests(requests)

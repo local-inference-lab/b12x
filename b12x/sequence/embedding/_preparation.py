@@ -10,10 +10,10 @@ from ._tuning import EmbeddingQuery, TUNING
 
 
 def query_from_call(weight, ids, *, out, num_rows=None):
-    from .api import _check_tensors
+    from .api import _check_tensors, _weight_width
     _check_tensors(weight, ids, out, num_rows)
     return EmbeddingQuery(
-        max_rows=ids.numel(), table_rows=weight.shape[0], width=weight.shape[1],
+        max_rows=ids.numel(), table_rows=weight.shape[0], width=_weight_width(weight),
         row_stride=weight.stride(0), weight_dtype=str(weight.dtype).removeprefix("torch."),
         id_dtype=str(ids.dtype).removeprefix("torch."), device_count=num_rows is not None,
     )
@@ -36,15 +36,19 @@ class _EmbeddingState:
     types: tuple
 
     def run(self, weight, ids, *, out, num_rows=None):
-        from .api import _check_tensors
+        from .api import _check_tensors, _weight_width
         from ._kernel import launch
         _check_tensors(weight, ids, out, num_rows)
         q = self.query
-        if (weight.device != self.device or (weight.shape[0] > q.table_rows or weight.shape[1] != q.width)
+        if (weight.device != self.device or (weight.shape[0] > q.table_rows or _weight_width(weight) != q.width)
                 or weight.stride(0) != q.row_stride or ids.numel() > q.max_rows
                 or weight.dtype != getattr(torch, q.weight_dtype) or ids.dtype != getattr(torch, q.id_dtype)
                 or (num_rows is not None) != q.device_count):
-            raise ValueError("embedding tensors differ from the prepared shape, dtype, or layout")
+            raise ValueError(
+                f"embedding tensors differ from prepared query {q}: "
+                f"weight={tuple(weight.shape)}/{weight.stride()}/{weight.dtype}/{weight.device}, "
+                f"ids={tuple(ids.shape)}/{ids.dtype}, device_count={num_rows is not None}"
+            )
         launch(weight, ids, out, num_rows, prepared=(self.program, self.types))
         return out
 

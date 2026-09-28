@@ -41,6 +41,7 @@ META = OpMeta(
         "bind",
         "run",
         "plan_cache_writer",
+        "plan_pooled_selection",
         "concat_and_cache_glm_next_mla",
         "concat_and_cache_glm_next_mla_fp8",
         "concat_and_cache_glm_next_mla_nvfp4",
@@ -82,6 +83,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         is_supported,
         plan,
         plan_cache_writer,
+        plan_pooled_selection,
         run,
     )
 

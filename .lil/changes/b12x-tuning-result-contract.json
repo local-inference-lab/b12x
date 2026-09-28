@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-tuning-result-contract",
+  "category": "fix",
+  "summary": "Restore distributed autotuning startup with Karmic vLLM",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Expose the rejected-candidate count required by vLLM's rank-to-rank tuning exchange.",
+    "Existing tuning results report zero rejections; kernel arithmetic and winner selection are unchanged."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [414],
+  "requires": []
+}

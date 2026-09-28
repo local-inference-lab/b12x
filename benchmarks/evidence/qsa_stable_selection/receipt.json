@@ -1,0 +1,403 @@
+{
+  "status": "research-only",
+  "scope": "Measured integration revisions; not a GPU qualification of the standalone master PR head.",
+  "measurement_date_utc": "2026-09-17/18",
+  "component_formula": "100 * (1 - median(candidate_samples_us) / median(control_samples_us)); positive means lower candidate latency.",
+  "serving_formula": "100 * (mean(candidate_tokens_per_second) / mean(control_tokens_per_second) - 1); positive means higher candidate throughput.",
+  "source_state": "Component candidates use git archives of the recorded commits. Serving uses immutable images built from recorded commit archives, without source overlays. Uncommitted worktree contents are excluded.",
+  "measurement_worktrees": {
+    "control": "/home/jasonc/spark_vllm/worktrees/b12x-qwen38-moe-20260916",
+    "candidate": "/home/jasonc/spark_vllm/worktrees/b12x-qwen-qsa-selection-20260917",
+    "vllm": "/home/jasonc/spark_vllm/worktrees/qwen38-moe-padding-20260917",
+    "pr_port": "/home/jasonc/spark_vllm/worktrees/b12x-qsa-stable-selection-pr-20260918"
+  },
+  "control_b12x": "72baebbda2a200762f37223ef25aa64e8a5cb734",
+  "serving_candidate_b12x": "d2d5368d6c8a5cc43d79bfc8a4a5c58db584fc47",
+  "vllm": "76061de4bff2adc741cb25018ca79991263228be",
+  "pr_code_commit": "e0ed66d89a1ee3b0f8d9108cf7ed5591550915d6",
+  "component_cases": {
+    "tp4": {
+      "candidate_commit": "7adadf451945cad662fedc83d92b6954431b0e82",
+      "candidate_tree": "9db6999e6b941c253234bdeec3b992a4ea0ff41d",
+      "candidate_archive_sha256": "76a8d4d2ed0235b75c530fa55e3e8de45bb6a60dbcf39838c216815ee85d5646",
+      "control_commit": "72baebbda2a200762f37223ef25aa64e8a5cb734",
+      "command_argv": [
+        "docker",
+        "run",
+        "--name",
+        "qwen38-qsa-selection-fusion-transaction-r1",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--ipc",
+        "host",
+        "-v",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/fusion-transaction-r1:/evidence",
+        "-v",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/fusion-transaction-r1/source:/candidate:ro",
+        "-v",
+        "/home/jasonc/.cache/qwen38-qsa-selection-components:/root/.cache",
+        "-e",
+        "PYTHONPATH=/candidate",
+        "-e",
+        "CUTE_DSL_ARCH=sm_121a",
+        "-e",
+        "VLLM_PLUGINS=",
+        "-e",
+        "B12X_COMPILE_CACHE_DIR=/root/.cache/b12x/compile",
+        "-e",
+        "B12X_CUTE_COMPILE_CACHE_DIR=/root/.cache/b12x/cute",
+        "--entrypoint",
+        "/opt/spark-vllm/.venv/bin/python",
+        "sha256:a2fbec2f2e348631fad52413c61a1f72ed4df62c6d31c13b5cd6aa90a3540f7c",
+        "-u",
+        "/evidence/bench-fusion.py"
+      ],
+      "command_host": "ampere",
+      "gpu": "NVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656",
+      "operating_mode": "Single physical NVIDIA GB10 GPU in DGX Spark, P0 in every per-case before/after snapshot; other serving GPU processes stopped. No fixed-clock setting is recorded.",
+      "samples": "component_tp4.json",
+      "benchmark": "component_tp4.py",
+      "benchmark_sha256": "4ae92f8fd286f9c5dfbeba0738129dadb4986807959cac6702a1acbb02a68563",
+      "harness_path": "/candidate/benchmarks/benchmark_qsa.py",
+      "harness_revision": "7adadf451945cad662fedc83d92b6954431b0e82",
+      "harness_sha256": "a37b69325373342e892c32cb6c70aa6be9a7619aeeb5ce66291721658e64d806",
+      "timing_semantics": "Prepared full QSA transaction plus identical state restoration in both CUDA graphs; A/B/B/A order, fifteen samples per segment, thirty per arm. No output/state correctness failure is timed.",
+      "original_benchmark_sha256": "24798f7104bef6739b44d5cfbce744010ede52b9206f978ca5d8d29e4b8ae359",
+      "benchmark_ast_identical": true,
+      "benchmark_formatting": "Semicolon-separated statements expanded onto separate lines; AST identical to the executed script."
+    },
+    "tp2": {
+      "candidate_commit": "d2d5368d6c8a5cc43d79bfc8a4a5c58db584fc47",
+      "candidate_tree": "f1db9cabc8f362134bc90fdf63b9401e545c47ff",
+      "candidate_archive_sha256": "99ae430493b984e61310ac291d7bb733aa6562b178e06d02a48122bd0ef4b891",
+      "control_commit": "72baebbda2a200762f37223ef25aa64e8a5cb734",
+      "command_argv": [
+        "docker",
+        "run",
+        "--name",
+        "qwen38-qsa-selection-fusion-tp2-r1",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--ipc",
+        "host",
+        "-v",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/fusion-tp2-r1:/evidence",
+        "-v",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/fusion-tp2-r1/source:/candidate:ro",
+        "-v",
+        "/home/jasonc/.cache/qwen38-qsa-selection-components:/root/.cache",
+        "-e",
+        "PYTHONPATH=/candidate",
+        "-e",
+        "CUTE_DSL_ARCH=sm_121a",
+        "-e",
+        "VLLM_PLUGINS=",
+        "-e",
+        "B12X_COMPILE_CACHE_DIR=/root/.cache/b12x/compile",
+        "-e",
+        "B12X_CUTE_COMPILE_CACHE_DIR=/root/.cache/b12x/cute",
+        "--entrypoint",
+        "/opt/spark-vllm/.venv/bin/python",
+        "sha256:a2fbec2f2e348631fad52413c61a1f72ed4df62c6d31c13b5cd6aa90a3540f7c",
+        "-u",
+        "/evidence/bench-fusion-tp2.py"
+      ],
+      "command_host": "ampere",
+      "gpu": "NVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656",
+      "operating_mode": "Single physical NVIDIA GB10 GPU in DGX Spark, P0 in every per-case before/after snapshot; other serving GPU processes stopped. No fixed-clock setting is recorded.",
+      "samples": "component_tp2.json",
+      "benchmark": "component_tp2.py",
+      "benchmark_sha256": "7ab07611c864ed737f0c366e5bc651cb642e2e94a7f611cf2db721210826b6b3",
+      "harness_path": "/candidate/benchmarks/benchmark_qsa.py",
+      "harness_revision": "d2d5368d6c8a5cc43d79bfc8a4a5c58db584fc47",
+      "harness_sha256": "a37b69325373342e892c32cb6c70aa6be9a7619aeeb5ce66291721658e64d806",
+      "timing_semantics": "Prepared full QSA transaction plus identical state restoration in both CUDA graphs; A/B/B/A order, fifteen samples per segment, thirty per arm. No output/state correctness failure is timed.",
+      "original_benchmark_sha256": "dd24ebaeb885972311b6017156f971ca50e336c383155ea16041f9cc3d1b91dc",
+      "benchmark_ast_identical": true,
+      "benchmark_formatting": "Semicolon-separated statements expanded onto separate lines; AST identical to the executed script."
+    }
+  },
+  "serving_arms": {
+    "tp4_control": {
+      "scope": "Full-model serving; all measured batches are retained. Warmup batches are excluded.",
+      "complete": true,
+      "included_in_comparison": true,
+      "command_argv": [
+        "/home/jasonc/spark_vllm/llm-inference-bench/.venv-stinger/bin/python",
+        "-u",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-checkpoint-spacing-20260917/measure.py",
+        "--depth",
+        "3",
+        "--profile",
+        "/home/jasonc/spark_vllm/deployments/qwen38-fp8-kv42-mtp3-20260917/profile.json",
+        "--label",
+        "baseline-return-performance",
+        "--skip-shared"
+      ],
+      "command_origin": "Reconstructed exactly from the committed-in-evidence driver.py run invocation; no separate command artifact was recorded.",
+      "command_cwd": "/home/jasonc/spark_vllm",
+      "benchmark_source_sha256": "55c34775fa675e57b66e19fe644e4d35b077462eca8d9135c29719e9856bb2fa",
+      "source": {
+        "vllm": {
+          "commit": "76061de4bff2adc741cb25018ca79991263228be",
+          "tree": "1f6d00d6db3f9a0df733a731c6197a3c3774f568",
+          "archive_sha256": "a37c84074dbf68b490f1b22b96ff181f5cbc7d90a8547340322233d8e7ebae34",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/qwen38-moe-padding-20260917"
+        },
+        "b12x": {
+          "commit": "72baebbda2a200762f37223ef25aa64e8a5cb734",
+          "tree": "1afd2fe0ed0f1405dd513d52350fe68b9c150ad3",
+          "archive_sha256": "7cc4fb6b507eb99068092e59f331f78998a66a03ffcf8806d0f8e4b083bb61c7",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/b12x-qwen38-moe-20260916"
+        }
+      },
+      "image_id": "sha256:a2fbec2f2e348631fad52413c61a1f72ed4df62c6d31c13b5cd6aa90a3540f7c",
+      "gpu_snapshots": {
+        "before": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2405 MHz, [N/A], 14.89 W, 67, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2411 MHz, [N/A], 17.78 W, 64, 0x0000000000000000\n",
+          "faraday": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-35fddba6-2b9c-a9dd-27cb-141630ca8f37, P0, 2405 MHz, [N/A], 16.60 W, 67, 0x0000000000000000\n",
+          "hertz": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-99fe1d41-bd13-d96a-be78-faa7c33af618, P0, 2398 MHz, [N/A], 14.91 W, 66, 0x0000000000000000\n"
+        },
+        "after": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2405 MHz, [N/A], 14.89 W, 67, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2411 MHz, [N/A], 17.78 W, 64, 0x0000000000000000\n",
+          "faraday": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-35fddba6-2b9c-a9dd-27cb-141630ca8f37, P0, 2405 MHz, [N/A], 16.60 W, 67, 0x0000000000000000\n",
+          "hertz": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-99fe1d41-bd13-d96a-be78-faa7c33af618, P0, 2398 MHz, [N/A], 14.91 W, 66, 0x0000000000000000\n"
+        }
+      },
+      "gpu_snapshot_scope": "The retained control provides an after-run snapshot only, reused in both slots; candidate snapshots bracket each arm. These are not continuous power-mode measurements.",
+      "runtime": {
+        "tensor_parallel_size": 4,
+        "max_model_len": 262144,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 8192,
+        "kv_cache_bytes_per_rank": 45097156608,
+        "mtp_tokens": 3,
+        "kv_cache_dtype": "fp8_e4m3",
+        "hc_prefill_mode": "shard",
+        "recurrent_checkpoint_policy": "aligned",
+        "prefix_cache_retention_interval": "0"
+      },
+      "profile": "tp4_control_profile.json",
+      "samples": "tp4_control.jsonl",
+      "performance_cells": 21
+    },
+    "tp4_candidate": {
+      "scope": "Full-model serving; all measured batches are retained. Warmup batches are excluded.",
+      "complete": true,
+      "included_in_comparison": true,
+      "command_argv": [
+        "/home/jasonc/spark_vllm/llm-inference-bench/.venv-stinger/bin/python",
+        "-u",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/measure.py",
+        "--depth",
+        "3",
+        "--profile",
+        "deployments/qwen38-qsa-selection-20260917/profile.json",
+        "--label",
+        "candidate-tp4-restart-performance",
+        "--skip-shared"
+      ],
+      "command_origin": "Recorded command artifact",
+      "command_cwd": "/home/jasonc/spark_vllm",
+      "benchmark_source_sha256": "55c34775fa675e57b66e19fe644e4d35b077462eca8d9135c29719e9856bb2fa",
+      "source": {
+        "vllm": {
+          "commit": "76061de4bff2adc741cb25018ca79991263228be",
+          "tree": "1f6d00d6db3f9a0df733a731c6197a3c3774f568",
+          "archive_sha256": "a37c84074dbf68b490f1b22b96ff181f5cbc7d90a8547340322233d8e7ebae34",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/qwen38-moe-padding-20260917"
+        },
+        "b12x": {
+          "commit": "d2d5368d6c8a5cc43d79bfc8a4a5c58db584fc47",
+          "tree": "f1db9cabc8f362134bc90fdf63b9401e545c47ff",
+          "archive_sha256": "99ae430493b984e61310ac291d7bb733aa6562b178e06d02a48122bd0ef4b891",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/b12x-qwen-qsa-selection-20260917"
+        }
+      },
+      "image_id": "sha256:953b00ee516cac5f295bfb26863d3cfdcb5f950a6461bed76e11a84281468346",
+      "gpu_snapshots": {
+        "before": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2411 MHz, [N/A], 12.59 W, 56, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2405 MHz, [N/A], 15.48 W, 56, 0x0000000000000000\n",
+          "faraday": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-35fddba6-2b9c-a9dd-27cb-141630ca8f37, P0, 2411 MHz, [N/A], 13.33 W, 52, 0x0000000000000000\n",
+          "hertz": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-99fe1d41-bd13-d96a-be78-faa7c33af618, P0, 2405 MHz, [N/A], 11.78 W, 51, 0x0000000000000000\n"
+        },
+        "after": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2405 MHz, [N/A], 16.56 W, 71, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2411 MHz, [N/A], 18.35 W, 66, 0x0000000000000000\n",
+          "faraday": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-35fddba6-2b9c-a9dd-27cb-141630ca8f37, P0, 2411 MHz, [N/A], 18.66 W, 72, 0x0000000000000000\n",
+          "hertz": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-99fe1d41-bd13-d96a-be78-faa7c33af618, P0, 2398 MHz, [N/A], 15.29 W, 68, 0x0000000000000000\n"
+        }
+      },
+      "gpu_snapshot_scope": "Snapshots bracket the arm where available; these are not continuous power-mode measurements.",
+      "runtime": {
+        "tensor_parallel_size": 4,
+        "max_model_len": 262144,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 8192,
+        "kv_cache_bytes_per_rank": 45097156608,
+        "mtp_tokens": 3,
+        "kv_cache_dtype": "fp8_e4m3",
+        "hc_prefill_mode": "shard",
+        "recurrent_checkpoint_policy": "aligned",
+        "prefix_cache_retention_interval": "0"
+      },
+      "profile": "tp4_candidate_profile.json",
+      "samples": "tp4_candidate.jsonl",
+      "performance_cells": 21
+    },
+    "tp2_candidate": {
+      "scope": "Full-model serving; all measured batches are retained. Warmup batches are excluded.",
+      "complete": true,
+      "included_in_comparison": true,
+      "command_argv": [
+        "/home/jasonc/spark_vllm/llm-inference-bench/.venv-stinger/bin/python",
+        "-u",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/measure.py",
+        "--depth",
+        "3",
+        "--profile",
+        "deployments/qwen38-qsa-selection-tp2-20260917/profile.json",
+        "--label",
+        "candidate-tp2-performance",
+        "--skip-shared"
+      ],
+      "command_origin": "Recorded command artifact",
+      "command_cwd": "/home/jasonc/spark_vllm",
+      "benchmark_source_sha256": "55c34775fa675e57b66e19fe644e4d35b077462eca8d9135c29719e9856bb2fa",
+      "source": {
+        "vllm": {
+          "commit": "76061de4bff2adc741cb25018ca79991263228be",
+          "tree": "1f6d00d6db3f9a0df733a731c6197a3c3774f568",
+          "archive_sha256": "a37c84074dbf68b490f1b22b96ff181f5cbc7d90a8547340322233d8e7ebae34",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/qwen38-moe-padding-20260917"
+        },
+        "b12x": {
+          "commit": "d2d5368d6c8a5cc43d79bfc8a4a5c58db584fc47",
+          "tree": "f1db9cabc8f362134bc90fdf63b9401e545c47ff",
+          "archive_sha256": "99ae430493b984e61310ac291d7bb733aa6562b178e06d02a48122bd0ef4b891",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/b12x-qwen-qsa-selection-20260917"
+        }
+      },
+      "image_id": "sha256:953b00ee516cac5f295bfb26863d3cfdcb5f950a6461bed76e11a84281468346",
+      "gpu_snapshots": {
+        "before": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2411 MHz, [N/A], 12.89 W, 58, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2405 MHz, [N/A], 15.48 W, 56, 0x0000000000000000\n"
+        },
+        "after": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2405 MHz, [N/A], 15.43 W, 69, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2411 MHz, [N/A], 20.43 W, 71, 0x0000000000000000\n"
+        }
+      },
+      "gpu_snapshot_scope": "Snapshots bracket the arm where available; these are not continuous power-mode measurements.",
+      "runtime": {
+        "tensor_parallel_size": 2,
+        "max_model_len": 262144,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 8192,
+        "kv_cache_bytes_per_rank": 17179869184,
+        "mtp_tokens": 3,
+        "kv_cache_dtype": "fp8_e4m3",
+        "hc_prefill_mode": "off",
+        "recurrent_checkpoint_policy": "aligned",
+        "prefix_cache_retention_interval": "0"
+      },
+      "profile": "tp2_candidate_profile.json",
+      "samples": "tp2_candidate.jsonl",
+      "performance_cells": 21
+    },
+    "tp4_initial_partial": {
+      "scope": "Full-model serving; all measured batches are retained. Warmup batches are excluded.",
+      "complete": false,
+      "included_in_comparison": false,
+      "command_argv": [
+        "/home/jasonc/spark_vllm/llm-inference-bench/.venv-stinger/bin/python",
+        "-u",
+        "/home/jasonc/spark_vllm/benchmark-results/qwen38-qsa-selection-20260917/measure.py",
+        "--depth",
+        "3",
+        "--profile",
+        "deployments/qwen38-qsa-selection-20260917/profile.json",
+        "--label",
+        "candidate-tp4-performance",
+        "--skip-shared"
+      ],
+      "command_origin": "Recorded command artifact",
+      "command_cwd": "/home/jasonc/spark_vllm",
+      "benchmark_source_sha256": "55c34775fa675e57b66e19fe644e4d35b077462eca8d9135c29719e9856bb2fa",
+      "source": {
+        "vllm": {
+          "commit": "76061de4bff2adc741cb25018ca79991263228be",
+          "tree": "1f6d00d6db3f9a0df733a731c6197a3c3774f568",
+          "archive_sha256": "a37c84074dbf68b490f1b22b96ff181f5cbc7d90a8547340322233d8e7ebae34",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/qwen38-moe-padding-20260917"
+        },
+        "b12x": {
+          "commit": "d2d5368d6c8a5cc43d79bfc8a4a5c58db584fc47",
+          "tree": "f1db9cabc8f362134bc90fdf63b9401e545c47ff",
+          "archive_sha256": "99ae430493b984e61310ac291d7bb733aa6562b178e06d02a48122bd0ef4b891",
+          "worktree": "/home/jasonc/spark_vllm/worktrees/b12x-qwen-qsa-selection-20260917"
+        }
+      },
+      "image_id": "sha256:953b00ee516cac5f295bfb26863d3cfdcb5f950a6461bed76e11a84281468346",
+      "gpu_snapshots": {
+        "before": {
+          "maxwell": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-128ca980-53cf-6524-40c5-a861a7941888, P0, 2405 MHz, [N/A], 12.79 W, 50, 0x0000000000000000\n",
+          "ampere": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-9ac97432-8546-9fc0-337d-3c0428d21656, P0, 2405 MHz, [N/A], 14.02 W, 49, 0x0000000000000000\n",
+          "faraday": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-35fddba6-2b9c-a9dd-27cb-141630ca8f37, P0, 2411 MHz, [N/A], 13.84 W, 50, 0x0000000000000000\n",
+          "hertz": "name, uuid, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.draw [W], temperature.gpu, clocks_event_reasons.active\nNVIDIA GB10, GPU-99fe1d41-bd13-d96a-be78-faa7c33af618, P0, 2405 MHz, [N/A], 11.55 W, 48, 0x0000000000000000\n"
+        }
+      },
+      "gpu_snapshot_scope": "Snapshots bracket the arm where available; these are not continuous power-mode measurements.",
+      "runtime": {
+        "tensor_parallel_size": 4,
+        "max_model_len": 262144,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 8192,
+        "kv_cache_bytes_per_rank": 45097156608,
+        "mtp_tokens": 3,
+        "kv_cache_dtype": "fp8_e4m3",
+        "hc_prefill_mode": "shard",
+        "recurrent_checkpoint_policy": "aligned",
+        "prefix_cache_retention_interval": "0"
+      },
+      "profile": "tp4_initial_partial_profile.json",
+      "samples": "tp4_initial_partial.jsonl",
+      "performance_cells": 13
+    }
+  },
+  "correctness": {
+    "component": "Every recorded case verifies finite nonzero output, exact selected positions and persistent state, and allocation-free graph replay before timing.",
+    "image_test_log": "image-qsa-tests.log",
+    "additional_scalar_transaction_cases_passed": 6,
+    "serving_candidate_tp2_shared_long": {
+      "passed": 26,
+      "total": 26
+    },
+    "serving_candidate_tp4_shared_long": {
+      "passed": 26,
+      "total": 26
+    },
+    "coverage_limit": "Bounded exact-answer checks do not establish general model quality. The initial TP4 arm did not complete the long-context checks."
+  },
+  "serving_reproducer": {
+    "path": "measure.py",
+    "measurement_functions_ast_identical": true,
+    "adaptations": "Workspace, output directory, and endpoint accept environment variables; the two prompt helpers are extracted verbatim; the separate post-performance shared-prefix subprocess is omitted. HTTP requests, token checks, timings, cache salts, warmups, and measured workload order are unchanged.",
+    "original_sha256": "55c34775fa675e57b66e19fe644e4d35b077462eca8d9135c29719e9856bb2fa"
+  },
+  "prompt_helper_source": {
+    "repository": "https://github.com/local-inference-lab/llm-inference-bench",
+    "worktree": "/home/jasonc/spark_vllm/llm-inference-bench",
+    "file_sha256": "053989edff8c9c93e2b96e61342b2ffbd9851e03deba17e6d3fc96fcd6694c1e",
+    "state": "Modified worktree; the two used functions and three constants are preserved verbatim in prompt_helpers.py."
+  },
+  "original_evidence_manifest_sha256": "c0ec47c3aa821b14b5f3e6f85fbb54d3789fc4f166028fd365772685b2653afb"
+}

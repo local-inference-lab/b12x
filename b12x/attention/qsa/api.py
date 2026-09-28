@@ -9,6 +9,9 @@ from ._contract import (
     DraftSelectionPlan,
     DraftSelectionReuse,
     DraftSelectionState,
+    LocalSelection,
+    attend,
+    attend_reuse,
     bind,
     cache_requirements,
     draft_selection_plan,
@@ -17,6 +20,7 @@ from ._contract import (
     is_supported,
     plan,
     run,
+    select,
 )
 from ._tuning import QsaConfig, QsaQuery
 from b12x.preparation import Plan
@@ -27,6 +31,7 @@ __all__ = [
     "DraftSelectionPlan",
     "DraftSelectionReuse",
     "DraftSelectionState",
+    "LocalSelection",
     "Plan",
     "Binding",
     "QsaConfig",
@@ -38,5 +43,8 @@ __all__ = [
     "plan",
     "bind",
     "run",
+    "select",
+    "attend",
+    "attend_reuse",
     "is_supported",
 ]

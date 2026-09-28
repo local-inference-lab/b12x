@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-402",
+  "category": "feature",
+  "summary": "Add context-parallel QSA selection and sparse attention",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "B12X adds rank-local cache geometry, global candidate merging, 64-bit cache offsets, and LSE-returning sparse attention for distributed softmax combination."
+  ],
+  "pull_requests": [
+    402
+  ],
+  "requires": [
+    "b12x-401"
+  ]
+}

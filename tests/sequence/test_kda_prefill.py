@@ -460,6 +460,45 @@ def _mirror_trace(inputs: dict):
     return trace
 
 
+def test_prologue_initializes_more_windows_than_threads() -> None:
+    """Small tuning windows must initialize the entire table, including its tail."""
+    from types import SimpleNamespace
+
+    from ..conftest import require_b12x
+    from b12x.sequence._shared.delta_prefill._cute_kernels import _compile_prologue
+
+    device = require_b12x()
+    tiles, windows, seqs = 515, 515, 4
+    caps = SimpleNamespace(max_seqs=seqs, tiles_capacity=tiles, heads=1)
+    layout = SimpleNamespace(caps=caps, window_tiles=1, max_windows=windows, workspace_windows=2)
+
+    def integers(size):
+        return torch.full((size,), -123456, dtype=torch.int32, device=device)
+
+    binding = SimpleNamespace(
+        _state=layout, output=torch.empty(0, device=device), seq_capacity=seqs,
+        cu_seqlens=integers(seqs + 1), num_seqs=integers(1),
+        band_base=integers(tiles + 2), sorted_seq=integers(seqs),
+        rank_of=integers(seqs), pos_seq=integers(tiles), pos_local=integers(tiles),
+        window_table=integers(2 * windows), ready_flags=integers(2),
+    )
+    _, launch = _compile_prologue(binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(binding)
+    for tokens in (8192, 17, 0):
+        binding.cu_seqlens.zero_()
+        binding.cu_seqlens[1:].fill_(tokens)
+        binding.num_seqs.fill_(1)
+        binding.window_table.fill_(-123456)
+        graph.replay()
+        table = binding.window_table.reshape(windows, 2).cpu()
+        count = (tokens + 15) // 16
+        for window, (band, rank) in enumerate(table.tolist()):
+            assert band == (window if window < count else tiles - 1)
+            assert rank == max(0, window - count)
+
+
 @pytest.mark.parametrize(
     "lengths",
     [[1], [16], [17], [15, 100, 0, 300, 33], [64, 64]],

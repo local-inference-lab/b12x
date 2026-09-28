@@ -1,11 +1,11 @@
-"""Bounded-degree hierarchical TP12/TP16 all-reduce runtime.
+"""Bounded-degree hierarchical TP9/TP10/TP12/TP16 all-reduce runtime.
 
 This runtime is specialized for single-node topologies with three or four
-contiguous four-GPU PCIe islands. Unlike the ordinary oneshot collective, it
-does not map every rank into every CUDA context: non-leaders map one peer and
-island leaders map five peers at TP12 or six at TP16. The collective is
-CUDA-graph capturable and stages arbitrary BF16 inputs into fixed IPC storage
-before reducing them.
+contiguous PCIe islands of up to four GPUs. Unlike the ordinary oneshot
+collective, it does not map every rank into every CUDA context: non-leaders
+map one peer and leaders map at most five peers through TP12 or six at TP16.
+The collective is CUDA-graph capturable and stages arbitrary BF16 inputs
+into fixed IPC storage before reducing them.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from .pcie_oneshot import _broadcast_gather_object, _normalize_device
 
 
 ISLAND_SIZE = 4
-SUPPORTED_WORLD_SIZES = (12, 16)
+SUPPORTED_WORLD_SIZES = (9, 10, 12, 16)
 SUPPORTED_BLOCKS = (1, 2, 4, 8, 16, 32)
 _ALIGNMENT = 256
 _HEADER_BYTES = 69_888
@@ -135,7 +135,7 @@ def _selected_peers(rank: int, world_size: int) -> tuple[int, ...]:
     leader = island * ISLAND_SIZE
     if local_rank != 0:
         return (leader,)
-    local_peers = tuple(range(leader, leader + ISLAND_SIZE))
+    local_peers = tuple(range(leader, min(leader + ISLAND_SIZE, world_size)))
     peer_leaders = tuple(range(0, world_size, ISLAND_SIZE))
     return tuple(sorted(set(local_peers + peer_leaders) - {rank}))
 
@@ -171,7 +171,7 @@ def _buffer_modes_from_env() -> tuple[bool, bool]:
 
 
 class PCIeHierarchicalAllReduce:
-    """Single-channel BF16 TP12/TP16 all-reduce with bounded peer degree."""
+    """Single-channel BF16 all-reduce with at most six mapped peers per rank."""
 
     def __init__(
         self,
@@ -336,7 +336,7 @@ class PCIeHierarchicalAllReduce:
         """Accept semantic owner names without allocating additional channels.
 
         The hierarchical runtime has one ordered channel. Owner names provide
-        API compatibility for callers that serialize TP12/TP16 collectives;
+        API compatibility for callers that serialize hierarchical collectives;
         they do not permit overlapping collective streams.
         """
 

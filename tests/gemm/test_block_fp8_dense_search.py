@@ -43,6 +43,22 @@ def test_block_scaled_linear_searches_the_complete_dense_domain(m, block, exhaus
         assert {config.tile_n for config in configs} == {16, 32, 64, 128}
 
 
+@pytest.mark.parametrize("n", (6400, 25600))
+@pytest.mark.parametrize("m", (1, 6, 8))
+def test_fp32_reduction_has_a_legal_default_and_search(monkeypatch, m, n):
+    """Disabling atomic BF16 must not leave an unsupported four-slice default."""
+    import b12x._lib.dense_gemm as dense
+
+    monkeypatch.setattr(dense, "_B12X_DENSE_SPLITK_TURBO", False)
+    declaration = replace(query(m), in_features=6144, out_features=n)
+    device = replace(DEVICE, compute_capability=(12, 1), sm_count=48,
+                     product_name="NVIDIA GB10")
+    configuration = TUNING.configure(declaration, device=device)
+    assert configuration.default.split_k_slices in (1, 2)
+    candidates = TUNING.eligible_plan(declaration, device).candidates
+    assert {config.split_k_slices for _, config in candidates} == {1, 2}
+
+
 @pytest.mark.parametrize("config", (
     replace(BASE, split_k_slices=2),
     replace(BASE, split_k_slices=4),

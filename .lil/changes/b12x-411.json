@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-411",
+  "category": "feature",
+  "summary": "Support prepared PCIe attention exchange and partial-island all-reduce for uneven TP/DCP groups",
+  "models": ["Kimi-K3"],
+  "compatibility": "Adds hierarchical all-reduce for 9/10 ranks and DCP attention exchange for 9/10/12 ranks. Partial-island default dispatch is capped at 32 KiB. Final-source GPU qualification is pending.",
+  "details": [
+    "Bounds peer accesses and synchronization to ranks present in each island.",
+    "Retains compiled owner launchers through preparation and preserves paired-gather thread defaults.",
+    "Kimi paired projection and top-k exchange retain their existing supported group sizes."
+  ],
+  "pull_requests": [411],
+  "requires": []
+}

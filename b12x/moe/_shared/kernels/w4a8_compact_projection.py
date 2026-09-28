@@ -65,6 +65,7 @@ class W4A8CompactMicroProjectionKernel:
         alpha: cute.Tensor,
         input_scale: cute.Tensor,
         num_pairs: Int32,
+        max_active_clusters: Int32,
         stream: cuda.CUstream,
     ):
         a_words = cute.recast_tensor(a8, cutlass.Uint32)
@@ -72,6 +73,9 @@ class W4A8CompactMicroProjectionKernel:
             projections.iterator,
             cute.make_layout((projections.shape[0] * projections.shape[1],)),
         )
+        grid = num_pairs * Int32(2 * self.n_tiles)
+        if max_active_clusters > Int32(0):
+            grid = cutlass.min(grid, max_active_clusters * Int32(2))
         self.kernel(
             a_words,
             scale_rows,
@@ -83,7 +87,7 @@ class W4A8CompactMicroProjectionKernel:
             input_scale,
             num_pairs,
         ).launch(
-            grid=(num_pairs * Int32(2 * self.n_tiles), 1, 1),
+            grid=(grid, 1, 1),
             block=[self.threads_per_cta, 1, 1],
             min_blocks_per_mp=2,
             stream=stream,
@@ -446,11 +450,10 @@ class W4A8CompactMicroProjectionKernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        gdimx, _, _ = cute.arch.grid_dim()
         tid = Int32(tidx)
         task = Int32(bidx)
         projection_tiles = Int32(2 * self.n_tiles)
-        pair = task // projection_tiles
-        projection_tile = task % projection_tiles
         smem = cutlass.utils.SmemAllocator()
 
         @cute.struct
@@ -460,7 +463,9 @@ class W4A8CompactMicroProjectionKernel:
             ]
 
         storage = smem.allocate(Storage)
-        if pair < num_pairs:
+        while task < num_pairs * projection_tiles:
+            pair = task // projection_tiles
+            projection_tile = task % projection_tiles
             expert = topk_ids[Int64(pair)].to(Int32)
             if expert >= Int32(0) and expert < Int32(alpha.shape[0]):
                 self._run_task(
@@ -478,6 +483,7 @@ class W4A8CompactMicroProjectionKernel:
                     expert,
                     projection_tile,
                 )
+            task += Int32(gdimx)
 
 
 __all__ = ["W4A8CompactMicroProjectionKernel"]

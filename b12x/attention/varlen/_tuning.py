@@ -60,7 +60,9 @@ def _default_config(
 ) -> VarlenAttentionConfig:
     if query.q_head_dim <= 64:
         return VarlenAttentionConfig(tile_m=128, tile_n=128)
-    if query.q_head_dim <= 128:
+    if query.q_head_dim <= 128 or (
+        query.q_head_dim == 192 and query.v_head_dim <= 128
+    ):
         return VarlenAttentionConfig(tile_m=128, tile_n=64)
     if query.q_head_dim == 256:
         return VarlenAttentionConfig(

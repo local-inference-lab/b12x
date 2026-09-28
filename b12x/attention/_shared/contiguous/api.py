@@ -384,7 +384,11 @@ def _validate_varlen_inputs_against_plan(
         device,
         dtype,
     )
-    if expected != actual:
+    shapes_fit = all(
+        0 < shape[0] <= capacity[0] and shape[1:] == capacity[1:]
+        for shape, capacity in zip(actual[:5], expected[:5])
+    )
+    if not shapes_fit or actual[5:] != expected[5:]:
         raise ValueError(
             "varlen attention plan mismatch: "
             "expected q/k/v/cu_q/cu_k/device/dtype="
@@ -458,7 +462,11 @@ class AttentionPlan:
 
 @dataclass(frozen=True, kw_only=True)
 class VarlenAttentionPlan:
-    """Exact-shape launch contract for one packed varlen contiguous attention shape."""
+    """Capacity-bounded launch contract for packed varlen attention.
+
+    Leading row and segment dimensions are maxima. Live tensors supply their
+    actual dimensions to the retained program; head geometry remains fixed.
+    """
 
     key: VarlenAttentionPlanKey
     compiled: object = field(repr=False, compare=False)
@@ -979,16 +987,22 @@ class _VarlenAttentionForwardLaunch:
         cu_seqlens_k_ptr: cute.Pointer,
         attention_sink_bias_ptr: cute.Pointer,
         softmax_scale: float,
+        q_rows: Int32,
+        kv_rows: Int32,
+        segment_count: Int32,
         current_stream: cuda.CUstream,
     ):
         q_tensor = cute.make_tensor(
-            q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride)
+            q_ptr, layout=cute.make_layout(
+                (q_rows, *self._q_shape[1:]), stride=self._q_stride)
         )
         k_tensor = cute.make_tensor(
-            k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride)
+            k_ptr, layout=cute.make_layout(
+                (kv_rows, *self._k_shape[1:]), stride=self._k_stride)
         )
         v_tensor = cute.make_tensor(
-            v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride)
+            v_ptr, layout=cute.make_layout(
+                (kv_rows, *self._v_shape[1:]), stride=self._v_stride)
         )
         o_tensor = cute.make_tensor(
             o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride)
@@ -1000,14 +1014,14 @@ class _VarlenAttentionForwardLaunch:
         cu_seqlens_q_tensor = cute.make_tensor(
             cu_seqlens_q_ptr,
             layout=cute.make_layout(
-                self._cu_seqlens_q_shape,
+                (segment_count + 1,),
                 stride=self._cu_seqlens_q_stride,
             ),
         )
         cu_seqlens_k_tensor = cute.make_tensor(
             cu_seqlens_k_ptr,
             layout=cute.make_layout(
-                self._cu_seqlens_k_shape,
+                (segment_count + 1,),
                 stride=self._cu_seqlens_k_stride,
             ),
         )
@@ -1144,10 +1158,13 @@ def _compile_varlen_attention(
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
+        Int32(q_shape[0]),
+        Int32(k_shape[0]),
+        Int32(cu_seqlens_q_shape[0] - 1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "attention.contiguous.varlen_forward",
-            1,
+            2,
             (
                 q_shape,
                 k_shape,
@@ -1840,11 +1857,11 @@ def build_varlen_attention_binding(
             "attention_sink_bias mismatch: "
             f"plan expects {plan.has_attention_sink_bias}, got {has_attention_sink_bias}"
         )
-    if max_seqlen_q is not None and int(max_seqlen_q) != plan.max_seqlen_q:
+    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= plan.max_seqlen_q:
         raise ValueError(
             f"max_seqlen_q mismatch: plan has {plan.max_seqlen_q}, got {max_seqlen_q}"
         )
-    if max_seqlen_k is not None and int(max_seqlen_k) != plan.max_seqlen_k:
+    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= plan.max_seqlen_k:
         raise ValueError(
             f"max_seqlen_k mismatch: plan has {plan.max_seqlen_k}, got {max_seqlen_k}"
         )
@@ -1932,11 +1949,11 @@ def _build_varlen_attention_binding_from_views(
             "attention_sink_bias mismatch: "
             f"plan expects {plan.has_attention_sink_bias}, got {has_attention_sink_bias}"
         )
-    if max_seqlen_q is not None and int(max_seqlen_q) != plan.max_seqlen_q:
+    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= plan.max_seqlen_q:
         raise ValueError(
             f"max_seqlen_q mismatch: plan has {plan.max_seqlen_q}, got {max_seqlen_q}"
         )
-    if max_seqlen_k is not None and int(max_seqlen_k) != plan.max_seqlen_k:
+    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= plan.max_seqlen_k:
         raise ValueError(
             f"max_seqlen_k mismatch: plan has {plan.max_seqlen_k}, got {max_seqlen_k}"
         )
@@ -2223,9 +2240,9 @@ def b12x_varlen_attention_forward(
             raise ValueError("attention_sink_bias is required by this plan")
     elif attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
-    if max_seqlen_q is not None and int(max_seqlen_q) != resolved_plan.max_seqlen_q:
+    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= resolved_plan.max_seqlen_q:
         raise ValueError(f"max_seqlen_q mismatch: plan has {resolved_plan.max_seqlen_q}, got {max_seqlen_q}")
-    if max_seqlen_k is not None and int(max_seqlen_k) != resolved_plan.max_seqlen_k:
+    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= resolved_plan.max_seqlen_k:
         raise ValueError(f"max_seqlen_k mismatch: plan has {resolved_plan.max_seqlen_k}, got {max_seqlen_k}")
     if causal is not None and bool(causal) != resolved_plan.causal:
         raise ValueError(f"causal mismatch: plan has {resolved_plan.causal}, got {causal}")
@@ -2254,9 +2271,10 @@ def b12x_varlen_attention_forward(
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_k.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, attention_sink_bias.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        float(softmax_scale), current_cuda_stream(),
+        float(softmax_scale), Int32(q_shape[0]), Int32(k_shape[0]),
+        Int32(cu_q_shape[0] - 1), current_cuda_stream(),
     )
-    return output, lse
+    return output[:q_shape[0]], lse[:, :q_shape[0]]
 
 
 __all__ = [

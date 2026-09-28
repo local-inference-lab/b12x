@@ -122,6 +122,11 @@ def parse_args():
         help="0 selects common helper's automatic L2 flush size",
     )
     parser.add_argument("--seed", type=int, default=20260910)
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        help="Benchmark checkpoint projections through prepared APIs",
+    )
     args = parser.parse_args()
     for name, choices in (
         ("cases", (*CASES, "vocab")),
@@ -357,7 +362,9 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
     graphs = {}
     blocks = []
     samples = {arm: [] for arm in ARMS}
-    with kernel_resolution_guard("BF16 projection native SIMT/MMA graph capture and paired replay"):
+    with kernel_resolution_guard(
+        "BF16 projection native SIMT/MMA graph capture and paired replay"
+    ):
         for arm in initial_order:
 
             def repeated(launch=launches[arm]):
@@ -419,8 +426,11 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
         },
         "production_policy_arm": default.backend,
         "production_policy_regresses_vs_simt": (
-            ratio < 1 if default.backend == "mma" else
-            False if default.backend == "simt" else None
+            ratio < 1
+            if default.backend == "mma"
+            else False
+            if default.backend == "simt"
+            else None
         ),
         "correctness": correctness,
         "median_us_per_projection": medians,
@@ -436,6 +446,10 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
 
 def main():
     args = parse_args()
+    if args.model_path is not None:
+        from benchmarks.checkpoint_projection import run
+
+        return run(args)
     require_sm120()
     # These options apply only to the untimed FP32 numerical oracle.
     torch.backends.cuda.matmul.allow_tf32 = False

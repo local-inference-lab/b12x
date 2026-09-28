@@ -1,4 +1,4 @@
-"""Safetensors metadata routing with O_DIRECT reads into owned destinations."""
+"""Safetensors metadata routing with O_DIRECT reads into ordinary CUDA tensors."""
 
 from __future__ import annotations
 
@@ -6,13 +6,11 @@ import json
 import math
 import os
 from array import array
-from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 
 from ._native import load
-from ._pool import HostWeightWriter, owns_storage, owns_tensor, weight_allocation
 
 
 def _unique_object(pairs):
@@ -43,41 +41,48 @@ class DirectWeightSession:
     No checkpoint payload is mapped or read through the page cache.
     """
 
-    def __init__(self, device=0, io_threads=8, *, allocation_scope=nullcontext,
-                 shared_read_group=None):
+    def __init__(self, device=0, io_threads=8, *,
+                 shared_read_group=None, read_mode="auto"):
         import torch
 
-        torch.cuda.init()
-        self.native = load()
-        self.reader = self.native.direct_reader(device)
+        if read_mode not in ("auto", "bounce", "gds"):
+            raise ValueError("read_mode must be auto, bounce or gds")
         if not 1 <= io_threads <= 16:
             raise ValueError("io_threads must be between 1 and 16")
+        torch.cuda.init()
+        self.native = load()
+        if read_mode == "auto":
+            caps = self.native.capabilities(device)
+            read_mode = "bounce" if caps["host_page_tables"] else "gds"
+        if read_mode != "gds" and shared_read_group is not None:
+            raise ValueError("shared checkpoint reads require the gds transport")
+        self.read_mode = read_mode
+        self.reader = self.native.direct_reader(device)
         self.device = device
         self.io_threads = io_threads
         self.shared_read_group = shared_read_group
         self.progress = None
         self._gds = None
         self._copy_programs = None
-        if weight_allocation(device) == "device":
+        if read_mode == "gds":
             from ._gds_native import load as load_gds
             from ._gds_kernels import compile_copies
 
             self._gds = load_gds()
             self._copy_programs = compile_copies(device)
-        self.allocation_scope = allocation_scope
         self.executor = None
         self.records = array("Q")
         self.destinations = []
         self.files = []
         self.file_identities = {}
         self.sources = {}
-        self.host_writer = HostWeightWriter()
+        self.torch_copy_bytes = 0
         self.payload_bytes = 0
         self.metadata_bytes = 0
         self.metadata_copy_bytes = 0
         self.loaded_tensors = 0
         self.transform_bytes = 0
-        self.inplace_transform_bytes = 0
+        self.bf16_expansion_bytes = 0
         self.transform_scratch = None
 
     def __enter__(self):
@@ -148,7 +153,6 @@ class DirectWeightSession:
                     self.executor = self._gds.checkpoint_create(
                         self.device,
                         self.io_threads,
-                        self.native.pool_api(),
                         *(program.function for program in self._copy_programs),
                     )
                 else:
@@ -172,12 +176,9 @@ class DirectWeightSession:
 
         if source.device.type != "meta":
             return source.clone()
-        with self.allocation_scope():
-            destination = torch.empty(
-                source.shape,
-                dtype=source.dtype,
-                device=torch.device("cuda", self.device),
-            )
+        destination = torch.empty(
+            source.shape, dtype=source.dtype, device=torch.device("cuda", self.device)
+        )
         self(destination, source)
         self.flush()
         return destination
@@ -370,7 +371,8 @@ class DirectWeightSession:
                 and not destination.is_neg()
                 and not destination.is_conj()
                 and destination.device.index == self.device
-                and owns_tensor(destination)
+                and destination.is_cuda
+                and destination.is_contiguous()
             ):
                 if source.nbytes:
                     self.records.extend(
@@ -389,7 +391,9 @@ class DirectWeightSession:
                     self.metadata_copy_bytes += source.nbytes
                     torch.autograd.graph.increment_version(destination)
                 return True
-            return self.host_writer(destination, source)
+            self.flush()
+            self.torch_copy_bytes += destination.nbytes
+            return False
         item = self.sources.get(source.untyped_storage()._cdata)
         if item is None:
             raise NotImplementedError(
@@ -423,14 +427,15 @@ class DirectWeightSession:
             raise ValueError(f"source view exceeds checkpoint range: {entry.name}")
         if source.nbytes == 0:
             return True
-        if destination.device.index != self.device:
+        if destination.device.type != "cuda" or destination.device.index != self.device:
             raise ValueError("destination must use the session CUDA device")
-        if not owns_storage(destination):
-            raise ValueError(
-                f"checkpoint destination was not allocated as a weight: {entry.name}"
-            )
+        storage = destination.untyped_storage()
+        extent = destination.element_size() * (1 + sum(
+            (size - 1) * stride for size, stride in zip(destination.shape, destination.stride(), strict=True)
+        ))
+        if destination.data_ptr() - storage.data_ptr() + extent > storage.nbytes():
+            raise ValueError(f"destination exceeds tensor storage: {entry.name}")
         with torch.cuda.device(destination.device):
-            stream = torch.cuda.current_stream(destination.device).cuda_stream
             expand = (
                 source.dtype == torch.bfloat16 and destination.dtype == torch.float32
             )
@@ -483,47 +488,36 @@ class DirectWeightSession:
                     )
                 self.destinations.append(destination)
                 if expand and self._gds is None:
-                    self.inplace_transform_bytes += source.nbytes
+                    self.bf16_expansion_bytes += source.nbytes
             else:
                 if not source.is_contiguous() or not destination.is_contiguous():
                     raise NotImplementedError(f"strided dtype conversion: {entry.name}")
                 self.flush()
                 if self.transform_scratch is None:
-                    with self.allocation_scope():
-                        self.transform_scratch = torch.empty(
-                            8 << 20, dtype=torch.uint8, device=destination.device
-                        )
+                    self.transform_scratch = torch.empty(
+                        8 << 20, dtype=torch.uint8, device=destination.device
+                    )
                 scratch = self.transform_scratch.view(source.dtype)
                 flat = destination.view(-1)
                 for start in range(0, source.numel(), scratch.numel()):
                     count = min(scratch.numel(), source.numel() - start)
-                    if self._gds is not None:
-                        self._execute(
-                            array(
-                                "Q",
-                                (
-                                    entry.fd,
-                                    entry.offset
-                                    + offset
-                                    + start * source.element_size(),
-                                    count * source.element_size(),
-                                    scratch.data_ptr(),
-                                    0,
-                                    1,
-                                    0,
-                                    0,
-                                ),
-                            )
+                    self._execute(
+                        array(
+                            "Q",
+                            (
+                                entry.fd,
+                                entry.offset
+                                + offset
+                                + start * source.element_size(),
+                                count * source.element_size(),
+                                scratch.data_ptr(),
+                                0,
+                                1,
+                                0,
+                                0,
+                            ),
                         )
-                    else:
-                        self.native.direct_into(
-                            self.reader,
-                            entry.fd,
-                            entry.offset + offset + start * source.element_size(),
-                            count * source.element_size(),
-                            scratch.data_ptr(),
-                            stream,
-                        )
+                    )
                     flat[start : start + count].copy_(scratch[:count])
                 self.transform_bytes += source.nbytes
         torch.autograd.graph.increment_version(destination)
@@ -555,15 +549,15 @@ class DirectWeightSession:
             io["shared_reads"] = dict(totals)
         return {
             **io,
+            "read_mode": self.read_mode,
             "payload_bytes": self.payload_bytes,
             "metadata_bytes": self.metadata_bytes,
             "loaded_tensors": self.loaded_tensors,
             "transform_bytes": self.transform_bytes,
-            "inplace_transform_bytes": self.inplace_transform_bytes,
+            "bf16_expansion_bytes": self.bf16_expansion_bytes,
             "transform_scratch_bytes": (
                 0 if self.transform_scratch is None else self.transform_scratch.nbytes
             ),
-            "metadata_host_copy_bytes": self.host_writer.host_bytes
-            + self.metadata_copy_bytes,
-            "torch_copy_bytes": self.host_writer.torch_bytes,
+            "metadata_host_copy_bytes": self.metadata_copy_bytes,
+            "torch_copy_bytes": self.torch_copy_bytes,
         }

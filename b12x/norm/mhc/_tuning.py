@@ -54,6 +54,7 @@ class MhcConfig:
     projection_num_n_warps: int
     projection_k_splits: int
     lagged_prepare: bool = False
+    partials_per_cta: int = 4
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "MhcConfig":
@@ -70,6 +71,7 @@ class MhcConfig:
             projection_num_n_warps=int(payload["projection_num_n_warps"]),
             projection_k_splits=int(payload["projection_k_splits"]),
             lagged_prepare=payload["lagged_prepare"],
+            partials_per_cta=int(payload["partials_per_cta"]),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -83,6 +85,7 @@ class MhcConfig:
             "projection_num_n_warps": self.projection_num_n_warps,
             "projection_k_splits": self.projection_k_splits,
             "lagged_prepare": self.lagged_prepare,
+            "partials_per_cta": self.partials_per_cta,
         }
 
 
@@ -205,7 +208,15 @@ def _default_config(query, device):
             prepared = prepared and int(splits) == 0
         elif device is not None and device.compute_capability == (12, 1) and query.hidden_size == 4096 and query.max_tokens >= 8:
             prepared = False
-    return replace(config, lagged_prepare=prepared)
+    partials = 4
+    if prepared:
+        raw = query.controls.get("B12X_MHC_PARTIALS_PER_CTA")
+        if raw not in (None, ""):
+            partials = int(raw)
+        elif (query.operation == "pre" and device is not None
+              and device.compute_capability == (12, 1) and query.hidden_size == 4096):
+            partials = 25 if query.max_tokens >= 8 else 9 if query.max_tokens >= 4 else 4
+    return replace(config, lagged_prepare=prepared, partials_per_cta=partials)
 
 
 def _encode(query: MhcQuery) -> dict[str, object]:
@@ -227,6 +238,10 @@ def _validate(
         raise TypeError("lagged_prepare must be a boolean")
     if config.lagged_prepare and (not query.lagged_mix or config.backend != "native"):
         raise ValueError("lagged preparation requires the native lagged route")
+    if not 1 <= config.partials_per_cta <= 25:
+        raise ValueError("partials_per_cta must be in [1, 25]")
+    if not config.lagged_prepare and config.partials_per_cta != 4:
+        raise ValueError("partial grouping requires the fused lagged producer")
     if config.backend == "native":
         return
     if not _tf32_eligible(query):
@@ -317,9 +332,11 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     backends = ("native", "tf32_tma") if tf32 else ("native",)
     if tf32 and pin is not None:
         backends = ("tf32_tma",) if pin else ("native",)
+    partials = query.controls.get("B12X_MHC_PARTIALS_PER_CTA")
     values = {
         "backend": backends,
         "lagged_prepare": (False, True) if query.lagged_mix else (False,),
+        "partials_per_cta": (int(partials),) if partials not in (None, "") else (4, 9, 13, 25),
         "projection_tile_k": tuple(
             k for k in (8, 16, 32, 64, 128, 256) if total_k % k == 0
         ),
@@ -480,8 +497,8 @@ def _materialize_tuning(query, device, choice):
 
 TUNING = TuningContract(
     component_id="norm.mhc",
-    query_schema_version=7,
-    config_schema_version=3,
+    query_schema_version=8,
+    config_schema_version=4,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -490,7 +507,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=12,
+    candidate_contract_version=13,
     knobs=(
         Knob(
             name="backend",
@@ -499,6 +516,8 @@ TUNING = TuningContract(
         ),
         Knob(name="lagged_prepare", values=None, binding=ParameterBinding.COMPILE,
              when=FrozenMapping({"backend": "native"}), otherwise=False),
+        Knob(name="partials_per_cta", values=None, binding=ParameterBinding.COMPILE,
+             when=FrozenMapping({"backend": "native", "lagged_prepare": True}), otherwise=4),
         Knob(
             name="projection_tile_n",
             values=(8, 16, 24, 32, 48, 64),

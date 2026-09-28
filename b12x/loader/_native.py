@@ -1,4 +1,4 @@
-"""Build the CPython/DLPack helper without linking the PyTorch C++ ABI."""
+"""Build the C99 I/O helper without linking the PyTorch C++ ABI."""
 
 from __future__ import annotations
 
@@ -31,14 +31,12 @@ def _build() -> Path:
     cuda = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")).resolve()
     includes = [
         Path(sysconfig.get_path("include")),
-        Path(torch.__file__).parent / "include" / "ATen",
         cuda / "include",
     ]
     headers = [
         includes[0] / "Python.h",
-        includes[1] / "dlpack.h",
-        includes[2] / "cuda_runtime_api.h",
-        includes[2] / "driver_types.h",
+        includes[1] / "cuda_runtime_api.h",
+        includes[1] / "driver_types.h",
     ]
     for path in headers:
         if not path.is_file():
@@ -111,6 +109,7 @@ def _build() -> Path:
                 f"-L{cuda / 'lib64'}",
                 f"-Wl,-rpath,{cuda / 'lib64'}",
                 "-lcudart",
+                "-lcuda",
                 *uring_ldflags,
                 "-o",
                 str(output),

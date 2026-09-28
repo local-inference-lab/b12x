@@ -861,6 +861,29 @@ def test_w4a8_dynamic_ignores_inactive_routes(inactive_expert: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_experts", (31, 32, 33))
+def test_grouped_expert_prefix_handles_warp_tail_and_multiple_tiles(num_experts):
+    """Empty experts and inactive routes must leave compact tile offsets exact."""
+    require_b12x()
+    routes = torch.tensor([[0, num_experts - 1]] * 33, dtype=torch.int32)
+    routes[::4, 0] = -1
+    out, ref, debug = _run_w4a8_dynamic(
+        recipe="w4a8_mx", activation="silu", E=num_experts,
+        m=33, K=256, n=128, top_k=2, seed=329, tile_m=16,
+        topk_ids_override=routes, return_debug=True,
+    )
+    counts = torch.bincount(routes[routes >= 0].long(), minlength=num_experts)
+    expected = torch.cat((
+        torch.zeros(1, dtype=torch.int64), ((counts + 15) // 16).cumsum(0),
+    ))
+    torch.testing.assert_close(
+        debug["expert_tile_base"].long(), expected, rtol=0, atol=0,
+    )
+    assert torch.isfinite(out).all() and torch.count_nonzero(out)
+    assert compare_to_reference(out.float(), ref).cos > 0.999
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("activation", ["silu", "situ", "relu2"])
 def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
     activation: str,

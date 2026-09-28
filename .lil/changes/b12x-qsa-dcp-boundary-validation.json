@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-qsa-dcp-boundary-validation",
+  "category": "fix",
+  "summary": "Validate distributed QSA capacity and query metadata before launching kernels",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "DCP plans must reserve at least one complete compressed group on each rank. Valid serving configurations are unchanged.",
+  "details": [
+    "Reject an empty planned local score domain before workspace preparation can divide by zero; live requests may still have no local groups.",
+    "Check query positions and destination row capacity before global selection expansion writes to caller-owned scratch.",
+    "Reject non-DCP draft-selection reuse before returning an unwritten log-sum-exp buffer."
+  ],
+  "pull_requests": [406],
+  "requires": ["b12x-402"]
+}

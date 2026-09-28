@@ -369,7 +369,6 @@ def test_adapter_path_graph_replay(runtime):
     """
     world = dist.get_world_size()
     rank = dist.get_rank()
-    runtime.prepare((torch.bfloat16,), padded_gather=True)
     h = torch.zeros(6 * 4096, dtype=torch.bfloat16, device=runtime.device)
     logits = torch.zeros(6, 38720, dtype=torch.bfloat16, device=runtime.device)
     odd = torch.zeros(

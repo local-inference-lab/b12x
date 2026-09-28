@@ -83,7 +83,7 @@ import b12x.attention
 import b12x.norm
 import b12x.sequence
 import b12x.loader
-from b12x.loader import read_tensor
+from b12x.loader import capabilities
 b12x.list_ops()
 
 introduced = set(sys.modules) - before

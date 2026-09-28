@@ -40,12 +40,12 @@ def _prepare_binding(session, plan, bind_args, run_args, output):
 
 @pytest.mark.parametrize(
     "heads,mode,large_pool,fp8",
-    [(heads, mode, False, False) for heads in (8, 16, 32, 64) for mode in ("decode", "extend")]
+    [(heads, mode, False, False) for heads in (8, 16, 24, 32, 64) for mode in ("decode", "extend")]
     + [(8, mode, True, False) for mode in ("decode", "extend")]
-    + [(heads, "decode", False, True) for heads in (1, 2, 4, 8, 12, 16, 20, 32, 64)]
-    + [(heads, "extend", False, True) for heads in (8, 16, 32, 64)]
+    + [(heads, "decode", False, True) for heads in (1, 2, 4, 8, 12, 16, 20, 24, 32, 64)]
+    + [(heads, "extend", False, True) for heads in (8, 16, 24, 32, 64)]
     + [(8, mode, True, True) for mode in ("decode", "extend")]
-    + [(16, mode, True, "default") for mode in ("decode", "extend")],
+    + [(heads, mode, True, "default") for heads in (16, 24) for mode in ("decode", "extend")],
 )
 @torch.inference_mode()
 def test_v41_heterogeneous_attention_replay_and_live_rows(

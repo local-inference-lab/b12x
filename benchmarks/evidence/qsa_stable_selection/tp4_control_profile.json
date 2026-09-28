@@ -1,0 +1,25 @@
+{
+  "image_id": "sha256:a2fbec2f2e348631fad52413c61a1f72ed4df62c6d31c13b5cd6aa90a3540f7c",
+  "hosts": {
+    "maxwell": {
+      "rank": 0,
+      "container": "qwen38-fp8-kv42-mtp3-20260917-0",
+      "environment_file": "/home/jasonc/spark_vllm/deployments/qwen38-fp8-kv42-mtp3-20260917/maxwell.env"
+    },
+    "ampere": {
+      "rank": 1,
+      "container": "qwen38-fp8-kv42-mtp3-20260917-1",
+      "environment_file": "/home/jasonc/spark_vllm/deployments/qwen38-fp8-kv42-mtp3-20260917/ampere.env"
+    },
+    "faraday": {
+      "rank": 2,
+      "container": "qwen38-fp8-kv42-mtp3-20260917-2",
+      "environment_file": "/home/jasonc/spark_vllm/deployments/qwen38-fp8-kv42-mtp3-20260917/faraday.env"
+    },
+    "hertz": {
+      "rank": 3,
+      "container": "qwen38-fp8-kv42-mtp3-20260917-3",
+      "environment_file": "/home/jasonc/spark_vllm/deployments/qwen38-fp8-kv42-mtp3-20260917/hertz.env"
+    }
+  }
+}

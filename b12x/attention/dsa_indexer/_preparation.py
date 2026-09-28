@@ -72,6 +72,9 @@ def invocation_from_descriptors(caps, *, operands: Mapping[str, Mapping[str, obj
         required = {"shape", "strides", "dtype", "alignment"}
         if set(fields) != required:
             raise ValueError(f"DSA {name} ABI descriptor fields do not match schema")
+        if name == "index_k_cache":
+            # Physical pool size is a runtime bound, not a kernel specialization.
+            fields = FrozenMapping({**dict(fields), "shape": (1, *fields["shape"][1:])})
         normalized[name] = fields
     return FrozenMapping({
         "operands": FrozenMapping(normalized),
@@ -107,7 +110,21 @@ def invocation_from_tensors(caps, **tensors) -> FrozenMapping:
 def _fake(descriptor, device):
     if descriptor is None:
         return None
-    return torch.empty_strided(tuple(descriptor["shape"]), tuple(descriptor["strides"]), dtype=getattr(torch, descriptor["dtype"]), device=device)
+    shape = tuple(descriptor["shape"])
+    strides = tuple(descriptor["strides"])
+    dtype = getattr(torch, descriptor["dtype"])
+    alignment = int(descriptor["alignment"])
+    if alignment >= 16:
+        return torch.empty_strided(shape, strides, dtype=dtype, device=device)
+    offset = alignment // dtype.itemsize
+    span = (
+        1
+        + sum((size - 1) * stride for size, stride in zip(shape, strides, strict=True))
+        if all(shape)
+        else 0
+    )
+    storage = torch.empty((span + offset,), dtype=dtype, device=device)
+    return storage.as_strided(shape, strides, storage_offset=offset)
 
 
 def _scratch_caps(query, *, device, config):

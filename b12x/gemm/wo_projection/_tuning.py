@@ -24,6 +24,9 @@ class WoProjectionQuery:
     return_3d: bool = False
     positions_dtype: str = "int64"
     cos_sin_dtype: str = "bfloat16"
+    sfb_k_replicated: bool = False
+    wo_a_tiled: bool = False
+    wo_b_tiled: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "codegen", FrozenMapping(self.codegen))
@@ -53,6 +56,12 @@ def _validate_query(query, device):
         raise ValueError("WO geometry must contain positive integer dimensions")
     if type(query.dynamic_tokens) is not bool:
         raise TypeError("WO dynamic_tokens must be a boolean")
+    if any(type(value) is not bool for value in (query.sfb_k_replicated, query.wo_a_tiled, query.wo_b_tiled)):
+        raise TypeError("WO packed-weight contracts must be boolean")
+    if query.wo_a_tiled and (query.groups, query.rank, query.group_width) != (4, 1024, 4096):
+        raise ValueError("tiled WO-A requires four packed 1024-by-4096 weight groups")
+    if query.wo_b_tiled and (query.hidden, query.groups * query.rank) != (4096, 4096):
+        raise ValueError("tiled WO-B requires the packed 4096-by-4096 weight layout")
     if query.operation not in ("plain", "inv_rope"):
         raise ValueError("WO operation must be plain or inv_rope")
     if query.operation == "inv_rope" and (
@@ -95,7 +104,7 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
-    query_schema_version=4,
+    query_schema_version=6,
     config_schema_version=2,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
@@ -109,7 +118,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=("mxfp8",), binding=ParameterBinding.COMPILE),
         Knob(name="decode_tile_n", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=5,
     parameters=_parameters,
     materialize=lambda query, device, choice: WoProjectionConfig(**dict(choice)),
 )

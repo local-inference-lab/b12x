@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-karmic-nvfp4-grid-and-iq2-xs",
+  "category": "performance",
+  "summary": "Refine NVFP4 decode tiles and expand supported dense and MoE quantization",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Use compact N16 token layouts and paired input producers for eligible NVFP4 decode kernels.",
+    "Include half-resident and three-quarter-resident grids in runtime tuning while enforcing the device residency limit.",
+    "Add safetensors IQ2_XS dense and expert-weight support without changing existing checkpoint formats."
+  ],
+  "authors": ["lukealonso"],
+  "pull_requests": [],
+  "requires": []
+}

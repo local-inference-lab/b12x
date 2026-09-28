@@ -13,7 +13,7 @@ from cutlass.cutlass_dsl import Int32
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, get_num_sm, make_ptr
+from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.kernels.w4a8_compact_projection import (
     W4A8CompactMicroProjectionKernel,
 )
@@ -198,6 +198,7 @@ class _DirectW4A8CompactLaunch:
             alpha1,
             input_scale,
             num_pairs,
+            max_active_clusters,
             stream,
         )
         self.activation(
@@ -297,7 +298,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            1,
+            2,
             (
                 device_index,
                 max_tokens,
@@ -343,9 +344,11 @@ def launch_w4a8_compact_micro(
     fast_math: bool,
     _prepared_kernel=None,
     _prepared_quantize=None,
-    _sm_count: int | None = None,
+    max_active_clusters: int | None = None,
 ) -> torch.Tensor:
     """Run quantized projections, routed activation, and direct FC2 from fixed scratch."""
+    if max_active_clusters is not None and max_active_clusters <= 0:
+        raise ValueError("max_active_clusters must be positive when set")
     if a.dtype != torch.bfloat16 or a.ndim != 2 or not a.is_contiguous():
         raise ValueError("a must be a contiguous BF16 [tokens, K] CUDA tensor")
     if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -424,7 +427,7 @@ def launch_w4a8_compact_micro(
         _ptr(cutlass.Float32, alpha2),
         _ptr(cutlass.Float32, down_scale),
         num_tokens * int(num_topk),
-        get_num_sm(a.device) if _sm_count is None else _sm_count,
+        0 if max_active_clusters is None else max_active_clusters,
         current_cuda_stream(),
     )
     return route.narrow(0, 0, num_tokens * int(num_topk))

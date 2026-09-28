@@ -48,10 +48,15 @@ def test_warmup_uses_only_default_hooks(tmp_path, monkeypatch, disable):
         _materialize=materialize,
     )
     with engine:
+        snapshots = []
         result = engine.prepare(
             (plan.request(name='local', prepare_call=prepare),),
             autotune=False if disable == 'job' else True if disable == 'environment' else None,
+            progress=snapshots.append,
         )
+        assert snapshots
+        # A normal warmup-only batch must not be presented as stopped tuning.
+        assert all(p.tuning_stopped == (disable in {'environment', 'cancel'}) for p in snapshots)
         assert plan.selection.config == Config(7)
         assert plan.prepared.state.value == 7
         assert plan.prepared.programs == frozenset({caller_program})

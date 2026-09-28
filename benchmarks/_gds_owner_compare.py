@@ -31,7 +31,7 @@ def _worker(connection, barrier, rank, devices, native_path, experts, destinatio
         import torch
         from b12x.loader._gds_kernels import compile_copies
         from b12x.loader._gds_native import load
-        from b12x.loader._pool import weight_pool
+
         from gds_layer_exchange import chunk_fragments
 
         torch.set_num_threads(1)
@@ -71,9 +71,8 @@ def _worker(connection, barrier, rank, devices, native_path, experts, destinatio
             event.record(stream)
             event.synchronize()
             slots.append(dict(index=index, stream=stream, event=event, state="idle", futures=[], plan=None))
-        with weight_pool(allocation="device", device=device) as pool, ThreadPoolExecutor(max_workers=io_threads) as executor:
-            with pool():
-                target = torch.empty(destination_bytes, device=device, dtype=torch.uint8)
+        with ThreadPoolExecutor(max_workers=io_threads) as executor:
+            target = torch.empty(destination_bytes, device=device, dtype=torch.uint8)
             ipc = native.export_ipc(device, target.data_ptr())
             connection.send(("allocated", ipc))
             command, all_ipc = connection.recv()

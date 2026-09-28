@@ -42,6 +42,8 @@ class SparseMlaQuery:
     use_cuda_graph: bool = False
     budget_max_splits: int | None = None
     budget_max_partial_rows: int | None = None
+    pool_size: int = 0
+    pool_topk: int = 0
 
 SparseMlaConfig = BackendConfig
 TUNING = replace(
@@ -50,7 +52,7 @@ TUNING = replace(
         query_type=SparseMlaQuery,
         backend="native",
     ),
-    query_schema_version=2,
+    query_schema_version=3,
     candidate_contract_version=3,
 )
 

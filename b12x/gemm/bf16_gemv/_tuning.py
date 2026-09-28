@@ -48,6 +48,11 @@ def _mma_eligible(query):
             and query.out_features >= 256 and query.in_features >= 16)
 
 
+def _torch_eligible(query):
+    return (query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
+            and query.bias_dtype in (None, "bfloat16"))
+
+
 def _prefill_eligible(query):
     return (
         query.bias_dtype is None
@@ -63,6 +68,8 @@ def default_config(query, device):
     prefill_min_rows = 128 if query.out_features == 1024 else 256
     if _prefill_eligible(query) and query.max_rows >= prefill_min_rows:
         return GemvConfig(backend="prefill")
+    if _torch_eligible(query) and query.max_rows > 8:
+        return GemvConfig(backend="torch")
     n_tiles = (query.out_features + 63) // 64
     minimum_mma_rows = 24 if n_tiles >= 64 else ((64 + n_tiles - 1) // n_tiles) * 32
     if _mma_eligible(query) and query.max_rows >= minimum_mma_rows:
@@ -94,6 +101,8 @@ def validate_config(query, config, device):
         raise ValueError("rows_per_tile only configures SIMT projection")
     if config.backend == "mma" and _mma_eligible(query):
         return
+    if config.backend == "torch" and _torch_eligible(query):
+        return
     if config.backend == "prefill" and _prefill_eligible(query):
         return
     raise ValueError(f"projection backend {config.backend!r} is ineligible for this query")
@@ -105,6 +114,8 @@ def _parameters(query, device):
         backends.append("mma")
     if _prefill_eligible(query):
         backends.append("prefill")
+    if _torch_eligible(query):
+        backends.append("torch")
     return ParameterSpace.create(
         TUNING.knobs, values={"backend": tuple(backends)}, predicates=(_eligible,),
     )
@@ -117,7 +128,7 @@ def _eligible(choice):
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
     query_schema_version=4,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
     encode_query=asdict,
@@ -130,7 +141,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

@@ -36,10 +36,21 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
         name = torch.cuda.get_device_name(device_ordinal).strip()
         if not name:
             raise RuntimeError("CUDA device name is unavailable")
+        properties = torch.cuda.get_device_properties(device_ordinal)
+        # Key on the silicon, not the product label. One part ships under
+        # several names (for example RTX PRO 6000 Blackwell "Workstation
+        # Edition" and "Max-Q Workstation Edition"), so a tensor-parallel group
+        # that mixes those labels would otherwise fail reconcile() across ranks
+        # even though every rank can reuse the same decisions. Reported total
+        # memory is excluded for the same reason: those two labels report it
+        # several MiB apart. The name is still read above so an unusable device
+        # fails closed.
         return {
-            "schema_version": 5, "tuning_cache_version": version,
+            "schema_version": 6, "tuning_cache_version": version,
             "measurement": "stream_gated_events_v1",
-            "namespace": dict(namespace), "device_name": name,
+            "namespace": dict(namespace),
+            "compute_capability": [int(properties.major), int(properties.minor)],
+            "sm_count": int(properties.multi_processor_count),
         }
 
 
@@ -48,13 +59,14 @@ class SelectionCache:
 
     def __init__(self, root: str | Path, identity: Mapping[str, object]):
         self.identity = json.loads(_json(identity))
-        if self.identity.get("schema_version") != 5:
-            raise ValueError("preparation selection cache requires schema 5")
+        if self.identity.get("schema_version") != 6:
+            raise ValueError("preparation selection cache requires schema 6")
         version = self.identity.get("tuning_cache_version")
         if type(version) is not int or version <= 0:
             raise ValueError("selection cache requires a positive tuning_cache_version")
         self.path = Path(root) / f"{digest(self.identity)}.json"
         self.records = self._read()
+        self._agreed_records = None
 
     def _validate(self, records):
         if not isinstance(records, dict):
@@ -98,8 +110,24 @@ class SelectionCache:
         return self._validate(payload["records"])
 
     def get(self, key):
-        record = self.records.get(key)
+        records = self.records if self._agreed_records is None else self._agreed_records
+        record = records.get(key)
         return None if record is None else FrozenMapping(record)
+
+    def reconcile(self, snapshots):
+        """Use the first completed record in rank order for this session.
+
+        Executable artifacts remain local. Only selection metadata is shared;
+        preparation still compiles and primes each selected configuration locally.
+        """
+        agreed = {}
+        for snapshot in snapshots:
+            if snapshot.identity.to_dict() != self.identity:
+                raise ValueError("tuning cache identities differ across ranks")
+            records = self._validate(snapshot.records.to_dict())
+            for key, record in records.items():
+                agreed.setdefault(key, record)
+        self._agreed_records = agreed
 
     def save(self, key, *, assignment, config, coverage, programs):
         update = {
@@ -132,3 +160,5 @@ class SelectionCache:
                 if temporary is not None and os.path.exists(temporary):
                     os.unlink(temporary)
             self.records = records
+            if self._agreed_records is not None:
+                self._agreed_records.update(update)

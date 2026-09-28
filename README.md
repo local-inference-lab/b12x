@@ -20,8 +20,8 @@ compiler and its CUDA 13 libraries come in as wheel dependencies
 `PreparationSession` compiles missing kernels before publishing execution.
 
 The optional vLLM [checkpoint loader](docs/checkpoint-loading.md) uses
-`--load-format b12x`: coherent managed-memory direct I/O on Spark, and shared
-GPUDirect Storage into device memory on discrete GPUs. Enable its
+`--load-format b12x`: an asynchronous io_uring/CUDA-copy ring on Spark, and shared
+GPUDirect Storage on discrete GPUs. Both load ordinary PyTorch CUDA allocations. Enable its
 `b12x_loader` vLLM plugin; the device selects the transport automatically.
 
 ## What's in here
@@ -310,6 +310,45 @@ compiling inside CUDA graph capture).
 Set `B12X_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with its
 cache-key parameters and duration — useful for figuring out what warmup
 actually covered. `B12X_TIMING=1` enables per-kernel timing logs.
+
+## DeepSeek V4 Flash 0731 MoE reproduction
+
+The `deepseek-v4-flash-0731` profile matches the native checkpoint's TP2
+W4A8 path: MXFP4 E8M0/K32 weights, MXFP8 activations, 256 experts, top-6,
+hidden size 4096, and intermediate width 1024 per rank. It defaults to SiLU
+with clamp 10, per-expert unit scales, and checkpoint layer 3. The first three
+layers use hash routing; `--layer-idx` can select them separately.
+
+For a baseline, pin the configuration recorded by the serving preparation
+session for the same token capacity. Do not autotune before reproducing it.
+This example replays the six-token GB10 configuration observed in serving:
+
+```bash
+CUTE_DSL_ARCH=sm_121a .venv/bin/python benchmarks/benchmark_moe.py \
+  --model-profile deepseek-v4-flash-0731 --model-path /path/to/checkpoint \
+  --batch-sizes 6 --routing-workload shared_40 \
+  --no-autotune --moe-config '{"backend":"dynamic","route_planner":"internal","max_active_clusters":72,"dynamic_tile_m":32,"dynamic_route_mode":"grouped"}' \
+  --graph-only --timing-backend cupti --warmup 10 --iters 30 --repeats 3 \
+  --output-json /tmp/ds4-moe.json --raw-samples-jsonl /tmp/ds4-moe-raw.jsonl \
+  --torch-trace-dir /tmp/ds4-moe-traces
+```
+
+Measure `shared_0`, `shared_20`, `shared_40`, `shared_60`, and `shared_80`
+separately. Sharing is the fraction of token/expert assignments reused across
+the batch, with no duplicate expert inside one token. At six tokens these
+cases have 36, 29, 22, 14, and 7 unique experts. `shared_100` reaches the
+six-expert floor. The output records actual expert row counts and useful
+weight bytes; nominal sharing percentages alone are insufficient for comparing
+small batches. Also cover verifier sizes 4 and 8, using their own saved serving
+configurations, and size 5 for this checkpoint's drafter.
+
+Weights, scratch and output use ordinary PyTorch CUDA storage. The numerical oracle runs before timing, and cold-L2 graph replay
+excludes loading, preparation, routing generation, and L2 flushing. The timed
+operation is one rank's routed MoE, including its internal bookkeeping, without
+the shared expert or TP collective. `--torch-trace-dir` saves an additional
+untimed replay so the kernel symbol, grid, registers, and shared memory can be
+compared with serving. Sharing levels are coverage points, not empirical
+frequency weights for a model-wide average.
 
 ## DeepSeek V4.1 Flash MoE benchmark
 

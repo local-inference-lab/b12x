@@ -7,10 +7,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16, Uint32
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from ..._lib.intrinsics import q8_0_pair_to_bf16x2
 from ..._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
 from ..._lib.runtime_control import raise_if_kernel_resolution_frozen
 from ..._lib.utils import current_cuda_stream, make_ptr
@@ -24,8 +25,9 @@ def _invalid_index(*, loc=None, ip=None):
 
 
 class _Embedding:
-    def __init__(self, width):
+    def __init__(self, width, q8=False):
         self.width = width
+        self.q8 = q8
 
     @cute.jit
     def __call__(self, weight: cute.Pointer, ids: cute.Pointer, out: cute.Pointer,
@@ -54,10 +56,21 @@ class _Embedding:
                 else:
                     src = index * row_stride
                     dst = Int64(row) * Int64(self.width)
-                    for item in cutlass.range_constexpr((self.width + 127) // 128):
-                        col = tid + item * 128
-                        if col < self.width:
-                            out[dst + Int64(col)] = weight[src + Int64(col)]
+                    if cutlass.const_expr(self.q8):
+                        words = cute.recast_ptr(weight, dtype=Uint16)
+                        pairs = cute.recast_ptr(out, dtype=Uint32)
+                        for item in cutlass.range_constexpr((self.width // 2 + 127) // 128):
+                            col = tid + item * 128
+                            if col < self.width // 2:
+                                block = src // 2 + Int64(col // 16) * 17
+                                pairs[dst // 2 + Int64(col)] = q8_0_pair_to_bf16x2(
+                                    Uint32(words[block + 1 + Int64(col % 16)]), Uint32(words[block]))
+                    else:
+                        for item in cutlass.range_constexpr((self.width + 127) // 128):
+                            col = tid + item * 128
+                            if col < self.width:
+                                out[dst + Int64(col)] = weight[src + Int64(col)]
+
 
 
 @dataclass(frozen=True)
@@ -69,18 +82,19 @@ class _EmbeddingProgram:
 @program_cache
 def compile_embedding(width, weight_dtype, id_dtype, device):
     key = (width, str(weight_dtype), str(id_dtype), device)
-    entry = _Embedding(width)
+    q8 = weight_dtype == torch.uint8
+    entry = _Embedding(width, q8)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
-    value_type = BFloat16 if weight_dtype == torch.bfloat16 else Float32
+    value_type = BFloat16 if weight_dtype in (torch.bfloat16, torch.uint8) else Float32
     index_type = Int32 if id_dtype == torch.int32 else Int64
-    types = (value_type, index_type, value_type, Int32)
+    types = (Uint8 if q8 else value_type, index_type, value_type, Int32)
     pointers = tuple(make_ptr(t, 16, cute.AddressSpace.gmem,
                               assumed_align=t.width // 8) for t in types)
     with torch.cuda.device(device):
         compiled = compile_cute(entry, *pointers, Int32(1), Int64(1),
                                 Int64(width), Int32(0), current_cuda_stream(),
                                 compile_spec=KernelCompileSpec.from_key(
-                                    "sequence.embedding", 1, key))
+                                    "sequence.embedding", 2, key))
     return attach_programs(_EmbeddingProgram(compiled, types), compiled)
 
 

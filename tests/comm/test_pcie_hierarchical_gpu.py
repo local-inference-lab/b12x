@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+from datetime import timedelta
 
 import pytest
 import torch
@@ -9,16 +10,18 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from b12x.comm.pcie.pcie_hierarchical import PCIeHierarchicalAllReduce
+from b12x.comm.pcie import _owner_preparation as preparation
+from b12x.preparation import PreparationSession
 
 
 pytestmark = pytest.mark.skipif(
     os.getenv("B12X_RUN_PCIE_HIERARCHICAL_TEST") != "1",
     reason=(
-        "set B12X_RUN_PCIE_HIERARCHICAL_TEST=1 to run TP12 hierarchical GPU tests"
+        "set B12X_RUN_PCIE_HIERARCHICAL_TEST=1 to run hierarchical GPU tests"
     ),
 )
 
-WORLD_SIZE = 12
+WORLD_SIZE = int(os.getenv("B12X_PCIE_HIERARCHICAL_TEST_WORLD_SIZE", "12"))
 
 
 def _free_port() -> int:
@@ -52,22 +55,41 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=device,
+        timeout=timedelta(seconds=90),
     )
+    # NCCL peer mappings must coexist with the bounded-degree communicator.
+    bootstrap = torch.zeros(7168, device=device, dtype=torch.bfloat16)
+    dist.all_reduce(bootstrap)
+    torch.cuda.synchronize(device)
     runtime = PCIeHierarchicalAllReduce(
         exchange_group=dist.group.WORLD,
         device=device,
-        max_elements=7169,
+        max_elements=43008,
     )
+    session = PreparationSession(device=device, autotune=False, compile_workers=1)
+
+    def prepare(inp, out):
+        query = preparation.query_from_runtime(runtime, call={"inp": inp, "out": out})
+        plan = preparation.plan(query, runtime=runtime)
+        session.prepare((plan.request(
+            name=f"hierarchical_{inp.numel()}",
+            prepare_call=lambda state: preparation.prepared_call(state, inp=inp, out=out),
+        ),))
+        return plan
+
     try:
         # Odd/even BF16x2 tails and the scalar path above the vector threshold.
-        for elements in (3583, 7168, 7169, 3583):
+        for elements in (1, 3583, 7168, 7169, 43008, 3583):
             base = torch.arange(
                 elements, device=device, dtype=torch.float32
             ) / 1024.0
             inp = (base + float(rank)).to(torch.bfloat16)
             out = torch.empty_like(inp)
             output_address = out.data_ptr()
-            actual = runtime.all_reduce(inp, out=out)
+            plan = prepare(inp, out)
+            with session.capture():
+                actual = runtime.all_reduce(inp, out=out, plan=plan)
             torch.cuda.synchronize(device)
             assert actual is out
             assert out.data_ptr() == output_address
@@ -86,14 +108,18 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
         graph_output = torch.empty_like(graph_input)
         graph_input_address = graph_input.data_ptr()
         graph_output_address = graph_output.data_ptr()
+        plan = prepare(graph_input, graph_output)
         graph = torch.cuda.CUDAGraph()
         dist.barrier()
-        with torch.cuda.graph(graph):
-            runtime.all_reduce(graph_input, out=graph_output)
-        for step in range(2):
+        with session.capture(), torch.cuda.graph(graph):
+            runtime.all_reduce(graph_input, out=graph_output, plan=plan)
+        for step in range(16):
             graph_input.fill_(float(rank) + 0.25 + float(step))
+            graph_output.fill_(float("nan"))
             dist.barrier()
-            graph.replay()
+            with session.capture():
+                for _ in range(32):
+                    graph.replay()
             torch.cuda.synchronize(device)
             expected_value = sum(
                 float(source_rank) + 0.25 + float(step)
@@ -103,7 +129,9 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
             torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
             assert graph_input.data_ptr() == graph_input_address
             assert graph_output.data_ptr() == graph_output_address
+        graph.reset()
     finally:
+        session.close()
         runtime.close()
         dist.destroy_process_group()
 

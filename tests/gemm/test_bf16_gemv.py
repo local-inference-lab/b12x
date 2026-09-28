@@ -48,6 +48,45 @@ def _op():
     return _mm
 
 
+@cuda_required
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import require_prepared
+
+    torch.manual_seed(41)
+    source = torch.randn(65, 1024, device="cuda", dtype=torch.bfloat16) * 0.125
+    weight = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16) * 0.125
+    bias = torch.randn(512, device="cuda", dtype=torch.bfloat16) if with_bias else None
+    output = torch.empty(65, 512, device="cuda", dtype=torch.bfloat16)
+    with PreparationSession(device=source.device, autotune=False, compile_workers=0) as session:
+        plan = _prepare_projection(session, source, weight, out=output, bias=bias,
+                                   override=bf16_gemv.GemvConfig(backend="torch"))
+        session.freeze()
+        state = require_prepared(plan, "gemm.bf16_gemv", source.device)
+        launcher = state.launcher
+        with kernel_resolution_guard("prepared cuBLAS projection"):
+            for rows in (1, 3, 8, 17, 65):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    bf16_gemv.mm(source[:rows], weight, out=output[:rows], bias=bias, plan=plan)
+                source.neg_()
+                output.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                expected = source[:rows].float() @ weight.float().T
+                if bias is not None:
+                    expected += bias.float()
+                torch.testing.assert_close(output[:rows].float(), expected, rtol=0.01, atol=0.01)
+                assert torch.isfinite(output[:rows]).all()
+                assert torch.count_nonzero(output[:rows])
+                assert torch.isnan(output[rows:]).all()
+                assert state.launcher is launcher
+                graph.reset()
+
+
 def _assert_matches_f32_ref(y: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
     ref = x.float() @ w.float().t()
     assert y.dtype == torch.bfloat16

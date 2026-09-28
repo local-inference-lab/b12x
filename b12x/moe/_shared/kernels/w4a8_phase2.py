@@ -120,8 +120,8 @@ class W4A8MaterializedPhase2Kernel:
         self.w4a8_trellis = trellis_bits is not None
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
         # Direct-LUT decode gathers each byte from the rate-indexed 192 KiB
-        # global state table instead of hashing into a 4 KiB shared T12
-        # staircase; the shared region is then not allocated.
+        # global table instead of reading a 4 KiB shared value table; the
+        # shared region is then not allocated.
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         if self.w4a8_trellis:
             self.trellis_lut_offset = self.shared_bytes
@@ -152,6 +152,8 @@ class W4A8MaterializedPhase2Kernel:
         grid_z = max_active_clusters * Int32(2)
         if cutlass.const_expr(self.direct_routes):
             grid_z = num_pairs * packed_output_tiles * Int32(256 // self.tile_n)
+            if max_active_clusters > Int32(0):
+                grid_z = cutlass.min(grid_z, max_active_clusters * Int32(2))
         self.kernel(
             intermediate_u32,
             down_rp,

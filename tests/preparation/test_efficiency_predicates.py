@@ -47,7 +47,7 @@ def _query():
 
 
 def _choice(**changes):
-    return dict(backend="tf32_tma", lagged_prepare=False,
+    return dict(backend="tf32_tma", lagged_prepare=False, partials_per_cta=4,
                 projection_tile_n=24, projection_tile_k=64,
                 projection_num_stages=2, projection_num_m_warps=2,
                 projection_num_n_warps=1, projection_k_splits=20) | changes

@@ -1,6 +1,8 @@
 """Preparation declarations for canonical fused tensor-parallel MoE."""
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -91,10 +93,14 @@ def _quant_mode(experts: PreparedExperts, config: MoeDecodeConfig) -> str:
 def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
+    from b12x.moe._shared.kernels.w4a16.host import (
+        prefill_fused_sum_enabled,
+    )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -180,11 +186,11 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         ),
         "trellis_bits": plan.trellis_bits,
         "trellis_tile_config": plan.trellis_tile_config,
-        "coupled_hadamard": plan.coupled_hadamard,
+        "intermediate_hadamard": plan.intermediate_hadamard,
         "trellis_codebook": plan.trellis_codebook,
         "trellis_rate_granularity": plan.trellis_rate_granularity,
         "trellis_pair_kinds": None if plan.trellis_pair_kinds is None else tuple(plan.trellis_pair_kinds),
-        "coupled_hadamard_blocks": plan.coupled_hadamard_blocks,
+        "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
     }
 
 
@@ -240,8 +246,13 @@ def _lower_caps(
         deterministic_output=query.deterministic_output,
         swiglu_limit=_decode_scalar(query.swiglu_limit),
         swiglu_alpha=_decode_scalar(query.swiglu_alpha),
-        w4a16_block_size_m=query.w4a16_block_size_m,
+        w4a16_block_size_m=(config.w4a16_block_size_m
+                            if config.w4a16_block_size_m is not None
+                            else query.w4a16_block_size_m),
         w4a16_fast_math=query.fast_math,
+        w4a16_prefill_fused_sum=bool(
+            query.controls.get("w4a16_prefill_fused_sum", False)
+        ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -273,6 +284,18 @@ class _W4A16PrimaryLaunches:
                 "W4A16 execution exceeds its prepared capacity: "
                 f"requested={int(tokens)}, prepared={self.tokens}"
             )
+        native_direct = (
+            int(tokens) == self.tokens
+            and self.route_mode != "packed"
+            and not has_route_map
+            and activation_amax is None
+            and any(
+                launch.topk_ids_dtype == route_ids_dtype
+                for launch in getattr(self.packed, "small_m_direct_launches", ())
+            )
+        )
+        if native_direct:
+            return self.packed, self.topk_sum, None
         direct = (
             int(tokens) == self.tokens
             and self.route_mode != "packed"
@@ -338,7 +361,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     tokens = int(scratch.launch_plan.max_tokens_per_launch)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
-    if weight_layout not in {"packed", "modelopt"}:
+    if weight_layout not in {"packed", "modelopt", "iq2_xs", "iq2_xxs", "q8_0"}:
         raise ValueError(f"unsupported standard W4A16 weight layout {weight_layout!r}")
     element_dtype = "bf16" if core.dtype == torch.bfloat16 else "fp16"
     w13_layout = caps.w13_layout if weight_layout == "modelopt" else "packed"
@@ -354,6 +377,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         props = torch.cuda.get_device_properties(core.device)
         compiler_args = dict(
             size_m=tokens, hidden_size=core.k, intermediate_size=core.n,
+            direct_token_capacity=int(caps.max_tokens),
             num_experts=core.weight_E, top_k=core.num_topk,
             activation=core.activation,
             apply_router_weight_on_input=caps.apply_router_weight_on_input,
@@ -366,15 +390,32 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             swiglu_limit=core.swiglu_limit, swiglu_alpha=core.swiglu_alpha,
             swiglu_beta=core.swiglu_beta, weight_layout=weight_layout,
             scale_format=scale_format, w13_layout=w13_layout,
+            force_tile_config=caps.decode_config.w4a16_tile_config,
+            pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,
+            prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         packed_mapped = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
+            prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         direct = direct_mapped = None
-        if weight_layout == "packed":
+        if weight_layout in BLOCK_CODECS:
+            if (caps.decode_config.w4a16_route_mode != "packed"
+                    and tokens <= 8 and core.activation in {"silu", "relu2"} and not caps.deterministic_output
+                    and not caps.collect_activation_amax and not caps.apply_router_weight_on_input):
+                decode_args = {**compiler_args, "moe_block_size": 8}
+                direct = compile_w4a16_fused_moe(
+                    **decode_args, zero_fc2_output=False, max_m_blocks=tokens * core.num_topk,
+                    direct_topk_routes=True, tc_decode_fused_sum=True,
+                )
+                direct_mapped = compile_w4a16_fused_moe(
+                    **decode_args, zero_fc2_output=False, max_m_blocks=tokens * core.num_topk,
+                    direct_topk_routes=True, use_expert_map=True, tc_decode_fused_sum=True,
+                )
+        elif weight_layout == "packed":
             if tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
                 direct = compile_w4a16_fused_moe(
                     **compiler_args, zero_fc2_output=False,
@@ -456,6 +497,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             planned_tile_m=tile_m,
             dynamic_route_mode="direct" if direct_routing else "grouped",
             deterministic_output=plan.deterministic_output,
+            w4a8_n64_repacked=n64_repacked,
         )
         and _impl._env_flag(
             _impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV,
@@ -503,7 +545,6 @@ class _CompactLaunches:
     kernels: object
     quantize: object
     topk_sum: object
-    sm_count: int
 
 
 def _compact_launches(plan, caps):
@@ -531,7 +572,7 @@ def _compact_launches(plan, caps):
         ) for dtype in (torch.int32, torch.int64)
     }
     topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
-    return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum, sms),
+    return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
                            tuple(kernels.values()), quantize, topk_sum)
 
 
@@ -549,6 +590,8 @@ def _program_carriers(
     launches = [item[-1] for item in scratch._prewarmed_fused_launches]
     launches.extend(item[-1] for item in scratch._prewarmed_topk_sum_launches)
     launches.extend(item[-1] for item in scratch._mixed_trellis_launches)
+    if scratch._prewarmed_route_pack_launches is not None:
+        launches.extend(scratch._prewarmed_route_pack_launches.carriers())
     plan = scratch.launch_plan
     if plan.implementation == "w4a16" and not scratch.full_rotation:
         launches.extend(
@@ -604,7 +647,7 @@ def _program_carriers(
                         swiglu_beta=plan.swiglu_beta,
                         weight_layout=weight_layout,
                         trellis_bits=caps.weight_plan.trellis_bits or 0,
-                        trellis_coupled=caps.weight_plan.coupled_hadamard,
+                        trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                     )
                     launches.append(launch)
     elif plan.implementation == "dynamic":
@@ -624,7 +667,7 @@ def _program_carriers(
                 deterministic_output=plan.deterministic_output,
                 swiglu_limit=plan.swiglu_limit, swiglu_alpha=plan.swiglu_alpha,
                 swiglu_beta=plan.swiglu_beta, trellis_bits=caps.weight_plan.trellis_bits or 0,
-                trellis_coupled=caps.weight_plan.coupled_hadamard,
+                trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
             )
             launches.append(launch)
@@ -908,6 +951,8 @@ def compile_dynamic_route_plan(payload, ordinal):
             MockTensor(ids_dtype, (rows,)),
             MockTensor(torch.int32, (num_experts,)),
             MockTensor(torch.int32, (num_experts + 1,)),
+            MockTensor(torch.int32, (1,)),
+            MockTensor(torch.int32, (1,)),
             rows,
             NUM_EXPERTS=num_experts,
             TILE_M=tile_m,
@@ -1046,6 +1091,8 @@ def plan_fc2(experts: PreparedExperts, invocation: FC2Invocation, *, override=No
              declaration_invocation: FrozenMapping = FrozenMapping()) -> Plan:
     if not isinstance(experts, PreparedExperts):
         raise TypeError("FC2 preparation requires canonical PreparedExperts")
+    if experts.plan._impl.source_format in BLOCK_CODECS:
+        raise NotImplementedError("standalone IQ2_XS FC2 is unsupported; use fused MoE")
     if not isinstance(invocation, FC2Invocation):
         raise TypeError("FC2 preparation requires FC2Invocation")
     from ._tuning import MoeFC2Query

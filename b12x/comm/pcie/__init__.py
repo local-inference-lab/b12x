@@ -7,7 +7,7 @@ Caller-owned runtimes retain CUDA-IPC handles and mapped peer buffers.
 Pools select only channels provisioned before preparation.
 
 - ``AllReduce``: peer-safe world-size dispatch. TP2-TP8 use the all-peer
-  oneshot path; TP12/TP16 use bounded-degree four-GPU islands.
+  oneshot path; TP9/TP10/TP12/TP16 use bounded-degree islands of up to four GPUs.
 - ``OneshotAllReduce``: low-level one-shot all-reduce
   (+ ``all_reduce_fused_add_rms_norm``).
 - ``DmaAllReduce``: CE-copy ring reduce-scatter + all-gather for prefill

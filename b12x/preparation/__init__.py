@@ -10,7 +10,7 @@ from .tuning import (
 from .types import (
     CollectiveRequirement, DeviceIdentity, FrozenMapping, MemoryRequirements,
     PersistentMemory, Plan, PreparationProgress, PreparationRequest,
-    PreparationResult, PreparedCall, Selection, TuningRequirement,
+    PreparationResult, PreparedCall, Selection, TuningCacheRequirement, TuningRequirement,
     current_plan, current_prepared_state, plan_from_handle, require_prepared,
 )
 
@@ -21,7 +21,7 @@ __all__ = [
     "ParameterSpace", "PersistentMemory", "Plan", "PreparationProgress",
     "PreparationJob", "PreparationSession", "PreparationDisplay",
     "PreparationRequest", "PreparationResult", "PreparedCall",
-    "Selection", "TuningConfiguration", "TuningContract", "TuningRequirement",
+    "Selection", "TuningCacheRequirement", "TuningConfiguration", "TuningContract", "TuningRequirement",
     "detect_device", "make_fixed_contract",
     "current_plan", "current_prepared_state", "plan_from_handle", "require_prepared",
 ]

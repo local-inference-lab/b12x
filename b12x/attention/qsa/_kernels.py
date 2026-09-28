@@ -168,6 +168,9 @@ def _compress_completed_groups_kernel(
     COMPRESS_RATIO: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
     COMPRESSED_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     POSITION_AXES: tl.constexpr,
     MROPE_INTERLEAVED: tl.constexpr,
     MROPE_SECTION_0: tl.constexpr,
@@ -184,7 +187,16 @@ def _compress_completed_groups_kernel(
         mask=real_request,
         other=-1,
     ).to(tl.int64)
-    complete = ((position + 1) % COMPRESS_RATIO) == 0
+    group_id = position // COMPRESS_RATIO
+    if DCP_SIZE == 1:
+        complete = ((position + 1) % COMPRESS_RATIO) == 0
+    else:
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        owner = (group_id // group_interleave) % DCP_SIZE
+        complete = (((position + 1) % COMPRESS_RATIO) == 0) & (
+            owner == DCP_RANK
+        )
     if real_request & complete & (state_slot >= 0):
         request_start = tl.load(query_start_loc + request).to(tl.int64)
         current_first = tl.load(query_positions + request_start).to(tl.int64)
@@ -307,9 +319,15 @@ def _compress_completed_groups_kernel(
         else:
             rotated = normalized * cosine + rotated_partner * sine
         representative = tl.where(in_rotary, rotated, normalized)
-        group_id = position // COMPRESS_RATIO
-        logical_page = group_id // COMPRESSED_PAGE_SIZE
-        page_offset = group_id % COMPRESSED_PAGE_SIZE
+        if DCP_SIZE == 1:
+            local_group = group_id
+        else:
+            local_group = (
+                (group_id // dcp_round) * group_interleave
+                + group_id % group_interleave
+            )
+        logical_page = local_group // COMPRESSED_PAGE_SIZE
+        page_offset = local_group % COMPRESSED_PAGE_SIZE
         table_offset = (request * compressed_table_stride + logical_page).to(tl.int64)
         physical_page = tl.load(compressed_block_table + table_offset).to(tl.int64)
         if physical_page >= 0:
@@ -433,6 +451,9 @@ def _score_representatives_kernel(
     INDEX_HEAD_DIM: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     COMPRESSED_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -446,10 +467,22 @@ def _score_representatives_kernel(
         mask=real_request,
         other=0,
     ).to(tl.int64)
-    eligible = tl.minimum(
+    global_eligible = tl.minimum(
         (position + 1) // COMPRESS_RATIO,
         sequence_length // COMPRESS_RATIO,
     )
+    if DCP_SIZE == 1:
+        eligible = global_eligible
+    else:
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        complete_rounds = global_eligible // dcp_round
+        remainder = global_eligible - complete_rounds * dcp_round
+        rank_remainder = tl.minimum(
+            tl.maximum(remainder - DCP_RANK * group_interleave, 0),
+            group_interleave,
+        )
+        eligible = complete_rounds * group_interleave + rank_remainder
     eligible = tl.minimum(eligible, MAX_GROUPS)
     eligible = tl.where(real_request, eligible, 0)
     prior_eligible = tl.minimum(eligible, GROUP_OFFSET)
@@ -568,152 +601,6 @@ def _remap_topk_group_ids_kernel(
 
 
 @triton.jit
-def _stable_topk_threshold_kernel(
-    topk_values,
-    merge_lengths,
-    thresholds,
-    greater_totals,
-    stable_values,
-    stable_ids,
-    GROUP_BUDGET: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    row = tl.program_id(0)
-    columns = tl.arange(0, BLOCK_K)
-    selected_count = tl.minimum(tl.load(merge_lengths + row), GROUP_BUDGET)
-    active = columns < selected_count
-    values = tl.load(
-        topk_values + row * GROUP_BUDGET + columns,
-        mask=active,
-        other=float("inf"),
-    ).to(tl.float32)
-    threshold = tl.min(values, axis=0)
-    greater = tl.sum((active & (values > threshold)).to(tl.int32), axis=0)
-    tl.store(thresholds + row, threshold)
-    tl.store(greater_totals + row, greater)
-    tl.store(
-        stable_values + row * GROUP_BUDGET + columns,
-        -float("inf"),
-        mask=columns < GROUP_BUDGET,
-    )
-    tl.store(
-        stable_ids + row * GROUP_BUDGET + columns,
-        -1,
-        mask=columns < GROUP_BUDGET,
-    )
-
-
-@triton.jit
-def _count_stable_topk_candidates_kernel(
-    scores,
-    merge_lengths,
-    thresholds,
-    tie_counts,
-    greater_counts,
-    score_row_stride,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    row = tl.program_id(0)
-    block = tl.program_id(1)
-    columns = block * BLOCK_C + tl.arange(0, BLOCK_C)
-    length = tl.load(merge_lengths + row)
-    active = columns < length
-    values = tl.load(
-        scores + row * score_row_stride + columns,
-        mask=active,
-        other=-float("inf"),
-    ).to(tl.float32)
-    threshold = tl.load(thresholds + row)
-    ties = tl.sum((active & (values == threshold)).to(tl.int32), axis=0)
-    greater = tl.sum((active & (values > threshold)).to(tl.int32), axis=0)
-    tl.store(tie_counts + row * NUM_BLOCKS + block, ties)
-    tl.store(greater_counts + row * NUM_BLOCKS + block, greater)
-
-
-@triton.jit
-def _emit_stable_topk_kernel(
-    scores,
-    merge_lengths,
-    prior_ids,
-    eligible_counts,
-    thresholds,
-    greater_totals,
-    tie_counts,
-    greater_counts,
-    stable_values,
-    stable_ids,
-    score_row_stride,
-    GROUP_OFFSET: tl.constexpr,
-    GROUP_BUDGET: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK_COUNTS: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    row = tl.program_id(0)
-    block = tl.program_id(1)
-    count_columns = tl.arange(0, BLOCK_COUNTS)
-    prior_blocks = (count_columns < block) & (count_columns < NUM_BLOCKS)
-    ties_before = tl.sum(
-        tl.load(
-            tie_counts + row * NUM_BLOCKS + count_columns,
-            mask=prior_blocks,
-            other=0,
-        ),
-        axis=0,
-    )
-    greater_before = tl.sum(
-        tl.load(
-            greater_counts + row * NUM_BLOCKS + count_columns,
-            mask=prior_blocks,
-            other=0,
-        ),
-        axis=0,
-    )
-
-    columns = block * BLOCK_C + tl.arange(0, BLOCK_C)
-    length = tl.load(merge_lengths + row)
-    active = columns < length
-    values = tl.load(
-        scores + row * score_row_stride + columns,
-        mask=active,
-        other=-float("inf"),
-    ).to(tl.float32)
-    threshold = tl.load(thresholds + row)
-    greater = active & (values > threshold)
-    ties = active & (values == threshold)
-    selected_count = tl.minimum(length, GROUP_BUDGET)
-    tie_needed = selected_count - tl.load(greater_totals + row)
-    tie_rank = ties_before + tl.cumsum(ties.to(tl.int32), axis=0) - 1
-    selected = greater | (ties & (tie_rank < tie_needed))
-    selected_before = greater_before + tl.minimum(ties_before, tie_needed)
-    output_columns = selected_before + tl.cumsum(selected.to(tl.int32), axis=0) - 1
-
-    eligible = tl.load(eligible_counts + row)
-    carry_count = tl.minimum(tl.minimum(eligible, GROUP_OFFSET), GROUP_BUDGET)
-    carried = tl.load(
-        prior_ids + row * GROUP_BUDGET + columns,
-        mask=active & (columns < carry_count),
-        other=-1,
-    )
-    global_ids = tl.where(
-        columns < carry_count,
-        carried,
-        GROUP_OFFSET + columns - carry_count,
-    )
-    tl.store(
-        stable_values + row * GROUP_BUDGET + output_columns,
-        values,
-        mask=selected,
-    )
-    tl.store(
-        stable_ids + row * GROUP_BUDGET + output_columns,
-        global_ids,
-        mask=selected,
-    )
-
-
-@triton.jit
 def _copy_stable_topk_kernel(
     stable_values,
     stable_ids,
@@ -767,6 +654,9 @@ def _expand_selected_groups_kernel(
     GROUP_BUDGET: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SELECTION_WIDTH: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -784,17 +674,102 @@ def _expand_selected_groups_kernel(
     expanded = group_ids * COMPRESS_RATIO + columns % COMPRESS_RATIO
     position = tl.load(query_positions + row).to(tl.int64)
     tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
-    tail_length = position + 1 - tail_start
+    if DCP_SIZE == 1:
+        local_tail_start = tail_start
+        tail_length = position + 1 - tail_start
+    else:
+        global_tail_group = tail_start // COMPRESS_RATIO
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        tail_owner = (global_tail_group // group_interleave) % DCP_SIZE
+        local_tail_group = (
+            (global_tail_group // dcp_round) * group_interleave
+            + global_tail_group % group_interleave
+        )
+        local_tail_start = local_tail_group * COMPRESS_RATIO
+        tail_length = tl.where(
+            tail_owner == DCP_RANK,
+            position + 1 - tail_start,
+            0,
+        )
     tail_column = columns - expanded_count
     in_tail = (tail_column >= 0) & (tail_column < tail_length)
     result = tl.where(
         columns < expanded_count,
         expanded,
-        tl.where(in_tail, tail_start + tail_column, -1),
+        tl.where(in_tail, local_tail_start + tail_column, -1),
     )
     tl.store(
         selected_positions + row * selected_row_stride + columns,
         result,
+        mask=column_mask,
+    )
+
+
+@triton.jit
+def _expand_global_selected_groups_kernel(
+    topk_group_ids,
+    query_positions,
+    selected_positions,
+    topk_row_stride,
+    selected_row_stride,
+    GROUP_BUDGET: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    SELECTION_WIDTH: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK_W)
+    column_mask = columns < SELECTION_WIDTH
+    group_columns = columns // COMPRESS_RATIO
+    global_group = tl.load(
+        topk_group_ids + row * topk_row_stride + group_columns,
+        mask=column_mask & (group_columns < GROUP_BUDGET),
+        other=-1,
+    ).to(tl.int64)
+    group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+    dcp_round = DCP_SIZE * group_interleave
+    safe_group = tl.maximum(global_group, 0)
+    owner = (safe_group // group_interleave) % DCP_SIZE
+    local_group = (
+        (safe_group // dcp_round) * group_interleave
+        + safe_group % group_interleave
+    )
+    expanded = local_group * COMPRESS_RATIO + columns % COMPRESS_RATIO
+    selected = tl.where(
+        (columns < GROUP_BUDGET * COMPRESS_RATIO)
+        & (global_group >= 0)
+        & (owner == DCP_RANK),
+        expanded,
+        -1,
+    )
+
+    position = tl.load(query_positions + row).to(tl.int64)
+    global_tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
+    global_tail_group = global_tail_start // COMPRESS_RATIO
+    tail_owner = (global_tail_group // group_interleave) % DCP_SIZE
+    local_tail_group = (
+        (global_tail_group // dcp_round) * group_interleave
+        + global_tail_group % group_interleave
+    )
+    tail_column = columns - GROUP_BUDGET * COMPRESS_RATIO
+    tail_length = position + 1 - global_tail_start
+    in_tail = (
+        (tail_owner == DCP_RANK)
+        & (tail_column >= 0)
+        & (tail_column < tail_length)
+    )
+    selected = tl.where(
+        in_tail,
+        local_tail_group * COMPRESS_RATIO + tail_column,
+        selected,
+    )
+    tl.store(
+        selected_positions + row * selected_row_stride + columns,
+        selected,
         mask=column_mask,
     )
 
@@ -806,11 +781,9 @@ _SUPPORT_KERNEL_KEYS = {
     _score_representatives_kernel: "score_representatives",
     _stage_topk_carry_kernel: "stage_topk_carry",
     _remap_topk_group_ids_kernel: "remap_topk_group_ids",
-    _stable_topk_threshold_kernel: "stable_topk_threshold",
-    _count_stable_topk_candidates_kernel: "stable_topk_count",
-    _emit_stable_topk_kernel: "stable_topk_emit",
     _copy_stable_topk_kernel: "stable_topk_copy",
     _expand_selected_groups_kernel: "expand_selected_groups",
+    _expand_global_selected_groups_kernel: "expand_global_selected_groups",
 }
 
 _support_launch_context: contextvars.ContextVar[
@@ -990,6 +963,9 @@ def launch_compress_completed_groups(
     COMPRESS_RATIO=int(caps.compress_ratio),
     RING_CAPACITY=int(caps.raw_ring_capacity),
     COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
     POSITION_AXES=int(caps.position_axes),
     MROPE_INTERLEAVED=bool(caps.mrope_interleaved),
     MROPE_SECTION_0=section0,
@@ -1082,6 +1058,9 @@ def launch_score_representatives(
     INDEX_HEAD_DIM=int(caps.index_head_dim),
     COMPRESS_RATIO=int(caps.compress_ratio),
     COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
     BLOCK_G=block_g,
     BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
     num_warps=4,)
@@ -1177,43 +1156,21 @@ def launch_stabilize_topk(
 ) -> None:
     """Make threshold ties exact and stable by retaining lower group IDs."""
     rows = int(scores.shape[0])
-    num_blocks = int(tie_counts.shape[1])
     block_k = triton.next_power_of_2(int(group_budget))
-    _launch_triton(_stable_topk_threshold_kernel, (rows,), topk_values,
-    merge_lengths,
-    thresholds,
-    greater_totals,
-    stable_values,
-    stable_ids,
-    GROUP_BUDGET=int(group_budget),
-    BLOCK_K=block_k,
-    num_warps=8,)
-    _launch_triton(_count_stable_topk_candidates_kernel, (rows, num_blocks), scores,
-    merge_lengths,
-    thresholds,
-    tie_counts,
-    greater_counts,
-    int(scores.stride(0)),
-    NUM_BLOCKS=num_blocks,
-    BLOCK_C=512,
-    num_warps=8,)
-    _launch_triton(_emit_stable_topk_kernel, (rows, num_blocks), scores,
-    merge_lengths,
-    prior_ids,
-    eligible_counts,
-    thresholds,
-    greater_totals,
-    tie_counts,
-    greater_counts,
-    stable_values,
-    stable_ids,
-    int(scores.stride(0)),
-    GROUP_OFFSET=int(group_offset),
-    GROUP_BUDGET=int(group_budget),
-    NUM_BLOCKS=num_blocks,
-    BLOCK_COUNTS=triton.next_power_of_2(num_blocks),
-    BLOCK_C=512,
-    num_warps=8,)
+    from ._stable_select_cute import launch_stable_selection
+
+    context = _support_launch_context.get()
+    prepared = None
+    if context is not None and not context[1]:
+        prepared = context[0]["stable_selection"]
+    raw = launch_stable_selection(
+        scores=scores, merge_lengths=merge_lengths, prior_ids=prior_ids,
+        eligible_counts=eligible_counts, topk_values=topk_values,
+        stable_values=stable_values, stable_ids=stable_ids,
+        group_offset=group_offset, group_budget=group_budget, prepared=prepared,
+    )
+    if context is not None and context[1]:
+        context[0]["stable_selection"] = raw
     _launch_triton(_copy_stable_topk_kernel, (rows,), stable_values,
     stable_ids,
     topk_values,
@@ -1241,6 +1198,32 @@ def launch_expand_selected_groups(
     GROUP_BUDGET=int(caps.group_budget),
     COMPRESS_RATIO=int(caps.compress_ratio),
     SELECTION_WIDTH=int(caps.selection_width),
+    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+    BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
+    num_warps=8,)
+
+
+def launch_expand_global_selected_groups(
+    *,
+    topk_group_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    selected_positions: torch.Tensor,
+    caps,
+) -> None:
+    rows = int(query_positions.shape[0])
+    _launch_triton(_expand_global_selected_groups_kernel, (rows,), topk_group_ids,
+    query_positions,
+    selected_positions,
+    int(topk_group_ids.stride(0)),
+    int(selected_positions.stride(0)),
+    GROUP_BUDGET=int(caps.group_budget),
+    COMPRESS_RATIO=int(caps.compress_ratio),
+    SELECTION_WIDTH=int(caps.selection_width),
+    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
     BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
     num_warps=8,)
 
@@ -1255,6 +1238,7 @@ _SUPPORT_WRAPPER_NAMES = (
     "launch_remap_topk_group_ids",
     "launch_stabilize_topk",
     "launch_expand_selected_groups",
+    "launch_expand_global_selected_groups",
 )
 
 for _support_wrapper_name in _SUPPORT_WRAPPER_NAMES:
@@ -1274,4 +1258,5 @@ __all__ = [
     "launch_remap_topk_group_ids",
     "launch_stabilize_topk",
     "launch_expand_selected_groups",
+    "launch_expand_global_selected_groups",
 ]

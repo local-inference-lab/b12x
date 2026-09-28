@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import math
 import os
 import statistics
@@ -129,13 +130,32 @@ class _StreamGate:
         self.streams.clear()
 
 
+@contextmanager
+def _collection_paused():
+    """Keep automatic garbage collection out of a gated sample.
+
+    A collection can finalize an unreferenced CuTe module, whose
+    ``cudaLibraryUnload`` waits for queued device work. Work behind the stream
+    gate waits for this thread to release it, so neither would proceed.
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
 class _TimedCall:
     def __init__(self, call, eviction, samples, gate):
         import torch
         self.call, self.eviction = call, eviction
         self.gate = gate
+        self.producers = call.benchmark_producers or (call.produce,)
         self.events = tuple((torch.cuda.Event(enable_timing=True),
-                             torch.cuda.Event(enable_timing=True)) for _ in range(samples))
+                             torch.cuda.Event(enable_timing=True))
+                            for _ in range(samples * len(self.producers)))
         for pair in self.events:
             for event in pair:
                 event.record()
@@ -146,13 +166,12 @@ class _TimedCall:
 
         stream = torch.cuda.current_stream()
         with call_scope():
-            for start, end in self.events:
+            for index, (start, end) in enumerate(self.events):
                 self.eviction()
                 if self.call.reset is not None:
                     self.call.reset()
-                if self.call.produce is not None:
-                    self.call.produce()
-                with self.gate.hold(stream):
+                self.producers[index % len(self.producers)]()
+                with _collection_paused(), self.gate.hold(stream):
                     start.record(stream)
                     self.call.invoke()
                     end.record(stream)
@@ -163,6 +182,7 @@ class _TimedCall:
     def close(self):
         self.call = self.eviction = self.gate = None
         self.events = ()
+        self.producers = ()
 
 
 @dataclass
@@ -222,6 +242,10 @@ def prepare_race_steps(
         raise ValueError("a race requires candidates and positive samples")
     if any(call.produce is None for call in calls):
         raise ValueError("candidate races require an activation-producing context")
+    workload_counts = {len(call.benchmark_producers) or 1 for call in calls}
+    if len(workload_counts) != 1:
+        raise ValueError("candidate races require the same workload count for every candidate")
+    sample_count = samples * workload_counts.pop()
     timers = []
     gate = None
     completed = False
@@ -243,10 +267,10 @@ def prepare_race_steps(
                 timers.append(_TimedCall(call, eviction, samples, gate))
             yield
         completed = True
-        return PreparedRace(tuple(timers), eviction, samples, gate=gate)
+        return PreparedRace(tuple(timers), eviction, sample_count, gate=gate)
     finally:
         if not completed:
-            PreparedRace(tuple(timers), None, samples, gate=gate).close()
+            PreparedRace(tuple(timers), None, sample_count, gate=gate).close()
 
 
 def _replay_timers(timers, *, device_ordinal, sample_count=0, compilation_active=None):

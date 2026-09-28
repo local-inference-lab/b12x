@@ -2974,6 +2974,20 @@ def fused_indexer_scratch_capacity(
 
 
 
+def _can_vectorize_q_load(q_bytes: torch.Tensor) -> bool:
+    if hasattr(q_bytes, "fake_mode") or q_bytes.is_meta:
+        # Preparation represents the declared alignment as a storage offset.
+        address = q_bytes.storage_offset() * q_bytes.element_size()
+    else:
+        address = int(q_bytes.data_ptr())
+    return (
+        address % 16 == 0
+        and int(q_bytes.stride(2)) == 1
+        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
+        and int(q_bytes.stride(0)) % 16 == 0
+    )
+
+
 def run_fused_paged_indexer(
     *,
     q_bytes: torch.Tensor,  # uint8 view of fp8 q, [rows, heads, 128]
@@ -3068,12 +3082,7 @@ def run_fused_paged_indexer(
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
     k_quant_page_stride = int(k_quant_bytes.stride(0))
     k_scales_row_stride = int(k_scales.stride(0))
-    vectorized_q_load = (
-        int(q_bytes.data_ptr()) % 16 == 0
-        and int(q_bytes.stride(2)) == 1
-        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
-        and int(q_bytes.stride(0)) % 16 == 0
-    )
+    vectorized_q_load = _can_vectorize_q_load(q_bytes)
     q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
     num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
     kernel = _build_fused_indexer_kernel(
@@ -3173,12 +3182,7 @@ def run_fused_indexer_mla(
         else out_values
     )
     pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, 1, dev)
-    vectorized_q_load = (
-        int(q_bytes.data_ptr()) % 16 == 0
-        and int(q_bytes.stride(2)) == 1
-        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
-        and int(q_bytes.stride(0)) % 16 == 0
-    )
+    vectorized_q_load = _can_vectorize_q_load(q_bytes)
     q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
     kernel = _build_fused_indexer_kernel(
         KV_LAYOUT_CONTIGUOUS_MLA,

@@ -33,13 +33,27 @@ _THREADS = 128
 
 
 class _RepresentativeScoreKernel:
-    def __init__(self, heads, dim, ratio, page_size, max_groups, budget):
+    def __init__(
+        self,
+        heads,
+        dim,
+        ratio,
+        page_size,
+        max_groups,
+        budget,
+        dcp_size,
+        dcp_rank,
+        cp_interleave,
+    ):
         self.heads = heads
         self.dim = dim
         self.ratio = ratio
         self.page_size = page_size
         self.max_groups = max_groups
         self.budget = budget
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.group_interleave = cp_interleave // ratio
         self.lane_values = (dim + 31) // 32
         self.scale = 1.0 / math.sqrt(dim)
         self.use_mma = heads <= 8 and dim % 16 == 0
@@ -206,9 +220,21 @@ class _RepresentativeScoreKernel:
         if request >= Int64(0):
             position_groups = (positions[row].to(Int64) + Int64(1)) // self.ratio
             sequence_groups = lengths[request].to(Int64) // self.ratio
-            eligible = cutlass.min(
-                cutlass.min(position_groups, sequence_groups), Int64(self.max_groups)
-            ).to(Int32)
+            global_eligible = cutlass.min(position_groups, sequence_groups).to(Int32)
+            eligible = global_eligible
+            if cutlass.const_expr(self.dcp_size > 1):
+                round_width = Int32(self.dcp_size * self.group_interleave)
+                complete_rounds = global_eligible // round_width
+                remainder = global_eligible - complete_rounds * round_width
+                rank_remainder = cutlass.min(
+                    cutlass.max(
+                        remainder - Int32(self.dcp_rank * self.group_interleave),
+                        Int32(0),
+                    ),
+                    Int32(self.group_interleave),
+                )
+                eligible = complete_rounds * Int32(self.group_interleave) + rank_remainder
+            eligible = cutlass.min(eligible, Int32(self.max_groups))
         carry = cutlass.min(cutlass.min(eligible, group_offset), Int32(self.budget))
         if (block == 0) & (thread == 0):
             counts[row] = eligible
@@ -329,6 +355,8 @@ def compile_score_representatives(
         int(caps.index_heads), int(caps.index_head_dim),
         int(caps.compress_ratio), int(caps.compressed_page_size),
         int(caps.max_groups), int(caps.group_budget),
+        int(caps.dcp_size), int(caps.dcp_rank),
+        int(caps.cp_kv_cache_interleave_size),
     )
     device_index = prepared_query.device.index
     if device_index is None:
@@ -347,7 +375,7 @@ def compile_score_representatives(
                 kernel, fake, (Int64(1),) * 4, Int32(1), Int32(0),
                 Int32(1), current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "attention.qsa.representative_score", 1, key
+                    "attention.qsa.representative_score", 2, key
                 ),
             )
             _CACHE[key] = raw

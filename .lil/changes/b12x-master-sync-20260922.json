@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-master-sync-20260922",
+  "category": "fix",
+  "summary": "Align contiguous attention normalization and tuning identities with master",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Preserve the native scale and FlashAttention 2 reduction order in contiguous attention normalization.",
+    "Share tuning identity across product labels with the same compute capability and SM count.",
+    "Retain configured traffic class in the switched-RoCE proxy."
+  ],
+  "pull_requests": [400, 407],
+  "authors": ["voipmonitor", "acronjob", "lukealonso"],
+  "requires": []
+}

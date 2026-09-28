@@ -9,7 +9,7 @@ from b12x.norm.mhc._tuning import TUNING
 from b12x.preparation import FrozenMapping, PreparedCall
 
 
-def declaration(operation, args, options, *, capacity=None, output_mode="provided", backend=None, lagged_prepare=None):
+def declaration(operation, args, options, *, capacity=None, output_mode="provided", backend=None, lagged_prepare=None, partials_per_cta=None):
     residual = args[0 if operation == "pre" else 1]
     norm = options.get("norm_weight")
     invocation = dict(
@@ -25,12 +25,15 @@ def declaration(operation, args, options, *, capacity=None, output_mode="provide
     caps = mhc.Caps(device=residual.device, max_tokens=capacity or residual.shape[0],
                     hidden_size=residual.shape[-1])
     plan = mhc.plan(caps, invocation=FrozenMapping(invocation))
-    if backend is not None or lagged_prepare is not None:
+    if backend is not None or lagged_prepare is not None or partials_per_cta is not None:
         config = TUNING.configure(plan.query, device=None).default
         if backend is not None:
-            config = replace(config, backend=backend, lagged_prepare=False)
+            config = replace(config, backend=backend, lagged_prepare=False, partials_per_cta=4)
         if lagged_prepare is not None:
-            config = replace(config, lagged_prepare=lagged_prepare)
+            config = replace(config, lagged_prepare=lagged_prepare,
+                             partials_per_cta=config.partials_per_cta if lagged_prepare else 4)
+        if partials_per_cta is not None:
+            config = replace(config, partials_per_cta=partials_per_cta)
         plan = mhc.plan(caps, invocation=FrozenMapping(invocation), override=config)
     return plan
 

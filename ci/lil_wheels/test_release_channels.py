@@ -1,4 +1,4 @@
-"""Both serving source branches use the same wheel builder and artifact identity."""
+"""Serving integration branches share a source-addressed wheel publisher."""
 
 from pathlib import Path
 
@@ -11,7 +11,11 @@ def test_source_channel_triggers_share_one_builder():
         (root / ".github/workflows/lil-cu134-wheel-release.yml").read_text(),
         Loader=yaml.BaseLoader,
     )
-    assert workflow["on"]["push"]["branches"] == ["master", "integration/beta"]
+    assert workflow["on"]["push"]["branches"] == [
+        "master",
+        "integration/beta",
+        "integration/karmic-kraken-beta",
+    ]
     assert "paths" not in workflow["on"]["push"]
     assert "workflow_dispatch" in workflow["on"]
     assert workflow["concurrency"]["cancel-in-progress"] == "false"
@@ -23,5 +27,7 @@ def test_source_channel_triggers_share_one_builder():
     notification = jobs["notify-container"]
     assert notification["needs"] == "build-beta"
     assert "integration/beta" in notification["if"]
+    for branch in workflow["on"]["push"]["branches"]:
+        assert f"refs/heads/{branch}" in notification["if"]
     assert "LIL_CONTAINER_DISPATCH_ENABLED" in notification["if"]
     assert notification["permissions"] == {}

@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-433",
+  "category": "feature",
+  "summary": "Share native and EXL3 trellis preparation with bounded W4A16 workspaces",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Native TrellisConfig callers remain accepted. Canonical EXL3 callers use trellis_from_exl3 and pass device to prepare_weights. GPU serving qualification is pending.",
+  "details": [
+    "Preserves codewords, FP16 scales and source-global transform coordinates through common trellis preparation.",
+    "Retains compact W4A16 trellis decoding and unordered atomic route packing.",
+    "Preserves IQ2_XS, IQ2_XXS and Q8_0 epilogues and pipeline tuning."
+  ],
+  "pull_requests": [
+    433
+  ],
+  "requires": []
+}
