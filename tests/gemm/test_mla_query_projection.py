@@ -162,6 +162,54 @@ def test_mxfp8_execution_still_requires_exact_m(monkeypatch, m, admitted):
         assert calls == []
 
 
+@pytest.mark.parametrize(
+    "capacity,rows", [(16, (1, 3, 15)), (32, (1, 15, 16, 17, 31))]
+)
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_bf16_capacity_plan_replays_unseen_rows(monkeypatch, capacity, rows, output_dtype):
+    """Capture unseen row counts using only the retained capacity launcher."""
+    require_b12x()
+    from b12x.gemm.mla_query_projection import _bf16
+
+    heads = 11
+    q_nope_cap, weight, q_pe_cap, q_scale = _inputs(
+        heads=heads, m=capacity, weight_format="bf16"
+    )
+    fp8 = output_dtype == torch.float8_e4m3fn
+    q_scale = q_scale if fp8 else None
+    out_cap = torch.empty(capacity, heads, 576, device="cuda", dtype=output_dtype)
+
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("capacity execution must reuse its retained compiled launcher")
+
+    with _prepared_plans(
+        weight, (capacity,), heads=heads, output_dtype=output_dtype
+    ) as (session, plans):
+        session.freeze()
+        # Reject JIT dispatch even when another test has warmed its cache.
+        monkeypatch.setattr(
+            _bf16._mla_query_projection_bf16_kernel, "run", reject_resolution
+        )
+        for m in rows:
+            q_nope, q_pe, out = q_nope_cap[:, :m], q_pe_cap[:m], out_cap[:m]
+            graph = torch.cuda.CUDAGraph()
+            with no_compilation(), session.capture(), torch.cuda.graph(graph):
+                mla_query_projection.run(
+                    q_nope, weight, q_pe, out, plan=plans[capacity], q_scale=q_scale
+                )
+            q_nope.normal_()
+            q_pe.normal_()
+            out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = _reference(q_nope, weight, q_pe)
+            if fp8:
+                expected = (expected.float() / q_scale).clamp(-448, 448).to(output_dtype)
+                assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8)), m
+            else:
+                torch.testing.assert_close(out, expected, rtol=.03, atol=.03)
+
+
 @pytest.mark.parametrize("capacity,rows", [(16, (1, 3, 7, 15, 16)), (32, (1, 3, 7, 15, 16, 17, 31, 32))])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_bf16_capacity_plan_matches_exact_m_plans(capacity, rows, output_dtype):
