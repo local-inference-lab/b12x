@@ -282,13 +282,7 @@ def _initialize_worker(
 
     def fake_geometry(tensor, index):
         with no_dispatch():
-            meta = torch.empty_strided(
-                tuple(tensor.shape), tuple(tensor.stride()),
-                dtype=tensor.dtype, device="meta",
-            ).as_strided(
-                tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset()
-            )
-            return meta[meta_index(index)]
+            return original_getitem(meta_index(tensor), meta_index(index))
 
     def fake_getitem(tensor, index):
         if not isinstance(tensor, FakeTensor):
@@ -307,13 +301,15 @@ def _initialize_worker(
     def fake_setitem(tensor, index, value):
         if not isinstance(tensor, FakeTensor):
             return original_setitem(tensor, index, value)
-        destination = fake_getitem(tensor, index)
-        if isinstance(value, FakeTensor):
-            destination.fill_(0)
-        elif isinstance(value, (bool, int, float, complex)):
-            destination.fill_(value)
-        else:
-            destination.copy_(value)
+        with no_dispatch():
+            meta = meta_index(tensor)
+            index = meta_index(index)
+            value = meta_index(value)
+            original_setitem(meta, index, value)
+            # Meta index_put_ skips broadcasting checks. Basic assignment to
+            # the selected region validates them, including leading ones.
+            destination = original_getitem(meta, index)
+            original_setitem(destination, Ellipsis, value)
 
     torch.Tensor.__getitem__ = fake_getitem
     torch.Tensor.__setitem__ = fake_setitem
