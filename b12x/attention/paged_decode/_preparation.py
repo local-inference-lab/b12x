@@ -13,6 +13,7 @@ from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.compiler import KernelCompileSpec, run_compiled
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import ScratchBufferSpec
 from b12x._lib.utils import current_cuda_stream
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
@@ -158,6 +159,7 @@ def _compile_key(query: PagedDecodeQuery, config: PagedDecodeConfig) -> tuple:
     return tuple(sorted((k, v) for k, v in fields.items() if k not in _LAUNCH_ONLY_FIELDS))
 
 
+@program_cache(scope="preparation")
 def compile_paged_decode(query_payload, config_payload, ordinal):
     """Compile the selected forward kernel (and split merge) from metadata only."""
     query = PagedDecodeQuery(**dict(query_payload))

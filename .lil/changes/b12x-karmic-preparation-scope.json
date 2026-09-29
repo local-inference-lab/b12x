@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-karmic-preparation-scope",
+  "category": "fix",
+  "summary": "Scope MiMo paged-decode and block-FP8 GEMV compile reuse to preparation jobs",
+  "models": ["MiMo-V2.6"],
+  "compatibility": "No user action required. Prepared calls retain their compiled programs after the preparation cache is cleared.",
+  "details": [
+    "Paged-decode and block-FP8 GEMV factories share compiled programs within a preparation job and release the factory cache with that job.",
+    "Block-FP8 GEMV reuses one compiled callable across live row counts without a process-wide factory cache."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [439],
+  "requires": []
+}

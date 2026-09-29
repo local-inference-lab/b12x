@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from b12x._lib.program_cache import PreparationProgramCache
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _block_fp8_gemv
@@ -110,11 +111,12 @@ def test_block_fp8_gemv_live_rows_reuse_one_compiled_callable():
     require_b12x()
     n, k = 3712, 4096
     ordinal = torch.cuda.current_device()
-    program = _block_fp8_gemv.compile_block_fp8_gemv(ordinal, n, k)
-    with kernel_resolution_guard("block-FP8 GEMV live rows"):
-        for m in (1, 2, 5, 8):
-            assert _block_fp8_gemv.compile_block_fp8_gemv(ordinal, n, k) is program
-            lhs, lhs_scale, rhs, rhs_scale = _operands(m, n, k, seed=m)
-            out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
-            program(lhs, lhs_scale, rhs, rhs_scale, out)
-            _assert_rounded(out, _reference(lhs, lhs_scale, rhs, rhs_scale))
+    with PreparationProgramCache().activate():
+        program = _block_fp8_gemv.compile_block_fp8_gemv(ordinal, n, k)
+        with kernel_resolution_guard("block-FP8 GEMV live rows"):
+            for m in (1, 2, 5, 8):
+                assert _block_fp8_gemv.compile_block_fp8_gemv(ordinal, n, k) is program
+                lhs, lhs_scale, rhs, rhs_scale = _operands(m, n, k, seed=m)
+                out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
+                program(lhs, lhs_scale, rhs, rhs_scale, out)
+                _assert_rounded(out, _reference(lhs, lhs_scale, rhs, rhs_scale))

@@ -181,7 +181,7 @@ class BlockFP8Gemv:
                     output[Int64(row) * self.n + Int64(feature)] = total.to(BFloat16)
 
 
-@program_cache
+@program_cache(scope="preparation")
 def compile_block_fp8_gemv(ordinal: int, n: int, k: int):
     fake = tuple(
         make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
