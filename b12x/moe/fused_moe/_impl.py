@@ -839,6 +839,7 @@ class TPMoEScratchCaps:
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
     w4a16_prefill_fused_sum: bool | None = None
+    w4a16_stable_route_pack: bool | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -897,6 +898,11 @@ class TPMoEScratchCaps:
 
             object.__setattr__(
                 self, "w4a16_prefill_fused_sum", prefill_fused_sum_enabled()
+            )
+        if self.w4a16_stable_route_pack is None:
+            object.__setattr__(
+                self, "w4a16_stable_route_pack",
+                _env_flag("B12X_W4A16_STABLE_ROUTE_PACK", default=False),
             )
         object.__setattr__(self, "frozen", bool(self.frozen))
 
@@ -8716,6 +8722,7 @@ def plan_tp_moe_scratch(
                 if core_workspace_plan.device.index is not None
                 else torch.cuda.current_device()
             ),
+            stable_order=caps.w4a16_stable_route_pack,
             bucket_tokens=False,
         )
     return TPMoEScratchPlan(
