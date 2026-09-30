@@ -1,18 +1,26 @@
-"""Prepared weight layout for the W6A8 MX-FP6 MoE kernel.
+"""Prepared weight layout for the W8A8 MXFP8 MoE kernel.
 
-Host-side, one-time preparation for the ``w6a8_mx`` quant recipe
-(``source_format='mxfp6_e2m3'``):
+Host-side, one-time preparation for the ``w8a8_mx`` quant recipe
+(``source_format='mxfp8_e8m0_k32'``):
 
-* Packed MX-FP6 E2M3 weight codes stay **source-native**: ``[E, N, 3*K//4]``
-  uint8 with four 6-bit values packed into three bytes along K.
+* MXFP8 E4M3 weight codes stay **source-native and byte-exact**:
+  ``[E, N, K]`` with one E4M3 byte per element.  Nothing is requantized to
+  FP4/FP6 and nothing is re-packed; the checkpoint bytes are the runtime
+  operand bytes.
 * Checkpoint UE8M0 K/32 block scales (``[E, N, K//32]`` bytes, unswizzled on
-  disk) are swizzled into the MMA block-scale layout consumed by the kernel.
+  disk) are validated by the canonical
+  :func:`b12x._lib.intrinsics.validate_e8m0_scale_grid` rule (every finite
+  UE8M0 byte preserved, ``0xFF`` NaN rejected, never clamped) and then swizzled
+  by the canonical :func:`b12x._lib.intrinsics.swizzle_block_scale` into the
+  MMA block-scale layout the kernel reads — the same two helpers the MX-FP6
+  recipe uses, so there is exactly one scale layout in the tree.
 * Per-expert f32 ``*_weight_scale_2`` globals combine with the reciprocal
   activation global scales into runtime alphas
   (``alpha = weight_scale_2 / a_gscale``).
 
-Activations are quantized at runtime to FP8 E4M3 with UE8M0 K/32 block
-scales; both operands feed the same mxf8f6f4 MMA.
+Activations are quantized at runtime to FP8 E4M3 with UE8M0 K/32 block scales,
+so both operands are genuine E4M3 and feed the ``MmaMXF8Op`` block-scaled
+``m16n8k32`` MMA natively (no FP6 byte-container expansion anywhere).
 """
 
 from __future__ import annotations
@@ -22,35 +30,29 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.intrinsics import (
-    align_up,
     swizzle_block_scale,
     validate_e8m0_scale_grid,
 )
 
 _SF_BLOCK = 32  # K elements per UE8M0 block scale
-_TILE_K = 128  # kernel K-tile width (packed 3:4 along K)
-_FP6_PACK_NUM = 4  # logical values per packed group
-_FP6_PACK_BYTES = 3  # bytes per packed group
-
-
-def _packed_k_bytes(k: int) -> int:
-    """Bytes per row of ``k`` FP6 values packed 4-values-in-3-bytes."""
-    return (k // _FP6_PACK_NUM) * _FP6_PACK_BYTES
+_TILE_K = 128  # kernel K-tile width (one E4M3 byte per element along K)
+_VALUE_DTYPES = (torch.uint8, torch.float8_e4m3fn)
 
 
 @dataclass(frozen=True, kw_only=True)
-class PreparedW6A8MXFP6Weights:
-    """Runtime contract for prepared W6A8 MX-FP6 MoE expert weights.
+class PreparedW8A8MXFP8Weights:
+    """Runtime contract for prepared W8A8 MXFP8 MoE expert weights.
 
-    ``w13_packed``/``w2_packed`` are the unmodified source FP6 code bytes;
-    ``*_sf_swizzled`` are UE8M0 block scales in the MMA swizzle
-    (``[E, pad128(rows), pad4(K//32)]`` bytes); ``*_alpha`` are per-expert
-    f32 runtime dequant scales.  This container is the input contract of the
-    ``quant_recipe="w6a8_mx"`` dynamic-kernel port.
+    ``w13_values``/``w2_values`` are the byte-exact source E4M3 codes
+    (``[E, N, K]`` uint8, one code per byte, K == logical K); ``*_sf_swizzled``
+    are UE8M0 block scales in the MMA swizzle
+    (``[E, pad128(rows), pad4(K//32)]`` bytes); ``*_alpha`` are per-expert f32
+    runtime dequant scales.  This container is the input contract of the
+    ``quant_recipe="w8a8_mx"`` dynamic-kernel port.
     """
 
-    w13_packed: torch.Tensor
-    w2_packed: torch.Tensor
+    w13_values: torch.Tensor
+    w2_values: torch.Tensor
     w13_sf_swizzled: torch.Tensor
     w2_sf_swizzled: torch.Tensor
     w13_alpha: torch.Tensor
@@ -62,20 +64,18 @@ class PreparedW6A8MXFP6Weights:
     def __post_init__(self) -> None:
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))
-        object.__setattr__(
-            self, "intermediate_size", int(self.intermediate_size)
-        )
+        object.__setattr__(self, "intermediate_size", int(self.intermediate_size))
 
     # Canonical-storage aliases consumed by the generic prepared-weight
-    # plumbing in b12x.moe.fused_moe._impl (mirrors w13/w2 attribute
+    # plumbing in b12x.moe.fused_moe._impl (mirrors the w13/w2 attribute
     # lookups used for the W4A16 native containers).
     @property
     def w13(self) -> torch.Tensor:
-        return self.w13_packed
+        return self.w13_values
 
     @property
     def w2(self) -> torch.Tensor:
-        return self.w2_packed
+        return self.w2_values
 
     @property
     def w13_scale(self) -> torch.Tensor:
@@ -94,29 +94,32 @@ class PreparedW6A8MXFP6Weights:
         return self.w2_alpha
 
 
-def _validate_packed_codes(
-    packed: torch.Tensor,
+def _validate_value_bytes(
+    values: torch.Tensor,
     *,
     name: str,
     num_experts: int,
     rows: int,
     k: int,
 ) -> torch.Tensor:
-    if not isinstance(packed, torch.Tensor):
+    """Return the contiguous uint8 view of ``values`` without touching bytes."""
+    if not isinstance(values, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
-    if packed.dtype != torch.uint8:
+    if values.dtype not in _VALUE_DTYPES:
         raise TypeError(
-            f"{name} must be packed MX-FP6 uint8 codes, got {packed.dtype}"
+            f"{name} must hold MXFP8 E4M3 codes (uint8/float8_e4m3fn), "
+            f"got {values.dtype}"
         )
-    expected = (num_experts, rows, _packed_k_bytes(k))
-    if packed.dim() != 3 or tuple(packed.shape) != expected:
+    expected = (num_experts, rows, k)
+    if values.dim() != 3 or tuple(values.shape) != expected:
         raise ValueError(
-            f"{name} must have packed shape {expected} "
-            f"(E, N, 3*K//4), got {tuple(packed.shape)}"
+            f"{name} must have one E4M3 byte per element with shape "
+            f"{expected} (E, N, K), got {tuple(values.shape)}"
         )
-    if not packed.is_contiguous():
+    uint8 = values.view(torch.uint8)
+    if not uint8.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
-    return packed
+    return uint8
 
 
 def _validate_e8m0_scale_grid(
@@ -152,22 +155,12 @@ def _validate_expert_scalars(
     return scale.reshape(num_experts).to(torch.float32).contiguous()
 
 
-def _swizzle_e8m0_grid(grid_u8: torch.Tensor) -> torch.Tensor:
-    """Swizzle an unswizzled ``[E, rows, blocks]`` UE8M0 grid to MMA layout.
-
-    Returns ``[E, pad128(rows), pad4(blocks)]`` uint8 (zero-padded), matching
-    the cutlass block-scale swizzle the kernel reads.
-    """
-    swizzled = swizzle_block_scale(grid_u8.view(torch.float8_e8m0fnu))
-    return swizzled.view(torch.uint8).contiguous()
-
-
-def prepare_w6a8_mxfp6_weights(
+def prepare_w8a8_mxfp8_weights(
     *,
-    w13_packed: torch.Tensor,
+    w13_values: torch.Tensor,
     w13_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
-    w2_packed: torch.Tensor,
+    w2_values: torch.Tensor,
     w2_scale: torch.Tensor,
     w2_scale_2: torch.Tensor,
     a1_gscale: torch.Tensor | None = None,
@@ -175,15 +168,15 @@ def prepare_w6a8_mxfp6_weights(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
-) -> PreparedW6A8MXFP6Weights:
-    """Prepare W6A8 MX-FP6 expert weights for the fused MoE kernel.
+) -> PreparedW8A8MXFP8Weights:
+    """Prepare W8A8 MXFP8 expert weights for the fused MoE kernel.
 
     Args:
-        w13_packed: FC1 (gated up+gate) packed E2M3 codes,
-            ``[E, 2*intermediate, 3*hidden//4]`` uint8.
+        w13_values: FC1 (gated up+gate) E4M3 codes,
+            ``[E, 2*intermediate, hidden]`` uint8 or float8_e4m3fn.
         w13_scale: FC1 UE8M0 K/32 grid, ``[E, 2*intermediate, hidden//32]``.
         w13_scale_2: per-expert f32 FC1 global weight scales (``[E]`` or scalar).
-        w2_packed: FC2 (down) packed codes, ``[E, hidden, 3*intermediate//4]``.
+        w2_values: FC2 (down) E4M3 codes, ``[E, hidden, intermediate]``.
         w2_scale: FC2 UE8M0 K/32 grid, ``[E, hidden, intermediate//32]``.
         w2_scale_2: per-expert f32 FC2 global weight scales.
         a1_gscale / a2_gscale: reciprocal activation global scales for the
@@ -202,22 +195,22 @@ def prepare_w6a8_mxfp6_weights(
             raise ValueError(f"{name} must be positive, got {value}")
     if hidden_size % _TILE_K != 0 or intermediate_size % _TILE_K != 0:
         raise ValueError(
-            f"W6A8 MX-FP6 requires hidden_size % {_TILE_K} == 0 and "
+            f"W8A8 MXFP8 requires hidden_size % {_TILE_K} == 0 and "
             f"intermediate_size % {_TILE_K} == 0, got hidden_size="
             f"{hidden_size}, intermediate_size={intermediate_size}"
         )
 
     w13_rows = 2 * intermediate_size  # gated silu FC1: [up; gate] stacked rows
-    w13_packed = _validate_packed_codes(
-        w13_packed,
-        name="w13_packed",
+    w13_values = _validate_value_bytes(
+        w13_values,
+        name="w13_values",
         num_experts=num_experts,
         rows=w13_rows,
         k=hidden_size,
     )
-    w2_packed = _validate_packed_codes(
-        w2_packed,
-        name="w2_packed",
+    w2_values = _validate_value_bytes(
+        w2_values,
+        name="w2_values",
         num_experts=num_experts,
         rows=hidden_size,
         k=intermediate_size,
@@ -259,35 +252,22 @@ def prepare_w6a8_mxfp6_weights(
         )
         w2_alpha = torch.empty_like(w2_scale_2)
         torch.div(w2_scale_2, a2, out=w2_alpha)
+    for name, alpha in (("w13", w13_alpha), ("w2", w2_alpha)):
+        if not bool(torch.isfinite(alpha).all().item()):
+            raise ValueError(
+                f"{name}_alpha = {name}_scale_2 / a_gscale is non-finite; a "
+                "zero activation global scale is a preparation error"
+            )
+    # One canonical swizzle: swizzle_block_scale already pads rows to 128 and
+    # scale columns to 4, so no second shape contract is asserted here.
+    w13_sf_swizzled = swizzle_block_scale(w13_grid.view(torch.float8_e8m0fnu))
+    w2_sf_swizzled = swizzle_block_scale(w2_grid.view(torch.float8_e8m0fnu))
 
-    w13_sf_swizzled = _swizzle_e8m0_grid(w13_grid)
-    w2_sf_swizzled = _swizzle_e8m0_grid(w2_grid)
-    expected_w13_sf = (
-        num_experts,
-        align_up(w13_rows, 128),
-        align_up(hidden_size // _SF_BLOCK, 4),
-    )
-    if tuple(w13_sf_swizzled.shape) != expected_w13_sf:
-        raise AssertionError(
-            f"swizzled w13 scale shape {tuple(w13_sf_swizzled.shape)} != "
-            f"{expected_w13_sf}"
-        )
-    expected_w2_sf = (
-        num_experts,
-        align_up(hidden_size, 128),
-        align_up(intermediate_size // _SF_BLOCK, 4),
-    )
-    if tuple(w2_sf_swizzled.shape) != expected_w2_sf:
-        raise AssertionError(
-            f"swizzled w2 scale shape {tuple(w2_sf_swizzled.shape)} != "
-            f"{expected_w2_sf}"
-        )
-
-    return PreparedW6A8MXFP6Weights(
-        w13_packed=w13_packed,
-        w2_packed=w2_packed,
-        w13_sf_swizzled=w13_sf_swizzled,
-        w2_sf_swizzled=w2_sf_swizzled,
+    return PreparedW8A8MXFP8Weights(
+        w13_values=w13_values,
+        w2_values=w2_values,
+        w13_sf_swizzled=w13_sf_swizzled.view(torch.uint8).contiguous(),
+        w2_sf_swizzled=w2_sf_swizzled.view(torch.uint8).contiguous(),
         w13_alpha=w13_alpha,
         w2_alpha=w2_alpha,
         num_experts=num_experts,
@@ -297,6 +277,6 @@ def prepare_w6a8_mxfp6_weights(
 
 
 __all__ = [
-    "PreparedW6A8MXFP6Weights",
-    "prepare_w6a8_mxfp6_weights",
+    "PreparedW8A8MXFP8Weights",
+    "prepare_w8a8_mxfp8_weights",
 ]
