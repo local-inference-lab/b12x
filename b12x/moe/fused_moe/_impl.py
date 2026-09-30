@@ -5867,8 +5867,22 @@ def _get_w8a8_weight_views(
     # kernel's k-major [N, K, E] weight tensors.
     w13 = w1_u8.permute(1, 2, 0)
     down = w2_u8.permute(1, 2, 0)
-    w13_sf = w1_blockscale.view(torch.uint8)
     down_sf = w2_blockscale.view(torch.uint8)
+    w13_gate_sf = None
+    if activation_spec.is_gated and n % _LEVEL_TILE_N != 0:
+        # Non-128 intermediate: preparation swizzled the up and gate halves
+        # independently ([2, E, pad128(n), pad4(k//32)]) for the kernel's
+        # separate FC1 half descriptors.
+        split_sf = w1_blockscale.view(torch.uint8)
+        if split_sf.dim() != 4 or split_sf.shape[0] != 2:
+            raise ValueError(
+                "w8a8_mx with intermediate % 128 != 0 requires half-major "
+                f"[2, E, rows, cols] FC1 scales; got {tuple(split_sf.shape)}"
+            )
+        w13_sf = split_sf[0]
+        w13_gate_sf = split_sf[1]
+    else:
+        w13_sf = w1_blockscale.view(torch.uint8)
     views = _WeightViews(
         w13=w13,
         down=down,
@@ -5881,6 +5895,7 @@ def _get_w8a8_weight_views(
         w2_storage=w2_u8,
         w2_scale_storage=down_sf,
     )
+    views.w13_gate_sf = w13_gate_sf
     # One E4M3 byte per element: the Float8E4M3FN element type is conveyed via
     # _gptr / compile-time fakes, so keep uint8 views here.
     views.w13_fp4 = w13
@@ -10495,8 +10510,10 @@ class _DynamicMoELaunch:
                 b_w13.iterator.align(16),
                 dtype=cutlass.Uint8,
             )
+            # _half_k is the packed bytes per K row: k // 2 for FP4 codes,
+            # k for the one-byte MXFP8 codes.
             gate_iterator = cute.recast_ptr(
-                (b_w13_bytes + self._n * self._k // 2).align(16),
+                (b_w13_bytes + self._n * self._half_k).align(16),
                 dtype=b_w13.element_type,
             )
             b_w13_gate = cute.make_tensor(
@@ -11014,8 +11031,15 @@ def _get_dynamic_kernel(
     if w4a8_n64_repacked:
         materialize_intermediate = True
         share_input_across_experts = True
+    # Independent zero-copy up/gate descriptors: NVFP4 at the 16-mod-32
+    # boundary, and MXFP8 whenever the gate half starts inside a 128-row
+    # tile/scale atom (the halves' tail tiles are TMA zero-filled).
     separate_w13_halves = bool(
-        quant_mode == "nvfp4" and activation_spec.is_gated and int(n) % 32 == 16
+        activation_spec.is_gated
+        and (
+            (quant_mode == "nvfp4" and int(n) % 32 == 16)
+            or (is_w8a8 and int(n) % _LEVEL_TILE_N != 0)
+        )
     )
     # Gated FC1 swap_ab handles 32-aligned, non-128 shards. The 16-mod-32
     # boundary uses independent zero-copy up/gate descriptors instead.

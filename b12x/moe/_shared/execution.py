@@ -917,13 +917,15 @@ def plan_moe_weight_preparation(
         if spec.quant_mode == "w8a8_mx":
             if spec.activation != "silu":
                 raise ValueError("W8A8-MXFP8 preparation currently requires silu")
-            # The MXFP8 kernel streams the same 128-wide K tiles as MX-FP6
-            # (one E4M3 byte per element, one UE8M0 per K/32 block), so both
-            # GEMM K extents must be 128-aligned.
-            if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            # FC1 streams 128-wide K tiles over hidden (one E4M3 byte per
+            # element), so hidden must be 128-aligned.  The intermediate is
+            # the FC2 K extent and the FC1 N extent: FC2 needs whole UE8M0
+            # K/32 blocks, and non-128 FC1 halves use independent up/gate
+            # TMA descriptors whose tail tile is zero-filled by TMA.
+            if hidden_size % 128 != 0 or intermediate_size % 32 != 0:
                 raise ValueError(
                     "W8A8-MXFP8 preparation requires hidden_size % 128 == 0 "
-                    "and intermediate_size % 128 == 0"
+                    "and intermediate_size % 32 == 0"
                 )
             # Weight bytes are preserved losslessly (no FP4/FP6 requantization);
             # UE8M0 scales are swizzled into the MMA layout and per-expert

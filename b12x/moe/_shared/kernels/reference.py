@@ -1371,8 +1371,8 @@ def moe_reference_w8a8_mx(
             "the W8A8-MXFP8 recipe is qualified for silu only"
         )
     _validate_reference_inputs(w1_e4m3, I_tp, activation)
-    if K % 128 != 0 or I_tp % 128 != 0:
-        raise ValueError("K and I_tp must be multiples of 128 for w8a8_mx")
+    if K % 128 != 0 or I_tp % 32 != 0:
+        raise ValueError("w8a8_mx requires K % 128 == 0 and I_tp % 32 == 0")
     w13_layout = _normalize_w13_layout(w13_layout)
     device = x.device
     m = x.shape[0]

@@ -49,6 +49,12 @@ class PreparedW8A8MXFP8Weights:
     (``[E, pad128(rows), pad4(K//32)]`` bytes); ``*_alpha`` are per-expert f32
     runtime dequant scales.  This container is the input contract of the
     ``quant_recipe="w8a8_mx"`` dynamic-kernel port.
+
+    When ``intermediate_size`` is not a multiple of 128 the gate half of FC1
+    starts inside a 128-row scale atom, so the kernel streams the up and gate
+    halves through independent TMA descriptors.  ``w13_sf_swizzled`` then
+    holds the two halves swizzled independently, half-major:
+    ``[2, E, pad128(I), pad4(K//32)]`` (index 0 = up, 1 = gate).
     """
 
     w13_values: torch.Tensor
@@ -193,11 +199,16 @@ def prepare_w8a8_mxfp8_weights(
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
-    if hidden_size % _TILE_K != 0 or intermediate_size % _TILE_K != 0:
+    if hidden_size % _TILE_K != 0:
         raise ValueError(
-            f"W8A8 MXFP8 requires hidden_size % {_TILE_K} == 0 and "
-            f"intermediate_size % {_TILE_K} == 0, got hidden_size="
-            f"{hidden_size}, intermediate_size={intermediate_size}"
+            f"W8A8 MXFP8 requires hidden_size % {_TILE_K} == 0, got "
+            f"hidden_size={hidden_size}"
+        )
+    if intermediate_size % _SF_BLOCK != 0:
+        raise ValueError(
+            f"W8A8 MXFP8 requires intermediate_size % {_SF_BLOCK} == 0 (one "
+            f"UE8M0 scale per FC2 K block), got intermediate_size="
+            f"{intermediate_size}"
         )
 
     w13_rows = 2 * intermediate_size  # gated silu FC1: [up; gate] stacked rows
@@ -260,7 +271,20 @@ def prepare_w8a8_mxfp8_weights(
             )
     # One canonical swizzle: swizzle_block_scale already pads rows to 128 and
     # scale columns to 4, so no second shape contract is asserted here.
-    w13_sf_swizzled = swizzle_block_scale(w13_grid.view(torch.float8_e8m0fnu))
+    if w13_split_halves(intermediate_size):
+        # The gate half begins mid-atom; swizzle each half on its own so both
+        # FC1 TMA descriptors address 128-row atoms from row zero.
+        w13_sf_swizzled = torch.stack(
+            [
+                swizzle_block_scale(half.contiguous().view(torch.float8_e8m0fnu))
+                for half in (
+                    w13_grid[:, :intermediate_size],
+                    w13_grid[:, intermediate_size:],
+                )
+            ]
+        )
+    else:
+        w13_sf_swizzled = swizzle_block_scale(w13_grid.view(torch.float8_e8m0fnu))
     w2_sf_swizzled = swizzle_block_scale(w2_grid.view(torch.float8_e8m0fnu))
 
     return PreparedW8A8MXFP8Weights(
@@ -276,7 +300,13 @@ def prepare_w8a8_mxfp8_weights(
     )
 
 
+def w13_split_halves(intermediate_size: int) -> bool:
+    """Whether FC1 up/gate halves use independent descriptors and scale grids."""
+    return int(intermediate_size) % _TILE_K != 0
+
+
 __all__ = [
     "PreparedW8A8MXFP8Weights",
     "prepare_w8a8_mxfp8_weights",
+    "w13_split_halves",
 ]

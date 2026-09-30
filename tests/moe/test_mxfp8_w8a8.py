@@ -115,10 +115,17 @@ def _checkpoint(experts: int, k: int, i: int, device):
             .to(torch.bfloat16)
             .to(device)
         )
+        # The row quantizer takes 128-multiple K; UE8M0 blocks are 32 wide
+        # and independent, so quantizing a zero-extended row and keeping the
+        # first `cols` codes and `cols // 32` scales is exact.
+        padded_cols = -(-cols // 128) * 128
+        source = torch.nn.functional.pad(source, (0, padded_cols - cols))
         quantized = quantize_mxfp8_rows_torch(source)
         return (
-            quantized.values.view(torch.uint8),
-            quantized.scale_rows.reshape(rows, cols // _SF_BLOCK).view(torch.uint8),
+            quantized.values.view(torch.uint8)[:, :cols].contiguous(),
+            quantized.scale_rows.reshape(rows, padded_cols // _SF_BLOCK)
+            .view(torch.uint8)[:, : cols // _SF_BLOCK]
+            .contiguous(),
         )
 
     w13_values, w13_scales, w2_values, w2_scales = [], [], [], []
@@ -299,6 +306,42 @@ def test_prepare_w8a8_keeps_weight_bytes_and_swizzles_scales_exactly() -> None:
     )
     torch.testing.assert_close(
         prepared.w2_alpha, torch.tensor([4.0, 4.0]), rtol=0, atol=0
+    )
+
+
+def test_prepare_w8a8_swizzles_non_128_fc1_halves_independently() -> None:
+    """A mid-atom gate half gets its own atom-aligned scale grid.
+
+    With I=96 the gate half starts at row 96 of the first 128-row atom, so a
+    single swizzle of the stacked grid would put gate rows inside the up
+    atom.  Each half must land where an independently swizzled [I, K/32] grid
+    places it.
+    """
+    from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
+
+    experts, k, i = 2, 256, 96
+    w13_scale = torch.stack(
+        [_finite_ue8m0_grid(2 * i, k // _SF_BLOCK).roll(e) for e in range(experts)]
+    )
+    prepared = prepare_w8a8_mxfp8_weights(
+        w13_values=torch.zeros(experts, 2 * i, k, dtype=torch.uint8),
+        w13_scale=w13_scale,
+        w13_scale_2=torch.ones(experts),
+        w2_values=torch.zeros(experts, k, i, dtype=torch.uint8),
+        w2_scale=torch.full((experts, k, i // _SF_BLOCK), 127, dtype=torch.uint8),
+        w2_scale_2=torch.ones(experts),
+        num_experts=experts,
+        hidden_size=k,
+        intermediate_size=i,
+    )
+    assert torch.equal(
+        prepared.w13_sf_swizzled,
+        torch.stack(
+            [
+                torch.stack([_expected_swizzled(w13_scale[e, :i]) for e in range(experts)]),
+                torch.stack([_expected_swizzled(w13_scale[e, i:]) for e in range(experts)]),
+            ]
+        ),
     )
 
 
@@ -628,8 +671,12 @@ def test_mxfp8_scaled_roundtrip_matches_the_device_ue8m0_rule() -> None:
 # ---------------------------------------------------------------------------
 
 
+# 640 is the TP=1 MTP shard (128-aligned, shared FC1 descriptor); 320 the TP=2
+# shard and 96 a sub-128 shard, both on the split up/gate FC1 descriptors
+# with a TMA zero-filled tail tile.
+@pytest.mark.parametrize("i", [INTERMEDIATE_SIZE, 320, 96])
 @pytest.mark.parametrize("tokens", [1, 5, 16])
-def test_w8a8_matches_oracle_on_model_geometry(tokens: int) -> None:
+def test_w8a8_matches_oracle_on_model_geometry(tokens: int, i: int) -> None:
     """Native MXFP8 experts reproduce the pure-torch oracle.
 
     tokens=1 is the sparsest grouped tile, 5 a partial 128-row tile, 16 the
@@ -645,7 +692,7 @@ def test_w8a8_matches_oracle_on_model_geometry(tokens: int) -> None:
     from .._reference.helpers import make_tp_moe_fp4_binding
 
     device = torch.device("cuda")
-    experts, k, i = NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE
+    experts, k = NUM_EXPERTS, HIDDEN_SIZE
     prepared, native = _prepare_experts(fused_moe, experts, k, i, device)
     a = (torch.randn(tokens, k, device=device) * 0.25).to(torch.bfloat16)
     topk_ids, topk_weights = _routes(experts, tokens, TOP_K, device)
@@ -743,7 +790,8 @@ def _capture_and_replay(fused_moe, binding, *, label: str):
     return result, misses_before, misses_after
 
 
-def test_w8a8_replays_under_cuda_graph_with_frozen_resolution() -> None:
+@pytest.mark.parametrize("i", [INTERMEDIATE_SIZE, 320])
+def test_w8a8_replays_under_cuda_graph_with_frozen_resolution(i: int) -> None:
     """A captured w8a8 launch must replay without compiling and stay correct.
 
     The default reduction is ``OutputReduction.ATOMIC_SCATTER``: expert
@@ -765,7 +813,7 @@ def test_w8a8_replays_under_cuda_graph_with_frozen_resolution() -> None:
     from .._reference.helpers import make_tp_moe_fp4_binding
 
     device = torch.device("cuda")
-    experts, k, i = NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE
+    experts, k = NUM_EXPERTS, HIDDEN_SIZE
     prepared, native = _prepare_experts(fused_moe, experts, k, i, device)
     tokens = 8
     a = (torch.randn(tokens, k, device=device) * 0.25).to(torch.bfloat16)

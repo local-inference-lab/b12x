@@ -35,10 +35,10 @@ documented in `docs/mxfp6-w6a8.md`.
   of `amax * global_scale / 448` (`fp6_block_ue8m0_exact`, not
   `ceil(log2(...))`), with the calibrated per-expert global scale folded in at
   quantize time.
-- **Geometry**: `hidden_size % 128 == 0` and `intermediate_size % 128 == 0`,
+- **Geometry**: `hidden_size % 128 == 0` and `intermediate_size % 32 == 0`,
   SiLU only, `sf_vec_size == 32`, and the production `(128, 128)` MMA tile.
-  Both GEMM K extents are streamed as 128-element tiles of one byte per
-  element, so a K-tile is 128 bytes on both operand sides.
+  Hidden (the FC1 K extent) is streamed as 128-element tiles of one byte per
+  element. See "Non-128 intermediate" below for the intermediate rule.
 
 ## MoE (`moe.fused_moe`, quant mode `w8a8_mx`)
 
@@ -57,7 +57,8 @@ binding under frozen kernel resolution.
 `prepare_weights` returns `PreparedExperts` whose representation value is
 `b12x.moe._shared.kernels.w8a8.PreparedW8A8MXFP8Weights`:
 `w13_values`/`w2_values` (byte-exact `[E, N, K]` uint8),
-`w13_sf_swizzled`/`w2_sf_swizzled` (`[E, pad128(N), pad4(K/32)]` uint8), and
+`w13_sf_swizzled`/`w2_sf_swizzled` (`[E, pad128(N), pad4(K/32)]` uint8; FC1
+is `[2, E, pad128(I), pad4(K/32)]` when `I % 128 != 0`), and
 `w13_alpha`/`w2_alpha` (`[E]` f32), with `w13`/`w2`/`w13_scale`/`w2_scale`/
 `w13_global_scale`/`w2_global_scale` aliases for the generic owner plumbing.
 Callers hand **unswizzled** scale grids; B12X swizzles them.
@@ -83,6 +84,26 @@ transport:
 Scheduling is the unified dynamic backend; `dynamic` is the only legal backend
 and `(128, 128)` the only legal tile, both enforced during tuning-contract
 validation rather than discovered at launch.
+
+## Non-128 intermediate
+
+The 128 alignment was a kernel addressing rule, not an arithmetic one. The
+`mxf8f6f4` MMA is `m16n8k32` with one UE8M0 scale per 32 K
+(`.scale_vec::1X`), and the activation and intermediate quantizers already
+work in 32-element blocks. What required `I % 128 == 0` was FC1: one TMA
+descriptor over the stacked `[up; gate]` rows addressed the gate tile as
+`slice + ceil(I/128)`, and scale factors are TMA'd in 128-row atoms, so a gate
+half starting at row `I` inside an atom had no valid tile or atom coordinate.
+
+For `I % 128 != 0` (and `I % 32 == 0`) the kernel uses the existing
+`separate_w13_halves` specialization: independent up and gate descriptors
+over `[I, K]` views of the same payload, and preparation swizzles the two
+halves' scale grids independently. The last intermediate slice's tail rows
+(FC1 N) and columns (FC2 K) are TMA zero-fill, so no padded weight bytes are
+read. The MMAs still run over the full 128-wide tail slice: a runtime guard
+that skipped FC2's dead `k32` blocks measured slower on an RTX 5090 (1 token,
+E=512: ~124 us with the guard against ~108 us without), most likely because
+the branch breaks the unrolled K-block copy/MMA interleave (not profiled).
 
 ## Shared byte-container geometry
 
@@ -111,13 +132,36 @@ shared ones so the two recipes cannot drift:
 
 ## Verified Execution
 
-The reduced expert-count lane uses E=16, K=2560, I=640 and top-k=10 on
-RTX PRO 6000 Blackwell Max-Q (SM120). The full native suite passes 21 tests.
-It covers numerical output at M=1/5/16, empty experts, atomic graph replay
-against the quantized reference and deterministic bit-exact graph replay.
-Compute Sanitizer memcheck passes all six execution/replay cases with zero
-reported errors. The retained NVFP4 preparation/decode/replay lane passes
-three tests with the same 42,538,496-byte peak allocation as before the change.
+The reduced expert-count lane uses E=16, K=2560 and top-k=10 on RTX PRO 6000
+Blackwell Max-Q (SM120), at I=640, the TP=2 shard I=320 and I=96. The full
+native suite passes 29 tests, one process per test. Compute Sanitizer
+memcheck reports no access errors on the I=320, I=96 and I=640 oracle cases
+and the I=320 graph replay; its only report is a host-side "selective device
+code recompilation" API warning from the Triton loader.
+
+Unpadded I=320 against the same weights zero-padded to I=384 (the former vLLM
+adapter workaround), MoE kernel device time from a CUPTI trace, median of 200
+eager launches, three interleaved processes per cell (range of the three
+medians):
+
+| tokens | RTX PRO 6000, E=128: I=320 / I=384 us | RTX 5090, E=512: I=320 / I=384 us |
+|---|---|---|
+| 1 | 131.4-131.6 / 131.2-131.3 | 105.2-106.1 / 104.8-105.2 |
+| 4 | 148.4-149.0 / 149.3-149.6 | 123.3-128.9 / 132.9-136.9 |
+| 16 | 292.6-292.7 / 311.1-311.5 | 356.2-358.0 / 380.0-386.4 |
+| 64 | 432.0-432.2 / 462.2-462.6 | 833.2-843.4 / 920.1-927.5 |
+
+At one token the two are equal within noise; the gain grows with routed
+rows, up to about 7% (SM120) and 10% (5090) at 64 tokens.
+
+The original I=640-only lane passed 21 tests covering numerical output at
+M=1/5/16, empty experts, atomic graph replay against the quantized reference
+and deterministic bit-exact graph replay; Compute Sanitizer memcheck passed
+its six execution/replay cases with zero reported errors. The retained NVFP4
+preparation/decode/replay lane passed three tests with the same
+42,538,496-byte peak allocation as before that change. This change leaves the
+NVFP4 path's `separate_w13_halves` selection and gate offset arithmetic
+numerically identical (`k // 2` bytes per FP4 row).
 
 The emitted device objects record `-arch sm_120f`. Their disassembly contains
 `QMMA.SF.16832.F32.E4M3.E4M3.E8`. This proves native block-scaled MXFP8
