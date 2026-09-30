@@ -1479,6 +1479,7 @@ def _micro_e8m0_scale_layout_for_quant_mode(quant_mode: str) -> str:
 
 
 def _normalize_quant_mode_requested(quant_mode: str | None) -> str:
+    """Lower-case a requested quant mode and reject unsupported recipes."""
     if quant_mode is None:
         return "nvfp4"
     normalized = str(quant_mode).lower()
@@ -2402,6 +2403,9 @@ def _safe_dynamic_max_rows_per_launch(
 
 
 def _dynamic_rows_padded_limit(k: int, *, quant_mode: str = "nvfp4") -> int:
+    """Return the largest padded row count whose packed input and scale planes fit
+    the runtime memref limit.
+    """
     tile_m = _dynamic_tile_m(quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     _qm = _normalize_quant_mode(quant_mode)
@@ -2701,6 +2705,9 @@ def _heuristic_moe_decode_config(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> MoeDecodeConfig:
+    """Choose the backend, tile, and route mode for a decode query without tuning
+    data.
+    """
     if query.quant_mode == "nvfp4_auto":
         if (
             device is not None
@@ -3251,6 +3258,9 @@ def _plan_core_workspace(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> _TPCoreWorkspacePlan:
+    """Size every scratch buffer the selected MoE implementation needs for this
+    geometry.
+    """
     source_format = _normalize_fp4_source_format(source_format)
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
@@ -5807,7 +5817,7 @@ def _get_w6a8_weight_views(
     return views
 
 
-def _get_w8a8_weight_views(
+def _resolve_w8a8_weight_views(
     w1_fp8: torch.Tensor,
     w1_blockscale: torch.Tensor,
     w2_fp8: torch.Tensor,
@@ -5819,17 +5829,18 @@ def _get_w8a8_weight_views(
     *,
     activation_spec: _ActivationKernelSpec,
 ) -> _WeightViews:
-    """Weight views for the prepared w8a8_mx (MXFP8) expert layout.
+    """Resolve the dynamic-launch views of prepared w8a8_mx (MXFP8) experts.
 
-    Mirrors ``_get_w6a8_weight_views`` structurally, but the operands are the
-    PreparedW8A8MXFP8Weights canonical tensors: byte-exact E4M3 codes
-    ``[E, N, K]`` (gmem K extent == logical K, no 3:4 packing) and
-    MMA-swizzled UE8M0 K/32 scale atoms ``[E, pad128(N), pad4(K//32)]``.  The
-    dynamic launch passes the permuted code views through Float8E4M3FN gmem
-    pointers and the swizzled scale bytes through Float8E8M0FNU pointers
-    (sf_vec_size 32), so the native MmaMXF8Op consumes them directly.
+    Called once by weight preparation; the result is stored on the prepared
+    container (``PreparedW8A8MXFP8Weights.launch_views``) and the launch path
+    reads it without re-validating geometry.  The operands are the canonical
+    tensors: byte-exact E4M3 codes ``[E, N, K]`` (gmem K extent == logical K,
+    no 3:4 packing) and MMA-swizzled UE8M0 K/32 scale atoms
+    ``[E, pad128(N), pad4(K//32)]``.  The dynamic launch passes the permuted
+    code views through Float8E4M3FN gmem pointers and the swizzled scale bytes
+    through Float8E8M0FNU pointers (sf_vec_size 32), so the native MmaMXF8Op
+    consumes them directly.
     """
-    global _LAST_WEIGHTS
     w1_n = activation_spec.w1_rows(n)
     w1_u8 = w1_fp8.view(torch.uint8)
     w2_u8 = w2_fp8.view(torch.uint8)
@@ -5845,23 +5856,6 @@ def _get_w8a8_weight_views(
         )
     if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
         raise ValueError("w1_alphas and w2_alphas must be contiguous")
-    key = (
-        w1_u8.data_ptr(),
-        w1_blockscale.data_ptr(),
-        w2_u8.data_ptr(),
-        w2_blockscale.data_ptr(),
-        w1_alphas.data_ptr(),
-        w2_alphas.data_ptr(),
-        activation_spec.activation,
-        "w8a8_mx",
-    )
-    last_wkey, last_wval = _LAST_WEIGHTS
-    if last_wkey == key:
-        return last_wval
-    cached = _WEIGHT_CACHE.get(key)
-    if cached is not None:
-        _LAST_WEIGHTS = (key, cached)
-        return cached
 
     # Permute [E, rows, K] -> [rows, K, E] (view, no copy!) to match the
     # kernel's k-major [N, K, E] weight tensors.
@@ -5912,8 +5906,6 @@ def _get_w8a8_weight_views(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
-    _WEIGHT_CACHE[key] = views
-    _LAST_WEIGHTS = (key, views)
     return views
 
 
@@ -5950,23 +5942,6 @@ def _get_weight_views(
         # the LOGICAL K, so the views are plain [N, 3K//4, E] permutes; the
         # FP4 K//2 view math and the in-place w31 flip below never apply.
         return _get_w6a8_weight_views(
-            w1_fp4,
-            w1_blockscale,
-            w2_fp4,
-            w2_blockscale,
-            w1_alphas,
-            w2_alphas,
-            n,
-            k,
-            activation_spec=activation_spec,
-        )
-    if quant_mode == "w8a8_mx":
-        # PreparedW8A8MXFP8Weights canonical storage: byte-exact E4M3 codes
-        # ([E, N, K] uint8, [up; gate]) plus MMA-swizzled UE8M0 K/32 atoms.
-        # The gate-first "w31" rotation ran during preparation, on the
-        # unswizzled grid.  gmem K extent == logical K, so the FP4 K//2 view
-        # math never applies.
-        return _get_w8a8_weight_views(
             w1_fp4,
             w1_blockscale,
             w2_fp4,
@@ -6474,7 +6449,7 @@ def _prepare_w8a8_from_mxfp8_source(
     hidden_size: int,
     intermediate_size: int,
 ):
-    """Prepare MXFP8 experts for the w8a8_mx dynamic-kernel port.
+    """Prepare MXFP8 experts and resolve their dynamic-launch views.
 
     Weight codes stay source-native and byte-exact ([E, N, K] uint8 — no
     requantization and no re-packing); UE8M0 grids are validated and swizzled
@@ -6484,7 +6459,8 @@ def _prepare_w8a8_from_mxfp8_source(
     while the payload and its scale grid are still both unswizzled, so the
     row flip and the MMA swizzle cannot disagree about which row is which.
     Returns a
-    :class:`b12x.moe._shared.kernels.w8a8.PreparedW8A8MXFP8Weights`.
+    :class:`b12x.moe._shared.kernels.w8a8.PreparedW8A8MXFP8Weights` whose
+    ``launch_views`` carry the validated kernel operand views and pointers.
     """
     from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
 
@@ -6497,7 +6473,7 @@ def _prepare_w8a8_from_mxfp8_source(
     activation = normalize_moe_activation(activation)
     if activation != "silu":
         raise ValueError(
-            f"W8A8 MXFP8 preparation currently requires silu, got {activation!r}"
+            f"W8A8 MXFP8 preparation requires silu, got {activation!r}"
         )
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     if w13_layout == "w31":
@@ -6508,7 +6484,7 @@ def _prepare_w8a8_from_mxfp8_source(
             k=hidden_size,
             quant_mode="w8a8_mx",
         )
-    return prepare_w8a8_mxfp8_weights(
+    prepared = prepare_w8a8_mxfp8_weights(
         w13_values=w1_fp8,
         w13_scale=w1_blockscale,
         w13_scale_2=w1_global_scale,
@@ -6521,6 +6497,22 @@ def _prepare_w8a8_from_mxfp8_source(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
+    # Geometry and pointer resolution happen here, once per prepared layer;
+    # the launch path reads launch_views directly.
+    launch_views = _resolve_w8a8_weight_views(
+        prepared.w13_values,
+        prepared.w13_sf_swizzled,
+        prepared.w2_values,
+        prepared.w2_sf_swizzled,
+        prepared.w13_alpha,
+        prepared.w2_alpha,
+        intermediate_size,
+        hidden_size,
+        activation_spec=_get_activation_kernel_spec(
+            activation, quant_mode="w8a8_mx"
+        ),
+    )
+    return replace(prepared, launch_views=launch_views)
 
 
 def _prepare_modelopt_nvfp4_runtime_alphas(
@@ -10426,6 +10418,7 @@ class _DynamicMoELaunch:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Assemble the kernel's tensor views from flat pointers and invoke it."""
         a_input = cute.make_tensor(
             a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
         )
@@ -10968,6 +10961,9 @@ def _get_dynamic_kernel(
     planned_tile_m: int | None = None,
     planned_num_tokens: int | None = None,
 ):
+    """Resolve, compile, and cache the dynamic MoE kernel specialization for this
+    launch geometry.
+    """
     quant_mode = _normalize_quant_mode(quant_mode)
     # Both MX byte-container recipes ride the nvfp4-shaped launch ABI (no
     # repack/residual operands) and the MXFP8 activation scratch with UE8M0
@@ -10976,7 +10972,7 @@ def _get_dynamic_kernel(
     # passes views of the raw E4M3 bytes (gmem K extent == logical K, native
     # MmaMXF8Op).  The ctor rejects swap_ab, direct_routing,
     # materialize_intermediate and share_input_across_experts for these
-    # recipes; all resolve to False below via existing quant-mode predicates.
+    # recipes; all resolve to False below via the quant-mode predicates.
     is_w6a8 = quant_mode in _W6A8_QUANT_MODES
     is_w8a8 = quant_mode in _W8A8_QUANT_MODES
     is_byte_container = is_w6a8 or is_w8a8
@@ -11269,6 +11265,7 @@ def _get_dynamic_kernel(
     dynamic_w1_n = w1_n
     if quant_mode == "w4a8_nvfp4":
         padded_n = align_up(n, _LEVEL_TILE_N)
+        dynamic_w1_n = 2 * padded_n if activation_spec.is_gated else padded_n
     # The MX-FP6 weight tensors are the 3:4-packed FP6 bytes, so their gmem K
     # extent is 3K/4 one-byte elements (the kernel expands to full-K
     # byte-containers in smem).  MXFP8 weights keep gmem K extent == logical K.
@@ -11497,6 +11494,7 @@ def _launch_dynamic_flat(
     planned_direct_routing: bool,
     planned_num_tokens: int,
 ) -> None:
+    """Launch the compiled dynamic MoE kernel over bound workspace and weight views."""
     quant_mode = _normalize_quant_mode(quant_mode)
     # Output rows follow the reduction contract, never an independent caller
     # quantity: deterministic kernels write one row per route, others per token.
@@ -13121,10 +13119,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         swiglu_beta,
     )
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
-    _validate_fp4_source_format_for_quant_mode(
-        source_format=source_format,
-        quant_mode=quant_mode,
-    )
     if activation_amax is not None and quant_mode != "w4a16":
         raise NotImplementedError(
             "activation_amax calibration is only supported for W4A16"
@@ -13377,26 +13371,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation_spec=activation_spec,
             )
         elif quant_mode == "w8a8_mx":
-            # The prepared payload is a PreparedW8A8MXFP8Weights container
-            # (byte-exact source-native E4M3 codes, MMA-swizzled UE8M0 scales,
-            # per-expert alphas).  Build the dynamic-launch views from it
-            # directly; the FP4 view builder must never touch FP8 code bytes.
-            if prepared_payload is None:
-                raise RuntimeError(
-                    "the w8a8_mx weight plan did not materialize its "
-                    "prepared MXFP8 representation"
-                )
-            wv = _get_w8a8_weight_views(
-                prepared_payload.w13_values,
-                prepared_payload.w13_sf_swizzled,
-                prepared_payload.w2_values,
-                prepared_payload.w2_sf_swizzled,
-                w1_alphas,
-                w2_alphas,
-                n,
-                k,
-                activation_spec=activation_spec,
-            )
+            # Weight preparation validated the MXFP8 geometry and resolved the
+            # launch views once (_prepare_w8a8_from_mxfp8_source); the planner
+            # guarantees the representation exists (representation_for).
+            wv = prepared_payload.launch_views
         elif prepared_payload is not None and quant_mode == "w4a8_mx":
             wv = _w4a8_prepared_weight_views(
                 prepared_payload,

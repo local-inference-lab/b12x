@@ -110,6 +110,7 @@ def _checkpoint(experts: int, k: int, i: int, device):
     generator = torch.Generator(device="cpu").manual_seed(7)
 
     def _quantized(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a random BF16 matrix to MXFP8 codes and UE8M0 scales."""
         source = (
             (torch.randn(rows, cols, generator=generator, dtype=torch.float32) * 0.2)
             .to(torch.bfloat16)
@@ -145,6 +146,7 @@ def _checkpoint(experts: int, k: int, i: int, device):
 
 
 def _prepare_experts(fused_moe, experts: int, k: int, i: int, device):
+    """Plan and prepare synthetic MXFP8 experts through the public API."""
     w13, w13_scale, w2, w2_scale = _checkpoint(experts, k, i, device)
     plan = fused_moe.plan_weights(
         source=fused_moe.PackedSource(
@@ -196,6 +198,7 @@ def _prepare_experts(fused_moe, experts: int, k: int, i: int, device):
 
 
 def _routes(experts: int, tokens: int, top_k: int, device, *, offset: int = 0):
+    """Build deterministic top-k routes and weights."""
     ids = torch.stack(
         tuple(
             (torch.arange(tokens, device=device) + offset + step) % experts
@@ -215,6 +218,7 @@ def _routes(experts: int, tokens: int, top_k: int, device, *, offset: int = 0):
 
 
 def test_plan_weights_mxfp8_a8_selects_the_w8a8_contract() -> None:
+    """MXFP8 with A8 activations plans the w8a8_mx recipe."""
     from b12x.moe import fused_moe
 
     plan = fused_moe.plan_weights(
@@ -245,6 +249,7 @@ def test_plan_weights_mxfp8_a8_selects_the_w8a8_contract() -> None:
 
 @pytest.mark.parametrize("mode", ["A16", "A4"])
 def test_plan_weights_mxfp8_rejects_narrower_activations(mode: str) -> None:
+    """MXFP8 weights reject activation modes narrower than A8."""
     from b12x.moe import fused_moe
 
     with pytest.raises(ValueError):
@@ -264,6 +269,7 @@ def test_plan_weights_mxfp8_rejects_narrower_activations(mode: str) -> None:
 
 
 def test_prepare_w8a8_keeps_weight_bytes_and_swizzles_scales_exactly() -> None:
+    """Preparation keeps E4M3 bytes and swizzles scales like the canonical helper."""
     from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
 
     experts, k, i = 2, 256, 128
@@ -346,6 +352,7 @@ def test_prepare_w8a8_swizzles_non_128_fc1_halves_independently() -> None:
 
 
 def test_prepare_w8a8_accepts_float8_payload_and_scale_storage() -> None:
+    """Float8 payload and scale storage dtypes are accepted as byte views."""
     from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
 
     experts, k, i = 1, 128, 128
@@ -371,6 +378,7 @@ def test_prepare_w8a8_accepts_float8_payload_and_scale_storage() -> None:
 
 
 def test_prepare_w8a8_rejects_ue8m0_nan_and_preserves_top_exponent() -> None:
+    """UE8M0 0xFF is rejected while 0xFE survives unchanged."""
     from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
 
     experts, k, i = 1, 128, 128
@@ -402,6 +410,7 @@ def test_prepare_w8a8_rejects_ue8m0_nan_and_preserves_top_exponent() -> None:
 
 
 def test_prepare_w8a8_rejects_non_finite_runtime_alpha() -> None:
+    """Non-finite runtime alphas are rejected."""
     from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
 
     experts, k, i = 1, 128, 128
@@ -433,6 +442,7 @@ def test_prepare_w8a8_rejects_non_finite_runtime_alpha() -> None:
     ],
 )
 def test_prepare_w8a8_rejects_malformed_inputs(field, value, error) -> None:
+    """Malformed payload, scale, or geometry inputs are rejected."""
     from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
 
     experts, k, i = 1, 128, 128
@@ -453,6 +463,7 @@ def test_prepare_w8a8_rejects_malformed_inputs(field, value, error) -> None:
 
 
 def test_w8a8_weight_plan_lowers_to_the_mxfp8_engine() -> None:
+    """The w8a8_mx weight plan lowers to the MXFP8 GEMM engine."""
     from b12x.moe._shared.execution import (
         GemmEngine,
         MoERegime,
@@ -499,6 +510,7 @@ def test_w8a8_weight_plan_lowers_to_the_mxfp8_engine() -> None:
 
 
 def test_dynamic_kernel_w8a8_shares_mxf8_geometry_without_fp6_packing() -> None:
+    """w8a8_mx shares the MXF8 geometry without FP6 packing."""
     from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
 
     backend = MoEDynamicKernelBackend(
@@ -527,6 +539,7 @@ def test_dynamic_kernel_w8a8_shares_mxf8_geometry_without_fp6_packing() -> None:
 
 
 def test_w8a8_tuning_requires_dynamic_backend_and_m128_tile() -> None:
+    """Tuning validation admits only the dynamic backend and M128 tile."""
     from b12x.moe.fused_moe._tuning import (
         MoeDecodeConfig,
         MoeDecodeQuery,
@@ -534,6 +547,7 @@ def test_w8a8_tuning_requires_dynamic_backend_and_m128_tile() -> None:
     )
 
     def query(**overrides) -> MoeDecodeQuery:
+        """Build a w8a8_mx decode query with overrides."""
         values = {
             "quant_mode": "w8a8_mx",
             "quant_modes": ("w8a8_mx",),

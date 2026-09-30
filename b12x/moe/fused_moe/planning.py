@@ -98,6 +98,7 @@ class WeightPlan:
 
 
 def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
+    """Map a packed source format and activation mode to its quant recipe."""
     source_format = source.format.value
     if mode is ActivationMode.A16:
         if source_format in ("mxfp6_e2m3", "mxfp8_e8m0_k32"):
@@ -164,6 +165,7 @@ def _prepared_format(
     recipe: str,
     constraints: WeightPlanConstraints,
 ) -> PreparedWeightFormat:
+    """Resolve the prepared weight format for a recipe from the preparation plan."""
     available = frozenset(WeightPacking(layout.value) for layout in plan.weight_layouts)
     required = plan.required_weight_layout(recipe)
     default_packing = (

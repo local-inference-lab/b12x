@@ -25,7 +25,8 @@ so both operands are genuine E4M3 and feed the ``MmaMXF8Op`` block-scaled
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -48,13 +49,16 @@ class PreparedW8A8MXFP8Weights:
     are UE8M0 block scales in the MMA swizzle
     (``[E, pad128(rows), pad4(K//32)]`` bytes); ``*_alpha`` are per-expert f32
     runtime dequant scales.  This container is the input contract of the
-    ``quant_recipe="w8a8_mx"`` dynamic-kernel port.
+    ``quant_recipe="w8a8_mx"`` dynamic kernel.
 
     When ``intermediate_size`` is not a multiple of 128 the gate half of FC1
     starts inside a 128-row scale atom, so the kernel streams the up and gate
     halves through independent TMA descriptors.  ``w13_sf_swizzled`` then
     holds the two halves swizzled independently, half-major:
     ``[2, E, pad128(I), pad4(K//32)]`` (index 0 = up, 1 = gate).
+    ``launch_views`` holds the dynamic-launch operand views and pointers that
+    ``b12x.moe.fused_moe`` resolves once when it prepares the experts; the
+    launch path reads them instead of re-deriving geometry per call.
     """
 
     w13_values: torch.Tensor
@@ -66,8 +70,10 @@ class PreparedW8A8MXFP8Weights:
     num_experts: int
     hidden_size: int
     intermediate_size: int
+    launch_views: Any = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        """Coerce the geometry fields to ``int``."""
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))
         object.__setattr__(self, "intermediate_size", int(self.intermediate_size))
@@ -77,26 +83,32 @@ class PreparedW8A8MXFP8Weights:
     # lookups used for the W4A16 native containers).
     @property
     def w13(self) -> torch.Tensor:
+        """FC1 E4M3 code bytes (canonical-storage alias)."""
         return self.w13_values
 
     @property
     def w2(self) -> torch.Tensor:
+        """FC2 E4M3 code bytes (canonical-storage alias)."""
         return self.w2_values
 
     @property
     def w13_scale(self) -> torch.Tensor:
+        """FC1 swizzled UE8M0 scales (canonical-storage alias)."""
         return self.w13_sf_swizzled
 
     @property
     def w2_scale(self) -> torch.Tensor:
+        """FC2 swizzled UE8M0 scales (canonical-storage alias)."""
         return self.w2_sf_swizzled
 
     @property
     def w13_global_scale(self) -> torch.Tensor:
+        """FC1 per-expert runtime alphas (canonical-storage alias)."""
         return self.w13_alpha
 
     @property
     def w2_global_scale(self) -> torch.Tensor:
+        """FC2 per-expert runtime alphas (canonical-storage alias)."""
         return self.w2_alpha
 
 
@@ -150,6 +162,7 @@ def _validate_e8m0_scale_grid(
 def _validate_expert_scalars(
     scale: torch.Tensor, *, name: str, num_experts: int
 ) -> torch.Tensor:
+    """Return a contiguous ``[E]`` f32 view of a scalar or per-expert scale."""
     if not isinstance(scale, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if scale.numel() == 1:

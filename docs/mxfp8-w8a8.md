@@ -63,16 +63,21 @@ is `[2, E, pad128(I), pad4(K/32)]` when `I % 128 != 0`), and
 `w13_global_scale`/`w2_global_scale` aliases for the generic owner plumbing.
 Callers hand **unswizzled** scale grids; B12X swizzles them.
 
+Preparation also validates the operand geometry once and stores the resolved
+dynamic-launch views and scale pointers in `launch_views`. `fused_moe.run`
+reads `launch_views` directly; the launch path does not re-derive or
+re-validate W8A8 geometry, and the source/recipe pairing is checked when the
+plan is prepared and the binding is built.
+
 A gate-first (`w31`) FC1 is rotated to the kernel-native `[up; gate]` order
 during preparation, while the payload and its scale grid are both still
 unswizzled, so the row flip and the MMA swizzle cannot disagree about which
 row is which.
 
-Everything else is the existing unified dynamic kernel: route/pack, the
-materialized persistent work queue, SwiGLU, the atomic scatter (or the
-deterministic route-buffer top-k sum), and the per-expert alpha plumbing are
-unchanged from `w6a8_mx`. The recipe differences are confined to operand
-transport:
+Everything else is the unified dynamic kernel shared with `w6a8_mx`:
+route/pack, the materialized persistent work queue, SwiGLU, the atomic scatter
+(or the deterministic route-buffer top-k sum), and the per-expert alpha
+plumbing. The recipe differences are confined to operand transport:
 
 | | `w6a8_mx` | `w8a8_mx` |
 |---|---|---|
@@ -95,7 +100,7 @@ tile as `slice + ceil(I/128)`, and scale factors are TMA'd in 128-row atoms,
 so with one stacked descriptor a gate half starting at row `I` inside an atom
 has no valid tile or atom coordinate.
 
-For `I % 128 != 0` (and `I % 32 == 0`) the kernel uses the existing
+For `I % 128 != 0` (and `I % 32 == 0`) the kernel uses the
 `separate_w13_halves` specialization: independent up and gate descriptors
 over `[I, K]` views of the same payload, and preparation swizzles the two
 halves' scale grids independently. The last intermediate slice's tail rows
@@ -109,7 +114,8 @@ shared ones so the two recipes cannot drift:
 
 - `is_w6a8` — 3:4-packed B staging, the in-place expansion, and the inline FP6
   MMA dispatch;
-- `is_w8a8` — the new recipe;
+- `is_w8a8` — direct E4M3 B transport (one byte per element, gmem K extent
+  equal to logical K) with native `MmaMXF8Op` dispatch;
 - `is_mxf8` (`is_w6a8 or is_w8a8`) — `tile_k = sf_vec_size * 4`, the
   `MmaMXF8Op` tiled MMA and its SF atom geometry, the one-byte-per-element
   activation scratch, and the FC2-intermediate container requant.

@@ -817,6 +817,9 @@ class MoEDynamicKernelBackend:
         trellis_intermediate_hadamard: bool = False,
         trellis_direct_lut: bool = False,
     ):
+        """Record the dynamic-kernel specialization and reject unsupported recipe
+        combinations.
+        """
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
             "nvfp4",
@@ -925,7 +928,7 @@ class MoEDynamicKernelBackend:
                 )
             if mma_tiler_mn != (128, 128):
                 raise ValueError(
-                    "w8a8_mx currently supports mma_tiler_mn == (128, 128) only"
+                    "w8a8_mx supports mma_tiler_mn == (128, 128) only"
                 )
             if swap_ab:
                 raise ValueError("w8a8_mx does not support swap_ab")
@@ -1429,6 +1432,7 @@ class MoEDynamicKernelBackend:
         )
 
     def _setup_attributes(self):
+        """Derive tile, shared-memory, and pipeline geometry for the selected recipe."""
         import cutlass.utils.blackwell_helpers as sm120_utils
 
         if cutlass.const_expr(self.is_mxf8):
@@ -2546,6 +2550,9 @@ class MoEDynamicKernelBackend:
         trellis_lut: cute.Tensor | None = None,  # 4 KiB lut_e4m3 value table (u8)
         trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
     ):
+        """Build TMA descriptors for the bound tensors and launch the persistent
+        kernel.
+        """
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
         if cutlass.const_expr(self.is_w6a8):

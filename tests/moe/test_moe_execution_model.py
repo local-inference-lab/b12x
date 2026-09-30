@@ -183,6 +183,7 @@ def test_materialized_fused_work_can_use_grid_or_load_balancing_queue() -> None:
 
 
 def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
+    """Execution plans map each kernel family to its execution contract."""
     dynamic_weights = _weight_plan("nvfp4", source_format="modelopt_nvfp4")
     dynamic = plan_tp_moe_execution(
         num_tokens=64,
@@ -224,6 +225,7 @@ def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
 
 
 def test_workspace_plan_uses_weight_plan_source_contract() -> None:
+    """The workspace plan inherits the weight plan's source contract."""
     weights = _weight_plan(
         "w4a8_mx",
         source_format="fp4_e8m0_k32",

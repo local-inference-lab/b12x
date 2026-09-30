@@ -225,6 +225,7 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    """Reject a decode config the query's recipe cannot execute."""
     if query.source_format == "iq2_xs":
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
             raise ValueError("IQ2_XS requires BF16 W4A16 execution")
