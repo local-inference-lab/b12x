@@ -87,23 +87,20 @@ validation rather than discovered at launch.
 
 ## Non-128 intermediate
 
-The 128 alignment was a kernel addressing rule, not an arithmetic one. The
+The intermediate size needs `I % 32 == 0`, not `I % 128 == 0`. The
 `mxf8f6f4` MMA is `m16n8k32` with one UE8M0 scale per 32 K
-(`.scale_vec::1X`), and the activation and intermediate quantizers already
-work in 32-element blocks. What required `I % 128 == 0` was FC1: one TMA
-descriptor over the stacked `[up; gate]` rows addressed the gate tile as
-`slice + ceil(I/128)`, and scale factors are TMA'd in 128-row atoms, so a gate
-half starting at row `I` inside an atom had no valid tile or atom coordinate.
+(`.scale_vec::1X`), and the activation and intermediate quantizers work in
+32-element blocks. The stacked `[up; gate]` FC1 descriptor addresses the gate
+tile as `slice + ceil(I/128)`, and scale factors are TMA'd in 128-row atoms,
+so with one stacked descriptor a gate half starting at row `I` inside an atom
+has no valid tile or atom coordinate.
 
 For `I % 128 != 0` (and `I % 32 == 0`) the kernel uses the existing
 `separate_w13_halves` specialization: independent up and gate descriptors
 over `[I, K]` views of the same payload, and preparation swizzles the two
 halves' scale grids independently. The last intermediate slice's tail rows
 (FC1 N) and columns (FC2 K) are TMA zero-fill, so no padded weight bytes are
-read. The MMAs still run over the full 128-wide tail slice: a runtime guard
-that skipped FC2's dead `k32` blocks measured slower on an RTX 5090 (1 token,
-E=512: ~124 us with the guard against ~108 us without), most likely because
-the branch breaks the unrolled K-block copy/MMA interleave (not profiled).
+read. The MMAs still run over the full 128-wide tail slice.
 
 ## Shared byte-container geometry
 
@@ -125,8 +122,8 @@ shared ones so the two recipes cannot drift:
   malformed-input rejection, and a check that the oracle quantizer reproduces
   the device PTX scale-byte rule at power-of-two boundaries. GPU: numerical
   execution against `moe_reference_w8a8_mx` on the model geometry
-  (K=2560, I=640, top-k=10) with 1/5/16 tokens, experts with no routes, and
-  CUDA-graph replay under frozen kernel resolution.
+  (K=2560, top-k=10, I=640/320/96) with 1/5/16 tokens, experts with no
+  routes, and CUDA-graph replay under frozen kernel resolution at I=640/320.
 - `tests/moe/test_moe_execution_model.py` — the recipe-independent lowering
   invariants.
 
@@ -139,43 +136,24 @@ memcheck reports no access errors on the I=320, I=96 and I=640 oracle cases
 and the I=320 graph replay; its only report is a host-side "selective device
 code recompilation" API warning from the Triton loader.
 
-Unpadded I=320 against the same weights zero-padded to I=384 (the former vLLM
-adapter workaround), MoE kernel device time from a CUPTI trace, median of 200
-eager launches, three interleaved processes per cell (range of the three
-medians):
-
-| tokens | RTX PRO 6000, E=128: I=320 / I=384 us | RTX 5090, E=512: I=320 / I=384 us |
-|---|---|---|
-| 1 | 131.4-131.6 / 131.2-131.3 | 105.2-106.1 / 104.8-105.2 |
-| 4 | 148.4-149.0 / 149.3-149.6 | 123.3-128.9 / 132.9-136.9 |
-| 16 | 292.6-292.7 / 311.1-311.5 | 356.2-358.0 / 380.0-386.4 |
-| 64 | 432.0-432.2 / 462.2-462.6 | 833.2-843.4 / 920.1-927.5 |
-
-At one token the two are equal within noise; the gain grows with routed
-rows, up to about 7% (SM120) and 10% (5090) at 64 tokens.
-
-The original I=640-only lane passed 21 tests covering numerical output at
-M=1/5/16, empty experts, atomic graph replay against the quantized reference
-and deterministic bit-exact graph replay; Compute Sanitizer memcheck passed
-its six execution/replay cases with zero reported errors. The retained NVFP4
-preparation/decode/replay lane passed three tests with the same
-42,538,496-byte peak allocation as before that change. This change leaves the
-NVFP4 path's `separate_w13_halves` selection and gate offset arithmetic
-numerically identical (`k // 2` bytes per FP4 row).
+At I=640 the native lane covers numerical output at M=1/5/16, empty experts,
+atomic graph replay against the quantized reference and deterministic
+bit-exact graph replay; Compute Sanitizer memcheck reports zero errors on its
+six execution/replay cases. The NVFP4 preparation/decode/replay lane passes
+three tests with a 42,538,496-byte peak allocation. NVFP4 keeps its
+`separate_w13_halves` selection and gate offset of `k // 2` bytes per FP4 row.
 
 The emitted device objects record `-arch sm_120f`. Their disassembly contains
 `QMMA.SF.16832.F32.E4M3.E4M3.E8`. This proves native block-scaled MXFP8
 execution on SM120 and compilation for the SM120/SM121 family. It does not
 prove SM121 execution.
 
-The host-directory program cache survives consumer-container removal. A fresh
-container runs the full native suite with 13 disk-cache hits and zero compile
-misses. Its bytes live on the host filesystem, not in the container. Removing
-the cache directory or losing that filesystem destroys them.
-
-Full step5500 MTP boot, acceptance rate and comparison with Marlin remain
-unmeasured. The available GPU runs a live engine that must stay untouched.
-The native recipe is not a serving-throughput improvement claim.
+Qwen3.8-Flash-Next-NVFP4 QAD step 5500 serves on two GB10 (SM121) TP=2 groups
+with its MXFP8 MTP draft experts on this path at I=320 per rank and its NVFP4
+target experts on B12X; the engine log selects `B12X_MXFP8` for the draft and
+no expert runs on Marlin. MTP acceptance rate against Marlin and per-kernel
+SM121 timing remain unmeasured. The native recipe is not a serving-throughput
+improvement claim.
 
 ## Related
 
