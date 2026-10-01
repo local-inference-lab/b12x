@@ -75,10 +75,10 @@ paired probes do not establish full-vocabulary KLD or attribute nondeterminism
 to a particular kernel. Component exactness is qualified separately.
 
 **Unsupported by these claims:** complete-model logit parity, 1M-context stress,
-other hardware modes and unmeasured serving geometries. The NVFP4 presence-mask
-change reduces GLM/Qwen batch regressions but does not resolve them: measured
-GLM TP4 still loses 3.6–8.5% at concurrency 8–32, and Qwen TP2 loses about 4%
-at concurrency 8/16. Inline NVFP4 research is excluded from this implementation.
+other hardware modes and unmeasured serving geometries. These DS4.1 measurements
+use presence-based scale expansion and do not qualify NVFP4 operand
+reconstruction. GLM/Qwen implementations, measurements and remaining overhead
+are covered by the separately pinned [NVFP4 serving report](nvfp4-serving.md).
 
 Raw receipts reside under `/data/trellis-quant/csf-batch-performance-20261001`:
 `ds41-api-serving-means.json`, `api-mxfp8-tests.log`, `api-vllm-tests-2.log`,

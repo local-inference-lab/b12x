@@ -2,6 +2,10 @@
 
 The [MXFP8 expert and serving report](mxfp8-serving.md) covers the DS4.1
 activation-policy repair and the composed loading/preparation serving tests.
+The [NVFP4 serving report](nvfp4-serving.md) covers GLM/Qwen batch decode and
+the [prepared scale operands](nvfp4-scale-operands.md) used by dynamic MoE.
+Independent [native routing and preparation invariants](dynamic-moe-correctness.md)
+have their own reproducers and correctness limits.
 The loading comparisons below retain their original source and precision scope.
 
 vLLM reads compressed FP4 checkpoints, validates their manifests and model
