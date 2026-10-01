@@ -1567,11 +1567,13 @@ def test_candidate_progress_counts_races_and_excludes_fixed_or_cached_choices(tm
 
 
 def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes(caplog):
+    from b12x.preparation.device import detect_device
     from b12x.preparation.session import _LAZY_SESSIONS, _warn_unprepared_declaration
 
     _warn_unprepared_declaration.cache_clear()
     plans = [declaration(shared=True) for _ in range(20)]
     plans.append(replace(declaration(shared=True), query=Query(5)))
+    ordinal = detect_device().ordinal
     try:
         with caplog.at_level("DEBUG", logger="b12x.preparation"):
             states = [require_prepared(plan, "test.arithmetic") for plan in plans]
@@ -1584,12 +1586,11 @@ def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes
         details = [r.getMessage() for r in caplog.records if "unprepared plan Query#" in r.getMessage()]
         assert len(details) == 21
     finally:
-        # Lazy sessions are keyed by device ordinal: None without CUDA, else the GPU.
-        from b12x.preparation.device import detect_device
-        session = _LAZY_SESSIONS[detect_device(None).ordinal]
+        session = _LAZY_SESSIONS[ordinal]
         for plan in plans:
             session.release(plan)
         _warn_unprepared_declaration.cache_clear()
+    assert all(plan.prepared is None for plan in plans)
 
 
 def test_progress_counts_prepared_selection_sources_once_per_shared_group(tmp_path):

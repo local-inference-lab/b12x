@@ -67,7 +67,7 @@ def test_mhc_prepared_norm_matches_native_oracle(tokens: int, rms_eps: float) ->
         torch.testing.assert_close(actual[2], expected_comb, rtol=2e-6, atol=4e-5)
 
 
-def test_mhc_prepared_projection_splits_share_projection_and_keep_finalizers_distinct() -> None:
+def test_mhc_prepared_projection_shares_rows_and_specializes_static_splits() -> None:
     device, hidden = require_b12x(), 4096
     requests = []
     for rows in (1, 128):
