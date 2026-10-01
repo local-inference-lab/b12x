@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-454",
+  "category": "internal",
+  "summary": "PLE tables can live in caller-provided mapped host memory, so several processes can share one copy",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. Without a caller-provided allocator PLE storage is allocated as before.",
+  "details": [
+    "allocate_storage and TableLayout.allocate_storage take an optional host_allocator that supplies each mapped-host table plane. The storage checks the region's shape, dtype, device and mapped device alias, and owns it afterwards.",
+    "vLLM uses it to keep one tmpfs copy of the 26.8 GiB Qwen3.8-Flash-Next PLE table for several TP1 servers on one host (VLLM_PLE_TABLE_MEMORY=shared).",
+    "Planes allocated before a failed allocation are released at once instead of at garbage collection."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    454
+  ],
+  "requires": []
+}
