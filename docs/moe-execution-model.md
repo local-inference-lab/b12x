@@ -36,6 +36,8 @@ The canonical numeric recipes are:
 | NVFP4 W4A4 | FP4 E2M1 / E4M3 K/16 | E4M3 K/16 | E4M3 K/16 |
 | W4A8 on NVFP4 | MXFP8 E4M3 / E8M0 K/32 | E4M3 K/16 | E8M0 K/32 base × K/16 residual |
 | native W4A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
+| W6A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
+| W8A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
 | W4A16 | BF16 / none | E4M3 K/16 or E8M0 K/32 | source-preserving |
 
 ## Intermediate Hadamard trellis transforms
@@ -302,6 +304,8 @@ the owner—not raw weight tensors—and execution takes only the completed bind
 | W4A16 source-native | source-native bytes | transfer the source allocation into the expert owner |
 | W4A16 MMA-packed | packed MMA layout | repack the source allocation in place |
 | native W4A8-MX | N256/K128 QMMA weights, or exact N128-bulk/N64-tail weights, plus SFB scales | repack weights and scales in place |
+| W6A8-MX | source-native 3:4-packed FP6 code bytes, plus swizzled UE8M0 K/32 scale atoms | transfer the source allocation into the expert owner |
+| W8A8-MX | source-native MXFP8 E4M3 code bytes (unchanged), plus swizzled UE8M0 K/32 scale atoms | transfer the source allocation into the expert owner |
 | source-native plus an incompatible model-sized repack, or two incompatible repacks | none | reject during planning |
 
 There is no runtime raw-weight overload, prepared-payload override, old cache-key
