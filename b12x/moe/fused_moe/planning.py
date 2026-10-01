@@ -507,13 +507,35 @@ def prepare_weights(
                     w2_blockscale=outputs[1],
                 ),
             )
+        inline = None
+        if (
+            plan.activation.mode is ActivationMode.A4
+            and plan.activation.nonlinearity == "silu"
+            and plan.geometry.intermediate_size % 64 == 0
+            and plan.geometry.hidden_size % 128 == 0
+        ):
+            from b12x._lib.quant.nvfp4_csf_inline import prepare_inline_scales
+
+            inline = tuple(prepare_inline_scales(plane) for plane in planes)
+            # Both execution paths own views of one fixed stream. Only the
+            # exception index differs between whole-plane and tile reads.
+            planes = tuple(
+                replace(plane, fixed=value.storage[1024: 1024 + plane.fixed.numel()].view_as(plane.fixed))
+                for plane, value in zip(planes, inline, strict=True)
+            )
+            plan = replace(plan, _impl=replace(plan._impl, nvfp4_inline_scales=True))
         decoder = Nvfp4CsfDecoder.prepare(
             *planes,
             prepared._impl.w1_blockscale,
             prepared._impl.w2_blockscale,
+            inline_scales=inline,
         )
         return PreparedExperts(
-            plan=plan, _impl=replace(prepared._impl, nvfp4_csf=decoder)
+            plan=plan,
+            _impl=replace(
+                prepared._impl, plan=plan._impl,
+                nvfp4_csf=replace(decoder, inline_scales=inline),
+            ),
         )
     if isinstance(weights, Mxfp4CsfWeights):
         if (
