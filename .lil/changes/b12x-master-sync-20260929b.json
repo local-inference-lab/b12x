@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-master-sync-20260929b",
+  "category": "compatibility",
+  "summary": "Carry current B12X master into beta: compiled kernels shared across identical GPUs, portable tuning winners, reclaimed MXFP4 programs",
+  "models": ["all"],
+  "compatibility": "No user action required. Compiled-kernel artifacts move to a new format keyed by compute capability and SM count instead of the GPU's UUID, so the first start after updating compiles again; later starts reuse the artifacts on every GPU of the same model.",
+  "details": [
+    "CuTe disk artifacts compiled on one GPU load on any other GPU with the same compute capability and SM count.",
+    "Tuning winners carry their program keys and can be staged and installed on other ranks with digest validation (used by vLLM's winner fetch at startup).",
+    "MXFP4 attention programs are owned and reclaimed like every other compiled program; losing tuning candidates are dropped.",
+    "NVIDIA GB10 (DGX Spark) defaults to four compiler workers; other GPUs keep eight."
+  ],
+  "authors": ["lukealonso"],
+  "requires": []
+}

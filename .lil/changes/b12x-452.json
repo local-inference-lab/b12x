@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-452",
+  "category": "feature",
+  "summary": "B12X runs MXFP8 MoE experts natively (W8A8)",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. vLLM uses it only when moe_backend b12x is requested for MXFP8 experts (vllm-957).",
+  "details": [
+    "MXFP8 expert weights (E4M3 values with one UE8M0 scale per 32 values) are prepared byte-exact and run on the block-scaled MXFP8 tensor cores, for intermediate sizes divisible by 32, such as the 320-wide per-rank MTP draft experts of the Qwen3.8-Flash-Next QAD step 5500 checkpoint at TP2.",
+    "W6A8 (MXFP6) expert scale grids are checked by the same rule at load: a NaN (0xFF) scale byte or a non-contiguous grid is rejected instead of copied.",
+    "Contributed by Naadir Jeewa."
+  ],
+  "authors": [
+    "randomvariable",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    452
+  ],
+  "requires": []
+}

@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-420",
+  "category": "feature",
+  "summary": "Add paged_decode: split-KV decode and verify attention with its KV-cache append",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Serves MiMo-V2 DiffKV layers and the DFlash drafter for decode and ragged speculative verify, BF16 or FP8 KV, from one CUDA graph per batch capacity.",
+    "The KV-cache append for those layers runs in the same prepared plan."
+  ],
+  "pull_requests": [
+    420
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-master-sync-20260924",
+  "category": "compatibility",
+  "summary": "Carry current B12X master into beta: validated kernel cache, concurrent Engram reads, compact IQ2_XXS and Q8_0",
+  "models": ["all"],
+  "compatibility": "No user action required. Cached MoE routing selections are invalidated once, so the first start after updating tunes again.",
+  "details": [
+    "Cached CuTe kernels are reused only after their size and SHA-256 match; a corrupt or incomplete cache entry is recompiled instead of failing startup (#418).",
+    "Disk Engram rows for several tables are read concurrently.",
+    "Compact IQ2_XXS and Q8_0 blocks stay resident for dense, GEMV, MoE and embedding kernels."
+  ],
+  "authors": ["lukealonso", "eugr", "voipmonitor"],
+  "requires": []
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-ds41-fp4-writer-ties",
+  "category": "fix",
+  "summary": "DeepSeek-V4.1 compressed KV cache records are bit-identical to the reference quantizer",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "No user action required. Existing caches stay valid; newly written records differ only where a value sat exactly between two FP4 codes.",
+  "details": [
+    "The 288-byte FP4 (E2M1 + E4M3 scale per 16) writer divides by the group scale like DeepSeek's fp4_quant_kernel instead of multiplying by a rounded reciprocal, so exact E2M1 midpoints round to the even code.",
+    "About 0.05% of cached values change by one FP4 step to the equally distant neighbour; model quality and speed are unchanged."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    435
+  ],
+  "requires": []
+}

@@ -1,0 +1,26 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-master-sync-20260929",
+  "category": "compatibility",
+  "summary": "Carry current B12X master into beta: A16 token cutoffs, job-scoped preparation reuse, safe rejection of oversized cooperative launches",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. The first start after updating compiles and tunes the changed kernels again: in our tests GLM-5.3-Flash Spark TP2 started about 5 minutes and Qwen3.8-Flash-Next TP2 about 11 minutes later than with a warm cache; later starts are fast again. The new a16_max_tokens planning constraint defaults to zero, so configured precisions are unchanged unless a caller sets it.",
+  "details": [
+    "Planning accepts an inclusive a16_max_tokens cutoff for dense and MoE execution and prepares an A16 capacity below it.",
+    "Preparation shares immutable launch bundles within a job, releases composite plans in batches and reclaims unused programs after teardown.",
+    "The beta-only paged_decode and small-row block-FP8 GEMV compile factories (MiMo-V2.6) use the same job-scoped reuse as every other factory.",
+    "Autotuning drains and releases cooperative launch trials rejected with CUDA error 720 instead of failing, and does not cache incomplete coverage.",
+    "W4A16 fallback activation-amax scales are flattened for parameter-backed global scales.",
+    "DSA compile workers keep fake-tensor indexing off CUDA (#390)."
+  ],
+  "authors": [
+    "lukealonso",
+    "tobymao"
+  ],
+  "pull_requests": [
+    390
+  ],
+  "requires": []
+}

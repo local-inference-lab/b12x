@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-master-sync-20260923",
+  "category": "compatibility",
+  "summary": "Carry current B12X master into beta: faster grouped MoE decode and asynchronous weight loading",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Dynamic MoE decode builds the grouped expert prefix in parallel, and full-capacity DSA indexer grids are bounded.",
+    "Ordinary CUDA weights load through a bounded asynchronous io_uring ring, including weights that span several expandable CUDA mappings.",
+    "Earlier autotuning decisions are invalidated once, so the first start after updating tunes again.",
+    "Sliced KDA state indices and serialized block-FP8 execution reuse prepared kernels within their planned capacity.",
+    "Trellis lookup-table codebooks and the EXL3 container use neutral names."
+  ],
+  "authors": ["lukealonso", "voipmonitor"],
+  "requires": []
+}

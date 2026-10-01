@@ -66,8 +66,10 @@ accumulation. Dot results, weighted
 products, and the final head sum retain their separate BF16 rounding points.
 
 
-**`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
-path, a unified dynamic path (persistent grid, `nvfp4`/`w4a8_mx`/`w4a8_nvfp4`),
+**`moe`** — `moe.fused_moe`, fused low-precision TP MoE across a micro-kernel decode
+path, a unified dynamic path (persistent grid) covering `nvfp4`, `w4a8_mx`,
+`w4a8_nvfp4`, and the byte-container `w6a8_mx`/`w8a8_mx` recipes (see
+`docs/mxfp6-w6a8.md` and `docs/mxfp8-w8a8.md`),
 and W4A16 (BF16 activations, inline FP4 weight dequant — no activation-scale
 math), with SiLU/ReLU2/SwiGLU-OAI activations; plus `moe.ep_moe` (expert
 parallel).

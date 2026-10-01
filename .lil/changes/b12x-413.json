@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-413",
+  "category": "feature",
+  "summary": "Packed attention accepts live row and segment counts within its prepared capacity without recompiling",
+  "models": ["Kimi-K3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Existing exact-shape callers remain valid; Kimi MLA prefill gains a 192/128 attention tile."
+  ],
+  "pull_requests": [413],
+  "requires": []
+}

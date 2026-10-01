@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-master-sync-20260930",
+  "category": "compatibility",
+  "summary": "Carry current B12X master into beta: CUTLASS DSL 4.7.1, block-quantized launch heuristics, tensor-based API compatibility",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. B12X now requires CUTLASS DSL 4.7.1, which the runtime image installs (docker-116). The first start after updating compiles and tunes B12X kernels again for the new compiler, so it takes longer once.",
+  "details": [
+    "The CUTLASS DSL compiler and its libraries move from 4.6.2 to 4.7.1.",
+    "Dense tiles and split-K for block-quantized weights are chosen from the codec, geometry, planned capacity, workspace limits and SM count, and MoE launches account for resident threads, without model-specific shape exceptions.",
+    "The tensor-based GEMM, MoE, attention and vLLM integration entry points are kept over the typed preparation APIs; callers without autotuning metadata get bounded dynamic preparation and heuristic planning."
+  ],
+  "authors": [
+    "lukealonso"
+  ],
+  "pull_requests": [],
+  "requires": []
+}
