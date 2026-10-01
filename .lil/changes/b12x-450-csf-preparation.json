@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-450-csf-preparation",
+  "category": "compatibility",
+  "summary": "Prepare compressed scale planes through the fused-MoE weight API",
+  "models": [
+    "Kimi-K3",
+    "DeepSeek-V4.1-Flash",
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "Install the paired vLLM/B12X CSF preparation changes. Canonical CSF checkpoint files and launch commands remain compatible.",
+  "details": [
+    "CsfScalePlanes carries rank-local CPU fixed and exception tensors; prepare_weights creates resident scale batches and retains the ordinary weight and scale preparation paths.",
+    "CSF checkpoint readers and tensor-store interfaces are removed from B12X; vLLM owns file access, model mapping and TP slicing.",
+    "Scale decoders, expert kernels and shared scratch ownership are unchanged."
+  ],
+  "pull_requests": [
+    450
+  ],
+  "requires": []
+}
