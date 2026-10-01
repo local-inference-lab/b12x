@@ -573,6 +573,15 @@ def ld_global_b16(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_global_u8(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.b8 $0, [$1];", "=r,l", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
 def prefetch_global_l2(base_ptr: Int64, *, loc=None, ip=None) -> None:
     """Prefetch a global memory line into L2."""
     llvm.inline_asm(

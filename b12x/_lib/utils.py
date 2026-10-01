@@ -530,6 +530,7 @@ def sm120_make_smem_layout_sfa(
     sf_vec_size: int,
     num_stages: int,
     *,
+    bank_linear: bool = False,
     loc=None,
     ip=None,
 ) -> cute.Layout:
@@ -563,7 +564,8 @@ def sm120_make_smem_layout_sfa(
     mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
 
     mn_basic_block_shape = (32, 4)
-    mn_basic_block_stride = (16, 4)
+    assert not bank_linear or (tile_shape_mnk[2] == 64 and sf_vec_size == 32)
+    mn_basic_block_stride = (4, 128) if bank_linear else (16, 4)
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
@@ -615,6 +617,7 @@ def sm120_make_smem_layout_sfb(
     sf_vec_size: int,
     num_stages: int,
     *,
+    bank_linear: bool = False,
     loc=None,
     ip=None,
 ) -> cute.Layout:
@@ -656,7 +659,8 @@ def sm120_make_smem_layout_sfb(
     mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
 
     mn_basic_block_shape = (32, 4)
-    mn_basic_block_stride = (16, 4)
+    assert not bank_linear or (tile_shape_mnk[2] == 64 and sf_vec_size == 32)
+    mn_basic_block_stride = (4, 128) if bank_linear else (16, 4)
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
