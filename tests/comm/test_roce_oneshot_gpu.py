@@ -101,24 +101,38 @@ def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
     return 2e-3, 4e-3 * world
 
 
-def test_payload_is_striped_across_every_hca(runtime):
-    """One peer payload is split evenly across both QSFP PCIe functions."""
-    if len(runtime.hca_names) < 2:
-        pytest.skip("requires two RoCE interfaces for one QSFP port")
+def test_payload_is_striped_across_every_rail(runtime):
+    """Each peer payload is split evenly across its rails, each on the HCA routed to that peer.
+
+    On a switched fabric every peer uses HCA ``h`` for rail ``h``; on a switchless ring each
+    peer's rails use the HCAs cabled to it, so every HCA carries only its peers' stripes.
+    """
+    if runtime.rail_count < 2:
+        pytest.skip("requires two RoCE rails per peer")
     world = dist.get_world_size()
+    rank = dist.get_rank()
     nbytes = 256 * 1024
     before = runtime.stats()
     before_bytes = before["bytes_posted_per_hca"]
     before_writes = before["writes_completed_per_hca"]
     inp = torch.full(
-        (nbytes // 2,), dist.get_rank() + 1, dtype=torch.bfloat16, device=runtime.device
+        (nbytes // 2,), rank + 1, dtype=torch.bfloat16, device=runtime.device
     )
     out = runtime.all_reduce(inp)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, torch.full_like(out, world * (world + 1) // 2))
 
-    expected_bytes = (world - 1) * nbytes // len(runtime.hca_names)
-    expected_writes = world - 1
+    routes = runtime.stats()["routes"]
+    assert len(routes) == world and routes[rank] == []
+    stripes_per_hca = [0] * len(runtime.hca_names)
+    for peer, links in enumerate(routes):
+        if peer == rank:
+            continue
+        assert len(links) == runtime.rail_count
+        assert len({local for local, _ in links}) == runtime.rail_count
+        for local, _ in links:
+            stripes_per_hca[local] += 1
+    expected_bytes = [n * nbytes // runtime.rail_count for n in stripes_per_hca]
     deadline = time.monotonic() + 5
     while True:
         after = runtime.stats()
@@ -134,13 +148,12 @@ def test_payload_is_striped_across_every_hca(runtime):
                 after["writes_completed_per_hca"], before_writes, strict=True
             )
         ]
-        if all(delta >= expected_writes for delta in write_deltas):
+        if all(delta >= n for delta, n in zip(write_deltas, stripes_per_hca)):
             break
         assert time.monotonic() < deadline, after
         time.sleep(0.001)
-    assert byte_deltas == [expected_bytes] * len(runtime.hca_names)
-    assert all(delta >= expected_writes for delta in write_deltas)
-    assert after["stripe_hcas"] == list(range(len(runtime.hca_names)))
+    assert byte_deltas == expected_bytes
+    assert all(delta >= n for delta, n in zip(write_deltas, stripes_per_hca))
     dist.barrier()
 
 

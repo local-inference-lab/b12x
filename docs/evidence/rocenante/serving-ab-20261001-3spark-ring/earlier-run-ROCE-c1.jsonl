@@ -1,0 +1,7 @@
+{"label": "rocenante", "run": 0, "ttft_s": 0.247, "completion_tokens": 512, "decode_tok_s": 36.17}
+{"label": "rocenante", "run": 1, "ttft_s": 0.226, "completion_tokens": 512, "decode_tok_s": 36.3}
+{"label": "rocenante", "run": 2, "ttft_s": 0.222, "completion_tokens": 512, "decode_tok_s": 35.74}
+{"label": "rocenante", "run": 3, "ttft_s": 0.239, "completion_tokens": 512, "decode_tok_s": 36.24}
+{"label": "rocenante", "run": 4, "ttft_s": 0.222, "completion_tokens": 512, "decode_tok_s": 36.26}
+{"label": "rocenante", "run": 5, "ttft_s": 0.225, "completion_tokens": 512, "decode_tok_s": 36.14}
+{"label": "rocenante", "runs": 5, "median_decode_tok_s": 36.24, "min": 35.74, "max": 36.3}
