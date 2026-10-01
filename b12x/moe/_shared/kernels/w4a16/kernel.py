@@ -509,6 +509,8 @@ def _w4a16_pipeline_stages(
         if type(pipeline_stages) is not int or pipeline_stages not in (2, 3, 4, 5):
             raise ValueError("W4A16 pipeline_stages must be 2, 3, 4 or 5")
         return pipeline_stages
+    if weight_layout in BLOCK_CODECS and tile_n == 128 and tile_k == 128:
+        return 2
     if weight_layout in BLOCK_CODECS and uses_m_block_8 and tile_n == 64 and tile_k == 128:
         return 3
     return _STAGES
@@ -732,7 +734,7 @@ def _select_tile_config(
     configs = (
         _LARGE_BATCH_TILE_CONFIGS if cta_m_blocks > 1 else _SMALL_BATCH_TILE_CONFIGS
     )
-    best_blocks_per_sm = 0
+    best_occupancy = 0
     best_tile_config: tuple[int, int, int, int] | None = None
     for tile_k, tile_n, cta_threads in configs:
         if required_cta_threads is not None and int(cta_threads) != int(
@@ -773,8 +775,11 @@ def _select_tile_config(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
         )
-        if blocks_per_sm_limit > best_blocks_per_sm:
-            best_blocks_per_sm = blocks_per_sm_limit
+        occupancy = blocks_per_sm_limit * (
+            cta_threads if weight_layout in BLOCK_CODECS else 1
+        )
+        if occupancy > best_occupancy:
+            best_occupancy = occupancy
             best_tile_config = (tile_k, tile_n, cta_threads, blocks_per_sm_limit)
     if best_tile_config is None:
         cta_thread_msg = (
@@ -9987,6 +9992,7 @@ def compile_w4a16_fused_moe(
     )
     if (
         bool(tc_decode_fused_sum)
+        and weight_layout not in BLOCK_CODECS
         and int(fc1_cols) % 256 == 0
         and fc1_tile_n == 128
         and (fc1_tile_n * fc1_tile_k) // 64 == 256

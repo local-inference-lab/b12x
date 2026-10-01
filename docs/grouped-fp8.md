@@ -123,9 +123,10 @@ contract 8) was measured with the mega-repository's xcheck and its specified
 DeepGEMM fork (`d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7`), not an arbitrary
 upstream DeepGEMM installation. The tested combination is CUDA toolkit 13.3,
 CUTLASS DSL 4.7.1, and RTX PRO 6000 Blackwell Server Edition (SM120, 188 SMs).
-SM121 and upstream's pinned DSL 4.6.2 are **not qualified**. Relaxed dependency
-bounds permit integration with the tested environment; they are not evidence
-for every allowed compiler version.
+Dependencies now pin DSL 4.7.1, matching that tested compiler. SM121 and
+other compiler versions are **not qualified**. The 819-case evidence describes
+the 2026-09-30 candidate before the upstream 1.5 merge; it does not qualify
+all newly merged upstream runtime paths.
 
 The independent 2026-09-30 round passed **819/819** cases: 373 prefill and 446
 decode across 47/56 slices. All phases satisfy b12x/DeepGEMM <=1.01. Initial

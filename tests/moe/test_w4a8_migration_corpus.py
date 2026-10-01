@@ -16,7 +16,6 @@ from .test_w4a8_mx_tp_moe import (
     _E,
     _K,
     _N,
-    _prepare,
     _routed_inputs,
     _weights,
 )
@@ -182,6 +181,7 @@ def test_w4a8_packed_prefill_matches_oracle_under_graph(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Prove the serving materialized route/phase1/phase2 prefill graph."""
 
@@ -234,9 +234,32 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         _N,
         activation="silu",
     )
-    prepared = _prepare(weights)
+    from b12x.moe import fused_moe
+
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat.MXFP4_E8M0_K32,
+            w13_layout=fused_moe.W13Layout.W13,
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8, nonlinearity="silu", io_dtype=x.dtype,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=_E, hidden_size=_K, intermediate_size=_N,
+        ),
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            w13=weights["w13_fp4"], w2=weights["w2_fp4"],
+            w13_block_scales=weights["w13_mx"], w2_block_scales=weights["w2_mx"],
+            w13_global_scales=weights["alphas"], w2_global_scales=weights["alphas"],
+            input_scale=weights["input_scale"], intermediate_scale=weights["input_scale"],
+        ),
+    )
     output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
     bindings = ExitStack()
+    request.addfinalizer(bindings.close)
     binding = bindings.enter_context(make_tp_moe_fp4_binding(
         a=x,
         experts=prepared,
@@ -384,6 +407,6 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         ValueError,
         match="deterministic route-output capacity mismatch",
     ):
-        b12x_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))
+        b12x_moe_fp4(binding=replace(binding, route_output=binding.route_output[:1]))
     del atomic_graph, graph
     bindings.close()

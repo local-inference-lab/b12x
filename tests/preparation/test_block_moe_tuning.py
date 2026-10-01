@@ -90,10 +90,12 @@ def test_override_cannot_bypass_launch_validation(change):
         TUNING.configure(q, device=DEVICE, override=replace(c, **change))
 
 
-def test_route_block_declaration_is_respected():
-    q = replace(query(), w4a16_block_size_m=32)
+@pytest.mark.parametrize("capacity", (1, 256))
+def test_route_block_declaration_is_respected(capacity):
+    q = replace(query(capacity=capacity), w4a16_block_size_m=32)
     configs = [c for _, c in TUNING.eligible_plan(q, DEVICE).candidates]
     assert {c.w4a16_block_size_m for c in configs} == {None, 32}
+    assert TUNING.configure(q, device=DEVICE, search=False).default.w4a16_route_mode == "packed"
 
 
 def test_q8_large_tiles_reject_excess_shared_memory_before_compilation():

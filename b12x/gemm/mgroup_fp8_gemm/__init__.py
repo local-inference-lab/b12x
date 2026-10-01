@@ -44,7 +44,8 @@ and consumer/empty directions. The upstream-adapted active-group candidate
 legacy and route-tp-v1 cases under interleaved-v1 timing on one RTX PRO 6000
 Blackwell Server Edition (SM120, 188 SMs): 373 prefill and 446 decode, every
 measured phase within 1.01 b12x/DeepGEMM. This bounded matrix does not qualify
-all live distributions, the whole upstream suite, or SM121. The older edeaa8af
+all live distributions, newly merged upstream 1.5 runtime paths, the whole
+upstream suite, or SM121. The older edeaa8af
 sequential baseline is separate; WI closure still awaits EP scaling wording
 owner disposition. Candidate contract version 8 excludes unsupported N16/N32
 MXFP8 tiles; default dispatch and serialized configuration fields are unchanged.

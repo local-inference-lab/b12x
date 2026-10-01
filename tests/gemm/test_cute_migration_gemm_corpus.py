@@ -376,8 +376,8 @@ def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypat
     resolve = quant_module._get_compiled_mxfp8_rows_quant
     calls = []
 
-    def track(*args):
-        compiled = resolve(*args)
+    def track(*args, **kwargs):
+        compiled = resolve(*args, **kwargs)
         calls.append(compiled)
         return compiled
 

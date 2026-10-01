@@ -2,8 +2,9 @@
 
 This mathematical alias uses the same ``query_from_call`` / ``plan`` /
 ``PreparationSession`` lifecycle as ``blockscaled``. BF16 precision queries
-and fixed FP16/prequantized queries retain distinct contracts; both execute
-through a prepared ``Plan``.
+and fixed FP16/prequantized queries retain distinct contracts. Omitting
+``plan`` selects a cached heuristic plan without autotuning; warm the required
+row capacities before CUDA graph capture.
 """
 
 from __future__ import annotations

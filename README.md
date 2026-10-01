@@ -16,7 +16,7 @@ pip install b12x
 
 You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
-(`nvidia-cutlass-dsl >= 4.6.2`), so there is no separate build step. A
+(`nvidia-cutlass-dsl == 4.7.1`), so there is no separate build step. A
 `PreparationSession` compiles missing kernels before publishing execution.
 
 The optional vLLM [checkpoint loader](docs/checkpoint-loading.md) uses

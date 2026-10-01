@@ -2659,7 +2659,13 @@ def _heuristic_w4a16_route_mode(
     device: DeviceIdentity | None,
 ) -> str:
     if query.source_format in BLOCK_CODECS:
-        return "packed"
+        return (
+            "direct"
+            if query.num_tokens == 1
+            and query.w4a16_block_size_m in (None, 8)
+            and _w4a16_direct_routing_supported(query)
+            else "packed"
+        )
     if not _w4a16_direct_routing_supported(query):
         return "packed"
     if (

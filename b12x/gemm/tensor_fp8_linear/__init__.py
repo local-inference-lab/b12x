@@ -1,8 +1,9 @@
 """Compatibility alias for tensor-scaled FP8 ``blockscaled`` calls.
 
 This mathematical alias uses the same ``query_from_call`` / ``plan`` /
-``PreparationSession`` lifecycle as ``blockscaled``. Execution requires the
-resulting prepared ``Plan``; no separate warmup API exists.
+``PreparationSession`` lifecycle as ``blockscaled``. Omitting ``plan`` selects
+a cached heuristic plan without autotuning. ``prewarm`` primes serving
+capacities before CUDA graph capture.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ META = OpMeta(
     name="tensor_fp8_linear",
     group="gemm",
     api_style="planned",
-    entry_points=("Weight", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "is_supported"),
+    entry_points=("Weight", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "prewarm", "is_supported"),
     dtypes=("fp8_e4m3", "bf16", "fp16"),
     recipes=("tensor_fp8",),
     requires=("triton",),
@@ -29,6 +30,6 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:
-    from .api import FixedBlockscaledQuery, Weight, is_supported, mm, pack_weight, plan, query_from_call  # noqa: F401
+    from .api import FixedBlockscaledQuery, Weight, is_supported, mm, pack_weight, plan, prewarm, query_from_call  # noqa: F401
 
 install_lazy_api(globals(), META)

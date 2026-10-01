@@ -14,11 +14,8 @@ from pathlib import Path
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import (
-    enable_tqdm,
-    file_source_tensor,
-    safetensors_file_sources,
-)
+from vllm.model_executor.model_loader import weight_utils
+from vllm.model_executor.model_loader.weight_utils import enable_tqdm
 
 from b12x.loader._checkpoint import DirectWeightSession
 from b12x.loader._progress import CheckpointDisplay
@@ -30,6 +27,11 @@ class B12xModelLoader(DefaultModelLoader):
     """Route checkpoint views through an asynchronous read ring or GDS."""
 
     def __init__(self, load_config):
+        missing = [name for name in ("file_source_tensor", "safetensors_file_sources")
+                   if not hasattr(weight_utils, name)]
+        if missing:
+            raise RuntimeError("b12x checkpoint loader requires vLLM file-source hooks: "
+                               + ", ".join(missing))
         options = dict(load_config.model_loader_extra_config)
         self.io_threads = options.pop("io_threads", 8)
         self.read_mode = options.pop("read_mode", "auto")
@@ -171,7 +173,7 @@ class B12xModelLoader(DefaultModelLoader):
             weight_map = json.loads(index_path.read_text())["weight_map"]
         indexed_paths = {}
         for path in files:
-            sources = safetensors_file_sources(path)
+            sources = weight_utils.safetensors_file_sources(path)
             file_names = {name for name in sources if source.file_weight_filter(name)}
             resolved_path = Path(path).resolve()
             selected = []
@@ -193,7 +195,7 @@ class B12xModelLoader(DefaultModelLoader):
                 if not should_skip_weight(name, self.local_expert_ids):
                     selected.append(name)
             file_backed = (
-                (source.prefix + name, file_source_tensor(sources[name]))
+                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
                 for name in selected
                 if name in file_names
             )
