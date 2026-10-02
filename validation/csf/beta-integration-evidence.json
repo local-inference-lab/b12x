@@ -1,0 +1,93 @@
+{
+  "schema": "csf-beta-integration/1",
+  "status": {
+    "implementation": "implemented in beta port composition",
+    "component_validation": "qualified for the listed cases",
+    "public_image_serving": "not yet measured"
+  },
+  "source": {
+    "b12x": "6f5a147478a9e354f0d445bf2497fad2c3248b0a",
+    "vllm": "747879ddad76922a0ee9747bf1aa4e85e97f8478"
+  },
+  "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+  "runtime_mode": "source overlays on CUTLASS DSL 4.7.1 / CUDA 13.4 for component gates; not the public CI-built image",
+  "hardware": "Frank1 RTX PRO 6000 Blackwell GPUs 14/15, 600 W",
+  "suites": {
+    "b12x-tests.xml": {
+      "tests": 468,
+      "failures": 2,
+      "errors": 0,
+      "skipped": 0
+    },
+    "b12x-block-fix-tests.xml": {
+      "tests": 139,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "vllm-loaders.xml": {
+      "tests": 61,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "vllm-moe-final-fixtures.xml": {
+      "tests": 29,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "receipts": {
+    "b12x-tests.log": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/b12x-tests.log",
+      "bytes": 43255,
+      "sha256": "7db351b68bdf712447ace3ca1157f58560b4cc0c5a466a671559d33cbda2205c"
+    },
+    "b12x-tests.xml": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/b12x-tests.xml",
+      "bytes": 110135,
+      "sha256": "2f19632e7a8c8af372d22d20f0072aec8caa9f27712b9cfc4e2f69a3507bc95b"
+    },
+    "b12x-block-reference.log": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/b12x-block-reference.log",
+      "bytes": 1358,
+      "sha256": "56d4f10d6e7aa5ceb4137029c499df8a05c3b26b250afbb1dc7b98364238fcf5"
+    },
+    "b12x-block-fix-tests.log": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/b12x-block-fix-tests.log",
+      "bytes": 287,
+      "sha256": "2188852e92f7310bb34a5b7834efa97b584f30dc95381bcb8449cbf9561f5e67"
+    },
+    "b12x-block-fix-tests.xml": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/b12x-block-fix-tests.xml",
+      "bytes": 20149,
+      "sha256": "5033cf6db3aeaba63e5b577442f1daaa088cdb602fa99040d146ebe7d1b8a5f0"
+    },
+    "vllm-tests.log": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/vllm-tests.log",
+      "bytes": 16056,
+      "sha256": "49ba34a381020bbd54e0f5f2b9933e2e1b9d6bed6ac882e1e4ebe4d495505972"
+    },
+    "vllm-loaders.xml": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/vllm-loaders.xml",
+      "bytes": 9022,
+      "sha256": "d0da9d6000f63ac5b3c1001a622ce428684899f6b0205aec0abaf9137c93bf02"
+    },
+    "vllm-moe-final-fixtures.log": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/vllm-moe-final-fixtures.log",
+      "bytes": 3715,
+      "sha256": "471c21ceb454fa18d041964859c8520229b423fd396fb38ad256abae9f8069f5"
+    },
+    "vllm-moe-final-fixtures.xml": {
+      "path": "/data/trellis-quant/csf-beta-integration-20261002/premerge/vllm-moe-final-fixtures.xml",
+      "bytes": 4134,
+      "sha256": "91c9446a96a117bdb65eccc83dcb3e8bbf6f5b8fceeaee4420812affdb36b9b9"
+    }
+  },
+  "limits": [
+    "No public Docker serving or speed claims from component gates.",
+    "Full-model KLD and maximum-context stress are not measured.",
+    "The frozen beta-port parent reproduces both non-Trellis shared-memory failures; the corrected affected suites pass without relaxing candidate coverage."
+  ]
+}
