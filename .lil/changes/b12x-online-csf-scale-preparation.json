@@ -3,9 +3,18 @@
   "id": "b12x-online-csf-scale-preparation",
   "category": "feature",
   "summary": "Compress native FP4 expert block scales losslessly during weight preparation",
-  "models": ["Kimi-K3", "DeepSeek-V4.1-Flash", "GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "models": [
+    "Kimi-K3",
+    "DeepSeek-V4.1-Flash",
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
   "compatibility": "Opt-in scale_compression=csf requires caller-owned serialized scale scratch. Default preparation and checkpoint codecs are unchanged.",
-  "details": ["GPU byte packing preserves native scale bytes and activation arithmetic; no per-request encoding."],
-  "pull_requests": [],
+  "details": [
+    "GPU byte packing preserves native scale bytes and activation arithmetic; no per-request encoding."
+  ],
+  "pull_requests": [
+    458
+  ],
   "requires": []
 }
