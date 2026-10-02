@@ -6669,7 +6669,8 @@ class W4A16FusedMoeKernel:
         if trellis_decode_table not in {"auto", "compact", "full"}:
             raise ValueError("trellis decode table must be auto, compact, or full")
         compact_smem = (
-            self.trellis_codebook == LUT_E4M3
+            self.weight_layout == "trellis_t256"
+            and self.trellis_codebook == LUT_E4M3
             and _lut_e4m3_smem_enabled()
         )
         lut_offset = (self.shared_words * 4 + 15) // 16 * 16
