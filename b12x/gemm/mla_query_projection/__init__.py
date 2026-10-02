@@ -6,6 +6,11 @@ query.  It appends the existing 64-wide RoPE query in the same launch.  The
 caller may request BF16 output, or static per-tensor E4M3 output for an FP8
 attention backend.  FP8 mode deliberately rounds the GEMM result through BF16
 before scaling, preserving the established two-kernel numerical contract.
+
+``plan(ProjectionQuery(...))`` declares the execution.  A BF16 plan's
+``max_rows`` is a row capacity (one launcher serves every live M up to it);
+an MXFP8 plan compiles its exact M.  ``query.served_rows`` names the live
+token counts a plan accepts.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ META = OpMeta(
     group="gemm",
     api_style="prepared",
     entry_points=(
+        "ProjectionQuery",
         "plan",
         "run",
         "can_implement",
@@ -42,6 +48,7 @@ META = OpMeta(
 
 if TYPE_CHECKING:
     from .api import (  # noqa: F401
+        ProjectionQuery,
         can_implement,
         clear_caches,
         is_supported,

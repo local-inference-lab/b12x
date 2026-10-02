@@ -12,12 +12,27 @@ from b12x.preparation import (
 
 @dataclass(frozen=True, kw_only=True)
 class ProjectionQuery:
+    """One prepared MLA query projection.
+
+    ``max_rows`` is the token count M the plan is declared for.  A BF16 plan
+    treats it as a capacity: its Triton launcher masks rows at runtime, so the
+    plan serves every live ``1 <= M <= max_rows``.  An MXFP8 plan compiles M
+    into its CuTe launcher and serves exactly ``M == max_rows``.
+    """
+
     heads: int
     max_rows: int
     weight_format: str
     output_dtype: str
     b_major: str
     sf_axis: str
+
+    @property
+    def served_rows(self) -> range:
+        """Live token counts M this plan executes."""
+        first = 1 if self.weight_format == "bf16" else self.max_rows
+        return range(first, self.max_rows + 1)
+
 
 def validate_query(query):
     if query.b_major != "n" or query.sf_axis != "n":

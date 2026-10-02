@@ -24,7 +24,15 @@ _BLOCK_N = 32
 _BLOCK_K = 64
 
 
-@triton.jit
+def block_m(max_rows: int) -> int:
+    """Return the compiled row-tile width for a plan's row capacity."""
+    return 16 if max_rows <= 16 else _MAX_M
+
+
+# ``m`` must stay a runtime scalar.  The compiled specialization is selected
+# only by the capacity bucket's BLOCK_M; its row mask admits every live M in
+# that bucket without resolving another kernel during serving or graph replay.
+@triton.jit(do_not_specialize=["m"])
 def _mla_query_projection_bf16_kernel(
     q_nope_ptr,
     weight_ptr,
@@ -183,8 +191,6 @@ def _validate(
     return heads, m, output_fp8
 
 
-
-
 def _run_prepared(
     q_nope: torch.Tensor,
     weight: torch.Tensor,
@@ -193,13 +199,15 @@ def _run_prepared(
     out: torch.Tensor,
     *,
     launcher: object,
-    block_m: int,
+    max_rows: int,
     output_fp8: bool,
     stream: Optional[object] = None,
 ) -> torch.Tensor:
     heads, m, actual_output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
-    if actual_output_fp8 != output_fp8 or block_m != (16 if m <= 16 else 32):
-        raise ValueError("MLA query plan differs from its prepared specialization")
+    if actual_output_fp8 != output_fp8:
+        raise ValueError("MLA query output dtype differs from its prepared plan")
+    if m > max_rows:
+        raise ValueError(f"BF16 MLA query plan serves 1<=M<={max_rows}, got M={m}")
     target = _torch_stream(stream, q_nope.device) if stream is not None else None
     context = torch.cuda.stream(target) if target is not None else nullcontext()
     with context:
@@ -207,7 +215,8 @@ def _run_prepared(
             q_nope, weight, q_pe, q_scale if q_scale is not None else out, out, m,
             q_nope.stride(0), q_nope.stride(1), weight.stride(0), weight.stride(1),
             q_pe.stride(0), q_pe.stride(1), out.stride(0), out.stride(1),
-            output_fp8, _NOPE_DIM, _LATENT_DIM, _ROPE_DIM, block_m, _BLOCK_N, _BLOCK_K,
+            output_fp8, _NOPE_DIM, _LATENT_DIM, _ROPE_DIM, block_m(max_rows),
+            _BLOCK_N, _BLOCK_K,
         )
         if target is not None:
             for tensor in (q_nope, weight, q_pe, out):
@@ -289,8 +298,6 @@ def can_implement(
         and int(latent_dim) == _LATENT_DIM
         and output_dtype in (torch.bfloat16, torch.float8_e4m3fn)
     )
-
-
 
 
 __all__ = ["can_implement", "run"]
