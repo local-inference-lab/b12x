@@ -15,6 +15,38 @@ from b12x._lib.runtime_control import kernel_resolution_guard
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("columns", [4, 20, 128, 256])
+@pytest.mark.parametrize("distribution", ["alphabet", "constant", "window"])
+def test_gpu_encoder_preserves_every_source_byte(columns, distribution):
+    from b12x._lib.quant.csf_encode import encode_scale_bytes
+
+    device = require_b12x()
+    shape = (3, 256, columns)
+    source = (torch.arange(np.prod(shape), device=device) % 256).to(torch.uint8).reshape(shape)
+    if distribution == "constant":
+        source.fill_(255)
+    elif distribution == "window":
+        source.remainder_(16).add_(117)
+        source.view(-1)[::97] = 254
+    original = source.clone()
+    batch = encode_scale_bytes(source, format="nvfp4")
+    expected = source.reshape(3, 2, 4, 32, columns // 4, 4)
+    expected = expected.permute(0, 1, 4, 3, 2, 5).contiguous().reshape(shape)
+    outputs = (torch.empty_like(source), torch.empty_like(source))
+    ids = torch.arange(3, device=device, dtype=torch.int32)
+    decode_nvfp4_csf_pair(batch, batch, ids, *outputs)
+    for output in outputs:
+        assert torch.equal(output, expected)
+    assert torch.equal(source, original)
+    # Independent exhaustive CPU window search also checks deterministic ties.
+    rows = source.cpu().numpy().reshape(-1, columns)
+    bases = batch.fixed.cpu().numpy()[:, :, :128].reshape(3, 2, 32, 4)
+    bases = bases.transpose(0, 1, 3, 2).reshape(-1)
+    for row, base in zip(rows, bases, strict=True):
+        coverage = [np.count_nonzero((row >= b) & (row.astype(int) < b + 16)) for b in range(241)]
+        assert base == np.argmax(coverage)
+
+
 def _fixture(rows, columns, codec, device):
     fixed, exceptions, logical = [], [], []
     for expert in range(4):

@@ -12,7 +12,7 @@ from ..quantization.test_mxfp4_csf import fixture
 @pytest.mark.parametrize("tokens", [1, 17, 33, 128])
 @pytest.mark.parametrize("h,n", [(512, 192), (5120, 576), (512, 256)])
 @pytest.mark.parametrize("raw", [False, True])
-def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, raw):
+def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, raw, online=False, mode="a8"):
     device = require_b12x()
     e, topk = 8, 2
     first, s13 = fixture(2 * n, h // 32, finite_scales=True)
@@ -38,7 +38,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
     weight_plan = moe.plan_weights(
         source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
         activation=moe.ActivationSpec(
-            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+            mode=mode, nonlinearity="silu", io_dtype=torch.bfloat16
         ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
     )
@@ -59,18 +59,31 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
         w13_scale_scratch=buffers[0],
         w2_scale_scratch=buffers[1],
     )
-    experts = [
-        moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
-    ]
+    if online:
+        from dataclasses import replace
+        source = replace(packed, w13=w13.clone(), w2=w2.clone(),
+                         w13_block_scales=s13.clone(), w2_block_scales=s2.clone())
+    experts = [moe.prepare_weights(plan=weight_plan, weights=packed)]
+    if not online:
+        experts.append(moe.prepare_weights(plan=weight_plan, weights=compressed))
+    if online:
+        online_plan = moe.plan_weights(
+            source=weight_plan.source, activation=weight_plan.activation,
+            geometry=weight_plan.geometry,
+            constraints=moe.WeightPlanConstraints(scale_compression="csf"),
+        )
+        experts.append(moe.prepare_weights(plan=online_plan, weights=source, scale_scratch=buffers))
+        assert experts[1].plan._impl.discards_source_parameters
     impl = experts[1]._impl
     assert impl.w1_blockscale.data_ptr() == buffers[0].data_ptr()
     assert impl.w2_blockscale.data_ptr() == buffers[1].data_ptr()
-    assert impl.representation.value.w13_sfb.data_ptr() == buffers[0].data_ptr()
-    assert impl.representation.value.w2_sfb.data_ptr() == buffers[1].data_ptr()
-    for attr in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale"):
-        assert torch.equal(
-            getattr(experts[0]._impl, attr), getattr(experts[1]._impl, attr)
-        )
+    if mode == "a8":
+        assert impl.representation.value.w13_sfb.data_ptr() == buffers[0].data_ptr()
+        assert impl.representation.value.w2_sfb.data_ptr() == buffers[1].data_ptr()
+        for attr in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale"):
+            assert torch.equal(
+                getattr(experts[0]._impl, attr), getattr(experts[1]._impl, attr)
+            )
     plans = [
         moe.plan_execution(
             experts=owner,
@@ -160,3 +173,52 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
             torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
         for graph in graphs:
             graph.reset()
+
+
+@pytest.mark.parametrize("tokens,h,n,mode", [
+    (1, 512, 192, "a8"), (17, 512, 256, "a8"),
+    (1, 3584, 192, "a16"), (17, 3584, 256, "a16"),
+])
+def test_online_compression_preserves_expert_graph_output(tokens, h, n, mode):
+    test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, False, online=True, mode=mode)
+
+
+@pytest.mark.parametrize(
+    "violation", ["source_alias", "weight_alias", "nonunit_factor"]
+)
+def test_online_compression_rejects_invalid_storage_or_factors_before_mutation(
+    violation,
+):
+    device = require_b12x()
+    plan = moe.plan_weights(
+        source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        activation=moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(num_experts=2, hidden_size=512, intermediate_size=128),
+        constraints=moe.WeightPlanConstraints(scale_compression="csf"),
+    )
+    w = torch.full((2, 256, 256), 0x31, device=device, dtype=torch.uint8)
+    scales = (
+        torch.ones((2, 256, 16), device=device, dtype=torch.uint8),
+        torch.ones((2, 512, 4), device=device, dtype=torch.uint8),
+    )
+    factor = torch.full(
+        (2,), 2.0 if violation == "nonunit_factor" else 1.0, device=device
+    )
+    packed = moe.PackedWeights(
+        w,
+        torch.zeros((2, 512, 64), device=device, dtype=torch.uint8),
+        *scales,
+        factor,
+        factor,
+    )
+    scratch = (
+        scales[0] if violation == "source_alias" else torch.empty_like(scales[0]),
+        torch.empty_like(scales[1]),
+    )
+    if violation == "weight_alias":
+        scratch = (w.flatten()[: scales[0].numel()].view_as(scales[0]), scratch[1])
+    with pytest.raises(ValueError, match="alias|unit global"):
+        moe.prepare_weights(plan=plan, weights=packed, scale_scratch=scratch)
+    assert bool((w == 0x31).all())
