@@ -1,0 +1,92 @@
+"""Compare complete layer tensors from file-based and tensor-source CSF loaders."""
+
+import argparse
+import dataclasses
+import gc
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import torch
+
+
+def read_module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def compare(first, second, path="weights"):
+    if isinstance(first, torch.Tensor):
+        assert first.dtype == second.dtype and first.shape == second.shape, path
+        a, b = first.reshape(-1).view(torch.uint8), second.reshape(-1).view(torch.uint8)
+        assert torch.equal(a, b), path
+        return [{"field": path, "shape": list(first.shape), "dtype": str(first.dtype),
+                 "bytes": a.numel(), "sha256": hashlib.sha256(a.cpu().numpy()).hexdigest()}]
+    if dataclasses.is_dataclass(first):
+        result = []
+        for field in dataclasses.fields(first):
+            a, b = getattr(first, field.name), getattr(second, field.name)
+            if field.name in ("w13_scale_scratch", "w2_scale_scratch", "w13_block_scales", "w2_block_scales"):
+                assert a is b, field.name
+            else:
+                result.extend(compare(a, b, path + "." + field.name))
+        return result
+    assert first == second, path
+    return []
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=("ds", "glm", "qwen", "kimi"), required=True)
+    parser.add_argument("--tp", type=int)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    cases = {
+        "ds": ("DeepSeek-V4.1-Flash-MXFP4-CSF", "872da235166458bd6ffa9ee3f3c5c4771b63159c", "mxfp4", 0, 384, 5120, 2304, 4),
+        "glm": ("GLM-5.3-Flash-NVFP4-CSF", "20f4777422f833c48b67bb0e554e1bc61dc55ca1", "nvfp4", 3, 288, 4096, 2048, 2),
+        "qwen": ("Qwen3.8-Flash-Next-NVFP4-CSF", "4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e", "nvfp4", 0, 512, 2560, 640, 2),
+        "kimi": ("Kimi-K3-MXFP4-CSF", "8b7d43b0f7141c4ff04a5f87d26c8675c30ff7a0", "mxfp4", 1, 896, 3584, 3072, 16),
+    }
+    name, revision, codec, layer, e, h, n, tp = cases[args.model]
+    tp = args.tp or tp
+    root = Path(f"/hf/models--local-inference-lab--{name}/snapshots/{revision}")
+    if args.model == "kimi":
+        root = Path("/data/trellis-quant/csf-loader-api-20261001/kimi-layer")
+    baseline_path = Path(f"/reference/b12x/b12x/moe/checkpoints/{codec}_csf.py")
+    baseline = read_module(baseline_path, "reference_csf")
+    if codec == "mxfp4":
+        from vllm.model_executor.model_loader.mxfp4_csf_loader import read_mxfp4_csf_layer as load
+    else:
+        from vllm.model_executor.model_loader.nvfp4_csf_loader import read_nvfp4_csf_layer as load
+    before = getattr(baseline, f"read_{codec}_csf_layer")
+    torch.set_num_threads(1)
+    torch.set_default_dtype(torch.bfloat16)
+    local = n // tp
+    shapes = ((e, h // 32, 2 * local), (e, local // 32, h)) if codec == "mxfp4" else ((e, 2 * local, h // 16), (e, h, local // 16))
+    dtype = torch.uint8 if codec == "mxfp4" else torch.float8_e4m3fn
+    scratch13, scratch2 = [torch.empty(s, device="cuda", dtype=dtype) for s in shapes]
+    result = {"model": name, "revision": revision, "layer": layer, "tp": tp,
+              "baseline_reader_sha256": hashlib.sha256(baseline_path.read_bytes()).hexdigest(),
+              "default_dtype": str(torch.get_default_dtype()), "ranks": []}
+    for rank in (0, tp - 1):
+        kwargs = dict(num_experts=e, hidden_size=h, intermediate_size=n, tp_rank=rank, tp_size=tp,
+                      device="cuda", w13_scale_scratch=scratch13, w2_scale_scratch=scratch2)
+        a = before(root, layer, **kwargs)
+        b = load(root, layer, **kwargs)
+        tensors = compare(a, b)
+        result["ranks"].append({"rank": rank, "tensors": tensors, "equal": True})
+        print(json.dumps({"model": name, "rank": rank, "equal": True, "tensors": len(tensors)}), flush=True)
+        del a, b
+        gc.collect()
+        torch.cuda.empty_cache()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("x") as stream:
+        json.dump(result, stream, indent=2)
+        stream.write("\n")
+
+
+if __name__ == "__main__":
+    main()

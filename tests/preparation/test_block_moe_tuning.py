@@ -67,6 +67,7 @@ def test_every_candidate_constructs_resource_valid_kernel(codec, monkeypatch):
             pipeline_stages=c.w4a16_pipeline_stages, weight_layout=codec,
             scale_format=codec, w13_layout="packed",
         )
+        assert not kernel.lut_e4m3_smem
         assert kernel.shared_words * 4 <= 101376
         assert kernel.fc1.stages == kernel.fc2.stages == c.w4a16_pipeline_stages
         assert kernel.__cache_key__ not in keys

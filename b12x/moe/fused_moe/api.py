@@ -45,6 +45,9 @@ from .source import PackedSource, PackedSourceFormat, TrellisExtent, TrellisSour
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
+    CsfScalePlanes,
+    Nvfp4CsfWeights,
+    Mxfp4CsfWeights,
     IQ2XSWeights,
     BlockQuantWeights,
     PreparedExperts,
@@ -55,6 +58,7 @@ from .weights import (
     WeightEncoding,
     WeightPacking,
 )
+
 
 def plan_weights(**kwargs):
     """Plan typed checkpoint sources or the tensor-based quantization contract."""
@@ -101,12 +105,25 @@ def _canonical_plan_weights(
 
 
 def _canonical_prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    *,
+    plan: WeightPlan,
+    weights: PackedWeights
+    | TrellisWeights
+    | IQ2XSWeights
+    | Mxfp4CsfWeights
+    | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
+    scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
-    return _prepare_weights(plan=plan, weights=weights, device=device, staging=staging)
+    return _prepare_weights(
+        plan=plan,
+        weights=weights,
+        device=device,
+        staging=staging,
+        scale_scratch=scale_scratch,
+    )
 
 
 def _canonical_plan_execution(
@@ -161,6 +178,7 @@ def run(*, binding: Binding):
     if plan is not None:
         require_prepared(plan, "moe.decode", binding.a.device)
     return _run(binding=binding)
+
 
 def _state_for(plan: Plan, hidden_states: torch.Tensor):
     root = require_prepared(plan, "moe.decode", hidden_states.device)
@@ -226,6 +244,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "clear_caches",
     "Caps",
     "plan",
     "TrellisExtent",
@@ -244,6 +263,10 @@ __all__ = [
     "PackedSource",
     "PackedSourceFormat",
     "PackedWeights",
+    "Mxfp4CsfWeights",
+    "CsfScalePlanes",
+    "Nvfp4CsfWeights",
+    "Mxfp4CsfWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
     "PreparedExperts",

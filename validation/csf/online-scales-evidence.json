@@ -1,0 +1,1079 @@
+{
+  "status": {
+    "implementation": "implemented",
+    "correctness": "qualified for listed contracts",
+    "timing": "research-only; NVML throttle 0x400"
+  },
+  "source_bases": {
+    "b12x": "bb5f4c4a43b420a1451f38c8aca0b0d9e6385662",
+    "vllm": "a5430f5f25b681cf0b3f35bd339e1d1f21d47fb1"
+  },
+  "encoder": [
+    {
+      "format": "mxfp4",
+      "revision": "models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+      "layer": 3,
+      "geometry": [
+        384,
+        5120,
+        576
+      ],
+      "source_bytes": 106168320,
+      "fixed_and_exception_bytes": 17299132,
+      "encode_pair_seconds": [
+        1.3811200599884614,
+        0.029349784017540514,
+        0.0029192949878051877,
+        0.0028919540345668793,
+        0.002882925036828965,
+        0.002877704973798245
+      ],
+      "exact": true
+    },
+    {
+      "format": "nvfp4",
+      "revision": "models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4/snapshots/b797d2e1160b9596b2570e56c1d3590faa09d4ed",
+      "layer": 3,
+      "geometry": [
+        512,
+        2560,
+        640
+      ],
+      "source_bytes": 157286400,
+      "fixed_and_exception_bytes": 82924412,
+      "encode_pair_seconds": [
+        0.26662313600536436,
+        0.05452378100017086,
+        0.002554767008405179,
+        0.0024906970211304724,
+        0.0024759770021773875,
+        0.002470546984113753
+      ],
+      "exact": true
+    }
+  ],
+  "ds41_expert_oracle": {
+    "original": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+    "scale_compression": "csf",
+    "layer": 3,
+    "tp": 4,
+    "rank": 0,
+    "prepared": {
+      "w1_fp4": true,
+      "w2_fp4": true,
+      "w1_blockscale": true,
+      "w2_blockscale": true
+    },
+    "cases": [
+      {
+        "tokens": 1,
+        "exact": true,
+        "implementations": [
+          "micro",
+          "micro"
+        ]
+      },
+      {
+        "tokens": 17,
+        "exact": true,
+        "implementations": [
+          "dynamic",
+          "dynamic"
+        ]
+      },
+      {
+        "tokens": 33,
+        "exact": true,
+        "implementations": [
+          "dynamic",
+          "dynamic"
+        ]
+      },
+      {
+        "tokens": 128,
+        "exact": true,
+        "implementations": [
+          "dynamic",
+          "dynamic"
+        ]
+      }
+    ]
+  },
+  "arms": {
+    "qwen-native-c8-profile-tp1-online-startup-1": {
+      "artifact_directory": "/data/trellis-quant/csf-online-20261001/qwen-native-c8-profile-tp1-online-startup-1",
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "docker_environment": [
+        "PORT=8043",
+        "HOST=0.0.0.0",
+        "HF_HUB_OFFLINE=1",
+        "VLLM_USE_FASTOKENS=0",
+        "PROFILE=qwen38-flash-next",
+        "HARDWARE_PROFILE=rtx-pro-6000-pcie",
+        "CHECKPOINT=original",
+        "VLLM_PLE_CPU_OFFLOAD=1",
+        "VLLM_B12X_MOE_FP4_CSF=1"
+      ],
+      "launcher_arguments": [
+        "--revision",
+        "b797d2e1160b9596b2570e56c1d3590faa09d4ed",
+        "--max-model-len",
+        "262144",
+        "--max-num-batched-tokens",
+        "4096",
+        "--max-num-seqs",
+        "16",
+        "--load-format",
+        "safetensors",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/results/traces\", \"torch_profiler_with_stack\": false, \"ignore_frontend\": true, \"delay_iterations\": 20, \"max_iterations\": 8}",
+        "--tensor-parallel-size",
+        "1"
+      ],
+      "gpus": [
+        "GPU-e7376e80-d7a4-1d1f-6554-49876db72e37"
+      ],
+      "loaded_memory_clocks_mhz": [
+        "13365 MHz"
+      ],
+      "loaded_graphics_clock_range_mhz": [
+        2355,
+        2715
+      ],
+      "power_limits_w": [
+        "600.00 W"
+      ],
+      "throttle_masks": [
+        "0x0000000000000004",
+        "0x0000000000000400"
+      ],
+      "artifact_sha256": {
+        "launch.json": "b0453860b8a55a0d0a3408e2c0b9c9e45c76193793a24901c1de4884138717a0",
+        "logprob-probes.json": "2bb9ebb504e355daf07858a917a2aff548e7fbf1df745ee30261b8bdfe22065d",
+        "telemetry.csv": "392bfa4eb4b26c148409bce9fb6bbef9ece76ffcba641ff9af39f525fc76e330",
+        "server.log": "3c191330841508b6f7139d95461b2e86c7186b443547f6d8f553c75c61529900",
+        "source-manifest.json": "4ba8f42b6001c1b064a91628911615902021f05b92d66b33793c8d204c8b7da8"
+      },
+      "model_load_gib_and_seconds": [
+        [
+          "71.13",
+          "299.725361"
+        ]
+      ],
+      "kv_tokens": [
+        "810,925"
+      ],
+      "kv_gib": [
+        "14.94"
+      ],
+      "online_layer_preparation_seconds": {
+        "0": [
+          1.635,
+          0.954,
+          0.255,
+          0.203,
+          0.25,
+          0.219,
+          0.407,
+          0.115,
+          0.112,
+          0.131,
+          0.112,
+          0.169,
+          0.218,
+          0.238,
+          0.227,
+          0.49,
+          0.665,
+          0.661,
+          0.133,
+          0.128,
+          0.126,
+          0.128,
+          0.135,
+          0.125,
+          0.127,
+          0.14,
+          0.128,
+          0.128,
+          0.13,
+          0.125,
+          0.188,
+          0.131,
+          0.127,
+          0.129,
+          0.135,
+          0.13,
+          0.153,
+          0.135,
+          0.142,
+          0.129,
+          0.127,
+          0.131,
+          0.134,
+          0.185,
+          0.141,
+          0.138,
+          0.142,
+          0.152,
+          2.127
+        ]
+      },
+      "probe_count": 8,
+      "probe_completion_tokens": [
+        128,
+        128,
+        128,
+        64,
+        128,
+        128,
+        84,
+        70
+      ]
+    },
+    "ds41-native-c1-profile-tp4-online-startup-1": {
+      "artifact_directory": "/data/trellis-quant/csf-online-20261001/ds41-native-c1-profile-tp4-online-startup-1",
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "docker_environment": [
+        "PORT=8041",
+        "HOST=0.0.0.0",
+        "HF_HUB_OFFLINE=1",
+        "VLLM_USE_FASTOKENS=0",
+        "PROFILE=ds41-flash",
+        "HARDWARE_PROFILE=rtx-pro-6000-pcie",
+        "CHECKPOINT=original",
+        "SPECULATOR=off",
+        "VLLM_B12X_MOE_FP4_CSF=1"
+      ],
+      "launcher_arguments": [
+        "--load-format",
+        "safetensors",
+        "--max-model-len",
+        "32768",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "16",
+        "--kv-cache-memory-bytes",
+        "2147483648",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/results/traces\", \"torch_profiler_with_stack\": false, \"ignore_frontend\": true, \"delay_iterations\": 20, \"max_iterations\": 8}",
+        "--tensor-parallel-size",
+        "4"
+      ],
+      "gpus": [
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141",
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7",
+        "GPU-a2f726b2-60db-8102-abef-abf76c457fe0",
+        "GPU-cd323562-fdc3-78c3-012e-86e281433050"
+      ],
+      "loaded_memory_clocks_mhz": [
+        "16365 MHz"
+      ],
+      "loaded_graphics_clock_range_mhz": [
+        2587,
+        2910
+      ],
+      "power_limits_w": [
+        "600.00 W"
+      ],
+      "throttle_masks": [
+        "0x0000000000000400"
+      ],
+      "artifact_sha256": {
+        "launch.json": "24eaab30c814924370057379edb7f6d36f22972e36ba4f8c0459923ca1a7c007",
+        "logprob-probes.json": "cbf8506d6e8eec1e1c09f1ccb0be7bce8dada78787d9a7da6a81789f31320630",
+        "telemetry.csv": "4fb1dddc2c829a3621dd5f2476a5e627604e25f898a7c043cb8acaecf566ba25",
+        "server.log": "74618da04fa79c9620e87e4fb1843f83289f1f4a01009e4c9c4f123c0a5b8919",
+        "source-manifest.json": "3149da12eb7b9df9f3a6977289e3849b357eb3187f252fe8c7ebe41136423a98"
+      },
+      "model_load_gib_and_seconds": [
+        [
+          "68.72",
+          "185.090795"
+        ],
+        [
+          "68.72",
+          "196.185664"
+        ],
+        [
+          "68.72",
+          "196.297608"
+        ],
+        [
+          "68.72",
+          "196.437095"
+        ]
+      ],
+      "kv_tokens": [
+        "810,599"
+      ],
+      "kv_gib": [],
+      "online_layer_preparation_seconds": {
+        "0": [
+          0.698,
+          0.124,
+          0.14,
+          0.122,
+          0.122,
+          0.123,
+          0.157,
+          0.195,
+          0.172,
+          0.174,
+          0.154,
+          0.131,
+          0.131,
+          0.123,
+          0.157,
+          0.122,
+          0.122,
+          0.121,
+          0.122,
+          0.121,
+          0.121,
+          0.121,
+          0.121,
+          0.121,
+          0.121,
+          0.12,
+          0.12,
+          0.137,
+          0.12,
+          0.121,
+          0.142,
+          0.121,
+          0.121,
+          0.121,
+          0.148,
+          0.122,
+          0.121,
+          0.122,
+          0.122,
+          0.125
+        ],
+        "1": [
+          2.664,
+          0.286,
+          0.125,
+          0.131,
+          0.122,
+          0.121,
+          0.121,
+          0.124,
+          0.124,
+          0.124,
+          0.124,
+          0.154,
+          0.122,
+          0.124,
+          0.131,
+          0.123,
+          0.158,
+          0.163,
+          0.127,
+          0.128,
+          0.125,
+          0.124,
+          0.124,
+          0.123,
+          0.125,
+          0.123,
+          0.123,
+          0.123,
+          0.143,
+          0.198,
+          0.194,
+          0.151,
+          0.257,
+          0.226,
+          0.234,
+          0.192,
+          0.25,
+          0.177,
+          0.261,
+          0.326
+        ],
+        "2": [
+          0.773,
+          0.123,
+          0.139,
+          0.123,
+          0.125,
+          0.122,
+          0.123,
+          0.124,
+          0.122,
+          0.155,
+          0.195,
+          0.238,
+          0.231,
+          0.167,
+          0.149,
+          0.121,
+          0.121,
+          0.133,
+          0.121,
+          0.122,
+          0.121,
+          0.123,
+          0.122,
+          0.121,
+          0.121,
+          0.121,
+          0.121,
+          0.121,
+          0.121,
+          0.126,
+          0.139,
+          0.121,
+          0.129,
+          0.129,
+          0.121,
+          0.121,
+          0.121,
+          0.122,
+          0.122,
+          0.125
+        ],
+        "3": [
+          0.776,
+          0.122,
+          0.138,
+          0.124,
+          0.125,
+          0.122,
+          0.122,
+          0.124,
+          0.121,
+          0.172,
+          0.16,
+          0.215,
+          0.218,
+          0.193,
+          0.155,
+          0.121,
+          0.122,
+          0.135,
+          0.122,
+          0.121,
+          0.121,
+          0.133,
+          0.122,
+          0.121,
+          0.12,
+          0.121,
+          0.121,
+          0.12,
+          0.121,
+          0.13,
+          0.138,
+          0.121,
+          0.13,
+          0.128,
+          0.121,
+          0.121,
+          0.121,
+          0.122,
+          0.122,
+          0.125
+        ]
+      },
+      "probe_count": 8,
+      "probe_completion_tokens": [
+        98,
+        128,
+        128,
+        83,
+        98,
+        128,
+        128,
+        128
+      ]
+    },
+    "glm-native-c8-profile-tp2-nospec-c8k-1": {
+      "artifact_directory": "/data/trellis-quant/csf-online-20261001/glm-native-c8-profile-tp2-nospec-c8k-1",
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "docker_environment": [
+        "PORT=8041",
+        "HOST=0.0.0.0",
+        "HF_HUB_OFFLINE=1",
+        "VLLM_USE_FASTOKENS=0",
+        "PROFILE=glm53-flash",
+        "HARDWARE_PROFILE=rtx-pro-6000-pcie",
+        "CHECKPOINT=original",
+        "SPECULATOR=off"
+      ],
+      "launcher_arguments": [
+        "--revision",
+        "46aaae8a82032f77100f2f03e9cc11b391df3b4d",
+        "--kv-cache-memory-bytes",
+        "3221225472",
+        "--max-model-len",
+        "8192",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "32",
+        "--max-cudagraph-capture-size",
+        "128",
+        "--cudagraph-capture-sizes",
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64",
+        "128",
+        "--mamba-cache-mode",
+        "align",
+        "--load-format",
+        "safetensors",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/results/traces\", \"torch_profiler_with_stack\": false, \"ignore_frontend\": true, \"delay_iterations\": 20, \"max_iterations\": 8}",
+        "--tensor-parallel-size",
+        "2"
+      ],
+      "gpus": [
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141",
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7"
+      ],
+      "loaded_memory_clocks_mhz": [
+        "16365 MHz"
+      ],
+      "loaded_graphics_clock_range_mhz": [
+        2610,
+        2895
+      ],
+      "power_limits_w": [
+        "600.00 W"
+      ],
+      "throttle_masks": [
+        "0x0000000000000400"
+      ],
+      "artifact_sha256": {
+        "launch.json": "2c0fde00ec331b2da6962a06d339e3d65a46e2ed58f45937b5554e8506ab5a38",
+        "logprob-probes.json": "6c5eb5c722b5461c616b08860aef19a3d7141cc5e6c6c420023b9367a560e095",
+        "decode-2.json": "990f1c4f6dcbd6a9e2bc86e2ae746fadb3f439cc1dddf5c72d11e1f504482151",
+        "decode-1.json": "768d4285b09c0861cef1daaa64324835c58936bad35f9f0574f1ba7bfaf352ed",
+        "telemetry.csv": "e0eae6d9306e4facb7a198a92161ceb2976d3115ee11760d116592c6ebd94e78",
+        "server.log": "82bbeff70123a95e42dcd413318fe606e04318425579488771cff20ed3b0c8bd",
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e"
+      },
+      "model_load_gib_and_seconds": [
+        [
+          "89.12",
+          "22.786152"
+        ],
+        [
+          "89.12",
+          "23.201480"
+        ]
+      ],
+      "kv_tokens": [
+        "36,132"
+      ],
+      "kv_gib": [],
+      "online_layer_preparation_seconds": {},
+      "decode-1": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 126.87902348669842,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 519.6869836186854,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "decode-2": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 126.76421770451022,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 515.7502552456558,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "probe_count": 4,
+      "probe_completion_tokens": [
+        128,
+        128,
+        79,
+        52
+      ]
+    },
+    "glm-csf-c8-profile-tp2-nospec-c8k-1": {
+      "artifact_directory": "/data/trellis-quant/csf-online-20261001/glm-csf-c8-profile-tp2-nospec-c8k-1",
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "docker_environment": [
+        "PORT=8041",
+        "HOST=0.0.0.0",
+        "HF_HUB_OFFLINE=1",
+        "VLLM_USE_FASTOKENS=0",
+        "PROFILE=glm53-flash",
+        "HARDWARE_PROFILE=rtx-pro-6000-pcie",
+        "CHECKPOINT=csf",
+        "SPECULATOR=off"
+      ],
+      "launcher_arguments": [
+        "--kv-cache-memory-bytes",
+        "3221225472",
+        "--max-model-len",
+        "8192",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "32",
+        "--max-cudagraph-capture-size",
+        "128",
+        "--cudagraph-capture-sizes",
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64",
+        "128",
+        "--mamba-cache-mode",
+        "align",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/results/traces\", \"torch_profiler_with_stack\": false, \"ignore_frontend\": true, \"delay_iterations\": 20, \"max_iterations\": 8}",
+        "--tensor-parallel-size",
+        "2"
+      ],
+      "gpus": [
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141",
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7"
+      ],
+      "loaded_memory_clocks_mhz": [
+        "16365 MHz"
+      ],
+      "loaded_graphics_clock_range_mhz": [
+        2602,
+        2895
+      ],
+      "power_limits_w": [
+        "600.00 W"
+      ],
+      "throttle_masks": [
+        "0x0000000000000400"
+      ],
+      "artifact_sha256": {
+        "launch.json": "36f9204f6ecb27f6dc4e40cabb79c6a82c1077eac5f6da07f7f15a31beba810e",
+        "logprob-probes.json": "eb4241b874e8e21ca3bb8999bba9417d351d64c6ba6793200f17bcad1b5d69ab",
+        "decode-2.json": "86df41a2fdcd173400f0aaf039fb767f7c4a666a841c230da284d13e8f423635",
+        "decode-1.json": "be9be9757d38a66414f665c6c495cb2c5ae116f1a9d8f8d68cf3ec69d8bdf525",
+        "telemetry.csv": "1c806e658887aacf648da82655c1573050b2d3a99f795f623b8b540a8e5583ce",
+        "server.log": "75c895ed2753881bf26f76c7005267b7bb83670c8c9df39037c3c20792c1b043",
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e"
+      },
+      "model_load_gib_and_seconds": [
+        [
+          "85.72",
+          "91.302104"
+        ],
+        [
+          "85.72",
+          "91.356085"
+        ]
+      ],
+      "kv_tokens": [
+        "36,132"
+      ],
+      "kv_gib": [],
+      "online_layer_preparation_seconds": {},
+      "decode-1": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 117.2788174597422,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 514.4361195366678,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "decode-2": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 117.16739349105066,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 494.1184918716643,
+          "server_steps_per_s": 0.0,
+          "server_spec_accept_length": 0.0,
+          "server_accept_len_effective": 0.0,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "probe_count": 4,
+      "probe_completion_tokens": [
+        128,
+        128,
+        95,
+        34
+      ]
+    },
+    "qwen-native-c8-profile-tp1-mtp-stream-1": {
+      "artifact_directory": "/data/trellis-quant/csf-online-20261001/qwen-native-c8-profile-tp1-mtp-stream-1",
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "docker_environment": [
+        "PORT=8042",
+        "HOST=0.0.0.0",
+        "HF_HUB_OFFLINE=1",
+        "VLLM_USE_FASTOKENS=0",
+        "PROFILE=qwen38-flash-next",
+        "HARDWARE_PROFILE=rtx-pro-6000-pcie",
+        "CHECKPOINT=original",
+        "VLLM_PLE_CPU_OFFLOAD=1"
+      ],
+      "launcher_arguments": [
+        "--revision",
+        "b797d2e1160b9596b2570e56c1d3590faa09d4ed",
+        "--max-model-len",
+        "262144",
+        "--max-num-batched-tokens",
+        "4096",
+        "--max-num-seqs",
+        "16",
+        "--load-format",
+        "safetensors",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/results/traces\", \"torch_profiler_with_stack\": false, \"ignore_frontend\": true, \"delay_iterations\": 20, \"max_iterations\": 8}",
+        "--tensor-parallel-size",
+        "1"
+      ],
+      "gpus": [
+        "GPU-6171baff-cc22-608e-4029-507f67c392ff"
+      ],
+      "loaded_memory_clocks_mhz": [
+        "13365 MHz"
+      ],
+      "loaded_graphics_clock_range_mhz": [
+        2355,
+        2835
+      ],
+      "power_limits_w": [
+        "600.00 W"
+      ],
+      "throttle_masks": [
+        "0x0000000000000004",
+        "0x0000000000000400"
+      ],
+      "artifact_sha256": {
+        "launch.json": "dc52149b7e39412844fa04c979cc7e0f67427cc261f16cd7862fcdddae752110",
+        "logprob-probes.json": "803a52ffd75f4b60cf86cc07efe3bb3bec953e96d9bd6dadd3ff4e6f346b5f65",
+        "decode-1.json": "f9934a7af7586423361aa4fd3236a670bec64bfb603934f1fc8db94fd4ac7429",
+        "telemetry.csv": "b46047bd4087b4c84033c4454b6bb57e9a5ff0d0315a5195df5aa89a62c7325c",
+        "server.log": "5802eae1d601b7a786266fa54848b4a13aff3d577fa8d957a7e33e41d0f4972c",
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e"
+      },
+      "model_load_gib_and_seconds": [
+        [
+          "73.86",
+          "248.462781"
+        ]
+      ],
+      "kv_tokens": [
+        "662,476"
+      ],
+      "kv_gib": [
+        "12.2"
+      ],
+      "online_layer_preparation_seconds": {},
+      "decode-1": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 200.5991639745571,
+          "server_steps_per_s": 86.0282318906844,
+          "server_spec_accept_length": 2.331782945736434,
+          "server_accept_len_effective": 2.331782945736434,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 816.5798296863007,
+          "server_steps_per_s": 351.33473887515777,
+          "server_spec_accept_length": 2.3242217160212606,
+          "server_accept_len_effective": 2.3242217160212606,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 16,
+          "aggregate_tps": 1047.923876312429,
+          "server_steps_per_s": 431.9925574026216,
+          "server_spec_accept_length": 2.425791505791506,
+          "server_accept_len_effective": 2.425791505791506,
+          "underfilled": true,
+          "capacity_limited": true,
+          "avg_running_reqs": 13.5,
+          "max_queue_reqs": 3,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "probe_count": 4,
+      "probe_completion_tokens": [
+        128,
+        128,
+        108,
+        67
+      ]
+    },
+    "qwen-csf-c8-profile-tp1-mtp-stream-1": {
+      "artifact_directory": "/data/trellis-quant/csf-online-20261001/qwen-csf-c8-profile-tp1-mtp-stream-1",
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "docker_environment": [
+        "PORT=8042",
+        "HOST=0.0.0.0",
+        "HF_HUB_OFFLINE=1",
+        "VLLM_USE_FASTOKENS=0",
+        "PROFILE=qwen38-flash-next",
+        "HARDWARE_PROFILE=rtx-pro-6000-pcie",
+        "CHECKPOINT=csf",
+        "VLLM_PLE_CPU_OFFLOAD=1"
+      ],
+      "launcher_arguments": [
+        "--max-model-len",
+        "262144",
+        "--max-num-batched-tokens",
+        "4096",
+        "--max-num-seqs",
+        "16",
+        "--profiler-config",
+        "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/results/traces\", \"torch_profiler_with_stack\": false, \"ignore_frontend\": true, \"delay_iterations\": 20, \"max_iterations\": 8}",
+        "--tensor-parallel-size",
+        "1"
+      ],
+      "gpus": [
+        "GPU-6171baff-cc22-608e-4029-507f67c392ff"
+      ],
+      "loaded_memory_clocks_mhz": [
+        "13365 MHz"
+      ],
+      "loaded_graphics_clock_range_mhz": [
+        2370,
+        2835
+      ],
+      "power_limits_w": [
+        "600.00 W"
+      ],
+      "throttle_masks": [
+        "0x0000000000000004",
+        "0x0000000000000400"
+      ],
+      "artifact_sha256": {
+        "launch.json": "367fe2d5ac4c55f1c21f601d284a03dbffc05d506eec754f0be55c3602b29b6a",
+        "logprob-probes.json": "17c4845ba764567e8ef4b37ce6748da082e9fa86c947dc30ff7835b63592b84d",
+        "decode-2.json": "a097e07e8eb2422c2cca74551755941eb02c4be64202db64e1248dcb879cb99d",
+        "decode-1.json": "ec27dc1e424dacf0fb060bd16703bce1a42c92c35569a5e9a583758c646420cf",
+        "telemetry.csv": "9e07a845f7451a683fa5cc53d1bca842393044726ab4742464b12b7526a0927f",
+        "server.log": "fae486c7f4cc200d1ad709b8e31ae8529af1a84339da8a8ba9706bc522e29b16",
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e",
+        "prefill.json": "798bc09cc3ccf53c2324b9638ee0b0058414c694a577867c2547391ec0e7d83e"
+      },
+      "model_load_gib_and_seconds": [
+        [
+          "71.2",
+          "345.449021"
+        ]
+      ],
+      "kv_tokens": [
+        "859,746"
+      ],
+      "kv_gib": [
+        "15.84"
+      ],
+      "online_layer_preparation_seconds": {},
+      "decode-1": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 199.54033816351938,
+          "server_steps_per_s": 84.70297348371246,
+          "server_spec_accept_length": 2.3557654466745377,
+          "server_accept_len_effective": 2.3557654466745377,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 806.8531548243031,
+          "server_steps_per_s": 352.34810496624937,
+          "server_spec_accept_length": 2.2899318697956095,
+          "server_accept_len_effective": 2.2899318697956095,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 16,
+          "aggregate_tps": 1130.2737312629213,
+          "server_steps_per_s": 496.1640593914585,
+          "server_spec_accept_length": 2.2780241935483874,
+          "server_accept_len_effective": 2.278024193548387,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 16,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "decode-2": [
+        {
+          "concurrency": 1,
+          "aggregate_tps": 190.12998673117528,
+          "server_steps_per_s": 84.47999059736948,
+          "server_spec_accept_length": 2.250591949486977,
+          "server_accept_len_effective": 2.250591949486977,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 1,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 8,
+          "aggregate_tps": 792.7910266646286,
+          "server_steps_per_s": 352.02561776042717,
+          "server_spec_accept_length": 2.252083333333333,
+          "server_accept_len_effective": 2.252083333333333,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 8,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        },
+        {
+          "concurrency": 16,
+          "aggregate_tps": 1162.945233604548,
+          "server_steps_per_s": 502.34696419882584,
+          "server_spec_accept_length": 2.315023910733262,
+          "server_accept_len_effective": 2.3150239107332626,
+          "underfilled": false,
+          "capacity_limited": false,
+          "avg_running_reqs": 16,
+          "max_queue_reqs": 0,
+          "num_errors": 0,
+          "loop_detected": false
+        }
+      ],
+      "probe_count": 4,
+      "probe_completion_tokens": [
+        128,
+        128,
+        117,
+        75
+      ]
+    }
+  },
+  "validation_artifacts": {
+    "final-gpu-tests-1.log": "f10223c51f3c622724a61ea25be7faff99f263542af2445176176108c00c73c4",
+    "online-guards-final-correct-image.log": "17964330b3a57ef12045775bbcab14f819592aaf526a7f8338232fc69276ec18",
+    "vllm-online-tests-final.log": "0d4a00af69571cefee595c223556eed2af2ca635c563c863e00e7247d37f1b0e",
+    "vllm-precommit-final.log": "0f66465c7157747da6c4373c8234973cd3666e11adefde969b05b8861e02ac7c",
+    "real-scale-encoder.json": "f499e4802bd03b254671e7756e308333141a3c0f51575dd50d803f2495e9359f",
+    "ds41-real-online-mxfp8-parity.json": "b9df79e3c25c32169a87dc6081960110d7ce1e1413fab54e5cf7a30e6144ec63"
+  },
+  "implementation_source_sha256": {
+    "b12x/b12x/_lib/quant/csf_encode.py": "b508fd655be1ce2c75bb0ba6c8587e7a6f70bb3f0aacec1dd099b74183d153c2",
+    "b12x/b12x/moe/fused_moe/online_scales.py": "8d00090b989bdb9c56c43ef5bf9b7694cf9e5dc09b789141f604c23511ed9755",
+    "b12x/b12x/moe/fused_moe/planning.py": "e080e8640877332a9b90ab99719920bab0eadb66ad0ab8efe376857b5c153ecb",
+    "b12x/b12x/moe/fused_moe/api.py": "ce01f2c8589a9ae9609e1f4cb29770c8b69e1ce223694979515b840ee8a5ba5b",
+    "vllm/vllm/envs.py": "0da0cbada79a236733891f86d091c8702d700731c535b16c1d08ab69f911bce6",
+    "vllm/vllm/model_executor/layers/fused_moe/b12x.py": "ba39705c1ee626272face5cd13eb80375e6faa6306da6b8476feb48760d5caf4",
+    "vllm/vllm/model_executor/layers/quantization/modelopt.py": "98180a281c7587500e071f54ec2eae7f277021697f38304d9f902c96cf326366",
+    "vllm/vllm/model_executor/layers/quantization/mxfp4.py": "801bf9566772b40f5a40481017fce1be45797e49a1574c97698cc6a5627ac6c8",
+    "vllm/vllm/model_executor/layers/quantization/utils/b12x_scale_compression.py": "7917d1fac9eda94e456f7b24b28ea30d0d39152d051559e0e52ce3ec759c802a"
+  }
+}
