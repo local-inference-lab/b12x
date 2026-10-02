@@ -47,7 +47,7 @@ def compress_fixture(swizzled, rows, columns, raw=False):
 @pytest.mark.parametrize("n", [64, 128, 192, 320])
 def test_native_expert_output_and_shared_scratch_poisoned_replay(
     tokens, activation_mode, raw, n, inline_scales=None, autotune=False,
-    deterministic=True,
+    deterministic=True, online=False,
 ):
     device = require_b12x()
     e, h, topk = 8, 256, 2
@@ -78,13 +78,29 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     )
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
     compressed = moe.Nvfp4CsfWeights(
-        packed=replace(packed, w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
+        packed=replace(packed, w13=packed.w13.clone(), w2=packed.w2.clone(),
+                       w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
         w13_scales=compress_fixture(s13, 2 * n, h // 16, raw=raw),
         w2_scales=compress_fixture(s2, h, n // 16, raw=raw),
     )
-    experts = [
-        moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
-    ]
+    if online:
+        from b12x.moe.fused_moe._impl import _swap_w13_scale_halves_inplace
+        source = replace(packed, w13=torch.roll(packed.w13, n, 1),
+                         w2=packed.w2.clone(),
+                         w13_block_scales=packed.w13_block_scales.clone(),
+                         w2_block_scales=packed.w2_block_scales.clone())
+        _swap_w13_scale_halves_inplace(source.w13_block_scales, rows=2*n, cols_blocks=h//16)
+    experts = [moe.prepare_weights(plan=weight_plan, weights=packed)]
+    if not online:
+        experts.append(moe.prepare_weights(plan=weight_plan, weights=compressed))
+    if online:
+        online_plan = moe.plan_weights(
+            source=replace(weight_plan.source, w13_layout="w31"), activation=weight_plan.activation,
+            geometry=weight_plan.geometry,
+            constraints=moe.WeightPlanConstraints(scale_compression="csf"),
+        )
+        experts.append(moe.prepare_weights(plan=online_plan, weights=source, scale_scratch=buffers))
+        assert experts[1].plan._impl.discards_source_parameters
     from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 
     override = None if inline_scales is None else MoeDecodeConfig(
@@ -197,4 +213,12 @@ def test_indexed_scale_programs_are_declared_for_preparation(deterministic):
     test_native_expert_output_and_shared_scratch_poisoned_replay(
         1, "a4", True, 128, inline_scales=False, autotune=True,
         deterministic=deterministic,
+    )
+
+
+@pytest.mark.parametrize("mode", ["a4", "a16"])
+@pytest.mark.parametrize("tokens,n", [(1, 64), (17, 320)])
+def test_online_compression_preserves_expert_graph_output(mode, tokens, n):
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        tokens, mode, False, n, online=True,
     )

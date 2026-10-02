@@ -20,6 +20,29 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("columns", [1, 8, 112, 255])
+@pytest.mark.parametrize("rotation", [0, 64])
+def test_gpu_encoder_preserves_bytes_and_rotated_exception_partitions(columns, rotation):
+    from b12x._lib.quant.csf_encode import encode_scale_bytes
+
+    device = require_b12x()
+    source = torch.randint(0, 256, (3, 128, columns), device=device, dtype=torch.uint8)
+    source[0].fill_(255)
+    original = source.clone()
+    batch = encode_scale_bytes(source, format="mxfp4", exception_row_rotation=rotation)
+    output = torch.empty_like(source)
+    ids = torch.arange(3, device=device, dtype=torch.int32)
+    decode_x4t_scales(batch, ids, output)
+    assert torch.equal(output, source)
+    assert torch.equal(source, original)
+    bounds = batch.task_exception_offsets.cpu().tolist()
+    records = batch.exceptions.cpu().to(torch.int64)
+    for expert in range(3):
+        for task in range(2):
+            rows = (records[bounds[expert][task]:bounds[expert][task+1]] & 0xFFFFFF) // columns
+            assert bool((((rows - rotation) % 128) // 64 == task).all())
+
+
 def _make_plane(
     rows: int,
     columns: int,
