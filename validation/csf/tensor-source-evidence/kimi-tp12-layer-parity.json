@@ -1,0 +1,222 @@
+{
+  "model": "Kimi-K3-MXFP4-CSF",
+  "revision": "8b7d43b0f7141c4ff04a5f87d26c8675c30ff7a0",
+  "layer": 1,
+  "tp": 12,
+  "baseline_reader_sha256": "8308c310f47bac21253c9c334173b6cec41628f47528aadfe4f0a4a142be3434",
+  "default_dtype": "torch.bfloat16",
+  "ranks": [
+    {
+      "rank": 0,
+      "tensors": [
+        {
+          "field": "weights.w13",
+          "shape": [
+            896,
+            512,
+            1792
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 822083584,
+          "sha256": "9acfd495ce5d5ff9e61c0466ba564c6f49132041e04128e5ca848f41c901379b"
+        },
+        {
+          "field": "weights.w2",
+          "shape": [
+            896,
+            3584,
+            128
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 411041792,
+          "sha256": "acb79d76b60764909fe215c4dc73ecebe1a270d8c79ad7e37651d50fc1d63a47"
+        },
+        {
+          "field": "weights.w13_scales.fixed",
+          "shape": [
+            896,
+            32,
+            240
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 6881280,
+          "sha256": "7ce3d5c14107c6d9d70432bbfa7dbba06af48bc032dc2b43a45bf8bc265460b2"
+        },
+        {
+          "field": "weights.w13_scales.exceptions",
+          "shape": [
+            279553
+          ],
+          "dtype": "torch.uint32",
+          "bytes": 1118212,
+          "sha256": "ab5c8e0f6620652d267e35f26843160b31487e60e3329f2d6e5e8079f9629c17"
+        },
+        {
+          "field": "weights.w13_scales.exception_offsets",
+          "shape": [
+            897
+          ],
+          "dtype": "torch.int64",
+          "bytes": 7176,
+          "sha256": "3a04b572f614086bc6486f74e48f697d74ad7e91d13ae141982900160b4b0d07"
+        },
+        {
+          "field": "weights.w13_scales.task_exception_offsets",
+          "shape": [
+            896,
+            9
+          ],
+          "dtype": "torch.int64",
+          "bytes": 64512,
+          "sha256": "7591ff6922310d4917b6e54475994b0a5a2f9b2d30e66f830c70b9ae1452cde7"
+        },
+        {
+          "field": "weights.w2_scales.fixed",
+          "shape": [
+            896,
+            224,
+            32
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 6422528,
+          "sha256": "ec37dc5ba51ae1685d2ca4c8f105d69d7439ff341041ad07af4d20b4bfe4188b"
+        },
+        {
+          "field": "weights.w2_scales.exceptions",
+          "shape": [
+            119470
+          ],
+          "dtype": "torch.uint32",
+          "bytes": 477880,
+          "sha256": "d443668fc170e340c9a28534046b29328052e85e6fe4159e01f5cc836a6c3e38"
+        },
+        {
+          "field": "weights.w2_scales.exception_offsets",
+          "shape": [
+            897
+          ],
+          "dtype": "torch.int64",
+          "bytes": 7176,
+          "sha256": "00be28b05cf9701f2fc378c09811243239570ebb2609ff8a6093ca00b3bea98b"
+        },
+        {
+          "field": "weights.w2_scales.task_exception_offsets",
+          "shape": [
+            896,
+            57
+          ],
+          "dtype": "torch.int64",
+          "bytes": 408576,
+          "sha256": "b85524f8060c877b49f178e1b4f709d93e506ef62b32d9bdfddb7e4abea31034"
+        }
+      ],
+      "equal": true
+    },
+    {
+      "rank": 11,
+      "tensors": [
+        {
+          "field": "weights.w13",
+          "shape": [
+            896,
+            512,
+            1792
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 822083584,
+          "sha256": "91c7986f41f64f22d9b7ec45ecbb0e62e446e44268a7945e7ca05e01b8de6b05"
+        },
+        {
+          "field": "weights.w2",
+          "shape": [
+            896,
+            3584,
+            128
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 411041792,
+          "sha256": "695979910307c858ab64970f48ce528d986261d80742348461d9a33ef95ea31e"
+        },
+        {
+          "field": "weights.w13_scales.fixed",
+          "shape": [
+            896,
+            32,
+            240
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 6881280,
+          "sha256": "f75ebcd1271fc1801db8232d6a5000c6960579d26d9cf72485ef295202f76125"
+        },
+        {
+          "field": "weights.w13_scales.exceptions",
+          "shape": [
+            277961
+          ],
+          "dtype": "torch.uint32",
+          "bytes": 1111844,
+          "sha256": "b5a5b7e47f749363720cbf86713f34267ecda668606b52168bbfbfdec9bbc42e"
+        },
+        {
+          "field": "weights.w13_scales.exception_offsets",
+          "shape": [
+            897
+          ],
+          "dtype": "torch.int64",
+          "bytes": 7176,
+          "sha256": "d99dc8a4b59bd999c9514e1c6cfb5a75a522af81be504852aa39849dadc79a34"
+        },
+        {
+          "field": "weights.w13_scales.task_exception_offsets",
+          "shape": [
+            896,
+            9
+          ],
+          "dtype": "torch.int64",
+          "bytes": 64512,
+          "sha256": "5a54c0a778532f3702d5db1c5da9112ae07fc113c433546c5bef73f62d75c595"
+        },
+        {
+          "field": "weights.w2_scales.fixed",
+          "shape": [
+            896,
+            224,
+            32
+          ],
+          "dtype": "torch.uint8",
+          "bytes": 6422528,
+          "sha256": "56be221fd3c878b9530f18f23b357f024b31e68448e1f3a775e1509dfeb4cd7b"
+        },
+        {
+          "field": "weights.w2_scales.exceptions",
+          "shape": [
+            118898
+          ],
+          "dtype": "torch.uint32",
+          "bytes": 475592,
+          "sha256": "f9c166bc228044bf6e88e918655849a78121a4e02e47333f1ba344e816729367"
+        },
+        {
+          "field": "weights.w2_scales.exception_offsets",
+          "shape": [
+            897
+          ],
+          "dtype": "torch.int64",
+          "bytes": 7176,
+          "sha256": "277eb8f713ff6a504f210f7938aaf429834c88fde5c87de65160d7fbb90d7071"
+        },
+        {
+          "field": "weights.w2_scales.task_exception_offsets",
+          "shape": [
+            896,
+            57
+          ],
+          "dtype": "torch.int64",
+          "bytes": 408576,
+          "sha256": "9148e8e95a07c70e8723a9d5e832f9272ef681f0be489fdc9d44f7a7743930c9"
+        }
+      ],
+      "equal": true
+    }
+  ]
+}

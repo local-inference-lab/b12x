@@ -45,6 +45,7 @@ from .source import PackedSource, PackedSourceFormat, TrellisExtent, TrellisSour
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
+    CsfScalePlanes,
     Nvfp4CsfWeights,
     Mxfp4CsfWeights,
     IQ2XSWeights,
@@ -256,6 +257,7 @@ __all__ = [
     "PackedSourceFormat",
     "PackedWeights",
     "Mxfp4CsfWeights",
+    "CsfScalePlanes",
     "Nvfp4CsfWeights",
     "Mxfp4CsfWeights",
     "IQ2XSWeights",

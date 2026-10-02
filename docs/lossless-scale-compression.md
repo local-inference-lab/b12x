@@ -17,12 +17,26 @@ ordinary `plan_weights` / `prepare_weights` interface. Supply decoded scale
 scratch buffers owned by the caller. Serialized layer executions may reuse
 these buffers. Concurrent execution streams require independent scratch.
 
-Checkpoint readers are
-`b12x.moe.checkpoints.mxfp4_csf.read_mxfp4_csf_layer` and
-`b12x.moe.checkpoints.nvfp4_csf.read_nvfp4_csf_layer`. They slice the
-TP-independent compressed payload into a rank's exact extent at load time.
-The NVFP4 reader also preserves the original FP32 global and activation
-calibration. Its FC1 tensors use kernel-native up/gate order.
+Pass compressed CPU scale planes as `CsfScalePlanes(fixed, exceptions)` in
+`w13_scales` and `w2_scales`. Each tuple contains one rank-local tensor per
+expert, in canonical 16-row slab order: fixed bytes are `torch.uint8` and
+exception records are `torch.uint32`. Geometry and codec come from the weight
+plan. MXFP4 uses 32-channel scale groups; NVFP4 uses 16-channel groups and retains
+the source FP32 scalar weight and activation calibration.
+
+`prepare_weights` uploads the compressed planes, partitions exception ranges,
+and applies the planned scale layout. NVFP4 uses the ordinary packed-weight
+preparation, including its W4A16 normalization when A16 is selected. MXFP4 uses
+the W4A16 preparation path for its planned native or MMA-packed weight layout.
+These operations happen during weight preparation, before graph capture.
+Callers with already resident scale batches may also pass those batches.
+
+vLLM owns CSF manifests, model inventories, tensor names, shard lifetimes and
+TP slicing. Its `mxfp4_csf_loader` and `nvfp4_csf_loader` readers slice packed
+weight views before materialization and produce rank-local weight bundles.
+B12X has no CSF checkpoint reader or model-file discovery API. Updating this
+integration requires the matching B12X `CsfScalePlanes` support; serialized
+checkpoints, tensor bytes and launch flags are unchanged.
 
 GPU decoding writes the native scale layout directly. Exception ranges are
 partitioned at load time; a thread block patches only its output rows.
@@ -32,7 +46,7 @@ caller-owned allocations.
 
 ## Serialized formats
 
-The readers accept `lil-mxfp4-csf-checkpoint/1` and
+The vLLM checkpoint readers accept `lil-mxfp4-csf-checkpoint/1` and
 `lil-nvfp4-csf-checkpoint/1`, respectively. Scale tensor components use
 `.mxfp4_csf_fixed` / `.mxfp4_csf_exceptions` or
 `.nvfp4_csf_fixed` / `.nvfp4_csf_exceptions` suffixes. Predecessor schemas

@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-456-csf-tuning-contract",
+  "category": "compatibility",
+  "summary": "Retain native MXFP8 and Trellis tuning with compressed FP4 scale operands",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "MoE tuning preserves native MXFP8 backend restrictions and Trellis decode-table validation while accepting NVFP4-CSF operand reconstruction.",
+    "Separate query and configuration schema versions invalidate cached choices from incompatible recipe contracts."
+  ],
+  "pull_requests": [456],
+  "requires": ["b12x-450-nvfp4-csf-cooperative"]
+}

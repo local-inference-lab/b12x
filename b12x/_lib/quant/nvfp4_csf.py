@@ -448,8 +448,13 @@ class _Plane:
 
 
 class _Pair:
-    def __init__(self, first, second):
-        self.first, self.second = _Plane(first), _Plane(second)
+    def __init__(self, first, second, indexed=False):
+        plane = _Plane
+        if indexed:
+            from b12x._lib.quant.nvfp4_csf_inline import IndexedNvfp4Plane
+
+            plane = IndexedNvfp4Plane
+        self.first, self.second = plane(first), plane(second)
 
     @cute.jit
     def __call__(
@@ -538,11 +543,16 @@ class _Pair:
                 if raw >= Int64(0) and raw < Int64(experts):
                     expert = raw.to(Int32)
                 if mode == Int32(0):
-                    prior = Int32(0)
-                    while prior < slot and expert >= Int32(0):
-                        if ids[prior].to(Int64) == raw:
-                            expert = Int32(-1)
-                        prior += Int32(1)
+                    # Every warp checks the same prefix in parallel. The
+                    # resulting predicate is uniform across the CTA, so only
+                    # the first route may write an expert's scale region.
+                    duplicate = cutlass.Boolean(False)
+                    prior = Int32(tid) % Int32(32)
+                    while prior < slot:
+                        duplicate = duplicate | (ids[prior].to(Int64) == raw)
+                        prior += Int32(32)
+                    if cute.arch.vote_any_sync(duplicate):
+                        expert = Int32(-1)
         if expert >= Int32(0) and expert < experts:
             if task < Int32(self.first.tasks):
                 self.first.decode(first, expert, task, Int32(tid))
@@ -553,9 +563,9 @@ class _Pair:
 
 
 @program_cache
-def compile_nvfp4_csf_pair(first, second, ids64=False):
-    launch = _Pair(first, second)
-    key = (first, second, bool(ids64))
+def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
+    launch = _Pair(first, second, indexed)
+    key = (first, second, bool(ids64), bool(indexed))
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     plane = (
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -583,12 +593,13 @@ def compile_nvfp4_csf_pair(first, second, ids64=False):
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         0,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 4, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 6, key),
     )
 
 
 def decode_nvfp4_csf_pair(
-    first, second, ids, out13, out2, *, mode=0, program=None, barriers=None
+    first, second, ids, out13, out2, *, mode=0, program=None, barriers=None,
+    indexed_scales=None,
 ):
     """Launch the precompiled pair into caller-owned native NVFP4 scale grids."""
     if first.num_experts != second.num_experts or mode not in (0, 1, 2, 3):
@@ -635,7 +646,8 @@ def decode_nvfp4_csf_pair(
         )
     if program is None:
         program = compile_nvfp4_csf_pair(
-            first.geometry, second.geometry, ids.dtype == torch.int64
+            first.geometry, second.geometry, ids.dtype == torch.int64,
+            indexed_scales is not None,
         )
 
     def device_ptr(t, dtype, align):
@@ -644,10 +656,13 @@ def decode_nvfp4_csf_pair(
         )
 
     args = []
-    for batch, out in ((first, out13), (second, out2)):
+    for index, (batch, out) in enumerate(((first, out13), (second, out2))):
         args.extend(
             (
-                device_ptr(batch.fixed, cutlass.Uint8, 16),
+                device_ptr(
+                    batch.fixed if indexed_scales is None else indexed_scales[index].storage,
+                    cutlass.Uint8, 16,
+                ),
                 device_ptr(batch.exceptions, cutlass.Uint8, 16),
                 device_ptr(batch.task_offsets, cutlass.Int64, 8),
                 device_ptr(out, cutlass.Uint8, 16),
@@ -688,9 +703,15 @@ class Nvfp4CsfDecoder:
     first: Nvfp4CsfBatch
     second: Nvfp4CsfBatch
     programs: tuple
+    routing_programs: tuple
+    active: torch.Tensor
+    inline_scales: tuple | None = None
+    indexed_programs: tuple | None = None
 
     @classmethod
-    def prepare(cls, first, second, out13, out2):
+    def prepare(cls, first, second, out13, out2, *, inline_scales=None):
+        from b12x._lib.quant.csf_routing import compile_csf_active_experts
+
         for plane, output in ((first, out13), (second, out2)):
             plane.validate()
             expected = (
@@ -713,12 +734,42 @@ class Nvfp4CsfDecoder:
             compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64)
             for ids64 in (False, True)
         )
-        return cls(first, second, programs)
+        return cls(
+            first,
+            second,
+            programs,
+            tuple(compile_csf_active_experts(ids64) for ids64 in (False, True)),
+            torch.empty(
+                first.num_experts, dtype=torch.int32, device=first.fixed.device
+            ),
+            inline_scales=inline_scales,
+            indexed_programs=(
+                tuple(
+                    compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64, True)
+                    for ids64 in (False, True)
+                ) if inline_scales is not None else None
+            ),
+        )
 
     def decode(self, ids, out13, out2, *, barriers=None):
-        # Sparse calls expand only selected experts. Above one route per
-        # expert on average, a full grid bounds duplicate-search work.
-        mode = 0 if ids.numel() < self.first.num_experts else 3
+        from b12x._lib.quant.csf_routing import mark_active_experts
+
+        # Build presence once for batch decode. Repeated token routes do not
+        # imply that every expert is active. Long prefills bound the scan work
+        # by expanding the complete, statically sized expert set instead.
+        mode = 0
+        if ids.numel() >= 16 * self.first.num_experts:
+            mode = 3
+        elif ids.numel() >= 64:
+            mark_active_experts(
+                ids, self.active, self.routing_programs[int(ids.dtype == torch.int64)]
+            )
+            ids, mode = self.active, 2
+        # Short route lists retain direct duplicate checks. Equal-size spans
+        # avoid assigning a large gate/up slab and a small down slab the same
+        # CTA budget. Presence and full-expert expansion retain their slab grid.
+        indexed = self.indexed_programs is not None and mode == 0
+        programs = self.indexed_programs if indexed else self.programs
         decode_nvfp4_csf_pair(
             self.first,
             self.second,
@@ -726,6 +777,7 @@ class Nvfp4CsfDecoder:
             out13,
             out2,
             mode=mode,
-            program=self.programs[int(ids.dtype == torch.int64)],
+            program=programs[int(ids.dtype == torch.int64)],
             barriers=barriers,
+            indexed_scales=self.inline_scales if indexed else None,
         )
