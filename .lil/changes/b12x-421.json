@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-421",
+  "category": "performance",
+  "summary": "Add a tensor-core BF16 GEMV backend for wide decode projections",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "An autotuning candidate for BF16 projections with up to eight rows; default selection is unchanged."
+  ],
+  "pull_requests": [
+    421
+  ]
+}
