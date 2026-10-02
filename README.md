@@ -16,7 +16,7 @@ pip install b12x
 
 You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
-(`nvidia-cutlass-dsl == 4.6.2`), so there is no separate build step. A
+(`nvidia-cutlass-dsl == 4.7.1`), so there is no separate build step. A
 `PreparationSession` compiles missing kernels before publishing execution.
 
 The optional vLLM [checkpoint loader](docs/checkpoint-loading.md) uses
@@ -38,7 +38,13 @@ owns declarative planning, `mm`, and `pack_weight`. The fixed
 execution. `gemm.block_fp8_linear` retains a separate interface because
 it owns caller-provided scratch and inline requantization. The fused MLA query
 projection (`gemm.mla_query_projection`) and grouped WO projection
-(`gemm.wo_projection`) are used around MLA attention.
+(`gemm.wo_projection`) are used around MLA attention. `gemm.mgroup_fp8_gemm`
+is the standalone M-grouped FP8 GEMM (DeepGEMM-style masked and
+contiguous-labels modes): masked lowers onto the batched dense MXFP8 engine,
+contiguous uses the `mgroup_labels` dense-engine variant that picks each M
+tile's group from the device labels tensor and zero-fills padding rows.
+See [grouped FP8 usage and qualification](docs/grouped-fp8.md) for prepared
+API examples, contracts and the bounded 819-case performance table.
 `gemm.block_fp8_linear` also accepts V4.1's 32x32 E4M3/UE8M0 weight blocks
 with per-32 activation quantization. `gemm.bf16_gemv.mm` handles unquantized
 BF16/FP32 projections, including FP32 outputs and bias before final rounding;

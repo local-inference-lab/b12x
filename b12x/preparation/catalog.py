@@ -56,6 +56,7 @@ TUNING_COMPONENTS = (
     KernelTuningRegistration(op_qualname='comm.roce', contract_ref='b12x.comm.roce._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='gemm.bf16_gemv', contract_ref='b12x.gemm.bf16_gemv._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='gemm.bmm', contract_ref='b12x.gemm._bmm._tuning:TUNING', variant='default'),
+    KernelTuningRegistration(op_qualname='gemm.mgroup_fp8_gemm', contract_ref='b12x.gemm.mgroup_fp8_gemm._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='gemm.mla_query_projection', contract_ref='b12x.gemm.mla_query_projection._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='gemm.mxfp8_linear', contract_ref='b12x.gemm.mxfp8_linear._tuning:TUNING', variant='default'),
     KernelTuningRegistration(op_qualname='gemm.mxfp8_linear', contract_ref='b12x.gemm.mxfp8_linear._tuning:FIXED_TUNING', variant='fixed'),

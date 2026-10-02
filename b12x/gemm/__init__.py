@@ -8,6 +8,9 @@
 - ``mxfp8_linear`` / ``tensor_fp8_linear``: compatibility aliases for
   ``blockscaled`` packed-weight calls.
 - ``mla_query_projection``: fused MXFP8 MLA query projection and assembly.
+- ``mgroup_fp8_gemm``: standalone M-grouped FP8 GEMM (masked + contiguous
+  labels); contiguous M tiles pick their group from device-side labels and
+  padding rows are zero-filled.
 - ``trellis_linear``: native EXL3 Trellis W4A16/direct-W4A8 dense linear.
 - ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).
 """
@@ -24,6 +27,7 @@ _OP_MODULES = (
     "mxfp8_linear",
     "tensor_fp8_linear",
     "mla_query_projection",
+    "mgroup_fp8_gemm",
     "trellis_linear",
     "wo_projection",
 )
