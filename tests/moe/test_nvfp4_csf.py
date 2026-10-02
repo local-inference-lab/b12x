@@ -47,7 +47,7 @@ def compress_fixture(swizzled, rows, columns, raw=False):
 @pytest.mark.parametrize("n", [64, 128, 192, 320])
 def test_native_expert_output_and_shared_scratch_poisoned_replay(
     tokens, activation_mode, raw, n, inline_scales=None, autotune=False,
-    deterministic=True, online=False,
+    deterministic=True, online=False, tile_m=16,
 ):
     device = require_b12x()
     e, h, topk = 8, 256, 2
@@ -105,7 +105,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
 
     override = None if inline_scales is None else MoeDecodeConfig(
         backend="dynamic", route_planner="internal", max_active_clusters=None,
-        dynamic_tile_m=16, dynamic_route_mode="grouped",
+        dynamic_tile_m=tile_m, dynamic_route_mode="grouped",
         nvfp4_inline_scales=inline_scales,
     )
     plans = [
@@ -205,6 +205,13 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
 def test_scale_decoder_override_preserves_expert_graph_output(inline_scales, tokens, n):
     test_native_expert_output_and_shared_scratch_poisoned_replay(
         tokens, "a4", True, n, inline_scales=inline_scales
+    )
+
+
+@pytest.mark.parametrize("tile_m", [16, 32, 64, 128])
+def test_split_gate_scale_operands_preserve_native_output_for_consumer_counts(tile_m):
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        33, "a4", True, 320, inline_scales=True, tile_m=tile_m
     )
 
 

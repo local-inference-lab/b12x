@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-csf-indexed-vectors",
+  "category": "performance",
+  "summary": "Share NVFP4-CSF address and exception lookup across four adjacent scale words",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"],
+  "compatibility": "Checkpoint schemas, prepared scale storage, activation arithmetic and decoder launch geometry are unchanged.",
+  "details": [
+    "Load eight packed code bytes and four row bases together, then store sixteen reconstructed scale bytes.",
+    "Use one bitmap and prefix lookup per four-word group while preserving individual exception words.",
+    "Keep expert-scaled addresses in 64-bit arithmetic, including output regions beyond 4 GiB."
+  ],
+  "pull_requests": [459],
+  "requires": ["b12x-csf-operand-reconstruction"]
+}
