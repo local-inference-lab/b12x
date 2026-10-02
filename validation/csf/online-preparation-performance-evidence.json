@@ -34,6 +34,370 @@
     }
   },
   "components": {
+    "ds41": {
+      "model": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+      "format": "mxfp4",
+      "layer": 3,
+      "geometry": [
+        384,
+        5120,
+        576
+      ],
+      "tp": 4,
+      "encoded_planes_exact": true,
+      "source_bytes_exact": true,
+      "prepared_index_exact": null,
+      "hardware_before": "uuid, pstate, clocks.current.memory [MHz], clocks.current.sm [MHz], power.limit [W], clocks_event_reasons.active\nGPU-cd323562-fdc3-78c3-012e-86e281433050, P1, 16365 MHz, 2632 MHz, 600.00 W, 0x0000000000000400\n",
+      "hardware_after": "uuid, pstate, clocks.current.memory [MHz], clocks.current.sm [MHz], power.limit [W], clocks_event_reasons.active\nGPU-cd323562-fdc3-78c3-012e-86e281433050, P1, 16365 MHz, 2617 MHz, 600.00 W, 0x0000000000000400\n",
+      "samples": [
+        {
+          "cycle": 0,
+          "arm": "baseline",
+          "seconds": 0.0035045380354858935
+        },
+        {
+          "cycle": 0,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028839930309914052
+        },
+        {
+          "cycle": 0,
+          "arm": "gpu_preparation",
+          "seconds": 0.002843082998879254
+        },
+        {
+          "cycle": 0,
+          "arm": "baseline",
+          "seconds": 0.0028455329593271017
+        },
+        {
+          "cycle": 1,
+          "arm": "baseline",
+          "seconds": 0.002845532028004527
+        },
+        {
+          "cycle": 1,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028407230274751782
+        },
+        {
+          "cycle": 1,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028366930200718343
+        },
+        {
+          "cycle": 1,
+          "arm": "baseline",
+          "seconds": 0.0028289229958318174
+        },
+        {
+          "cycle": 2,
+          "arm": "baseline",
+          "seconds": 0.0028410929953679442
+        },
+        {
+          "cycle": 2,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028377430280670524
+        },
+        {
+          "cycle": 2,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028345230384729803
+        },
+        {
+          "cycle": 2,
+          "arm": "baseline",
+          "seconds": 0.002830552984960377
+        },
+        {
+          "cycle": 3,
+          "arm": "baseline",
+          "seconds": 0.002833072969224304
+        },
+        {
+          "cycle": 3,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028259229729883373
+        },
+        {
+          "cycle": 3,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028304429724812508
+        },
+        {
+          "cycle": 3,
+          "arm": "baseline",
+          "seconds": 0.00283038301859051
+        },
+        {
+          "cycle": 4,
+          "arm": "baseline",
+          "seconds": 0.002824402996338904
+        },
+        {
+          "cycle": 4,
+          "arm": "gpu_preparation",
+          "seconds": 0.00283111201133579
+        },
+        {
+          "cycle": 4,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028286429587751627
+        },
+        {
+          "cycle": 4,
+          "arm": "baseline",
+          "seconds": 0.002835232997313142
+        },
+        {
+          "cycle": 5,
+          "arm": "baseline",
+          "seconds": 0.002832992991898209
+        },
+        {
+          "cycle": 5,
+          "arm": "gpu_preparation",
+          "seconds": 0.00283129297895357
+        },
+        {
+          "cycle": 5,
+          "arm": "gpu_preparation",
+          "seconds": 0.002833532984368503
+        },
+        {
+          "cycle": 5,
+          "arm": "baseline",
+          "seconds": 0.0028342229779809713
+        },
+        {
+          "cycle": 6,
+          "arm": "baseline",
+          "seconds": 0.0028812719974666834
+        },
+        {
+          "cycle": 6,
+          "arm": "gpu_preparation",
+          "seconds": 0.002836213039699942
+        },
+        {
+          "cycle": 6,
+          "arm": "gpu_preparation",
+          "seconds": 0.002840182976797223
+        },
+        {
+          "cycle": 6,
+          "arm": "baseline",
+          "seconds": 0.002822852984536439
+        },
+        {
+          "cycle": 7,
+          "arm": "baseline",
+          "seconds": 0.0028187119751237333
+        },
+        {
+          "cycle": 7,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028281229897402227
+        },
+        {
+          "cycle": 7,
+          "arm": "gpu_preparation",
+          "seconds": 0.002827912976499647
+        },
+        {
+          "cycle": 7,
+          "arm": "baseline",
+          "seconds": 0.002827703021466732
+        }
+      ],
+      "median_warm": {
+        "baseline": 0.0028330329805612564,
+        "gpu_preparation": 0.0028340280114207417
+      }
+    },
+    "qwen": {
+      "model": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4/snapshots/b797d2e1160b9596b2570e56c1d3590faa09d4ed",
+      "format": "nvfp4",
+      "layer": 3,
+      "geometry": [
+        512,
+        2560,
+        640
+      ],
+      "tp": 1,
+      "encoded_planes_exact": true,
+      "source_bytes_exact": true,
+      "prepared_index_exact": true,
+      "hardware_before": "uuid, pstate, clocks.current.memory [MHz], clocks.current.sm [MHz], power.limit [W], clocks_event_reasons.active\nGPU-cd323562-fdc3-78c3-012e-86e281433050, P1, 16365 MHz, 2625 MHz, 600.00 W, 0x0000000000000400\n",
+      "hardware_after": "uuid, pstate, clocks.current.memory [MHz], clocks.current.sm [MHz], power.limit [W], clocks_event_reasons.active\nGPU-cd323562-fdc3-78c3-012e-86e281433050, P1, 16365 MHz, 2625 MHz, 600.00 W, 0x0000000000000400\n",
+      "samples": [
+        {
+          "cycle": 0,
+          "arm": "baseline",
+          "seconds": 0.10835240397136658
+        },
+        {
+          "cycle": 0,
+          "arm": "gpu_preparation",
+          "seconds": 0.06560172297758982
+        },
+        {
+          "cycle": 0,
+          "arm": "gpu_preparation",
+          "seconds": 0.0028204729896970093
+        },
+        {
+          "cycle": 0,
+          "arm": "baseline",
+          "seconds": 0.10541371197905391
+        },
+        {
+          "cycle": 1,
+          "arm": "baseline",
+          "seconds": 0.10590679995948449
+        },
+        {
+          "cycle": 1,
+          "arm": "gpu_preparation",
+          "seconds": 0.003040981013327837
+        },
+        {
+          "cycle": 1,
+          "arm": "gpu_preparation",
+          "seconds": 0.0027760739903897047
+        },
+        {
+          "cycle": 1,
+          "arm": "baseline",
+          "seconds": 0.10535245202481747
+        },
+        {
+          "cycle": 2,
+          "arm": "baseline",
+          "seconds": 0.1054914920241572
+        },
+        {
+          "cycle": 2,
+          "arm": "gpu_preparation",
+          "seconds": 0.0030734920292161405
+        },
+        {
+          "cycle": 2,
+          "arm": "gpu_preparation",
+          "seconds": 0.002793313004076481
+        },
+        {
+          "cycle": 2,
+          "arm": "baseline",
+          "seconds": 0.1052882430376485
+        },
+        {
+          "cycle": 3,
+          "arm": "baseline",
+          "seconds": 0.10550767101813108
+        },
+        {
+          "cycle": 3,
+          "arm": "gpu_preparation",
+          "seconds": 0.0030302319792099297
+        },
+        {
+          "cycle": 3,
+          "arm": "gpu_preparation",
+          "seconds": 0.0027642829809337854
+        },
+        {
+          "cycle": 3,
+          "arm": "baseline",
+          "seconds": 0.10517546400660649
+        },
+        {
+          "cycle": 4,
+          "arm": "baseline",
+          "seconds": 0.10543287202017382
+        },
+        {
+          "cycle": 4,
+          "arm": "gpu_preparation",
+          "seconds": 0.003059772017877549
+        },
+        {
+          "cycle": 4,
+          "arm": "gpu_preparation",
+          "seconds": 0.0027855830267071724
+        },
+        {
+          "cycle": 4,
+          "arm": "baseline",
+          "seconds": 0.10513699398143217
+        },
+        {
+          "cycle": 5,
+          "arm": "baseline",
+          "seconds": 0.10537469299742952
+        },
+        {
+          "cycle": 5,
+          "arm": "gpu_preparation",
+          "seconds": 0.003025370999239385
+        },
+        {
+          "cycle": 5,
+          "arm": "gpu_preparation",
+          "seconds": 0.0027743629761971533
+        },
+        {
+          "cycle": 5,
+          "arm": "baseline",
+          "seconds": 0.10519715398550034
+        },
+        {
+          "cycle": 6,
+          "arm": "baseline",
+          "seconds": 0.10555616195779294
+        },
+        {
+          "cycle": 6,
+          "arm": "gpu_preparation",
+          "seconds": 0.0030388610321097076
+        },
+        {
+          "cycle": 6,
+          "arm": "gpu_preparation",
+          "seconds": 0.0027789330342784524
+        },
+        {
+          "cycle": 6,
+          "arm": "baseline",
+          "seconds": 0.10516855400055647
+        },
+        {
+          "cycle": 7,
+          "arm": "baseline",
+          "seconds": 0.10565817099995911
+        },
+        {
+          "cycle": 7,
+          "arm": "gpu_preparation",
+          "seconds": 0.003034651977941394
+        },
+        {
+          "cycle": 7,
+          "arm": "gpu_preparation",
+          "seconds": 0.00277121301041916
+        },
+        {
+          "cycle": 7,
+          "arm": "baseline",
+          "seconds": 0.10514425399014726
+        }
+      ],
+      "median_warm": {
+        "baseline": 0.10539420248824172,
+        "gpu_preparation": 0.0029229219944681972
+      }
+    },
     "kimi": {
       "model": "/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970",
       "geometry": [
@@ -2938,6 +3302,10 @@
         "bytes": 360146,
         "sha256": "7e79b289d2f5c6b10e2d24355e02b396034e3713564db7c1b3e34f757a4f074c"
       },
+      "kimi-original-restored-probe.json": {
+        "bytes": 22505,
+        "sha256": "9a14b31fca83b6449203c26618f4f147e385a989a9c1c2bd45bd48ec67b2822a"
+      },
       "kimi-2-online-server.log": {
         "bytes": 468641,
         "sha256": "0fc81ffb5e23e1ffa2088f9ee26e9316951de5d74f50cf6c869926146b65ca45"
@@ -3026,6 +3394,10 @@
         "bytes": 725,
         "sha256": "b47dc8ca557a3764b9b5ca5d787c1fe9957de6452eff14884f6742954edc0420"
       },
+      "publication.json": {
+        "bytes": 807,
+        "sha256": "c5fa91efac01eae09f4c9087ffb112212971ebe596c4b1d94efa5bc58c6f39e6"
+      },
       "kimi-fp32-composition-tests-launch.json": {
         "bytes": 463,
         "sha256": "1e454b48ecf3af39d28566aafe685b012f8a26b0f82c98889f27188aff9af44a"
@@ -3042,13 +3414,29 @@
         "bytes": 492,
         "sha256": "776d5eb10d27da028bdf4450810c1516a169c985ddee23d2e52de2156848d181"
       },
+      "ds41-encoder-source-byte-probe.json": {
+        "bytes": 541,
+        "sha256": "1ef43c8c8ff873df4ac62319f46845954350cb1d7a7a00a070429742df0dd2d0"
+      },
+      "kimi-3-online-validation.json": {
+        "bytes": 52,
+        "sha256": "fd570309426b6327d328249ed4b072958b62d1472525a14a3b7f3b2b79f60764"
+      },
       "kimi-encoder-balanced-3.log": {
         "bytes": 593,
         "sha256": "b5e0ee7f29ae62428a42823adf2abb423c4bfd14f43c2297be0038b1a759f7e0"
       },
+      "ds41-encoder-source-byte-probe-failed-format.json": {
+        "bytes": 545,
+        "sha256": "81501bdded4a640d8f974db8c8e75cf7747ddf4cbed2b33c8d97145e16c114ca"
+      },
       "kimi-source-manifest-3.json": {
         "bytes": 360146,
         "sha256": "8fb2bc20ab3b9540ca748d7e60daaed911ae40bf5f433c954a843401fc50309a"
+      },
+      "ds41-encoder-balanced.json": {
+        "bytes": 4057,
+        "sha256": "a2b20346c6058d4eab05df535928cb3be9cd02e3c7a35ae7d25f68cf3a6a0d48"
       },
       "kimi-encoder-narrow.log": {
         "bytes": 378,
@@ -3065,6 +3453,10 @@
       "kimi-online-validation.json": {
         "bytes": 143,
         "sha256": "0640356d3e80e309e5eba18325467c0ac7e9b09aec41cf6ce5efb35e40e6e6c5"
+      },
+      "ds41-encoder-balanced.log": {
+        "bytes": 1283,
+        "sha256": "e9a2cb1036888e18769260c1afb3d06bd0620b6d8b9e7981fe5a4129d62947f6"
       },
       "frank2-image-parity.json": {
         "bytes": 979,
@@ -3094,6 +3486,10 @@
         "bytes": 92,
         "sha256": "9156575e837ee1e5087491f6966880cbe4bcd0ad94135791d48f0a3305494c29"
       },
+      "ds41-encoder-balanced-launch-failed-format.json": {
+        "bytes": 659,
+        "sha256": "045818df3dc3f28ce1f8ac4fdd37e9955d729fe33d69d94571ab9ad4ada3e979"
+      },
       "glm-reproducible-probe-launch.json": {
         "bytes": 651,
         "sha256": "9d31b2a3e922a1f8a5a7181b5e80977261d9a52f7d134d7041e4c3aff9037cd8"
@@ -3113,6 +3509,10 @@
       "b12x-pr-before.json": {
         "bytes": 2703,
         "sha256": "319629d2bd993da515db71eddbba75c90ddefb1a568e7d05ac54d5591d3624bf"
+      },
+      "ds41-encoder-balanced-launch.json": {
+        "bytes": 659,
+        "sha256": "045818df3dc3f28ce1f8ac4fdd37e9955d729fe33d69d94571ab9ad4ada3e979"
       },
       "glm-serving-probe-comparison.json": {
         "bytes": 1289,
@@ -3186,6 +3586,10 @@
         "bytes": 525787,
         "sha256": "f011a21bd806e92d911580760869226755e4f569ad6ae4ddaf6808aa953d9168"
       },
+      "qwen-encoder-balanced.log": {
+        "bytes": 1440,
+        "sha256": "9271c37a944bb578fe5573e2fac65b6a6456aa1b1a85de24c6eef63a5bd2dea8"
+      },
       "gpu-index-byte-parity.log": {
         "bytes": 53,
         "sha256": "d76ee17bd6e359726c9bc22bc884b914ad2b19dea0c78e733438a2496f9d7e3f"
@@ -3193,6 +3597,10 @@
       "gpu-index-big-offset.log": {
         "bytes": 113,
         "sha256": "7d235e3957c4a09f4d3148c919cb7acb8d66ddf4e561a693703cae23edefc4ea"
+      },
+      "qwen-encoder-balanced-launch.json": {
+        "bytes": 659,
+        "sha256": "fa691306e45b761688362107ec050da6c821bd97816f2a38d72eb8ffac4b47c8"
       },
       "gpu-index-tests-1-launch.json": {
         "bytes": 418,
@@ -3238,6 +3646,14 @@
         "bytes": 437,
         "sha256": "5c747c86e034742e72d44aea9ec893bf905ebd6e8d257e4cdf727650d61d16f5"
       },
+      "qwen-encoder-source-byte-probe.json": {
+        "bytes": 729,
+        "sha256": "4e95ba6384f430ef871973e451bb5ff853081c7e2f2bfa3246b16245619cbd00"
+      },
+      "ds41-encoder-balanced-failed-format.log": {
+        "bytes": 1024,
+        "sha256": "c33e9b1c6fe2c4fed2ed97e302036edd295b361aa580eb204732aa4251a9b9e7"
+      },
       "kimi-preflight-server.log": {
         "bytes": 34639,
         "sha256": "aa20d068afdd1c1808bf1325e330f2ced2985f543be6026e7832c386278531eb"
@@ -3254,6 +3670,14 @@
         "bytes": 5069,
         "sha256": "5982538e29bedfdae9e032cc3139bc723a636fb6bac392b6dea510670ecdc004"
       },
+      "b12x-pr-after.json": {
+        "bytes": 186,
+        "sha256": "61f698492f59c555c3d2e58700d08050d87f0195e7f1a34fa94901c3bff59db1"
+      },
+      "vllm-pr-after.json": {
+        "bytes": 186,
+        "sha256": "00ffd2907176116a68eab354083011f926ae3078a12ca95d70164d947499ddd8"
+      },
       "mxfp4-narrow-tests-2.log": {
         "bytes": 1735,
         "sha256": "ae8c253961d553f3577b0d9ec814d22d62233fec8f8c0d7f37c7efefbe988dcf"
@@ -3261,6 +3685,10 @@
       "vllm-pr-before.json": {
         "bytes": 2396,
         "sha256": "228972a66fa7ae42f42f5e91742dcdc4e05392fc6e9d7d429be215ab47f83448"
+      },
+      "qwen-encoder-balanced.json": {
+        "bytes": 4044,
+        "sha256": "8e9d1ebab96addd24edc9a15aed0490aaeb23c5cd0f7cea3acaa8029a6ecea50"
       },
       "kimi-preflight-wrapper.log": {
         "bytes": 151,
@@ -3293,6 +3721,10 @@
       "reproducers/validate_kimi_3.py": {
         "bytes": 4685,
         "sha256": "130f14a7afbf042c115702be4a2220f1ecc9dd145235ee79d9b3a004e797625c"
+      },
+      "reproducers/compare_ds41_qwen.py": {
+        "bytes": 3425,
+        "sha256": "fab5d8b67d7a28971a44b006cc292b9baea1a65b3feca75fe7fd9c0fb15f9167"
       },
       "reproducers/preflight_kimi.py": {
         "bytes": 3095,

@@ -39,15 +39,24 @@ FP4 weight preparation, and whole-model warmup.
 |---|---:|---:|---:|
 | Kimi-K3, TP16 rank 0, 896 experts, H=3584, N=192; scale encoding | 4.000 ms | 0.823 ms | 4.86x |
 | GLM-5.3-Flash NVFP4, TP2 rank 0, 288 experts, H=4096, N=1024; encoding plus exception-word index | 134.921 ms | 2.969 ms | 45.45x |
+| DS4.1 MXFP4, TP4 rank 0, 384 experts, H=5120, N=576; scale encoding | 2.833 ms | 2.834 ms | 1.00x |
+| Qwen3.8-Flash-Next NVFP4, TP1, 512 experts, H=2560, N=640; encoding plus exception-word index | 105.394 ms | 2.923 ms | 36.06x |
 
 A separate GLM timing split measured encoding at 2.61 ms and the CPU index at
 132.69 ms. The GPU index took 0.47 ms. Removing the CPU index accounts for the
 large improvement; the general NVFP4 palette encoder is unchanged.
 
+Qwen uses the same GPU index builder as GLM. Its prepared storage is exactly
+equal to the CPU implementation for both projections and all 512 experts.
+DS4.1 TP4 has 160 and 18 scales per row in the two projections. Both exceed
+the eight-column grouped-row cutoff, so it retains the same encoder kernels;
+the balanced comparison shows no material timing change. Its encoded planes,
+exception metadata, and reconstructed source bytes remain exact.
+
 Kimi used Frank2 GPU `GPU-2faf5385-78f7-dab0-5528-dfaca9cc8eb8`, RTX PRO 6000
-Blackwell, 600 W, memory clock 13,365 MHz. GLM component measurements used
+Blackwell, 600 W, memory clock 13,365 MHz. GLM, DS4.1, and Qwen components used
 Frank1 GPU `GPU-cd323562-fdc3-78c3-012e-86e281433050`, the same GPU model,
-600 W, memory clock 16,365 MHz. The two model rows are independent comparisons,
+600 W, memory clock 16,365 MHz. The model rows are independent comparisons,
 not a cross-host performance comparison. Hardware snapshots and individual
 samples are in [the evidence JSON](online-preparation-performance-evidence.json).
 
@@ -60,6 +69,17 @@ Python threads and two CUDA streams measured 0.944 ms, versus 0.877 ms for
 serial dispatch in the paired experiment. That extra concurrency was not
 adopted. The compact-allocation host synchronization and dispatch costs limit
 its usefulness for these short operations.
+
+### DS4.1 and Qwen serving scope
+
+Complete native-checkpoint startup and eight generation requests per model
+are qualified by the separately pinned [loading evidence](online-scales.md#complete-native-checkpoint-loading):
+DS4.1 TP4 with MXFP8 expert activations and Engram in host RAM, and Qwen TP1
+with MTP3 and PLE/ngram in host RAM. Those whole-model runs use the preparation
+implementation identified in that report. The measurements in the table
+above exercise real DS4.1/Qwen scale data with GPU preparation revision
+`654f7a62`; they do not repeat complete DS4.1/Qwen loading or measure their
+whole-model startup reduction after the GPU-index change.
 
 ## Full native GLM loading
 
@@ -123,6 +143,8 @@ read-only and no converted checkpoint is produced.
 | NVFP4 empty, sparse, and dense exceptions over four shapes | 12 complete prepared buffers exactly equal the retained CPU implementation | Header, fixed stream, metadata, payload, and padding remain byte-identical |
 | Real GLM layer 3, all 288 TP2 rank-0 experts, both projections | Complete prepared buffers exactly equal CPU output | The index comparison includes actual checkpoint distributions |
 | Real Kimi layer 3, all 896 TP16 rank-0 experts | All source bytes reconstruct exactly; encoded planes equal the baseline encoder | Grouped rows preserve values and encoding, including rotated exception partitions |
+| Real DS4.1 layer 3, all 384 TP4 rank-0 experts, both projections | Encoded planes and all exception-offset tensors equal the baseline; source bytes reconstruct exactly | The wider-row path retains its byte contract |
+| Real Qwen layer 3, all 512 TP1 experts, both projections | Complete prepared buffers equal CPU output; source bytes reconstruct exactly | GPU indexing preserves Qwen's actual checkpoint distribution |
 | Final exception stored beyond 2 GiB | Exact payload and tile metadata | Signed 32-bit byte-offset overflow is covered |
 | Dense/empty/tail index readers under compute-sanitizer memcheck | 24 cases passed, zero errors | No reported invalid memory access in the tested cases |
 | vLLM compressed-tensors scale placement and online ownership | 6 focused GPU cases passed; pre-commit passed | Online staging uses CPU scales and GPU weights; default placement remains unchanged |
@@ -177,6 +199,8 @@ Config, RootFS layers, architecture, and OS compare exactly.
 |---|---|
 | `moonshotai/Kimi-K3` | `2496450e92e425c886db095102a52a6682ca3970` |
 | `local-inference-lab/GLM-5.3-Flash-NVFP4` | `46aaae8a82032f77100f2f03e9cc11b391df3b4d` |
+| `deepseek-ai/DeepSeek-V4.1-Flash` | `dba1be0a40aa45a94ad051997016db3960a90277` |
+| `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` | `b797d2e1160b9596b2570e56c1d3590faa09d4ed` |
 
 Raw commands, source manifests, samples, tests, and serving logs are retained
 under `/data/trellis-quant/csf-online-performance-20261002` on Frank1. Frank2
