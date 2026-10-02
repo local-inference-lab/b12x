@@ -45,8 +45,9 @@ execution reconstructs the scales required by its selected decoder.
 The buffers must not alias source tensors or each other. Share them only
 between serialized layer executions on one CUDA stream. Independent model
 execution lanes need independent buffers. Preparation allocates, synchronizes
-once to size each compact exception stream, and may compile kernels. Complete
-it before graph capture. Replay does not run the encoder or allocate storage.
+to size each compact exception stream and NVFP4 exception-word index, and may
+compile kernels. Complete it before graph capture. Replay does not run the
+encoder or allocate storage.
 
 Supported arithmetic contracts are MXFP4 with A8 or A16 activations and
 ModelOpt NVFP4 with A4 or A16 activations, with a gated nonlinearity. The
@@ -62,6 +63,12 @@ two-byte interval; NVFP4 uses four-bit offsets within a sixteen-byte interval.
 Exceptions retain their original bytes. Highly dispersed scales can produce
 a representation larger than the input; enabling compression does not
 promise a fixed compression ratio.
+
+CUDA blocks process different experts and row partitions independently. Short
+MXFP4 rows are grouped within a block, and NVFP4 exception indexing stays on
+the GPU. TP ranks prepare their own shards independently. No extra encoder
+thread setting is required. See [preparation measurements](../validation/csf/online-preparation-performance.md)
+for measured Kimi and GLM costs.
 
 See [the validation report](../validation/csf/online-scales.md) for exact
 correctness coverage, encoding cost, and serving limits. B12X consumes tensors

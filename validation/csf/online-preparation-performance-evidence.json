@@ -1,0 +1,3355 @@
+{
+  "schema": "csf-online-preparation-performance/1",
+  "status": {
+    "implementation": "implemented",
+    "correctness": "qualified for listed contracts",
+    "timing": "research-only"
+  },
+  "source": {
+    "b12x_baseline": "c41b25529b2c4153f58aeab81d91bb662f1a3e39",
+    "b12x_implementation": "654f7a6205b0a7d907113094a473d5d8cfc3ba38",
+    "kimi_composition": "0125f956a8a0fe84f1401be27c8dfe2b74b4773c (654f7a62 + merged B12X #441 d887c66f)",
+    "vllm_staging": "d92d1fa6efe8aa77d66da49e5c7d182a5017bd39"
+  },
+  "image_parity": {
+    "source_id": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+    "target_id": "sha256:a853f9275c13eb871747d30d62f44bd12930d0f1f892198460d94527d0763104",
+    "parity": {
+      "Architecture": true,
+      "Os": true,
+      "RootFS": true,
+      "Config": true
+    },
+    "source": {
+      "Architecture": "58d0bd713781c92156db59d1ab2ffb7d7743d4e9b0992195ddc7ec669c6051ad",
+      "Os": "f32af962aa06e4f20ceda568d6493687257ce3aff79853b582d13ee6fbf5171b",
+      "RootFS": "1cfd2e7530a1b713359ede30f64ead78e5ec4c65e614da5ee5938a53f64718f2",
+      "Config": "b1c9ade81b106be20ef924336fed0a51e31ad70da491de8e2de89b3447d77c70"
+    },
+    "target": {
+      "Architecture": "58d0bd713781c92156db59d1ab2ffb7d7743d4e9b0992195ddc7ec669c6051ad",
+      "Os": "f32af962aa06e4f20ceda568d6493687257ce3aff79853b582d13ee6fbf5171b",
+      "RootFS": "1cfd2e7530a1b713359ede30f64ead78e5ec4c65e614da5ee5938a53f64718f2",
+      "Config": "b1c9ade81b106be20ef924336fed0a51e31ad70da491de8e2de89b3447d77c70"
+    }
+  },
+  "components": {
+    "kimi": {
+      "model": "/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970",
+      "geometry": [
+        896,
+        3584,
+        192
+      ],
+      "hardware": "uuid, pstate, clocks.current.memory [MHz], clocks.current.sm [MHz], power.limit [W], clocks_event_reasons.active\nGPU-2faf5385-78f7-dab0-5528-dfaca9cc8eb8, P1, 13365 MHz, 2610 MHz, 600.00 W, 0x0000000000000400\n",
+      "tp": 16,
+      "encoded_planes_exact": true,
+      "samples": [
+        {
+          "cycle": 0,
+          "arm": "baseline",
+          "seconds": 0.004735967027954757
+        },
+        {
+          "cycle": 0,
+          "arm": "grouped",
+          "seconds": 0.0008710459806025028
+        },
+        {
+          "cycle": 0,
+          "arm": "grouped",
+          "seconds": 0.0008365859976038337
+        },
+        {
+          "cycle": 0,
+          "arm": "baseline",
+          "seconds": 0.004025449976325035
+        },
+        {
+          "cycle": 1,
+          "arm": "baseline",
+          "seconds": 0.004012551042251289
+        },
+        {
+          "cycle": 1,
+          "arm": "grouped",
+          "seconds": 0.0008225759956985712
+        },
+        {
+          "cycle": 1,
+          "arm": "grouped",
+          "seconds": 0.0008133660303428769
+        },
+        {
+          "cycle": 1,
+          "arm": "baseline",
+          "seconds": 0.0039888310711830854
+        },
+        {
+          "cycle": 2,
+          "arm": "baseline",
+          "seconds": 0.0040003599133342505
+        },
+        {
+          "cycle": 2,
+          "arm": "grouped",
+          "seconds": 0.0008153369417414069
+        },
+        {
+          "cycle": 2,
+          "arm": "grouped",
+          "seconds": 0.0008051659679040313
+        },
+        {
+          "cycle": 2,
+          "arm": "baseline",
+          "seconds": 0.003994739963673055
+        },
+        {
+          "cycle": 3,
+          "arm": "baseline",
+          "seconds": 0.003992810961790383
+        },
+        {
+          "cycle": 3,
+          "arm": "grouped",
+          "seconds": 0.0008266359800472856
+        },
+        {
+          "cycle": 3,
+          "arm": "grouped",
+          "seconds": 0.0008216359419748187
+        },
+        {
+          "cycle": 3,
+          "arm": "baseline",
+          "seconds": 0.003996100975200534
+        },
+        {
+          "cycle": 4,
+          "arm": "baseline",
+          "seconds": 0.0040159199852496386
+        },
+        {
+          "cycle": 4,
+          "arm": "grouped",
+          "seconds": 0.0008295660372823477
+        },
+        {
+          "cycle": 4,
+          "arm": "grouped",
+          "seconds": 0.0008173260139301419
+        },
+        {
+          "cycle": 4,
+          "arm": "baseline",
+          "seconds": 0.003997911000624299
+        },
+        {
+          "cycle": 5,
+          "arm": "baseline",
+          "seconds": 0.003998570959083736
+        },
+        {
+          "cycle": 5,
+          "arm": "grouped",
+          "seconds": 0.0008263159543275833
+        },
+        {
+          "cycle": 5,
+          "arm": "grouped",
+          "seconds": 0.0008228759979829192
+        },
+        {
+          "cycle": 5,
+          "arm": "baseline",
+          "seconds": 0.003994771046563983
+        },
+        {
+          "cycle": 6,
+          "arm": "baseline",
+          "seconds": 0.004004620015621185
+        },
+        {
+          "cycle": 6,
+          "arm": "grouped",
+          "seconds": 0.0008329759584739804
+        },
+        {
+          "cycle": 6,
+          "arm": "grouped",
+          "seconds": 0.0008228960214182734
+        },
+        {
+          "cycle": 6,
+          "arm": "baseline",
+          "seconds": 0.004007671028375626
+        },
+        {
+          "cycle": 7,
+          "arm": "baseline",
+          "seconds": 0.004000050015747547
+        },
+        {
+          "cycle": 7,
+          "arm": "grouped",
+          "seconds": 0.0008293460123240948
+        },
+        {
+          "cycle": 7,
+          "arm": "grouped",
+          "seconds": 0.0008238869486376643
+        },
+        {
+          "cycle": 7,
+          "arm": "baseline",
+          "seconds": 0.003999730106443167
+        }
+      ],
+      "stream_samples": [
+        {
+          "cycle": 0,
+          "arm": "serial",
+          "seconds": 0.0008777959737926722
+        },
+        {
+          "cycle": 0,
+          "arm": "two_streams",
+          "seconds": 0.0029069959418848157
+        },
+        {
+          "cycle": 1,
+          "arm": "serial",
+          "seconds": 0.0008988849585875869
+        },
+        {
+          "cycle": 1,
+          "arm": "two_streams",
+          "seconds": 0.0010255250381305814
+        },
+        {
+          "cycle": 2,
+          "arm": "serial",
+          "seconds": 0.0008804760873317719
+        },
+        {
+          "cycle": 2,
+          "arm": "two_streams",
+          "seconds": 0.0009629350388422608
+        },
+        {
+          "cycle": 3,
+          "arm": "serial",
+          "seconds": 0.0008795959874987602
+        },
+        {
+          "cycle": 3,
+          "arm": "two_streams",
+          "seconds": 0.0009707050630822778
+        },
+        {
+          "cycle": 4,
+          "arm": "serial",
+          "seconds": 0.0008758860640227795
+        },
+        {
+          "cycle": 4,
+          "arm": "two_streams",
+          "seconds": 0.0009318359661847353
+        },
+        {
+          "cycle": 5,
+          "arm": "serial",
+          "seconds": 0.0008674949640408158
+        },
+        {
+          "cycle": 5,
+          "arm": "two_streams",
+          "seconds": 0.0009473660029470921
+        },
+        {
+          "cycle": 6,
+          "arm": "serial",
+          "seconds": 0.0008777949260547757
+        },
+        {
+          "cycle": 6,
+          "arm": "two_streams",
+          "seconds": 0.0009297559736296535
+        },
+        {
+          "cycle": 7,
+          "arm": "serial",
+          "seconds": 0.0008753059664741158
+        },
+        {
+          "cycle": 7,
+          "arm": "two_streams",
+          "seconds": 0.0009402550058439374
+        }
+      ],
+      "median_warm": {
+        "baseline": 0.003999890061095357,
+        "grouped": 0.0008233914850279689
+      },
+      "stream_median": {
+        "serial": 0.0008768404950387776,
+        "two_streams": 0.0009438105043955147
+      }
+    },
+    "glm": {
+      "model": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4/snapshots/46aaae8a82032f77100f2f03e9cc11b391df3b4d",
+      "geometry": [
+        288,
+        4096,
+        1024
+      ],
+      "tp": 2,
+      "hardware": "uuid, pstate, clocks.current.memory [MHz], clocks.current.sm [MHz], power.limit [W], clocks_event_reasons.active\nGPU-cd323562-fdc3-78c3-012e-86e281433050, P1, 16365 MHz, 180 MHz, 600.00 W, 0x0000000000000400\n",
+      "all_prepared_bytes_exact": true,
+      "samples": [
+        {
+          "cycle": 0,
+          "arm": "cpu_index",
+          "seconds": 0.14068447396857664
+        },
+        {
+          "cycle": 0,
+          "arm": "gpu_index",
+          "seconds": 0.0035669200005941093
+        },
+        {
+          "cycle": 0,
+          "arm": "gpu_index",
+          "seconds": 0.002913834003265947
+        },
+        {
+          "cycle": 0,
+          "arm": "cpu_index",
+          "seconds": 0.13410577102331445
+        },
+        {
+          "cycle": 1,
+          "arm": "cpu_index",
+          "seconds": 0.13529589399695396
+        },
+        {
+          "cycle": 1,
+          "arm": "gpu_index",
+          "seconds": 0.0030404030112549663
+        },
+        {
+          "cycle": 1,
+          "arm": "gpu_index",
+          "seconds": 0.0027654049918055534
+        },
+        {
+          "cycle": 1,
+          "arm": "cpu_index",
+          "seconds": 0.13488155597588047
+        },
+        {
+          "cycle": 2,
+          "arm": "cpu_index",
+          "seconds": 0.1350673249689862
+        },
+        {
+          "cycle": 2,
+          "arm": "gpu_index",
+          "seconds": 0.00302352401195094
+        },
+        {
+          "cycle": 2,
+          "arm": "gpu_index",
+          "seconds": 0.002770874009002
+        },
+        {
+          "cycle": 2,
+          "arm": "cpu_index",
+          "seconds": 0.13454552798066288
+        },
+        {
+          "cycle": 3,
+          "arm": "cpu_index",
+          "seconds": 0.13435437000589445
+        },
+        {
+          "cycle": 3,
+          "arm": "gpu_index",
+          "seconds": 0.0030253740260377526
+        },
+        {
+          "cycle": 3,
+          "arm": "gpu_index",
+          "seconds": 0.002773445041384548
+        },
+        {
+          "cycle": 3,
+          "arm": "cpu_index",
+          "seconds": 0.13410718098748475
+        },
+        {
+          "cycle": 4,
+          "arm": "cpu_index",
+          "seconds": 0.1347330870339647
+        },
+        {
+          "cycle": 4,
+          "arm": "gpu_index",
+          "seconds": 0.0030412430060096085
+        },
+        {
+          "cycle": 4,
+          "arm": "gpu_index",
+          "seconds": 0.002758434973657131
+        },
+        {
+          "cycle": 4,
+          "arm": "cpu_index",
+          "seconds": 0.13460987794678658
+        },
+        {
+          "cycle": 5,
+          "arm": "cpu_index",
+          "seconds": 0.13508259505033493
+        },
+        {
+          "cycle": 5,
+          "arm": "gpu_index",
+          "seconds": 0.0030549030052497983
+        },
+        {
+          "cycle": 5,
+          "arm": "gpu_index",
+          "seconds": 0.0027627749950625002
+        },
+        {
+          "cycle": 5,
+          "arm": "cpu_index",
+          "seconds": 0.13482647604541853
+        },
+        {
+          "cycle": 6,
+          "arm": "cpu_index",
+          "seconds": 0.1349608459859155
+        },
+        {
+          "cycle": 6,
+          "arm": "gpu_index",
+          "seconds": 0.0030369129963219166
+        },
+        {
+          "cycle": 6,
+          "arm": "gpu_index",
+          "seconds": 0.0027571849641390145
+        },
+        {
+          "cycle": 6,
+          "arm": "cpu_index",
+          "seconds": 0.13499393599340692
+        },
+        {
+          "cycle": 7,
+          "arm": "cpu_index",
+          "seconds": 0.13556403201073408
+        },
+        {
+          "cycle": 7,
+          "arm": "gpu_index",
+          "seconds": 0.0030407339800149202
+        },
+        {
+          "cycle": 7,
+          "arm": "gpu_index",
+          "seconds": 0.002766613964922726
+        },
+        {
+          "cycle": 7,
+          "arm": "cpu_index",
+          "seconds": 0.13589202100411057
+        }
+      ],
+      "median_warm": {
+        "cpu_index": 0.134921200980898,
+        "gpu_index": 0.0029686790076084435
+      }
+    },
+    "glm_timing_split_baseline": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4/snapshots/46aaae8a82032f77100f2f03e9cc11b391df3b4d",
+      "tp": 2,
+      "layer": 3,
+      "geometry": [
+        288,
+        4096,
+        1024
+      ],
+      "exact": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "encode_seconds": 1.1293214180041105,
+          "index_seconds": 0.16897489299299195
+        },
+        {
+          "repeat": 1,
+          "encode_seconds": 0.06044369097799063,
+          "index_seconds": 0.16797825798857957
+        },
+        {
+          "repeat": 2,
+          "encode_seconds": 0.002623995009344071,
+          "index_seconds": 0.1715589679661207
+        },
+        {
+          "repeat": 3,
+          "encode_seconds": 0.002594695019070059,
+          "index_seconds": 0.13062345795333385
+        },
+        {
+          "repeat": 4,
+          "encode_seconds": 0.0025957750040106475,
+          "index_seconds": 0.1318172510364093
+        },
+        {
+          "repeat": 5,
+          "encode_seconds": 0.002623295004013926,
+          "index_seconds": 0.13357066101161763
+        }
+      ],
+      "median_warm": {
+        "encode_seconds": 0.0026095350040122867,
+        "index_seconds": 0.13269395602401346
+      }
+    },
+    "glm_timing_split_gpu_index": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4/snapshots/46aaae8a82032f77100f2f03e9cc11b391df3b4d",
+      "tp": 2,
+      "layer": 3,
+      "geometry": [
+        288,
+        4096,
+        1024
+      ],
+      "exact": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "encode_seconds": 0.9974441230297089,
+          "index_seconds": 0.31702292000409216
+        },
+        {
+          "repeat": 1,
+          "encode_seconds": 0.0030504019814543426,
+          "index_seconds": 0.0007333959802053869
+        },
+        {
+          "repeat": 2,
+          "encode_seconds": 0.002399015997070819,
+          "index_seconds": 0.0006563960341736674
+        },
+        {
+          "repeat": 3,
+          "encode_seconds": 0.002393785980530083,
+          "index_seconds": 0.00046356802340596914
+        },
+        {
+          "repeat": 4,
+          "encode_seconds": 0.0023739869939163327,
+          "index_seconds": 0.00045964698074385524
+        },
+        {
+          "repeat": 5,
+          "encode_seconds": 0.0023923260159790516,
+          "index_seconds": 0.00047244696179404855
+        }
+      ],
+      "median_warm": {
+        "encode_seconds": 0.0023930559982545674,
+        "index_seconds": 0.00046800749260000885
+      }
+    }
+  },
+  "correctness": {
+    "component_gpu_tests": 166,
+    "index_memcheck_cases": 24,
+    "index_memcheck_errors": 0,
+    "vllm_staging_ownership_tests": 6,
+    "kimi_fp32_attention_gpu_tests": 4,
+    "kimi_dummy_preflight": {
+      "scope": "five layers, 16 experts, dummy weights; API/warmup only",
+      "healthy": true
+    },
+    "byte_index_cases": [
+      {
+        "shape": [
+          1,
+          128,
+          4
+        ],
+        "distribution": "empty",
+        "prepared_bytes": 1440,
+        "exact": true
+      },
+      {
+        "shape": [
+          1,
+          128,
+          4
+        ],
+        "distribution": "sparse",
+        "prepared_bytes": 1472,
+        "exact": true
+      },
+      {
+        "shape": [
+          1,
+          128,
+          4
+        ],
+        "distribution": "dense",
+        "prepared_bytes": 1440,
+        "exact": true
+      },
+      {
+        "shape": [
+          3,
+          256,
+          20
+        ],
+        "distribution": "empty",
+        "prepared_bytes": 10432,
+        "exact": true
+      },
+      {
+        "shape": [
+          3,
+          256,
+          20
+        ],
+        "distribution": "sparse",
+        "prepared_bytes": 11072,
+        "exact": true
+      },
+      {
+        "shape": [
+          3,
+          256,
+          20
+        ],
+        "distribution": "dense",
+        "prepared_bytes": 13600,
+        "exact": true
+      },
+      {
+        "shape": [
+          4,
+          640,
+          160
+        ],
+        "distribution": "empty",
+        "prepared_bytes": 233984,
+        "exact": true
+      },
+      {
+        "shape": [
+          4,
+          640,
+          160
+        ],
+        "distribution": "sparse",
+        "prepared_bytes": 250880,
+        "exact": true
+      },
+      {
+        "shape": [
+          4,
+          640,
+          160
+        ],
+        "distribution": "dense",
+        "prepared_bytes": 602624,
+        "exact": true
+      },
+      {
+        "shape": [
+          7,
+          1024,
+          256
+        ],
+        "distribution": "empty",
+        "prepared_bytes": 1040384,
+        "exact": true
+      },
+      {
+        "shape": [
+          7,
+          1024,
+          256
+        ],
+        "distribution": "sparse",
+        "prepared_bytes": 1116064,
+        "exact": true
+      },
+      {
+        "shape": [
+          7,
+          1024,
+          256
+        ],
+        "distribution": "dense",
+        "prepared_bytes": 2760704,
+        "exact": true
+      }
+    ],
+    "real_glm_index": {
+      "geometry": [
+        288,
+        4096,
+        1024
+      ],
+      "all_prepared_bytes_exact": true
+    },
+    "glm_full_model_repeatability": [
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 0,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 1,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 2,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 3,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 4,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 5,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 6,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-1",
+          "baseline-2"
+        ],
+        "probe": 7,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 0,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 1,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 2,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 3,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 4,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 5,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 6,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      },
+      {
+        "arms": [
+          "baseline-2",
+          "gpu-index-1"
+        ],
+        "probe": 7,
+        "message_equal": false,
+        "selected_logprobs_equal": false
+      }
+    ]
+  },
+  "glm_serving": {
+    "baseline-1": {
+      "artifact": "glm-native-c1-profile-tp2-online-baseline-1",
+      "preparation": {
+        "0": {
+          "layers": 42,
+          "sum_seconds": 11.62,
+          "first_seconds": 2.146,
+          "median_after_first_seconds": 0.184,
+          "samples_seconds": [
+            2.146,
+            0.19,
+            0.171,
+            0.235,
+            0.763,
+            0.141,
+            0.143,
+            0.301,
+            0.232,
+            0.302,
+            0.299,
+            0.892,
+            0.224,
+            0.139,
+            0.138,
+            0.215,
+            0.136,
+            0.141,
+            0.158,
+            0.184,
+            0.207,
+            0.548,
+            0.265,
+            0.31,
+            0.251,
+            0.184,
+            0.227,
+            0.178,
+            0.258,
+            0.299,
+            0.144,
+            0.138,
+            0.189,
+            0.149,
+            0.137,
+            0.138,
+            0.137,
+            0.141,
+            0.142,
+            0.141,
+            0.141,
+            0.146
+          ]
+        },
+        "1": {
+          "layers": 42,
+          "sum_seconds": 11.704,
+          "first_seconds": 2.148,
+          "median_after_first_seconds": 0.178,
+          "samples_seconds": [
+            2.148,
+            0.199,
+            0.175,
+            0.364,
+            0.519,
+            0.143,
+            0.153,
+            0.309,
+            0.32,
+            0.26,
+            0.595,
+            1.003,
+            0.142,
+            0.14,
+            0.137,
+            0.138,
+            0.181,
+            0.178,
+            0.196,
+            0.313,
+            0.245,
+            0.245,
+            0.203,
+            0.215,
+            0.176,
+            0.253,
+            0.297,
+            0.145,
+            0.139,
+            0.167,
+            0.162,
+            0.137,
+            0.137,
+            0.137,
+            0.149,
+            0.14,
+            0.139,
+            0.139,
+            0.14,
+            0.243,
+            0.207,
+            0.276
+          ]
+        }
+      },
+      "model_load": [
+        [
+          "85.71",
+          "86.059746"
+        ],
+        [
+          "85.71",
+          "86.639937"
+        ]
+      ],
+      "completed_probes": 8,
+      "launch_sha256": "23b2ad8182f621a9d5552976bd22494f4aa7eb38f988615c4edf912fbfe223e1",
+      "source_manifest_sha256": "37989a8061ed8532997e12dde19f0c775355e7af9faa27d41938c427b15d04ab"
+    },
+    "baseline-2": {
+      "artifact": "glm-native-c1-profile-tp2-online-baseline-2",
+      "preparation": {
+        "1": {
+          "layers": 42,
+          "sum_seconds": 8.815,
+          "first_seconds": 0.942,
+          "median_after_first_seconds": 0.143,
+          "samples_seconds": [
+            0.942,
+            0.284,
+            0.255,
+            0.408,
+            0.142,
+            0.142,
+            0.23,
+            0.143,
+            0.139,
+            0.173,
+            0.14,
+            0.258,
+            0.142,
+            0.137,
+            0.137,
+            0.153,
+            0.137,
+            0.206,
+            0.203,
+            0.451,
+            0.217,
+            0.263,
+            0.286,
+            0.215,
+            0.229,
+            0.207,
+            0.286,
+            0.281,
+            0.134,
+            0.135,
+            0.135,
+            0.134,
+            0.134,
+            0.137,
+            0.172,
+            0.19,
+            0.143,
+            0.136,
+            0.136,
+            0.141,
+            0.139,
+            0.143
+          ]
+        },
+        "0": {
+          "layers": 42,
+          "sum_seconds": 8.737,
+          "first_seconds": 0.982,
+          "median_after_first_seconds": 0.148,
+          "samples_seconds": [
+            0.982,
+            0.303,
+            0.256,
+            0.381,
+            0.141,
+            0.141,
+            0.23,
+            0.148,
+            0.142,
+            0.172,
+            0.14,
+            0.255,
+            0.142,
+            0.138,
+            0.138,
+            0.148,
+            0.137,
+            0.216,
+            0.201,
+            0.397,
+            0.223,
+            0.184,
+            0.216,
+            0.242,
+            0.213,
+            0.207,
+            0.214,
+            0.214,
+            0.346,
+            0.138,
+            0.134,
+            0.134,
+            0.134,
+            0.135,
+            0.135,
+            0.152,
+            0.212,
+            0.136,
+            0.137,
+            0.137,
+            0.139,
+            0.147
+          ]
+        }
+      },
+      "model_load": [
+        [
+          "85.71",
+          "34.645344"
+        ],
+        [
+          "85.71",
+          "34.806838"
+        ]
+      ],
+      "completed_probes": 8,
+      "launch_sha256": "ba68acd0efabbdf38dffc5ff4c91fb4185e8b80d0d9f14424907dbfd9dc20aa1",
+      "source_manifest_sha256": "37989a8061ed8532997e12dde19f0c775355e7af9faa27d41938c427b15d04ab"
+    },
+    "gpu-index-1": {
+      "artifact": "glm-native-c1-profile-tp2-online-gpu-index-1",
+      "preparation": {
+        "0": {
+          "layers": 42,
+          "sum_seconds": 2.382,
+          "first_seconds": 1.832,
+          "median_after_first_seconds": 0.009,
+          "samples_seconds": [
+            1.832,
+            0.034,
+            0.012,
+            0.012,
+            0.012,
+            0.012,
+            0.012,
+            0.012,
+            0.011,
+            0.011,
+            0.011,
+            0.124,
+            0.01,
+            0.009,
+            0.009,
+            0.01,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.01,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.023,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009
+          ]
+        },
+        "1": {
+          "layers": 42,
+          "sum_seconds": 2.4,
+          "first_seconds": 1.862,
+          "median_after_first_seconds": 0.009,
+          "samples_seconds": [
+            1.862,
+            0.023,
+            0.012,
+            0.012,
+            0.012,
+            0.012,
+            0.011,
+            0.012,
+            0.012,
+            0.011,
+            0.011,
+            0.122,
+            0.009,
+            0.009,
+            0.009,
+            0.01,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.023,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.012,
+            0.009,
+            0.009,
+            0.009,
+            0.009,
+            0.009
+          ]
+        }
+      },
+      "model_load": [
+        [
+          "85.71",
+          "26.924750"
+        ],
+        [
+          "85.71",
+          "27.347335"
+        ]
+      ],
+      "completed_probes": 8,
+      "launch_sha256": "4a2aa74407c0516d3d031b94fd7cd797b69e0815e4786a4453f6431e25c2550f",
+      "source_manifest_sha256": "9fb91248f9d3e8f52c6749e9b05c674c1e093f92d0356ea9c12d084ab0f63a07"
+    }
+  },
+  "limits": [
+    "NVML event mask 0x400; no locked SM clocks or clean-clock release performance qualification.",
+    "No full-model KLD or full-vocabulary logits oracle. Unchanged GLM controls are not bitwise reproducible across launches.",
+    "Layer startup timings include first-use compilation. Whole-model I/O and compiler caches differ.",
+    "Two additional Python threads/CUDA streams did not improve Kimi preparation."
+  ],
+  "kimi_serving": {
+    "receipt": {
+      "schema": "csf-native-generation-validation/1",
+      "generation_passed": true,
+      "scope": "Native Kimi MXFP4 online CSF startup and bounded generation requests; no full-model quality parity claim",
+      "requests": 8,
+      "finite_token_logprobs": true,
+      "completion_tokens": [
+        85,
+        128,
+        128,
+        128,
+        85,
+        128,
+        128,
+        128
+      ],
+      "prefill_usage": {
+        "prompt_tokens": 10401,
+        "total_tokens": 10465,
+        "completion_tokens": 64,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": null
+      },
+      "ranks": 16,
+      "compressed_moe_layers_per_rank": 92,
+      "server_log_sha256": "cfc26cf1fd841285fbf5f6646c8a3c6ef17649c43fca5374212b8e709751b160"
+    },
+    "preparation": {
+      "13": {
+        "layers": 92,
+        "sum_seconds": 4.538,
+        "first_seconds": 1.96,
+        "median_after_first_seconds": 0.006,
+        "samples_seconds": [
+          1.96,
+          0.003,
+          0.004,
+          0.007,
+          0.006,
+          0.003,
+          0.002,
+          0.004,
+          0.002,
+          0.004,
+          0.004,
+          0.01,
+          0.01,
+          0.003,
+          0.005,
+          0.009,
+          0.002,
+          0.007,
+          0.004,
+          0.004,
+          0.011,
+          0.007,
+          0.007,
+          0.002,
+          0.01,
+          0.012,
+          0.003,
+          0.008,
+          0.006,
+          0.005,
+          0.011,
+          0.008,
+          0.002,
+          0.01,
+          0.013,
+          0.004,
+          0.006,
+          0.012,
+          0.002,
+          0.009,
+          0.007,
+          0.002,
+          0.006,
+          0.002,
+          0.007,
+          0.002,
+          0.003,
+          0.006,
+          0.002,
+          0.008,
+          0.006,
+          0.002,
+          0.008,
+          0.004,
+          0.007,
+          0.002,
+          0.004,
+          0.005,
+          0.003,
+          0.005,
+          0.003,
+          0.007,
+          0.007,
+          0.002,
+          0.008,
+          0.002,
+          0.007,
+          0.006,
+          0.003,
+          0.523,
+          0.391,
+          0.359,
+          0.412,
+          0.16,
+          0.202,
+          0.05,
+          0.01,
+          0.01,
+          0.003,
+          0.007,
+          0.004,
+          0.006,
+          0.007,
+          0.002,
+          0.005,
+          0.011,
+          0.008,
+          0.002,
+          0.008,
+          0.01,
+          0.003,
+          0.008
+        ]
+      },
+      "2": {
+        "layers": 92,
+        "sum_seconds": 4.555,
+        "first_seconds": 1.961,
+        "median_after_first_seconds": 0.006,
+        "samples_seconds": [
+          1.961,
+          0.003,
+          0.003,
+          0.007,
+          0.005,
+          0.004,
+          0.003,
+          0.003,
+          0.003,
+          0.003,
+          0.01,
+          0.002,
+          0.007,
+          0.01,
+          0.002,
+          0.006,
+          0.007,
+          0.004,
+          0.008,
+          0.011,
+          0.005,
+          0.006,
+          0.003,
+          0.014,
+          0.011,
+          0.006,
+          0.003,
+          0.01,
+          0.007,
+          0.004,
+          0.008,
+          0.012,
+          0.002,
+          0.008,
+          0.01,
+          0.002,
+          0.01,
+          0.009,
+          0.003,
+          0.01,
+          0.006,
+          0.002,
+          0.005,
+          0.005,
+          0.002,
+          0.003,
+          0.008,
+          0.002,
+          0.006,
+          0.002,
+          0.007,
+          0.004,
+          0.002,
+          0.006,
+          0.002,
+          0.002,
+          0.004,
+          0.003,
+          0.012,
+          0.002,
+          0.007,
+          0.009,
+          0.002,
+          0.008,
+          0.008,
+          0.468,
+          0.337,
+          0.428,
+          0.384,
+          0.139,
+          0.201,
+          0.144,
+          0.01,
+          0.007,
+          0.002,
+          0.003,
+          0.005,
+          0.009,
+          0.002,
+          0.006,
+          0.007,
+          0.003,
+          0.009,
+          0.003,
+          0.008,
+          0.011,
+          0.004,
+          0.006,
+          0.004,
+          0.006,
+          0.01,
+          0.015
+        ]
+      },
+      "8": {
+        "layers": 92,
+        "sum_seconds": 4.652,
+        "first_seconds": 1.962,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.962,
+          0.003,
+          0.007,
+          0.005,
+          0.003,
+          0.003,
+          0.006,
+          0.003,
+          0.006,
+          0.003,
+          0.008,
+          0.01,
+          0.007,
+          0.003,
+          0.01,
+          0.004,
+          0.004,
+          0.01,
+          0.013,
+          0.007,
+          0.003,
+          0.011,
+          0.011,
+          0.006,
+          0.006,
+          0.003,
+          0.009,
+          0.011,
+          0.011,
+          0.013,
+          0.008,
+          0.009,
+          0.003,
+          0.012,
+          0.008,
+          0.003,
+          0.01,
+          0.007,
+          0.007,
+          0.005,
+          0.004,
+          0.006,
+          0.004,
+          0.005,
+          0.009,
+          0.003,
+          0.006,
+          0.008,
+          0.004,
+          0.002,
+          0.005,
+          0.003,
+          0.004,
+          0.011,
+          0.002,
+          0.008,
+          0.01,
+          0.009,
+          0.002,
+          0.007,
+          0.416,
+          0.455,
+          0.426,
+          0.41,
+          0.138,
+          0.252,
+          0.004,
+          0.009,
+          0.009,
+          0.004,
+          0.006,
+          0.01,
+          0.006,
+          0.004,
+          0.008,
+          0.007,
+          0.003,
+          0.01,
+          0.01,
+          0.011,
+          0.002,
+          0.012,
+          0.011,
+          0.012,
+          0.005,
+          0.007,
+          0.012,
+          0.009,
+          0.011,
+          0.009,
+          0.009,
+          0.01
+        ]
+      },
+      "9": {
+        "layers": 92,
+        "sum_seconds": 5.338,
+        "first_seconds": 2.679,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          2.679,
+          0.003,
+          0.006,
+          0.005,
+          0.003,
+          0.003,
+          0.005,
+          0.003,
+          0.003,
+          0.003,
+          0.008,
+          0.009,
+          0.008,
+          0.004,
+          0.009,
+          0.007,
+          0.003,
+          0.009,
+          0.011,
+          0.006,
+          0.005,
+          0.013,
+          0.01,
+          0.003,
+          0.009,
+          0.006,
+          0.004,
+          0.008,
+          0.003,
+          0.008,
+          0.01,
+          0.013,
+          0.01,
+          0.003,
+          0.008,
+          0.009,
+          0.003,
+          0.009,
+          0.004,
+          0.003,
+          0.008,
+          0.005,
+          0.004,
+          0.003,
+          0.009,
+          0.008,
+          0.003,
+          0.008,
+          0.003,
+          0.003,
+          0.006,
+          0.003,
+          0.003,
+          0.008,
+          0.002,
+          0.01,
+          0.01,
+          0.012,
+          0.004,
+          0.004,
+          0.011,
+          0.332,
+          0.448,
+          0.449,
+          0.455,
+          0.207,
+          0.206,
+          0.005,
+          0.007,
+          0.009,
+          0.011,
+          0.002,
+          0.008,
+          0.008,
+          0.003,
+          0.005,
+          0.011,
+          0.002,
+          0.007,
+          0.008,
+          0.003,
+          0.009,
+          0.012,
+          0.002,
+          0.007,
+          0.014,
+          0.007,
+          0.011,
+          0.012,
+          0.007,
+          0.008,
+          0.008
+        ]
+      },
+      "12": {
+        "layers": 92,
+        "sum_seconds": 4.542,
+        "first_seconds": 1.965,
+        "median_after_first_seconds": 0.006,
+        "samples_seconds": [
+          1.965,
+          0.003,
+          0.007,
+          0.005,
+          0.002,
+          0.002,
+          0.004,
+          0.003,
+          0.003,
+          0.002,
+          0.009,
+          0.003,
+          0.007,
+          0.011,
+          0.008,
+          0.002,
+          0.007,
+          0.004,
+          0.006,
+          0.002,
+          0.007,
+          0.005,
+          0.005,
+          0.009,
+          0.007,
+          0.01,
+          0.003,
+          0.006,
+          0.006,
+          0.003,
+          0.01,
+          0.006,
+          0.003,
+          0.01,
+          0.002,
+          0.008,
+          0.003,
+          0.007,
+          0.01,
+          0.003,
+          0.008,
+          0.003,
+          0.006,
+          0.005,
+          0.002,
+          0.007,
+          0.002,
+          0.004,
+          0.007,
+          0.002,
+          0.006,
+          0.006,
+          0.002,
+          0.007,
+          0.004,
+          0.008,
+          0.002,
+          0.004,
+          0.003,
+          0.003,
+          0.006,
+          0.002,
+          0.01,
+          0.002,
+          0.007,
+          0.01,
+          0.011,
+          0.004,
+          0.005,
+          0.195,
+          0.457,
+          0.451,
+          0.512,
+          0.162,
+          0.18,
+          0.142,
+          0.01,
+          0.01,
+          0.002,
+          0.009,
+          0.007,
+          0.002,
+          0.01,
+          0.006,
+          0.004,
+          0.01,
+          0.004,
+          0.009,
+          0.01,
+          0.011,
+          0.003,
+          0.01
+        ]
+      },
+      "0": {
+        "layers": 92,
+        "sum_seconds": 4.657,
+        "first_seconds": 2.029,
+        "median_after_first_seconds": 0.006,
+        "samples_seconds": [
+          2.029,
+          0.003,
+          0.007,
+          0.006,
+          0.004,
+          0.004,
+          0.006,
+          0.006,
+          0.004,
+          0.009,
+          0.011,
+          0.01,
+          0.002,
+          0.01,
+          0.006,
+          0.003,
+          0.006,
+          0.003,
+          0.011,
+          0.006,
+          0.002,
+          0.013,
+          0.009,
+          0.003,
+          0.009,
+          0.002,
+          0.008,
+          0.011,
+          0.009,
+          0.002,
+          0.011,
+          0.008,
+          0.002,
+          0.011,
+          0.002,
+          0.007,
+          0.005,
+          0.006,
+          0.009,
+          0.003,
+          0.003,
+          0.006,
+          0.004,
+          0.002,
+          0.004,
+          0.002,
+          0.007,
+          0.003,
+          0.005,
+          0.006,
+          0.004,
+          0.006,
+          0.002,
+          0.005,
+          0.004,
+          0.002,
+          0.007,
+          0.006,
+          0.005,
+          0.009,
+          0.002,
+          0.01,
+          0.011,
+          0.007,
+          0.003,
+          0.523,
+          0.345,
+          0.592,
+          0.297,
+          0.317,
+          0.027,
+          0.012,
+          0.008,
+          0.003,
+          0.012,
+          0.009,
+          0.003,
+          0.006,
+          0.008,
+          0.004,
+          0.005,
+          0.011,
+          0.01,
+          0.003,
+          0.01,
+          0.01,
+          0.003,
+          0.008,
+          0.004,
+          0.01,
+          0.007,
+          0.007
+        ]
+      },
+      "7": {
+        "layers": 92,
+        "sum_seconds": 4.689,
+        "first_seconds": 2.091,
+        "median_after_first_seconds": 0.006,
+        "samples_seconds": [
+          2.091,
+          0.003,
+          0.009,
+          0.005,
+          0.004,
+          0.003,
+          0.003,
+          0.003,
+          0.005,
+          0.006,
+          0.003,
+          0.009,
+          0.002,
+          0.007,
+          0.009,
+          0.003,
+          0.006,
+          0.007,
+          0.002,
+          0.011,
+          0.005,
+          0.006,
+          0.009,
+          0.006,
+          0.01,
+          0.005,
+          0.004,
+          0.008,
+          0.002,
+          0.009,
+          0.005,
+          0.002,
+          0.009,
+          0.009,
+          0.002,
+          0.009,
+          0.002,
+          0.008,
+          0.007,
+          0.003,
+          0.009,
+          0.005,
+          0.002,
+          0.006,
+          0.005,
+          0.003,
+          0.003,
+          0.008,
+          0.002,
+          0.007,
+          0.002,
+          0.006,
+          0.006,
+          0.002,
+          0.004,
+          0.003,
+          0.002,
+          0.005,
+          0.003,
+          0.009,
+          0.002,
+          0.009,
+          0.012,
+          0.008,
+          0.003,
+          0.007,
+          0.306,
+          0.452,
+          0.428,
+          0.521,
+          0.117,
+          0.276,
+          0.008,
+          0.004,
+          0.011,
+          0.007,
+          0.002,
+          0.009,
+          0.002,
+          0.007,
+          0.008,
+          0.006,
+          0.004,
+          0.01,
+          0.012,
+          0.006,
+          0.005,
+          0.01,
+          0.002,
+          0.009,
+          0.014,
+          0.009
+        ]
+      },
+      "14": {
+        "layers": 92,
+        "sum_seconds": 4.514,
+        "first_seconds": 1.888,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.888,
+          0.003,
+          0.007,
+          0.006,
+          0.003,
+          0.003,
+          0.004,
+          0.003,
+          0.005,
+          0.004,
+          0.009,
+          0.007,
+          0.003,
+          0.009,
+          0.004,
+          0.005,
+          0.006,
+          0.004,
+          0.008,
+          0.007,
+          0.005,
+          0.009,
+          0.002,
+          0.009,
+          0.013,
+          0.002,
+          0.006,
+          0.002,
+          0.009,
+          0.01,
+          0.009,
+          0.002,
+          0.009,
+          0.011,
+          0.012,
+          0.003,
+          0.008,
+          0.007,
+          0.003,
+          0.011,
+          0.003,
+          0.003,
+          0.01,
+          0.006,
+          0.004,
+          0.003,
+          0.007,
+          0.004,
+          0.007,
+          0.011,
+          0.004,
+          0.004,
+          0.005,
+          0.003,
+          0.003,
+          0.005,
+          0.005,
+          0.011,
+          0.01,
+          0.01,
+          0.003,
+          0.007,
+          0.01,
+          0.332,
+          0.32,
+          0.426,
+          0.212,
+          0.41,
+          0.162,
+          0.228,
+          0.003,
+          0.009,
+          0.011,
+          0.01,
+          0.002,
+          0.008,
+          0.005,
+          0.004,
+          0.009,
+          0.003,
+          0.007,
+          0.009,
+          0.002,
+          0.007,
+          0.011,
+          0.003,
+          0.007,
+          0.01,
+          0.012,
+          0.005,
+          0.01,
+          0.009
+        ]
+      },
+      "1": {
+        "layers": 92,
+        "sum_seconds": 4.539,
+        "first_seconds": 1.832,
+        "median_after_first_seconds": 0.008,
+        "samples_seconds": [
+          1.832,
+          0.009,
+          0.007,
+          0.003,
+          0.004,
+          0.004,
+          0.004,
+          0.006,
+          0.008,
+          0.003,
+          0.01,
+          0.01,
+          0.011,
+          0.003,
+          0.006,
+          0.007,
+          0.004,
+          0.012,
+          0.01,
+          0.005,
+          0.008,
+          0.013,
+          0.006,
+          0.004,
+          0.01,
+          0.012,
+          0.009,
+          0.007,
+          0.005,
+          0.011,
+          0.01,
+          0.009,
+          0.003,
+          0.01,
+          0.011,
+          0.007,
+          0.009,
+          0.003,
+          0.004,
+          0.007,
+          0.006,
+          0.004,
+          0.008,
+          0.009,
+          0.004,
+          0.003,
+          0.005,
+          0.003,
+          0.004,
+          0.009,
+          0.003,
+          0.007,
+          0.009,
+          0.002,
+          0.008,
+          0.011,
+          0.011,
+          0.569,
+          0.427,
+          0.406,
+          0.284,
+          0.21,
+          0.205,
+          0.006,
+          0.006,
+          0.01,
+          0.008,
+          0.002,
+          0.008,
+          0.003,
+          0.007,
+          0.008,
+          0.003,
+          0.008,
+          0.011,
+          0.008,
+          0.002,
+          0.01,
+          0.003,
+          0.009,
+          0.006,
+          0.005,
+          0.012,
+          0.008,
+          0.007,
+          0.007,
+          0.012,
+          0.009,
+          0.01,
+          0.008,
+          0.011,
+          0.009
+        ]
+      },
+      "5": {
+        "layers": 92,
+        "sum_seconds": 4.601,
+        "first_seconds": 1.973,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.973,
+          0.008,
+          0.006,
+          0.003,
+          0.003,
+          0.004,
+          0.004,
+          0.005,
+          0.002,
+          0.006,
+          0.009,
+          0.002,
+          0.007,
+          0.01,
+          0.003,
+          0.005,
+          0.007,
+          0.004,
+          0.011,
+          0.007,
+          0.002,
+          0.013,
+          0.011,
+          0.003,
+          0.008,
+          0.011,
+          0.003,
+          0.007,
+          0.009,
+          0.01,
+          0.002,
+          0.009,
+          0.012,
+          0.006,
+          0.003,
+          0.008,
+          0.003,
+          0.007,
+          0.003,
+          0.004,
+          0.006,
+          0.004,
+          0.003,
+          0.007,
+          0.002,
+          0.006,
+          0.008,
+          0.002,
+          0.007,
+          0.002,
+          0.004,
+          0.003,
+          0.002,
+          0.004,
+          0.003,
+          0.008,
+          0.002,
+          0.009,
+          0.007,
+          0.002,
+          0.01,
+          0.008,
+          0.002,
+          0.008,
+          0.002,
+          0.462,
+          0.404,
+          0.591,
+          0.295,
+          0.201,
+          0.141,
+          0.009,
+          0.004,
+          0.008,
+          0.012,
+          0.009,
+          0.003,
+          0.006,
+          0.009,
+          0.009,
+          0.003,
+          0.01,
+          0.007,
+          0.003,
+          0.013,
+          0.012,
+          0.006,
+          0.005,
+          0.012,
+          0.008,
+          0.013,
+          0.012
+        ]
+      },
+      "11": {
+        "layers": 92,
+        "sum_seconds": 4.467,
+        "first_seconds": 1.836,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.836,
+          0.007,
+          0.006,
+          0.003,
+          0.004,
+          0.004,
+          0.004,
+          0.003,
+          0.005,
+          0.007,
+          0.003,
+          0.011,
+          0.009,
+          0.008,
+          0.002,
+          0.008,
+          0.002,
+          0.009,
+          0.011,
+          0.004,
+          0.008,
+          0.013,
+          0.011,
+          0.003,
+          0.009,
+          0.002,
+          0.007,
+          0.009,
+          0.002,
+          0.009,
+          0.01,
+          0.009,
+          0.002,
+          0.009,
+          0.009,
+          0.002,
+          0.009,
+          0.002,
+          0.007,
+          0.006,
+          0.002,
+          0.007,
+          0.005,
+          0.003,
+          0.003,
+          0.006,
+          0.003,
+          0.008,
+          0.002,
+          0.007,
+          0.007,
+          0.002,
+          0.003,
+          0.003,
+          0.003,
+          0.006,
+          0.002,
+          0.008,
+          0.002,
+          0.008,
+          0.007,
+          0.002,
+          0.009,
+          0.004,
+          0.006,
+          0.281,
+          0.477,
+          0.515,
+          0.41,
+          0.208,
+          0.207,
+          0.009,
+          0.002,
+          0.009,
+          0.01,
+          0.004,
+          0.006,
+          0.01,
+          0.009,
+          0.004,
+          0.007,
+          0.009,
+          0.003,
+          0.007,
+          0.012,
+          0.01,
+          0.002,
+          0.008,
+          0.016,
+          0.011,
+          0.01,
+          0.009
+        ]
+      },
+      "4": {
+        "layers": 92,
+        "sum_seconds": 4.554,
+        "first_seconds": 1.896,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.896,
+          0.008,
+          0.007,
+          0.005,
+          0.004,
+          0.003,
+          0.003,
+          0.004,
+          0.008,
+          0.003,
+          0.01,
+          0.01,
+          0.003,
+          0.006,
+          0.01,
+          0.004,
+          0.004,
+          0.01,
+          0.007,
+          0.01,
+          0.007,
+          0.009,
+          0.01,
+          0.004,
+          0.006,
+          0.008,
+          0.002,
+          0.011,
+          0.01,
+          0.002,
+          0.008,
+          0.009,
+          0.002,
+          0.011,
+          0.004,
+          0.005,
+          0.003,
+          0.007,
+          0.009,
+          0.003,
+          0.004,
+          0.008,
+          0.002,
+          0.003,
+          0.008,
+          0.002,
+          0.006,
+          0.007,
+          0.002,
+          0.009,
+          0.002,
+          0.005,
+          0.003,
+          0.005,
+          0.005,
+          0.003,
+          0.005,
+          0.01,
+          0.002,
+          0.009,
+          0.002,
+          0.008,
+          0.008,
+          0.004,
+          0.006,
+          0.465,
+          0.45,
+          0.358,
+          0.506,
+          0.115,
+          0.206,
+          0.011,
+          0.003,
+          0.008,
+          0.011,
+          0.005,
+          0.005,
+          0.008,
+          0.009,
+          0.003,
+          0.011,
+          0.011,
+          0.01,
+          0.003,
+          0.01,
+          0.013,
+          0.01,
+          0.014,
+          0.005,
+          0.01,
+          0.008,
+          0.013
+        ]
+      },
+      "15": {
+        "layers": 92,
+        "sum_seconds": 4.477,
+        "first_seconds": 1.84,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.84,
+          0.007,
+          0.006,
+          0.005,
+          0.004,
+          0.003,
+          0.005,
+          0.002,
+          0.008,
+          0.003,
+          0.008,
+          0.01,
+          0.009,
+          0.002,
+          0.007,
+          0.01,
+          0.002,
+          0.011,
+          0.008,
+          0.002,
+          0.012,
+          0.01,
+          0.003,
+          0.008,
+          0.009,
+          0.002,
+          0.008,
+          0.01,
+          0.011,
+          0.01,
+          0.002,
+          0.008,
+          0.01,
+          0.002,
+          0.009,
+          0.003,
+          0.006,
+          0.005,
+          0.002,
+          0.008,
+          0.002,
+          0.002,
+          0.006,
+          0.007,
+          0.003,
+          0.006,
+          0.002,
+          0.008,
+          0.008,
+          0.002,
+          0.004,
+          0.005,
+          0.005,
+          0.004,
+          0.008,
+          0.002,
+          0.009,
+          0.01,
+          0.009,
+          0.004,
+          0.006,
+          0.567,
+          0.516,
+          0.378,
+          0.267,
+          0.164,
+          0.205,
+          0.003,
+          0.008,
+          0.01,
+          0.002,
+          0.007,
+          0.01,
+          0.003,
+          0.006,
+          0.008,
+          0.003,
+          0.006,
+          0.009,
+          0.003,
+          0.006,
+          0.012,
+          0.012,
+          0.007,
+          0.005,
+          0.008,
+          0.005,
+          0.009,
+          0.01,
+          0.011,
+          0.007,
+          0.008
+        ]
+      },
+      "6": {
+        "layers": 92,
+        "sum_seconds": 4.6610000000000005,
+        "first_seconds": 1.981,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.981,
+          0.006,
+          0.005,
+          0.004,
+          0.004,
+          0.003,
+          0.005,
+          0.004,
+          0.009,
+          0.007,
+          0.003,
+          0.01,
+          0.009,
+          0.002,
+          0.006,
+          0.008,
+          0.002,
+          0.012,
+          0.008,
+          0.002,
+          0.01,
+          0.012,
+          0.002,
+          0.007,
+          0.009,
+          0.002,
+          0.009,
+          0.01,
+          0.009,
+          0.003,
+          0.011,
+          0.011,
+          0.002,
+          0.009,
+          0.004,
+          0.007,
+          0.01,
+          0.003,
+          0.004,
+          0.008,
+          0.003,
+          0.004,
+          0.006,
+          0.002,
+          0.008,
+          0.003,
+          0.007,
+          0.006,
+          0.005,
+          0.007,
+          0.003,
+          0.004,
+          0.004,
+          0.004,
+          0.004,
+          0.01,
+          0.002,
+          0.008,
+          0.009,
+          0.002,
+          0.008,
+          0.012,
+          0.569,
+          0.302,
+          0.529,
+          0.357,
+          0.201,
+          0.142,
+          0.01,
+          0.003,
+          0.008,
+          0.01,
+          0.006,
+          0.004,
+          0.009,
+          0.007,
+          0.003,
+          0.011,
+          0.009,
+          0.002,
+          0.009,
+          0.013,
+          0.013,
+          0.012,
+          0.014,
+          0.009,
+          0.007,
+          0.007,
+          0.011,
+          0.012,
+          0.013,
+          0.006
+        ]
+      },
+      "10": {
+        "layers": 92,
+        "sum_seconds": 4.516,
+        "first_seconds": 1.844,
+        "median_after_first_seconds": 0.007,
+        "samples_seconds": [
+          1.844,
+          0.005,
+          0.006,
+          0.004,
+          0.005,
+          0.003,
+          0.004,
+          0.003,
+          0.008,
+          0.008,
+          0.003,
+          0.006,
+          0.007,
+          0.002,
+          0.006,
+          0.007,
+          0.002,
+          0.013,
+          0.006,
+          0.004,
+          0.011,
+          0.008,
+          0.006,
+          0.006,
+          0.003,
+          0.009,
+          0.009,
+          0.002,
+          0.01,
+          0.012,
+          0.011,
+          0.009,
+          0.002,
+          0.01,
+          0.003,
+          0.007,
+          0.009,
+          0.003,
+          0.006,
+          0.004,
+          0.004,
+          0.006,
+          0.004,
+          0.003,
+          0.008,
+          0.004,
+          0.005,
+          0.008,
+          0.003,
+          0.006,
+          0.005,
+          0.003,
+          0.003,
+          0.006,
+          0.004,
+          0.011,
+          0.01,
+          0.011,
+          0.009,
+          0.003,
+          0.009,
+          0.464,
+          0.449,
+          0.381,
+          0.531,
+          0.226,
+          0.051,
+          0.011,
+          0.01,
+          0.003,
+          0.008,
+          0.011,
+          0.006,
+          0.004,
+          0.008,
+          0.01,
+          0.003,
+          0.008,
+          0.009,
+          0.003,
+          0.008,
+          0.013,
+          0.006,
+          0.005,
+          0.011,
+          0.01,
+          0.007,
+          0.006,
+          0.009,
+          0.013,
+          0.01,
+          0.011
+        ]
+      },
+      "3": {
+        "layers": 92,
+        "sum_seconds": 4.351,
+        "first_seconds": 1.766,
+        "median_after_first_seconds": 0.006,
+        "samples_seconds": [
+          1.766,
+          0.003,
+          0.006,
+          0.003,
+          0.002,
+          0.003,
+          0.004,
+          0.003,
+          0.009,
+          0.002,
+          0.007,
+          0.01,
+          0.002,
+          0.007,
+          0.009,
+          0.002,
+          0.006,
+          0.007,
+          0.007,
+          0.007,
+          0.002,
+          0.011,
+          0.006,
+          0.01,
+          0.004,
+          0.004,
+          0.01,
+          0.011,
+          0.003,
+          0.007,
+          0.011,
+          0.012,
+          0.002,
+          0.009,
+          0.009,
+          0.002,
+          0.007,
+          0.002,
+          0.008,
+          0.002,
+          0.003,
+          0.006,
+          0.003,
+          0.003,
+          0.003,
+          0.003,
+          0.011,
+          0.003,
+          0.005,
+          0.002,
+          0.007,
+          0.005,
+          0.002,
+          0.004,
+          0.002,
+          0.004,
+          0.003,
+          0.007,
+          0.009,
+          0.002,
+          0.009,
+          0.005,
+          0.005,
+          0.01,
+          0.01,
+          0.31,
+          0.344,
+          0.426,
+          0.236,
+          0.366,
+          0.137,
+          0.275,
+          0.004,
+          0.008,
+          0.01,
+          0.007,
+          0.003,
+          0.01,
+          0.002,
+          0.007,
+          0.007,
+          0.003,
+          0.008,
+          0.009,
+          0.003,
+          0.006,
+          0.011,
+          0.002,
+          0.01,
+          0.009,
+          0.011,
+          0.004
+        ]
+      }
+    },
+    "model_load": [
+      [
+        "86.23",
+        "1117.606754"
+      ],
+      [
+        "86.23",
+        "1117.646913"
+      ],
+      [
+        "86.23",
+        "1117.664862"
+      ],
+      [
+        "86.23",
+        "1117.684828"
+      ],
+      [
+        "86.23",
+        "1117.663715"
+      ],
+      [
+        "86.23",
+        "1117.699045"
+      ],
+      [
+        "86.23",
+        "1117.737150"
+      ],
+      [
+        "86.23",
+        "1117.674097"
+      ],
+      [
+        "86.23",
+        "1117.680995"
+      ],
+      [
+        "86.23",
+        "1117.663417"
+      ],
+      [
+        "86.23",
+        "1117.703670"
+      ],
+      [
+        "86.23",
+        "1117.760339"
+      ],
+      [
+        "86.23",
+        "1117.727924"
+      ],
+      [
+        "86.23",
+        "1117.751536"
+      ],
+      [
+        "86.23",
+        "1117.759723"
+      ],
+      [
+        "86.23",
+        "1117.791434"
+      ]
+    ],
+    "completed_probes": 8,
+    "prefill_usage": {
+      "prompt_tokens": 10401,
+      "total_tokens": 10465,
+      "completion_tokens": 64,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": null
+    }
+  },
+  "raw_receipts": {
+    "root": "/data/trellis-quant/csf-online-performance-20261002",
+    "files": {
+      "gpu-index-memcheck-launch.json": {
+        "bytes": 562,
+        "sha256": "05350750d8647b6a8f483130c68962931f7c02b75a67dfe6ded1c002ca5903c9"
+      },
+      "kimi-reproducible-probe.log": {
+        "bytes": 421,
+        "sha256": "ee489d01ed62388e53bdacd7b5e04e4b46354593a03615fab0627dd6c30ff538"
+      },
+      "kimi-source-manifest-2.json": {
+        "bytes": 360146,
+        "sha256": "7e79b289d2f5c6b10e2d24355e02b396034e3713564db7c1b3e34f757a4f074c"
+      },
+      "kimi-2-online-server.log": {
+        "bytes": 468641,
+        "sha256": "0fc81ffb5e23e1ffa2088f9ee26e9316951de5d74f50cf6c869926146b65ca45"
+      },
+      "glm-encoder-balanced.json": {
+        "bytes": 3615,
+        "sha256": "c030127b211318f129c09fe0eb6ca16f621d0bc5d4092a51788fb3d0d0ff3c56"
+      },
+      "encoder-component-tests.log": {
+        "bytes": 272,
+        "sha256": "3a8d848d339ea4f930499d55b80f99a480d77b307e837fc377ff6a92bd2cee4a"
+      },
+      "kimi-3-online-prefill.json": {
+        "bytes": 71751,
+        "sha256": "65210cb5429723ea0c9a7875155b55547ecc36b6c22b5137ea9bdb3a2f07998b"
+      },
+      "kimi-online-wrapper-2.log": {
+        "bytes": 6904,
+        "sha256": "8bc373421ea64cb33692357ede10de192b287e4125d55eb111497b208ab72a2b"
+      },
+      "frank2-image-transfer.log": {
+        "bytes": 89,
+        "sha256": "8430627b0be125ef6f9be5edd3ea2d3d344bd9c9d1393fe4eaa1f1e21da048bb"
+      },
+      "vllm-staging-tests.log": {
+        "bytes": 1172,
+        "sha256": "8956f72e505c375b9356bbc501c462a8d91f6499e9249e7cfcdfb201eb38b103"
+      },
+      "kimi-online-launch.json": {
+        "bytes": 525798,
+        "sha256": "3b1d2df6c9e679dc09301bf2e9dc10721beb59e69e0bed86c15bc1cbb4ec1674"
+      },
+      "gpu-index-big-offset-launch.json": {
+        "bytes": 453,
+        "sha256": "2d2addfa0532fa9e85a86f289c59742e0a284272d78db108f5857bb2f5f9d437"
+      },
+      "vllm-doc-precommit.log": {
+        "bytes": 3602,
+        "sha256": "d6d8e8ca8c075fb8b835a1ae3f98c97ab97850a342759bafcec33c4c1df4c05f"
+      },
+      "vllm-staging-tests-launch.json": {
+        "bytes": 621,
+        "sha256": "8ddf2f688996e26f0c03bcbe735f081c3372bf653586186d1b9fc840fc6fd24d"
+      },
+      "gpu-index-tests-2-launch.json": {
+        "bytes": 418,
+        "sha256": "08b98e1e19407458857a78a8922c0904a34d25c4611e2083ed0a782dc7055470"
+      },
+      "glm-encoder-balanced-launch.json": {
+        "bytes": 861,
+        "sha256": "6ea9e744e3a9dfcc5dcb83b867b7fa7583c3dc9563ffca9b7fee11ca686d61d6"
+      },
+      "kimi-preflight-config.json": {
+        "bytes": 7003,
+        "sha256": "9e261e1d0eff0886bcabf1cd54904cbb7841a06fdaf23dd9ae881113b5ab2d64"
+      },
+      "glm-real-index-parity-launch.json": {
+        "bytes": 862,
+        "sha256": "711f2f76b91ef7520ae978424c2141dc2ecb7200ad71533337b40ec8d71464a9"
+      },
+      "kimi-3-online-probes.json": {
+        "bytes": 1707824,
+        "sha256": "f21f24bbca6afa0865f133f8dce430c16e84d0f2bf25160700c757b2177da654"
+      },
+      "encoder-component-tests-launch.json": {
+        "bytes": 569,
+        "sha256": "4b9fb5fa4d615f4e0f50ec16ac30b02eeb66363e5525e9f3141a3f0826fa1774"
+      },
+      "glm-real-index-parity.log": {
+        "bytes": 90,
+        "sha256": "7028e38b6a1717342c1ba8e01b28e121bea024db9eb8eb2d7dcfc1e4aadee18f"
+      },
+      "glm-encoder-baseline-1-launch.json": {
+        "bytes": 779,
+        "sha256": "ccac8dec7a78dfda6f83bf3ec9fce9723948959a586ebc84ee41527386f9d7a4"
+      },
+      "glm-real-index-parity.json": {
+        "bytes": 88,
+        "sha256": "9818eaa106fc04c282bc72b709a28dcaa95883bc32dd73185f7ec4df997971e4"
+      },
+      "kimi-3-online-generation-validation.json": {
+        "bytes": 679,
+        "sha256": "79bd424aebd75c9eb3b102d7e913966c960f9ff50ee88fa3a3fb60717d9ec6cb"
+      },
+      "glm-encoder-gpu-index-1.log": {
+        "bytes": 725,
+        "sha256": "b47dc8ca557a3764b9b5ca5d787c1fe9957de6452eff14884f6742954edc0420"
+      },
+      "kimi-fp32-composition-tests-launch.json": {
+        "bytes": 463,
+        "sha256": "1e454b48ecf3af39d28566aafe685b012f8a26b0f82c98889f27188aff9af44a"
+      },
+      "kimi-encoder-balanced.log": {
+        "bytes": 366,
+        "sha256": "2faf8669268176eb2e615731b1dc26c6f7b27c86399e4fbd7ba2934fbf9f9e28"
+      },
+      "glm-probe-repeatability.json": {
+        "bytes": 2411,
+        "sha256": "02bbb1055851e1e4b692d7757fffcb3a9f2ca1f85d724c317d107141500d1370"
+      },
+      "glm-online-gpu-index-1.log": {
+        "bytes": 492,
+        "sha256": "776d5eb10d27da028bdf4450810c1516a169c985ddee23d2e52de2156848d181"
+      },
+      "kimi-encoder-balanced-3.log": {
+        "bytes": 593,
+        "sha256": "b5e0ee7f29ae62428a42823adf2abb423c4bfd14f43c2297be0038b1a759f7e0"
+      },
+      "kimi-source-manifest-3.json": {
+        "bytes": 360146,
+        "sha256": "8fb2bc20ab3b9540ca748d7e60daaed911ae40bf5f433c954a843401fc50309a"
+      },
+      "kimi-encoder-narrow.log": {
+        "bytes": 378,
+        "sha256": "9516705f840601229a848b52f27f4a751b397fa531064b62cb2fb3a9bde6b0c0"
+      },
+      "kimi-import-check.log": {
+        "bytes": 1474,
+        "sha256": "6a6ffd5dc687ce7c6cd2ed4e31ef400d569dc5614dcac14e1624302a88d8b288"
+      },
+      "kimi-preflight-launch.json": {
+        "bytes": 525124,
+        "sha256": "e591f022469685600f4392189a35b9fc7f2a6b73076b03f6d444370921f03ed1"
+      },
+      "kimi-online-validation.json": {
+        "bytes": 143,
+        "sha256": "0640356d3e80e309e5eba18325467c0ac7e9b09aec41cf6ce5efb35e40e6e6c5"
+      },
+      "frank2-image-parity.json": {
+        "bytes": 979,
+        "sha256": "e4d8e3de9d72e8775e65043a440635c494210740475e58bc1031c3abc0cb1536"
+      },
+      "glm-online-baseline-2.log": {
+        "bytes": 488,
+        "sha256": "b08df67bea9ef14afb05cd55f4f40c8e7be9e2dccbb35eb4d4b2e7db5cbd9555"
+      },
+      "kimi-encoder-balanced.json": {
+        "bytes": 4993,
+        "sha256": "41844ea38fb61009aefdbeefa1515a6b34cca5b230c4f93b4110f1f0433a9cfb"
+      },
+      "gpu-index-byte-parity.json": {
+        "bytes": 1651,
+        "sha256": "7afd3673a01e93afe8c8321ee8efa9509c3515837131d3a754b9b2bb298c3246"
+      },
+      "kimi-encoder-baseline.log": {
+        "bytes": 374,
+        "sha256": "12c85b8a0d1334a5c0708c0b161516d1e959dbfa2c825d306aab5dc88b62b6bd"
+      },
+      "gpu-index-byte-parity-launch.json": {
+        "bytes": 636,
+        "sha256": "6b2f861a6876e665ee86dbc8dcaebb92682fab721cd837346824a287ec7e3161"
+      },
+      "kimi-preflight-result.json": {
+        "bytes": 92,
+        "sha256": "9156575e837ee1e5087491f6966880cbe4bcd0ad94135791d48f0a3305494c29"
+      },
+      "glm-reproducible-probe-launch.json": {
+        "bytes": 651,
+        "sha256": "9d31b2a3e922a1f8a5a7181b5e80977261d9a52f7d134d7041e4c3aff9037cd8"
+      },
+      "kimi-read-ahead-probe.json": {
+        "bytes": 285,
+        "sha256": "87f9aa7661df7b02861a6d53e44626b2d26c9e495408e85d7b7633396e98ae5b"
+      },
+      "kimi-encoder-packed-rows.log": {
+        "bytes": 380,
+        "sha256": "01e364ffb08005efcceee99b23f42ee7f631b0c99a572b24554604828cbc6aae"
+      },
+      "glm-encoder-baseline-1.log": {
+        "bytes": 707,
+        "sha256": "ecb9d4a936ccc7e2e9c53761f5c366fc9a9b160111be821fa7eb0b5a2abbc12f"
+      },
+      "b12x-pr-before.json": {
+        "bytes": 2703,
+        "sha256": "319629d2bd993da515db71eddbba75c90ddefb1a568e7d05ac54d5591d3624bf"
+      },
+      "glm-serving-probe-comparison.json": {
+        "bytes": 1289,
+        "sha256": "e648da4acccee9ca69a8ca2c4d7b05c04fc55641a4c1c7a164c01ba4874c037c"
+      },
+      "glm-encoder-baseline-1.json": {
+        "bytes": 1093,
+        "sha256": "b42a6314758063a19c79d58f4454bd3021d266410d01ab630a954150a88ec739"
+      },
+      "glm-reproducible-probe.log": {
+        "bytes": 574,
+        "sha256": "eee96a7cd8b70ff54739b2016d259f7f8fd91e1f83c385c6a49d8b4a5371928d"
+      },
+      "kimi-2-online-validation.json": {
+        "bytes": 168,
+        "sha256": "f7d87e2431d612632e97112a595699307d47b71f94b2cba99e33cdc89a96d5d6"
+      },
+      "vllm-staging-tests-2.log": {
+        "bytes": 3000,
+        "sha256": "c1abe856adc2e2e2157ddd98cb03dcca62b74f20d8dbadba0ddd1090739bf4c1"
+      },
+      "glm-reproducible-probe.json": {
+        "bytes": 727,
+        "sha256": "7ec004309e0a89f09896f3f648bea7ff094499583324fcfa70211ff4fc818571"
+      },
+      "vllm-precommit.log": {
+        "bytes": 3602,
+        "sha256": "a30f78369945f5f8d0d565b1e93d51fdf9224369f3d75c19ca0f2d20dbd32f76"
+      },
+      "kimi-3-online-server.log": {
+        "bytes": 424599,
+        "sha256": "cfc26cf1fd841285fbf5f6646c8a3c6ef17649c43fca5374212b8e709751b160"
+      },
+      "kimi-source-manifest.json": {
+        "bytes": 360146,
+        "sha256": "505f7a1700480bf71df83ae489b5461c311941a44fbdc932b96f9f551a1055db"
+      },
+      "kimi-online-launch-3.json": {
+        "bytes": 525792,
+        "sha256": "dd8347ff9c72456efaa9ecb5563ff8c29cc729019d44e0f55561eefbf2b79480"
+      },
+      "kimi-encoder-balanced-3.json": {
+        "bytes": 5233,
+        "sha256": "0de13bd6f6526e01f2af1cc418f047c09027dcd2f16b24758930c6ed1c49d001"
+      },
+      "glm-encoder-balanced.log": {
+        "bytes": 527,
+        "sha256": "72af07a40c3270fb3ad9387479c14eae80ab643c29d308500e6e997450a3af7e"
+      },
+      "gpu-index-tests-1.log": {
+        "bytes": 4752,
+        "sha256": "2439c48a5724d3c6c293228e2cee67351b8abc3b544d54563928a6bf34672c1c"
+      },
+      "glm-online-baseline-1.log": {
+        "bytes": 488,
+        "sha256": "7853dc79aa3685fbcc7c9e04315404007d2a431638dfcb9cda87295a37d61719"
+      },
+      "kimi-encoder-balanced-2.log": {
+        "bytes": 1014,
+        "sha256": "f3f7bac091acad3bfd07071ef5f08c3af288811c16e97819b335cf494ca04be0"
+      },
+      "kimi-config-check.log": {
+        "bytes": 2201,
+        "sha256": "fadcc0604e477efa4d2a0153373e4954ff13c4555e6792e0f9f4ab68b4e823d7"
+      },
+      "kimi-encoder-baseline.json": {
+        "bytes": 546,
+        "sha256": "9baf211611ae1690f64753441920a0939f05f5aae75ef2eedc23c00006c2e395"
+      },
+      "kimi-online-launch-2.json": {
+        "bytes": 525787,
+        "sha256": "f011a21bd806e92d911580760869226755e4f569ad6ae4ddaf6808aa953d9168"
+      },
+      "gpu-index-byte-parity.log": {
+        "bytes": 53,
+        "sha256": "d76ee17bd6e359726c9bc22bc884b914ad2b19dea0c78e733438a2496f9d7e3f"
+      },
+      "gpu-index-big-offset.log": {
+        "bytes": 113,
+        "sha256": "7d235e3957c4a09f4d3148c919cb7acb8d66ddf4e561a693703cae23edefc4ea"
+      },
+      "gpu-index-tests-1-launch.json": {
+        "bytes": 418,
+        "sha256": "08b98e1e19407458857a78a8922c0904a34d25c4611e2083ed0a782dc7055470"
+      },
+      "glm-encoder-gpu-index-1-launch.json": {
+        "bytes": 771,
+        "sha256": "50914bb717f44b65657ad943eddd8164334bbabf888755de5ee1d3bc01316eab"
+      },
+      "kimi-reproducible-probe.json": {
+        "bytes": 532,
+        "sha256": "5bbfe3da705b9205a63adaee0cbd1e91c70ea7011176861473f18079b2dcce3d"
+      },
+      "kimi-fp32-composition-tests.log": {
+        "bytes": 113,
+        "sha256": "bc431fce6ad647faa0dd50d962b77ec48b8d4e438ec9e96a2b98f71570cd2189"
+      },
+      "kimi-online-server.log": {
+        "bytes": 10783,
+        "sha256": "a019e39246dc155a6f2346872f0b7d0b5b4df56d92d56c04fbe55745687fa242"
+      },
+      "glm-encoder-gpu-index-1.json": {
+        "bytes": 1114,
+        "sha256": "7c624d6832ffb5d6e158275ba006c8a33beafbc42538224bc00b7809222837a9"
+      },
+      "gpu-index-tests-2.log": {
+        "bytes": 99,
+        "sha256": "421c3c5885df3d4b155b84dc27d27e5ff9ad74b83ace4784c6588aecb950d996"
+      },
+      "kimi-import-check-launch.json": {
+        "bytes": 523819,
+        "sha256": "76733952b75ca426e101efb1ab106476531f3684e014b002b290aff35a81f562"
+      },
+      "mxfp4-narrow-tests.log": {
+        "bytes": 112,
+        "sha256": "34c4b0b647b23dad56a68d4b290d7174ff23806b8050f8414f33e5ba5a2e1ba3"
+      },
+      "vllm-staging-tests-2-launch.json": {
+        "bytes": 547109,
+        "sha256": "92f8cf0bef02c8d0bfd1f89d50fa1cc8f3767b67e38e80e27529309adbb2a41a"
+      },
+      "mxfp4-narrow-tests-launch.json": {
+        "bytes": 437,
+        "sha256": "5c747c86e034742e72d44aea9ec893bf905ebd6e8d257e4cdf727650d61d16f5"
+      },
+      "kimi-preflight-server.log": {
+        "bytes": 34639,
+        "sha256": "aa20d068afdd1c1808bf1325e330f2ced2985f543be6026e7832c386278531eb"
+      },
+      "gpu-index-memcheck.log": {
+        "bytes": 176,
+        "sha256": "fe23de57e49e7696a25ab0ab7c0c5029540bfcf9f0cc31e442599452fe6a5f17"
+      },
+      "kimi-encoder-packed-rows.json": {
+        "bytes": 553,
+        "sha256": "2cf11501d4b266e0a623b1a908e0ba08415dd24280368e4334d6ccce422dc989"
+      },
+      "kimi-online-wrapper.log": {
+        "bytes": 5069,
+        "sha256": "5982538e29bedfdae9e032cc3139bc723a636fb6bac392b6dea510670ecdc004"
+      },
+      "mxfp4-narrow-tests-2.log": {
+        "bytes": 1735,
+        "sha256": "ae8c253961d553f3577b0d9ec814d22d62233fec8f8c0d7f37c7efefbe988dcf"
+      },
+      "vllm-pr-before.json": {
+        "bytes": 2396,
+        "sha256": "228972a66fa7ae42f42f5e91742dcdc4e05392fc6e9d7d429be215ab47f83448"
+      },
+      "kimi-preflight-wrapper.log": {
+        "bytes": 151,
+        "sha256": "e7bc8edd2a7742b2ca0c665c09368355b6581646ddb9d04f22a7b6b79b04d0dd"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-1/launch.json": {
+        "bytes": 27846,
+        "sha256": "23b2ad8182f621a9d5552976bd22494f4aa7eb38f988615c4edf912fbfe223e1"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-1/logprob-probes.json": {
+        "bytes": 1394146,
+        "sha256": "cc60dfad818d30fb5df793d04d44f8c231a8690df48923defb38494bfaa143c8"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-1/telemetry.csv": {
+        "bytes": 101248,
+        "sha256": "4e5acfca58bce9cdd8d91ac47c440080465e7182fbe19f95a40db824541dc705"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-1/server.log": {
+        "bytes": 88533,
+        "sha256": "87aa5513825078bb7f4db16c5002ae79f04d2d3e18d32ac22ada90f6b80c6d71"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-1/source-manifest.json": {
+        "bytes": 390877,
+        "sha256": "37989a8061ed8532997e12dde19f0c775355e7af9faa27d41938c427b15d04ab"
+      },
+      "reproducers/profile_kimi_balanced_3.py": {
+        "bytes": 3829,
+        "sha256": "e4250fcd88c043f3c2228072f30a7428deb7cc3cee818a5527b43c1c24bdedd9"
+      },
+      "reproducers/validate_kimi_3.py": {
+        "bytes": 4685,
+        "sha256": "130f14a7afbf042c115702be4a2220f1ecc9dd145235ee79d9b3a004e797625c"
+      },
+      "reproducers/preflight_kimi.py": {
+        "bytes": 3095,
+        "sha256": "c1a45ab263d58928ec9cd773beb910a5bcc8c606d3c4371c717cf6e3c0341435"
+      },
+      "reproducers/check_index_parity.py": {
+        "bytes": 1364,
+        "sha256": "566e068cce81622551f8477f61734df426b516160b3a057ab37f4b6422250086"
+      },
+      "reproducers/prepare_kimi_launch_3.py": {
+        "bytes": 3142,
+        "sha256": "5389c3152899a1f899354e1fa80bc394f1ee2515e82fa6c0fae8c4a30c74b1ba"
+      },
+      "reproducers/profile_glm_balanced.py": {
+        "bytes": 3085,
+        "sha256": "eb549b37d69604d54cc63047c0277286df8440ed48b28156a8526610ffde51f6"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-2/launch.json": {
+        "bytes": 27846,
+        "sha256": "ba68acd0efabbdf38dffc5ff4c91fb4185e8b80d0d9f14424907dbfd9dc20aa1"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-2/logprob-probes.json": {
+        "bytes": 1356000,
+        "sha256": "3af8595c4a86cc316cac8194c65e3ea063c264758f59508956be3aef6edf2cdd"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-2/telemetry.csv": {
+        "bytes": 31664,
+        "sha256": "d95d148d2f68be941e35afc5dc396b8233bc0e9aa302b24cacc9dcdf08aa70b0"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-2/server.log": {
+        "bytes": 62173,
+        "sha256": "239eeef1095c363aa53f3dfabe287873e56812b0f9dff7b356e68f7d9d7d50ac"
+      },
+      "glm-native-c1-profile-tp2-online-baseline-2/source-manifest.json": {
+        "bytes": 390877,
+        "sha256": "37989a8061ed8532997e12dde19f0c775355e7af9faa27d41938c427b15d04ab"
+      },
+      "glm-native-c1-profile-tp2-online-gpu-index-1/launch.json": {
+        "bytes": 26795,
+        "sha256": "4a2aa74407c0516d3d031b94fd7cd797b69e0815e4786a4453f6431e25c2550f"
+      },
+      "glm-native-c1-profile-tp2-online-gpu-index-1/logprob-probes.json": {
+        "bytes": 1323882,
+        "sha256": "e49d825bb36a7fa1ba099756ccb20e4cc25a6b4378818693430d8c8e0de53199"
+      },
+      "glm-native-c1-profile-tp2-online-gpu-index-1/telemetry.csv": {
+        "bytes": 46235,
+        "sha256": "ab8b8895e51513d48335c061ba4632750dea256b93c52ce7fba5e51491fa1d2d"
+      },
+      "glm-native-c1-profile-tp2-online-gpu-index-1/server.log": {
+        "bytes": 84684,
+        "sha256": "61657520dceda8da489fb20f28129db7c28ad613b292a8fb18df10fb433fbcba"
+      },
+      "glm-native-c1-profile-tp2-online-gpu-index-1/source-manifest.json": {
+        "bytes": 390995,
+        "sha256": "9fb91248f9d3e8f52c6749e9b05c674c1e093f92d0356ea9c12d084ab0f63a07"
+      }
+    }
+  }
+}

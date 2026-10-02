@@ -44,9 +44,10 @@ produce a larger representation; compression does not imply a fixed saving.
 
 Native and compressed expert preparations receive independent source clones:
 ordinary preparation can normalize weights in place. The MXFP4 A16 cases use
-the supported Kimi H=3584 geometries. They qualify the component, not a complete
-Kimi online serving deployment. Full-model KLD and complete logit parity were
-not measured for the online loading feature.
+the supported Kimi H=3584 geometries. Complete-model startup evidence for Kimi
+and GLM is tracked in
+[the preparation report](online-preparation-performance.md). Full-model KLD
+and complete logit parity were not measured for the online loading feature.
 
 Reproduce the component gates in a B12X CUDA environment:
 
@@ -106,7 +107,8 @@ These are loader log durations, not additional encoder overhead. A separate
 Qwen native TP1 control loaded 73.86 GiB/GPU and exposed 12.20 GiB KV. The
 online run used GPU 11 and that control used GPU 10: the memory observations
 show source-scale release, but the startup durations are not a paired speed
-comparison. Full online Kimi and GLM serving are unmeasured.
+comparison. Kimi/GLM validation and GPU preparation measurements are in
+[the preparation performance report](online-preparation-performance.md).
 
 ## Native versus stored-CSF serving
 
