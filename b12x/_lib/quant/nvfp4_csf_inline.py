@@ -117,6 +117,82 @@ def _load_at(pointer, offset: Int64):
     return cute.make_tensor(pointer + offset, cute.make_layout(1))[0]
 
 
+@dsl_user_op
+def _global_scale_vector(codes, bases, metadata, records, lane_word, *, loc=None, ip=None):
+    """Decode four adjacent words with shared address and exception metadata."""
+    unpack = "\n".join(
+        f"""
+        shr.u32 packed, code{index // 2}, {16 * (index % 2)};
+        shr.u32 shifted, packed, 4;
+        prmt.b32 packed, packed, shifted, 0x5140;
+        and.b32 packed, packed, 0x0f0f0f0f;
+        prmt.b32 base, base_word, base_word, 0x{index}{index}{index}{index};
+        add.u32 ${index}, packed, base;
+        """ for index in range(4)
+    )
+    exceptions = "\n".join(
+        f"""
+        and.b32 test, selected, {1 << index};
+        setp.ne.u32 present, test, 0;
+        @present ld.global.u32 ${index}, [address];
+        @present add.u64 address, address, 4;
+        """ for index in range(4)
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [codes.ir_value(), bases.ir_value(), metadata.ir_value(), records.ir_value(),
+         lane_word.ir_value()],
+        """{
+        .reg .b32 code0, code1, base_word, packed, shifted, base;
+        .reg .b32 group, bit, mask, selected, flag, first, prefixes, rank, test;
+        .reg .b64 address, offset;
+        .reg .pred present;
+        ld.global.v2.u32 {code0, code1}, [$4];
+        ld.global.u32 base_word, [$5];
+        """ + unpack + """
+        shr.u32 group, $8, 5;
+        mad.wide.u32 address, group, 4, $6;
+        ld.global.u32 mask, [address+8];
+        and.b32 bit, $8, 31;
+        shr.u32 selected, mask, bit;
+        and.b32 selected, selected, 15;
+        setp.eq.u32 present, selected, 0;
+        @present bra CSF_VECTOR_DONE;
+        ld.global.v2.u32 {first, prefixes}, [$6];
+        shl.b32 group, group, 3;
+        shr.u32 prefixes, prefixes, group;
+        and.b32 prefixes, prefixes, 255;
+        mov.u32 flag, 1;
+        shl.b32 flag, flag, bit;
+        sub.u32 flag, flag, 1;
+        and.b32 mask, mask, flag;
+        popc.b32 rank, mask;
+        add.u32 first, first, prefixes;
+        add.u32 first, first, rank;
+        cvt.u64.u32 offset, first;
+        shl.b64 offset, offset, 2;
+        add.u64 address, $7, offset;
+        """ + exceptions + """
+        CSF_VECTOR_DONE:
+        }""",
+        "=&r,=&r,=&r,=&r,l,l,l,l,r,~{memory}",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+                 for i in range(4))
+
+
+@dsl_user_op
+def _store_scale_vector(address, a, b, c, d, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [x.ir_value() for x in (address, a, b, c, d)],
+        "st.global.v4.u32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r,~{memory}",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
 @dataclass(frozen=True)
 class InlineNvfp4Scales:
     storage: torch.Tensor
@@ -503,15 +579,23 @@ class IndexedNvfp4Plane(InlineNvfp4Reader):
     @cute.jit
     def decode(self, tensors, expert, task, tid):
         storage, output, experts = tensors
-        for iteration in cutlass.range_constexpr(4):
-            word = task * Int32(1024) + tid + Int32(iteration * 256)
-            if word < Int32(self.rows * self.columns // 4):
-                row = word // Int32(128 * (self.columns // 4))
-                column = (word // Int32(128)) % Int32(self.columns // 4)
-                value = self.word_pointer(
-                    storage, experts, expert, row, column, word % Int32(128)
-                )
-                destination = Int64(expert) * Int64(
-                    self.rows * self.columns // 4
-                ) + Int64(word)
-                cute.make_tensor(output + destination, cute.make_layout(1))[0] = value
+        word = task * Int32(1024) + tid * Int32(4)
+        if word < Int32(self.rows * self.columns // 4):
+            row = word // Int32(128 * (self.columns // 4))
+            column = (word // Int32(128)) % Int32(self.columns // 4)
+            lane_word = word % Int32(128)
+            origin = storage.toint() + Int64(_HEADER_BYTES)
+            slab = Int64(expert) * Int64(self.rows // 128) + Int64(row)
+            fixed = slab * Int64(128 * (1 + self.columns // 2))
+            tile = slab * Int64(self.columns // 4) + Int64(column)
+            partitions = Int64(experts) * Int64(self.fixed_bytes)
+            codes = origin + fixed + Int64(128) + (
+                Int64(column) * Int64(128) + Int64(lane_word)
+            ) * Int64(2)
+            bases = origin + fixed + Int64(lane_word)
+            metadata = origin + partitions + tile * Int64(32)
+            records = origin + partitions + Int64(experts) * Int64(self.tiles * 32)
+            values = _global_scale_vector(codes, bases, metadata, records, lane_word)
+            destination = (Int64(expert) * Int64(self.rows * self.columns)
+                           + Int64(word) * Int64(4))
+            _store_scale_vector(output.toint() + destination, *values)
