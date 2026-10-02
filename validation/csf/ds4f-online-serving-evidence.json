@@ -1,0 +1,539 @@
+{
+  "schema": "csf-native-serving/1",
+  "status": {
+    "implementation": "implemented in paired B12X/vLLM online scale preparation",
+    "validation": "qualified for recorded TP2 startup, prefill, decode and eight concurrent requests",
+    "timing": "research-only"
+  },
+  "checkpoint": {
+    "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+    "weight_shards": 48,
+    "all_weight_blobs_shared_with_metadata_incomplete_revision": true,
+    "metadata_incomplete_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+    "config_equal": true
+  },
+  "runtime": {
+    "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+    "b12x_implementation": "654f7a6205b0a7d907113094a473d5d8cfc3ba38",
+    "vllm_staging": "d92d1fa6efe8aa77d66da49e5c7d182a5017bd39",
+    "source_manifest_sha256": "70392f31e825951cec3f6890fb4cb6c7b349d31f73962683889b484a27a7dcba",
+    "source_identity_note": "Serving uses the compatible beta overlay pinned by the per-file source manifest, not a bare repository revision.",
+    "cuda": "13.4",
+    "cutlass_dsl": "4.7.1",
+    "host": "Frank1",
+    "gpu_model": "NVIDIA RTX PRO 6000 Blackwell",
+    "gpu_indices": [
+      12,
+      13
+    ],
+    "gpu_uuids": [
+      "GPU-3304d777-8f0e-2767-419a-d72ffa553141",
+      "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7"
+    ],
+    "power_limit_w": 600,
+    "during_run_clocks_sampled": false,
+    "tensor_parallel_size": 2,
+    "decode_context_parallel_size": 1,
+    "expert_backend": "B12X_MXFP4_MXFP8",
+    "speculation": false,
+    "kv_cache_dtype": "fp8",
+    "kv_cache_bytes_per_gpu": 4294967296,
+    "max_model_len": 65536,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 4096,
+    "prefix_caching": false,
+    "effective_cudagraph_mode": "FULL_DECODE_ONLY",
+    "selected_launch_environment": {
+      "PORT": "8044",
+      "VLLM_B12X_MOE_FP4_CSF": "1"
+    }
+  },
+  "model_loading": [
+    {
+      "rank": 1,
+      "memory_gib": 71.89,
+      "seconds": 54.063591
+    },
+    {
+      "rank": 0,
+      "memory_gib": 71.89,
+      "seconds": 53.945805
+    }
+  ],
+  "online_preparation": {
+    "0": {
+      "layers": 43,
+      "sum_seconds": 8.036,
+      "first_seconds": 2.069,
+      "median_after_first_seconds": 0.1065
+    },
+    "1": {
+      "layers": 43,
+      "sum_seconds": 8.01,
+      "first_seconds": 2.089,
+      "median_after_first_seconds": 0.1055
+    }
+  },
+  "validation": {
+    "passed": true,
+    "container_stopped": true,
+    "online_preparation_seconds_by_rank": {
+      "0": [
+        2.069,
+        0.163,
+        0.108,
+        0.193,
+        0.178,
+        0.21,
+        0.172,
+        0.188,
+        0.15,
+        0.165,
+        0.238,
+        0.195,
+        0.192,
+        0.102,
+        0.102,
+        0.103,
+        0.104,
+        0.103,
+        0.104,
+        0.103,
+        0.124,
+        0.103,
+        0.103,
+        0.102,
+        0.103,
+        0.117,
+        0.215,
+        0.202,
+        0.257,
+        0.29,
+        0.228,
+        0.102,
+        0.103,
+        0.102,
+        0.102,
+        0.103,
+        0.109,
+        0.103,
+        0.103,
+        0.105,
+        0.105,
+        0.105,
+        0.108
+      ],
+      "1": [
+        2.089,
+        0.171,
+        0.188,
+        0.11,
+        0.177,
+        0.209,
+        0.171,
+        0.188,
+        0.158,
+        0.165,
+        0.239,
+        0.231,
+        0.177,
+        0.104,
+        0.104,
+        0.104,
+        0.104,
+        0.103,
+        0.104,
+        0.104,
+        0.105,
+        0.104,
+        0.105,
+        0.103,
+        0.11,
+        0.109,
+        0.221,
+        0.192,
+        0.245,
+        0.262,
+        0.205,
+        0.103,
+        0.103,
+        0.103,
+        0.103,
+        0.103,
+        0.103,
+        0.103,
+        0.103,
+        0.105,
+        0.105,
+        0.106,
+        0.109
+      ]
+    },
+    "startup_wait_seconds": 180.1654003089643,
+    "generation_requests": 8,
+    "concurrent_requests": 8,
+    "prefill": [
+      {
+        "usage": {
+          "prompt_tokens": 8192,
+          "total_tokens": 8256,
+          "completion_tokens": 64,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "client_ttft_seconds": 0.5327091149520129,
+        "client_total_seconds": 0.8980587859987281,
+        "client_decode_tokens_per_second": 172.43754406431242
+      },
+      {
+        "usage": {
+          "prompt_tokens": 32768,
+          "total_tokens": 32896,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "client_ttft_seconds": 2.187927931023296,
+        "client_total_seconds": 2.925712433003355,
+        "client_decode_tokens_per_second": 172.1369853380745
+      }
+    ],
+    "decode": {
+      "usage": {
+        "prompt_tokens": 17,
+        "total_tokens": 1041,
+        "completion_tokens": 1024,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "client_ttft_seconds": 0.147434277983848,
+      "client_total_seconds": 6.026486037007999,
+      "client_decode_tokens_per_second": 174.00765326308425
+    }
+  },
+  "chat_probes": {
+    "generation-probes.json": {
+      "requests": 8,
+      "finite_generated_token_logprobs": true,
+      "usage": [
+        {
+          "prompt_tokens": 12,
+          "total_tokens": 61,
+          "completion_tokens": 49,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 98,
+          "completion_tokens": 84,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 16,
+          "total_tokens": 28,
+          "completion_tokens": 12,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 18,
+          "total_tokens": 146,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 12,
+          "total_tokens": 72,
+          "completion_tokens": 60,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 109,
+          "completion_tokens": 95,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 16,
+          "total_tokens": 28,
+          "completion_tokens": 12,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 18,
+          "total_tokens": 146,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        }
+      ]
+    },
+    "concurrent-eight-probes.json": {
+      "requests": 8,
+      "finite_generated_token_logprobs": true,
+      "usage": [
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        {
+          "prompt_tokens": 14,
+          "total_tokens": 142,
+          "completion_tokens": 128,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        }
+      ]
+    }
+  },
+  "request_metrics": {
+    "finish_reasons": {
+      "stop": 6.0,
+      "length": 13.0,
+      "abort": 0.0,
+      "error": 0.0,
+      "repetition": 0.0
+    },
+    "preemptions": 0.0,
+    "total_requests": 19
+  },
+  "limits": [
+    "Client timings are one request per input/output length, without a matched native-storage control or during-run clock samples.",
+    "Full-model KLD, full-vocabulary logit parity, maximum context and sequence-capacity-16 saturation are unmeasured.",
+    "Preparation log times include staging, weight preparation and first-use compilation; they do not isolate the scale encoder.",
+    "startup_wait_seconds starts when the validation controller attaches, after model loading began; it is not whole startup duration.",
+    "Generated-token logprobs are checked on the 16 chat probes; the three streamed completion requests validate token counts and successful execution."
+  ],
+  "raw_receipts": {
+    "root": "/data/trellis-quant/ds4f-online-csf-20261002",
+    "files": {
+      "checkpoint-identity.json": {
+        "bytes": 303,
+        "sha256": "376d2867953201be40561a2e723d21a63ab465bb32eb60b78bedb4661c930d40"
+      },
+      "concurrent-eight-probes.json": {
+        "bytes": 1250551,
+        "sha256": "07eca61850feea8debaf15fb4d96aaf63cc87dea384827b3b36ccc8902b326f6"
+      },
+      "controller.log": {
+        "bytes": 1480,
+        "sha256": "bba6e5d7165debb9f37bc441ce67eca7fd0aae954f3d00014b72865263b64cd4"
+      },
+      "decode-1024.json": {
+        "bytes": 4965,
+        "sha256": "b96325e93af80ae65787c90a364e08f7bf60e7c47f7c65c481bd1712996cd5c9"
+      },
+      "generation-probes.json": {
+        "bytes": 711993,
+        "sha256": "4ca58a4bb559ca08463356816f82c31f981de4b2879587f1e2f2f9819ac1b0c9"
+      },
+      "launch-attempt1.json": {
+        "bytes": 26473,
+        "sha256": "46e607382d44d5ed1929266fe78ccb4839df9d3dead1e26fe5fb3893e0a082eb"
+      },
+      "launch-attempt2.json": {
+        "bytes": 26438,
+        "sha256": "b0e4785a4d1a9807d69e48e069e829736645c23f4c903ae50bff7a93cf0a3d15"
+      },
+      "launch.json": {
+        "bytes": 26438,
+        "sha256": "413885ee1c6d784d0ceb342a2af6b0cf34cce213e87b6dc52097314cacb5ff35"
+      },
+      "metrics-after.txt": {
+        "bytes": 65282,
+        "sha256": "0c5bec8f974091e028922d5464394a9a557d5ef8d94d4eeb2ddcd606418dad6f"
+      },
+      "metrics-before.txt": {
+        "bytes": 60361,
+        "sha256": "f359182acfa09c37ac5213252a11d69e867b357fbff1ae1238a0ac58d8be20b4"
+      },
+      "prefill-32768.json": {
+        "bytes": 392649,
+        "sha256": "ed0ae01063bf8fda9f76f6aac741ae2ac25464f2c979b00a3206e1a5953bdf26"
+      },
+      "prefill-8192.json": {
+        "bytes": 98781,
+        "sha256": "fe3558fa9bfc91e9b01215f9f4a77c69dcc42305277322e29279af467eae7c2a"
+      },
+      "reproducers/start.sh": {
+        "bytes": 23992,
+        "sha256": "2824a57b3e4a1a6064f48168afb9b5f62d7dc6ad939dd1f75cedf6330cd0544d"
+      },
+      "reproducers/validate_serving.py": {
+        "bytes": 7975,
+        "sha256": "e7e587e4f4d1920ea15c42ae054b4a104b0b9557a5c659ba6901ac1b05c568ca"
+      },
+      "server.log": {
+        "bytes": 74338,
+        "sha256": "5436e5ee0bfdce9fc7bddfc15e9472ff7c4b7c2fdc36580e86b58c1e0bddf51c"
+      },
+      "source-manifest.json": {
+        "bytes": 707011,
+        "sha256": "70392f31e825951cec3f6890fb4cb6c7b349d31f73962683889b484a27a7dcba"
+      },
+      "startup-checkpoint-selector-error.log": {
+        "bytes": 73,
+        "sha256": "93f8000f838791d1b0e67627e1031681553ba92b1b35343397084eec7a35e426"
+      },
+      "startup-incomplete-snapshot-error.log": {
+        "bytes": 9862,
+        "sha256": "e7973c44fbf365cb9d363890a01396aa17ff03b6a53d4e0fe849deb98fefbb81"
+      },
+      "validation.json": {
+        "bytes": 2443,
+        "sha256": "fefcb73d4be5d86cdb7660ad9c1b100ee359b307551b0a601cde05bf33ec5415"
+      }
+    }
+  }
+}

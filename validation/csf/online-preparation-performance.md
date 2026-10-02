@@ -135,6 +135,46 @@ Full-model KLD, full-vocabulary logit parity, concurrency-8 saturation, and
 1M-token context are unmeasured by this validation. Source checkpoints are
 read-only and no converted checkpoint is produced.
 
+## Native DeepSeek-V4-Flash TP2 prefill and decode
+
+**Qualified for the bounded requests below:**
+`deepseek-ai/DeepSeek-V4-Flash-0731` at revision
+`9e165c30e2704aec5d9d593cce3eebd58bbef1cb`, native MXFP4 safetensors,
+TP2/DCP1, no speculation, and `VLLM_B12X_MOE_FP4_CSF=1`. This is
+DeepSeek-V4-Flash, distinct from DeepSeek-V4.1-Flash. The source was mounted
+read-only; online preparation does not write a converted checkpoint.
+All 43 MoE layers per rank used online CSF preparation. Expert activations
+retained the `B12X_MXFP4_MXFP8` backend.
+
+The run used Frank1 RTX PRO 6000 Blackwell GPUs 12/13 at a 600 W power limit,
+FP8 KV fixed at 4 GiB per GPU, maximum context 65,536, sequence capacity 16,
+batch-token limit 4096, and disabled prefix caching. The runtime selected
+`FULL_DECODE_ONLY` graphs because the model does not provide piecewise
+capture. Image and preparation source identities are listed below; the
+exact launch and source-manifest hashes are in the
+[DS4F evidence JSON](ds4f-online-serving-evidence.json).
+
+| Conditions and measurement | Result | Conclusion |
+|---|---|---|
+| Full native checkpoint loading | 71.89 GiB/rank; model-loading log duration 53.95–54.06 s | TP2 loading and warmup completed |
+| Preparation of all 43 MoE layers | 8.010–8.036 s/rank, including first compilation | Online scale preparation completed on both ranks |
+| Eight short generation requests | 8/8 completed with finite generated-token logprobs | Chat generation executes after online preparation |
+| 17-token input, 1024 generated tokens | Completed; client decode 174.01 tokens/s | Sustained decode executes |
+| 8192-token input, 64 generated tokens | Completed; client time to first text 0.533 s | Uncached 8K prefill and continuation execute |
+| 32,768-token input, 128 generated tokens | Completed; client time to first text 2.188 s | Uncached 32K prefill and continuation execute |
+| Eight concurrent requests, 128 generated tokens each | 8/8 completed with finite generated-token logprobs | Concurrent decode executes |
+| Server metrics after all 19 requests | Zero errors, aborts, repetition stops, and preemptions; final health HTTP 200 | No request or capacity failure observed in this workload |
+
+**Research-only:** timing values come from one bounded request per length,
+without a matched native-storage control or during-run memory/SM clock
+telemetry. Client decode rate is `(output_tokens - 1) / (end - first_text)`.
+Preparation includes staging and weight preparation, so its eight-second
+sum is not a scale-encoder-only measurement. The configured KV pool reports
+77,789 tokens of physical capacity; neither maximum-context operation nor
+sequence-capacity-16 saturation was tested. Full-model KLD and logit parity
+are unmeasured. No implementation change was needed for this model. The test
+container was stopped after validation.
+
 ## Correctness evidence
 
 | Conditions and measurement | Result | Conclusion |
@@ -200,9 +240,13 @@ Config, RootFS layers, architecture, and OS compare exactly.
 | `moonshotai/Kimi-K3` | `2496450e92e425c886db095102a52a6682ca3970` |
 | `local-inference-lab/GLM-5.3-Flash-NVFP4` | `46aaae8a82032f77100f2f03e9cc11b391df3b4d` |
 | `deepseek-ai/DeepSeek-V4.1-Flash` | `dba1be0a40aa45a94ad051997016db3960a90277` |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` | `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` |
 | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` | `b797d2e1160b9596b2570e56c1d3590faa09d4ed` |
 
 Raw commands, source manifests, samples, tests, and serving logs are retained
 under `/data/trellis-quant/csf-online-performance-20261002` on Frank1. Frank2
 runtime and source probes are under `/data/ssd2/csf-online-performance-20261002`.
 The evidence JSON records content hashes for the verification receipts.
+DeepSeek-V4-Flash receipts are stored separately under
+`/data/trellis-quant/ds4f-online-csf-20261002`; their hashes are recorded in
+[the DS4F evidence JSON](ds4f-online-serving-evidence.json).
