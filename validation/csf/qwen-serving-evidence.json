@@ -1,0 +1,1867 @@
+{
+  "status": "research-only",
+  "ratio": "(candidate/reference - 1) * 100; positive is faster",
+  "source_receipt": {
+    "base": "bb5f4c4a43b420a1451f38c8aca0b0d9e6385662",
+    "files": {
+      "b12x/_lib/quant/nvfp4_csf_inline.py": "a98b1bc29e4559c15190eccf8a01f6695c3d03bfde08b1cce16ade72d0b3d24e",
+      "b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+      "b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+      "tests/moe/test_nvfp4_csf.py": "0465fec46e36543204edb3a3bd387cf40de4f9748ec34cf23a10fe122d537899"
+    },
+    "validation": {
+      "tail-tests-1.log": "498c7f6464f518368ddfdafcf97fb9abaad51c5a6794c575e16e7c97b85728a5",
+      "tail-inline-tests-1.log": "4e550aa671e86edf960a02b65cc070b7b37328fddadc472ee0ca3894789aa506"
+    }
+  },
+  "arms": {
+    "native_tp1": {
+      "directory": "qwen-native-c8-profile-tp1-native-control-1",
+      "utc": {
+        "starting": "2026-10-02T00:51:46.019501",
+        "healthy": "2026-10-02T01:02:21.152663",
+        "logprob-probe": "2026-10-02T01:02:21.152712",
+        "decode-1": "2026-10-02T01:02:23.189049",
+        "decode-2": "2026-10-02T01:03:52.184731",
+        "profiling": "2026-10-02T01:05:21.154260",
+        "complete": "2026-10-02T01:05:29.036776"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e",
+        "launch.json": "366d084e1301dd890370cbc628d9ddb6fd336abc5223b616012a91eb5b006844",
+        "decode-1.json": "c2c39b68f5e702b69f351a1b429a56ebff3ea54f08ce5fa43bbc0861ab2717a9",
+        "decode-2.json": "c2a5735ce4062696360d608235c9311db6dcafce3dd55dbb7eef3b07eacd782e",
+        "server.log": "95edf3fc0828c44ca0d2811e20a0b840be06f7c9db68a1d22691a3afbb479180",
+        "telemetry.csv": "c16a55a5e0d237ef3aed034ed38ae51168dbfefd5e8f5105f22230fa69c94458",
+        "logprob-probes.json": "1de245d6c0b950ef7b0a3e5d44f995e24a44224c9498ffcd5a826a314e5c4c83",
+        "kernel-summary.json": "d5c570d529cb90cb47750cbcc70227b5e40fa7adadccc8221398cf9d232095a6"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "485ee222f03f70cf9ac66e9c70b489bbb5a70777c3da647c7e892a58d45f84e9",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "35bd6d3c0c19f393e67ca071a0a0c0a1ae2cab151e3248ee80fdc3a1bd11df4e",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "0eaccbd7660c18a6a10829774cde660958b6c971a0b747f963ce4b57ad45b7b8"
+      },
+      "model_gib_per_rank": [
+        73.86
+      ],
+      "kv_tokens": [
+        660986
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 196.02085697030634,
+          "server_steps_per_s": 86.15182772395272,
+          "server_spec_accept_length": 2.2753527895299435
+        },
+        "8": {
+          "aggregate_tps": 797.9884020548965,
+          "server_steps_per_s": 346.3920589034601,
+          "server_spec_accept_length": 2.3037256835300397
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 198.53975074049598,
+            "server_steps_per_s": 86.00277987079913,
+            "server_spec_accept_length": 2.3085271317829457,
+            "measurement_seconds": 29.99903,
+            "client_output_tokens": 5956,
+            "server_output_tokens": 5956,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 193.5019632001167,
+            "server_steps_per_s": 86.30087557710631,
+            "server_spec_accept_length": 2.242178447276941,
+            "measurement_seconds": 29.999696,
+            "client_output_tokens": 5805,
+            "server_output_tokens": 5805,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 796.0801436637254,
+            "server_steps_per_s": 346.84681584008143,
+            "server_spec_accept_length": 2.2951923076923078,
+            "measurement_seconds": 29.983162,
+            "client_output_tokens": 23869,
+            "server_output_tokens": 23870,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 799.8966604460676,
+            "server_steps_per_s": 345.93730196683885,
+            "server_spec_accept_length": 2.312259059367772,
+            "measurement_seconds": 29.993874,
+            "client_output_tokens": 23992,
+            "server_output_tokens": 23992,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-6171baff-cc22-608e-4029-507f67c392ff": {
+          "physical_index": 10,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            13365.0
+          ],
+          "graphics_mhz_median": 2805.0,
+          "graphics_mhz_range": [
+            2610.0,
+            2835.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 72346.776,
+          "mean_us": 188.4030625
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xsequencegdn_decode_cute_kernels_PackedRecurrentQwenKernel_object_at__ptrbf16gmem_ptrbf16gmem_ptrbf16gmem_ptrf32gmem_ptrbf16gmem_ptrf32gmem_ptri32gmem_ptri32gmem__0",
+          "count": 288,
+          "total_us": 14154.985,
+          "mean_us": 49.14925347222222
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypef8E4M3FN_tensor00o2560111100_tensorptrf8E4M3FNgmemalign1_0",
+          "count": 384,
+          "total_us": 11469.271,
+          "mean_us": 29.867893229166665
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 792,
+          "total_us": 9790.768,
+          "mean_us": 12.362080808080808
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_160x128x64_2_80x32x64_tmaAB_alignCD4_bz_TNNN",
+          "count": 8,
+          "total_us": 6565.309,
+          "mean_us": 820.663625
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_32x32x128_6_32x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 800,
+          "total_us": 5492.416,
+          "mean_us": 6.86552
+        }
+      ]
+    },
+    "native_tp2": {
+      "directory": "qwen-native-c8-profile-tp2-native-control-1",
+      "utc": {
+        "starting": "2026-10-02T00:51:45.367436",
+        "healthy": "2026-10-02T01:01:00.569352",
+        "logprob-probe": "2026-10-02T01:01:00.569408",
+        "decode-1": "2026-10-02T01:01:02.384811",
+        "decode-2": "2026-10-02T01:03:08.925368",
+        "profiling": "2026-10-02T01:05:16.592799",
+        "complete": "2026-10-02T01:05:22.376355"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e",
+        "launch.json": "1937330116186e06d61acceedff5187eca5dc79eb2f5976cd8128248b6b914b6",
+        "decode-1.json": "32ddea16341ff288ef16153ac75ca3cb589cb12c1c65e5b21214b4e953a7f570",
+        "decode-2.json": "918fa9b2faf93f212bbf161059acde01b9bf3277f203e437270182049fd5b358",
+        "server.log": "b8051c22a49b8ecf9855e551030d0251079881236e77782637ec70ead86b1b78",
+        "telemetry.csv": "9f78050ffbd6f2980f50064b15e7697b5300fcb6b3adaf0e7dcee885d3b4c468",
+        "logprob-probes.json": "67da9127f211d455c0b2dad17734b7f1df5e444808b3bee0dead261e0e52569c",
+        "kernel-summary.json": "49c75336b0121c7013c3410130b55f2e2de785e386b0eeb1ec62577355065fa9"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "485ee222f03f70cf9ac66e9c70b489bbb5a70777c3da647c7e892a58d45f84e9",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "35bd6d3c0c19f393e67ca071a0a0c0a1ae2cab151e3248ee80fdc3a1bd11df4e",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "0eaccbd7660c18a6a10829774cde660958b6c971a0b747f963ce4b57ad45b7b8"
+      },
+      "model_gib_per_rank": [
+        38.41
+      ],
+      "kv_tokens": [
+        3912587
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 274.5833014635851,
+          "server_steps_per_s": 118.0309257517821,
+          "server_spec_accept_length": 2.3266158302135262
+        },
+        "8": {
+          "aggregate_tps": 1233.3828106216456,
+          "server_steps_per_s": 528.9902108967458,
+          "server_spec_accept_length": 2.3315817801015184
+        },
+        "16": {
+          "aggregate_tps": 1884.4386491229627,
+          "server_steps_per_s": 810.7640423022707,
+          "server_spec_accept_length": 2.3242612175036914
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 283.13875682586337,
+            "server_steps_per_s": 118.24951965869978,
+            "server_spec_accept_length": 2.394811054709532,
+            "measurement_seconds": 29.995894,
+            "client_output_tokens": 8493,
+            "server_output_tokens": 8493,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 266.0278461013068,
+            "server_steps_per_s": 117.81233184486443,
+            "server_spec_accept_length": 2.2584206057175207,
+            "measurement_seconds": 29.99686,
+            "client_output_tokens": 7980,
+            "server_output_tokens": 7980,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1232.4278249559438,
+            "server_steps_per_s": 529.3309674708676,
+            "server_spec_accept_length": 2.3282745591939547,
+            "measurement_seconds": 30.000134,
+            "client_output_tokens": 36973,
+            "server_output_tokens": 36973,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1234.3377962873476,
+            "server_steps_per_s": 528.6494543226239,
+            "server_spec_accept_length": 2.3348890010090817,
+            "measurement_seconds": 29.99341,
+            "client_output_tokens": 37022,
+            "server_output_tokens": 37022,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ],
+        "16": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1874.254986684721,
+            "server_steps_per_s": 807.6339973931031,
+            "server_spec_accept_length": 2.320673712021136,
+            "measurement_seconds": 29.993784,
+            "client_output_tokens": 56216,
+            "server_output_tokens": 56216,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1894.6223115612045,
+            "server_steps_per_s": 813.8940872114383,
+            "server_spec_accept_length": 2.3278487229862472,
+            "measurement_seconds": 30.001758,
+            "client_output_tokens": 56842,
+            "server_output_tokens": 56874,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141": {
+          "physical_index": 12,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2737.0,
+          "graphics_mhz_range": [
+            2617.0,
+            2820.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        },
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7": {
+          "physical_index": 13,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2820.0,
+          "graphics_mhz_range": [
+            2610.0,
+            2895.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 39549.727,
+          "mean_us": 102.99408072916667
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xcommpcie_oneshot_cute_OneshotLaunch_object_at__ptri64gmem_ptri64gmem_ptri32gmemalign16_ptri32gmemalign16________0",
+          "count": 856,
+          "total_us": 9776.922999999999,
+          "mean_us": 11.421639018691588
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xsequencegdn_decode_cute_kernels_PackedRecurrentQwenKernel_object_at__ptrbf16gmem_ptrbf16gmem_ptrbf16gmem_ptrf32gmem_ptrbf16gmem_ptrf32gmem_ptri32gmem_ptri32gmem__0",
+          "count": 288,
+          "total_us": 6263.3730000000005,
+          "mean_us": 21.747822916666667
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 792,
+          "total_us": 5365.38,
+          "mean_us": 6.774469696969697
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypef8E4M3FN_tensor00o2560111100_tensorptrf8E4M3FNgmemalign1_0",
+          "count": 384,
+          "total_us": 5085.173,
+          "mean_us": 13.242638020833333
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_32x32x128_6_32x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 800,
+          "total_us": 4554.423,
+          "mean_us": 5.69302875
+        }
+      ]
+    },
+    "baseline_csf_tp2": {
+      "directory": "qwen-csf-c8-profile-tp2-baseline-csf-1",
+      "utc": {
+        "starting": "2026-10-02T01:19:50.887521",
+        "healthy": "2026-10-02T01:25:53.962257",
+        "logprob-probe": "2026-10-02T01:25:53.962300",
+        "decode-1": "2026-10-02T01:25:55.652659",
+        "decode-2": "2026-10-02T01:28:03.118639",
+        "profiling": "2026-10-02T01:30:10.738015",
+        "complete": "2026-10-02T01:30:16.535986"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "bdd0cb2bb946345383d1724319885b940c566d211d8c05cf565eeed23cce357e",
+        "launch.json": "40581cf357d990758045c7e3a2b72729867142099b1ef5bbb4bc989733db3715",
+        "decode-1.json": "8231eb930d899106023c4c79a41f979e3768b4e05c427298cf3d60e8f9ac2c19",
+        "decode-2.json": "9501c023f60b593040e83cecf3dcff39951cde70514f7bbc925b9dd557935565",
+        "server.log": "2d852ac53c742b5f579ee4752af9df210b082cd07f173e33957d092a02c3887b",
+        "telemetry.csv": "ea1f09684907c0f913dd9b033a554ea3d107e6908bfe0bffb3253330b9c035c7",
+        "logprob-probes.json": "044d6231e0b2bfb32d40949a7b9f5c55fc971db8eec560a7bc6220e88b83fd87",
+        "kernel-summary.json": "eff2a68457cc21924293739369d2aecb2e8bfc065696354d15d85205c8448410"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "485ee222f03f70cf9ac66e9c70b489bbb5a70777c3da647c7e892a58d45f84e9",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "35bd6d3c0c19f393e67ca071a0a0c0a1ae2cab151e3248ee80fdc3a1bd11df4e",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "0eaccbd7660c18a6a10829774cde660958b6c971a0b747f963ce4b57ad45b7b8"
+      },
+      "model_gib_per_rank": [
+        37.12
+      ],
+      "kv_tokens": [
+        4096315
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 272.7795942485086,
+          "server_steps_per_s": 114.04582404170444,
+          "server_spec_accept_length": 2.3922650190708317
+        },
+        "8": {
+          "aggregate_tps": 1173.8177353243823,
+          "server_steps_per_s": 509.22161739914065,
+          "server_spec_accept_length": 2.3051945285642783
+        },
+        "16": {
+          "aggregate_tps": 1790.2010402755004,
+          "server_steps_per_s": 779.7264292549091,
+          "server_spec_accept_length": 2.296526122431793
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 270.32504997540696,
+            "server_steps_per_s": 114.12464801009102,
+            "server_spec_accept_length": 2.369082407948568,
+            "measurement_seconds": 29.993521,
+            "client_output_tokens": 8108,
+            "server_output_tokens": 8108,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 275.23413852161025,
+            "server_steps_per_s": 113.96700007331785,
+            "server_spec_accept_length": 2.4154476301930954,
+            "measurement_seconds": 29.999912,
+            "client_output_tokens": 8257,
+            "server_output_tokens": 8257,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1191.359827982652,
+            "server_steps_per_s": 508.26374911388814,
+            "server_spec_accept_length": 2.343979538300105,
+            "measurement_seconds": 30.000172,
+            "client_output_tokens": 35741,
+            "server_output_tokens": 35741,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1156.2756426661128,
+            "server_steps_per_s": 510.1794856843932,
+            "server_spec_accept_length": 2.2664095188284517,
+            "measurement_seconds": 29.981605,
+            "client_output_tokens": 34667,
+            "server_output_tokens": 34667,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ],
+        "16": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1792.5519494101209,
+            "server_steps_per_s": 778.1558848355157,
+            "server_spec_accept_length": 2.3035897875257025,
+            "measurement_seconds": 29.999131,
+            "client_output_tokens": 53775,
+            "server_output_tokens": 53775,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1787.8501311408802,
+            "server_steps_per_s": 781.2969736743024,
+            "server_spec_accept_length": 2.289462457337884,
+            "measurement_seconds": 29.980701,
+            "client_output_tokens": 53601,
+            "server_output_tokens": 53638,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141": {
+          "physical_index": 12,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2737.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2812.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        },
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7": {
+          "physical_index": 13,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2812.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2887.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 47003.421,
+          "mean_us": 122.4047421875
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xcommpcie_oneshot_cute_OneshotLaunch_object_at__ptri64gmem_ptri64gmem_ptri32gmemalign16_ptri32gmemalign16________0",
+          "count": 856,
+          "total_us": 9220.947,
+          "mean_us": 10.772134345794392
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xsequencegdn_decode_cute_kernels_PackedRecurrentQwenKernel_object_at__ptrbf16gmem_ptrbf16gmem_ptrbf16gmem_ptrf32gmem_ptrbf16gmem_ptrf32gmem_ptri32gmem_ptri32gmem__0",
+          "count": 288,
+          "total_us": 6235.571,
+          "mean_us": 21.651288194444444
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 792,
+          "total_us": 5281.808,
+          "mean_us": 6.668949494949495
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypef8E4M3FN_tensor00o2560111100_tensorptrf8E4M3FNgmemalign1_0",
+          "count": 384,
+          "total_us": 5057.2,
+          "mean_us": 13.169791666666667
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_32x32x128_6_32x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 800,
+          "total_us": 4535.471,
+          "mean_us": 5.66933875
+        }
+      ]
+    },
+    "csf_tp1": {
+      "directory": "qwen-csf-c8-profile-tp1-tail-select-1",
+      "utc": {
+        "starting": "2026-10-02T01:33:59.881905",
+        "healthy": "2026-10-02T01:41:51.454519",
+        "logprob-probe": "2026-10-02T01:41:51.454568",
+        "decode-1": "2026-10-02T01:41:53.537707",
+        "decode-2": "2026-10-02T01:43:23.169274",
+        "profiling": "2026-10-02T01:44:52.427909",
+        "complete": "2026-10-02T01:44:59.738293"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "e3713950347a5cd5798f6f010d9484a2dab2ecec7630a7cad5acc1e50ec9c65b",
+        "launch.json": "a58f0809cdb1a7a3a6172178f6f53fb566fc41fc6c608c814a3dd205ba4e03c4",
+        "decode-1.json": "0e71ac5a101e908adbdb5185a8c143b8be127482df509edc3715670ecee1e160",
+        "decode-2.json": "a463010c6a3999ba680b865bdfaaa74a9eef4ca74d59b800881018a0ca0c5ebb",
+        "server.log": "c862137dae58ecf885abab7e2298dbeda46093a20ac10c04991aa91fd88de58e",
+        "telemetry.csv": "1b2b0198ba495dd1b20b4ad2a9514fc05c095ea6e0852012a8343454482b811c",
+        "logprob-probes.json": "765281550e8315b1805601fcd35da1216224d01a8b944f1948a12e0e871587e7",
+        "kernel-summary.json": "c937cd31069abeda45a5cc5d7fe11d29599ae256ed5dc0f135367e0c846d4d93"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "a98b1bc29e4559c15190eccf8a01f6695c3d03bfde08b1cce16ade72d0b3d24e"
+      },
+      "model_gib_per_rank": [
+        71.2
+      ],
+      "kv_tokens": [
+        859746
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 201.2855275317392,
+          "server_steps_per_s": 84.7413599948469,
+          "server_spec_accept_length": 2.3752851969346445
+        },
+        "8": {
+          "aggregate_tps": 802.9563038783177,
+          "server_steps_per_s": 351.6227536010988,
+          "server_spec_accept_length": 2.283572464356295
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 203.46629814825954,
+            "server_steps_per_s": 84.7665131374548,
+            "server_spec_accept_length": 2.4003145890680297,
+            "measurement_seconds": 30.000054,
+            "client_output_tokens": 6104,
+            "server_output_tokens": 6104,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 199.1047569152189,
+            "server_steps_per_s": 84.716206852239,
+            "server_spec_accept_length": 2.350255804801259,
+            "measurement_seconds": 29.989238,
+            "client_output_tokens": 5971,
+            "server_output_tokens": 5972,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 802.0246916533102,
+            "server_steps_per_s": 351.444524673901,
+            "server_spec_accept_length": 2.2820804859529233,
+            "measurement_seconds": 29.979127,
+            "client_output_tokens": 24044,
+            "server_output_tokens": 24044,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 803.8879161033252,
+            "server_steps_per_s": 351.8009825282966,
+            "server_spec_accept_length": 2.2850644427596665,
+            "measurement_seconds": 29.994231,
+            "client_output_tokens": 24112,
+            "server_output_tokens": 24112,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-6171baff-cc22-608e-4029-507f67c392ff": {
+          "physical_index": 10,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            13365.0
+          ],
+          "graphics_mhz_median": 2805.0,
+          "graphics_mhz_range": [
+            2610.0,
+            2835.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 74292.051,
+          "mean_us": 193.4688828125
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xsequencegdn_decode_cute_kernels_PackedRecurrentQwenKernel_object_at__ptrbf16gmem_ptrbf16gmem_ptrbf16gmem_ptrf32gmem_ptrbf16gmem_ptrf32gmem_ptri32gmem_ptri32gmem__0",
+          "count": 288,
+          "total_us": 13655.565,
+          "mean_us": 47.41515625
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypef8E4M3FN_tensor00o2560111100_tensorptrf8E4M3FNgmemalign1_0",
+          "count": 384,
+          "total_us": 11479.190999999999,
+          "mean_us": 29.8937265625
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 792,
+          "total_us": 9444.19,
+          "mean_us": 11.924482323232324
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_160x128x64_2_80x32x64_tmaAB_alignCD4_bz_TNNN",
+          "count": 8,
+          "total_us": 6541.6720000000005,
+          "mean_us": 817.7090000000001
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_32x32x128_6_32x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 800,
+          "total_us": 5466.536,
+          "mean_us": 6.83317
+        }
+      ]
+    },
+    "csf_tp2": {
+      "directory": "qwen-csf-c8-profile-tp2-tail-select-1",
+      "utc": {
+        "starting": "2026-10-02T01:33:59.894307",
+        "healthy": "2026-10-02T01:40:01.314288",
+        "logprob-probe": "2026-10-02T01:40:01.314332",
+        "decode-1": "2026-10-02T01:40:02.907093",
+        "decode-2": "2026-10-02T01:42:10.038598",
+        "profiling": "2026-10-02T01:44:17.668403",
+        "complete": "2026-10-02T01:44:23.382461"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "e3713950347a5cd5798f6f010d9484a2dab2ecec7630a7cad5acc1e50ec9c65b",
+        "launch.json": "67d7aefe9b5f1e7b064b0cd4d08fd7b069120fc71ebe2d2373da4813a2630e00",
+        "decode-1.json": "ffd23a30478075c7867640d2de192cc4b3ba2f627dbc724fb79016fd4a3b5d7b",
+        "decode-2.json": "3d7fb4d20ba7af1fa3bdfbc0cb664473ff3c2422e9ead4e894c9ea7f80558a78",
+        "server.log": "c3f3bbe525acdc291b463828a7d2161431b79c3b8213cd9051c3845a16c5de1d",
+        "telemetry.csv": "80b68e8527e89f2bccda33e312fbd766ff51ed4e5015d776ae2ddce91502a71c",
+        "logprob-probes.json": "e06f0e446c5a3a6e6e6e56e31e9d700153dd8d29be4cbcc690dd2e082e6e5cf4",
+        "kernel-summary.json": "abbe2f9b42ef276e44c4fe61e39931039e7aa4d5c7fca9adfd1bd9d13bd8e3e5"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "a98b1bc29e4559c15190eccf8a01f6695c3d03bfde08b1cce16ade72d0b3d24e"
+      },
+      "model_gib_per_rank": [
+        37.12
+      ],
+      "kv_tokens": [
+        4096315
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 267.6226935271412,
+          "server_steps_per_s": 114.09294183548039,
+          "server_spec_accept_length": 2.3460581313741518
+        },
+        "8": {
+          "aggregate_tps": 1199.9138409720395,
+          "server_steps_per_s": 519.1663945435787,
+          "server_spec_accept_length": 2.3112315927287814
+        },
+        "16": {
+          "aggregate_tps": 1822.3610091545393,
+          "server_steps_per_s": 798.3713594850973,
+          "server_spec_accept_length": 2.28258208547852
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 266.0651909831352,
+            "server_steps_per_s": 114.1660334649509,
+            "server_spec_accept_length": 2.3308995327102804,
+            "measurement_seconds": 29.992649,
+            "client_output_tokens": 7980,
+            "server_output_tokens": 7982,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 269.18019607114724,
+            "server_steps_per_s": 114.01985020600986,
+            "server_spec_accept_length": 2.3612167300380227,
+            "measurement_seconds": 29.994777,
+            "client_output_tokens": 8074,
+            "server_output_tokens": 8074,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1197.9518219009058,
+            "server_steps_per_s": 518.3358855466402,
+            "server_spec_accept_length": 2.3111496913580245,
+            "measurement_seconds": 29.98785,
+            "client_output_tokens": 35924,
+            "server_output_tokens": 35943,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1201.8758600431731,
+            "server_steps_per_s": 519.9969035405171,
+            "server_spec_accept_length": 2.3113134940995383,
+            "measurement_seconds": 29.984794,
+            "client_output_tokens": 36038,
+            "server_output_tokens": 36038,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ],
+        "16": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1808.5819466444589,
+            "server_steps_per_s": 797.501754299588,
+            "server_spec_accept_length": 2.267809364548495,
+            "measurement_seconds": 29.993664,
+            "client_output_tokens": 54246,
+            "server_output_tokens": 54246,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1836.1400716646199,
+            "server_steps_per_s": 799.2409646706066,
+            "server_spec_accept_length": 2.2973548064085447,
+            "measurement_seconds": 29.988453,
+            "client_output_tokens": 55063,
+            "server_output_tokens": 55063,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141": {
+          "physical_index": 12,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2730.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2820.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        },
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7": {
+          "physical_index": 13,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2812.0,
+          "graphics_mhz_range": [
+            2610.0,
+            2895.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 42812.955,
+          "mean_us": 111.4920703125
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xcommpcie_oneshot_cute_OneshotLaunch_object_at__ptri64gmem_ptri64gmem_ptri32gmemalign16_ptri32gmemalign16________0",
+          "count": 856,
+          "total_us": 9746.181999999999,
+          "mean_us": 11.385726635514018
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xsequencegdn_decode_cute_kernels_PackedRecurrentQwenKernel_object_at__ptrbf16gmem_ptrbf16gmem_ptrbf16gmem_ptrf32gmem_ptrbf16gmem_ptrf32gmem_ptri32gmem_ptri32gmem__0",
+          "count": 288,
+          "total_us": 6250.897,
+          "mean_us": 21.70450347222222
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 792,
+          "total_us": 5304.544,
+          "mean_us": 6.697656565656565
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypef8E4M3FN_tensor00o2560111100_tensorptrf8E4M3FNgmemalign1_0",
+          "count": 384,
+          "total_us": 5067.874,
+          "mean_us": 13.197588541666667
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_32x32x128_6_32x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 800,
+          "total_us": 4547.378,
+          "mean_us": 5.6842225
+        }
+      ]
+    }
+  },
+  "comparisons_percent": {
+    "csf_tp1/native_tp1": {
+      "1": {
+        "aggregate_tps": 2.6857706076809817,
+        "server_steps_per_s": -1.6371883990961122,
+        "server_spec_accept_length": 4.391952222290141
+      },
+      "8": {
+        "aggregate_tps": 0.6225531361895076,
+        "server_steps_per_s": 1.510050407678798,
+        "server_spec_accept_length": -0.8748098490122036
+      }
+    },
+    "csf_tp2/native_tp2": {
+      "1": {
+        "aggregate_tps": -2.5349713181181843,
+        "server_steps_per_s": -3.336400092788616,
+        "server_spec_accept_length": 0.8356472481682253
+      },
+      "8": {
+        "aggregate_tps": -2.7135913814736234,
+        "server_steps_per_s": -1.8570884963095557,
+        "server_spec_accept_length": -0.8728060729592313
+      },
+      "16": {
+        "aggregate_tps": -3.294224516001887,
+        "server_steps_per_s": -1.52851904753728,
+        "server_spec_accept_length": -1.7932206462548894
+      }
+    },
+    "baseline_csf_tp2/native_tp2": {
+      "1": {
+        "aggregate_tps": -0.6568888950866159,
+        "server_steps_per_s": -3.3763199641916763,
+        "server_spec_accept_length": 2.8216600267557013
+      },
+      "8": {
+        "aggregate_tps": -4.829406959810112,
+        "server_steps_per_s": -3.7370433498369215,
+        "server_spec_accept_length": -1.1317317609203181
+      },
+      "16": {
+        "aggregate_tps": -5.000831886531376,
+        "server_steps_per_s": -3.8281930904614625,
+        "server_spec_accept_length": -1.193286488757328
+      }
+    },
+    "csf_tp2/baseline_csf_tp2": {
+      "1": {
+        "aggregate_tps": -1.890500913594484,
+        "server_steps_per_s": 0.04131479093765211,
+        "server_spec_accept_length": -1.9315120744701986
+      },
+      "8": {
+        "aggregate_tps": 2.2231820888654052,
+        "server_steps_per_s": 1.952936954096951,
+        "server_spec_accept_length": 0.26188957546515734
+      },
+      "16": {
+        "aggregate_tps": 1.7964445420101782,
+        "server_steps_per_s": 2.391214345267856,
+        "server_spec_accept_length": -0.6071795490184995
+      }
+    }
+  },
+  "implementation_commit": "0cb79c43d2678de8aa6e71ff9d706caea9a11b1e",
+  "correctness_receipts": {
+    "tail-tests-1.log": "498c7f6464f518368ddfdafcf97fb9abaad51c5a6794c575e16e7c97b85728a5",
+    "tail-inline-tests-1.log": "4e550aa671e86edf960a02b65cc070b7b37328fddadc472ee0ca3894789aa506",
+    "tail-racecheck-1.log": "6b738e960ccbef978ee3ab4ef21f63c2116058173ad7c7c391a229a134712324",
+    "online-composition-1.log": "5146117e5de56982966b99583abf2de6d6296149ae913e99cdcc3d2a047a420e",
+    "lint-final.json": "62295d4e3c8ea2f00f4e86f73f9113568685adf17a97fa43790b054b351d2b78"
+  },
+  "online_composition_base": "c41b25529b2c4153f58aeab81d91bb662f1a3e39",
+  "components": {
+    "tp2-experts-control": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-CSF/snapshots/4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e",
+      "model": "qwen",
+      "layer": 3,
+      "tp": 2,
+      "geometry": [
+        512,
+        2560,
+        320
+      ],
+      "fast_math": true,
+      "serving_policy": false,
+      "serving_routes": false,
+      "atomic_control": false,
+      "comparison": "latency CSF/native",
+      "cases": [
+        {
+          "tokens": 8,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              93.39903831481934,
+              93.0406379699707,
+              93.0508804321289,
+              93.27615737915039,
+              93.08159828186035,
+              92.78464317321777
+            ],
+            [
+              105.4758358001709,
+              105.11327743530273,
+              105.25088310241699,
+              105.12800216674805,
+              105.27135848999023,
+              105.15872001647949
+            ],
+            [
+              120.88288307189941,
+              120.70272445678711,
+              120.67232131958008,
+              120.77055931091309,
+              120.71935653686523,
+              120.71328163146973
+            ]
+          ],
+          "median_us": [
+            93.06623935699463,
+            105.20480155944824,
+            120.71631908416748
+          ]
+        },
+        {
+          "tokens": 32,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              337.3875045776367,
+              337.23777770996094,
+              337.48992919921875,
+              337.2582244873047,
+              337.4630355834961,
+              337.5513458251953
+            ],
+            [
+              369.8624038696289,
+              369.5747375488281,
+              369.7804641723633,
+              369.69791412353516,
+              369.6166229248047,
+              369.6985626220703
+            ],
+            [
+              358.04161071777344,
+              358.1235122680664,
+              357.891845703125,
+              358.03550720214844,
+              358.0419158935547,
+              358.2057571411133
+            ]
+          ],
+          "median_us": [
+            337.4252700805664,
+            369.69823837280273,
+            358.04176330566406
+          ]
+        },
+        {
+          "tokens": 64,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              504.36126708984375,
+              504.2726516723633,
+              504.33406829833984,
+              504.10655975341797,
+              504.2115020751953,
+              504.1766357421875
+            ],
+            [
+              550.8297729492188,
+              550.9324645996094,
+              550.8230209350586,
+              550.7888031005859,
+              550.6044769287109,
+              550.8227157592773
+            ],
+            [
+              487.3052978515625,
+              487.4281692504883,
+              487.2643280029297,
+              487.3049545288086,
+              487.30464935302734,
+              487.1001434326172
+            ]
+          ],
+          "median_us": [
+            504.2420768737793,
+            550.822868347168,
+            487.30480194091797
+          ]
+        }
+      ],
+      "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2865 MHz, 16365 MHz, 0x0000000000000400\n"
+    },
+    "tp2-experts-tail-gpu14-1": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-CSF/snapshots/4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e",
+      "model": "qwen",
+      "layer": 3,
+      "tp": 2,
+      "geometry": [
+        512,
+        2560,
+        320
+      ],
+      "fast_math": true,
+      "serving_policy": false,
+      "serving_routes": false,
+      "atomic_control": false,
+      "comparison": "latency CSF/native",
+      "cases": [
+        {
+          "tokens": 8,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              93.67936134338379,
+              92.99936294555664,
+              93.01407814025879,
+              93.03423881530762,
+              93.01376342773438,
+              93.17791938781738
+            ],
+            [
+              105.02143859863281,
+              105.21599769592285,
+              104.8681640625,
+              105.31840324401855,
+              105.1750373840332,
+              105.04192352294922
+            ],
+            [
+              110.4793643951416,
+              110.88864326477051,
+              110.82719802856445,
+              110.59200286865234,
+              110.61247825622559,
+              110.74560165405273
+            ]
+          ],
+          "median_us": [
+            93.0241584777832,
+            105.10848045349121,
+            110.67903995513916
+          ]
+        },
+        {
+          "tokens": 32,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              337.51041412353516,
+              337.24414825439453,
+              337.0393753051758,
+              337.2787094116211,
+              337.38719940185547,
+              337.2585678100586
+            ],
+            [
+              369.82784271240234,
+              369.84832763671875,
+              369.48001861572266,
+              369.7660827636719,
+              369.4793701171875,
+              369.31583404541016
+            ],
+            [
+              347.4470520019531,
+              347.6377487182617,
+              347.79552459716797,
+              347.82176971435547,
+              347.71934509277344,
+              347.73983001708984
+            ]
+          ],
+          "median_us": [
+            337.26863861083984,
+            369.62305068969727,
+            347.72958755493164
+          ]
+        },
+        {
+          "tokens": 64,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              504.2726516723633,
+              504.33406829833984,
+              504.0883255004883,
+              504.33406829833984,
+              503.92478942871094,
+              504.4364929199219
+            ],
+            [
+              550.885124206543,
+              551.0076904296875,
+              550.9260940551758,
+              550.7609558105469,
+              550.6867218017578,
+              550.5369567871094
+            ],
+            [
+              484.2124938964844,
+              484.07520294189453,
+              484.3212890625,
+              484.11006927490234,
+              484.0873718261719,
+              483.94527435302734
+            ]
+          ],
+          "median_us": [
+            504.30335998535156,
+            550.8230400085449,
+            484.0987205505371
+          ]
+        }
+      ],
+      "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2872 MHz, 16365 MHz, 0x0000000000000400\n"
+    },
+    "glm-experts-baseline-gpu14": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-CSF/snapshots/20f4777422f833c48b67bb0e554e1bc61dc55ca1",
+      "model": "glm",
+      "layer": 3,
+      "tp": 4,
+      "geometry": [
+        288,
+        4096,
+        512
+      ],
+      "fast_math": true,
+      "serving_policy": false,
+      "serving_routes": false,
+      "atomic_control": false,
+      "comparison": "latency CSF/native",
+      "cases": [
+        {
+          "tokens": 8,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              143.59807968139648,
+              143.5260772705078,
+              143.45600128173828,
+              143.58943939208984,
+              143.44608306884766,
+              143.5260772705078
+            ],
+            [
+              154.63839530944824,
+              154.5958423614502,
+              154.5417594909668,
+              154.59744453430176,
+              154.41887855529785,
+              154.60351943969727
+            ],
+            [
+              183.7708854675293,
+              183.5456085205078,
+              183.42912673950195,
+              183.11391830444336,
+              183.16287994384766,
+              183.14239501953125
+            ]
+          ],
+          "median_us": [
+            143.5260772705078,
+            154.59664344787598,
+            183.2960033416748
+          ]
+        },
+        {
+          "tokens": 32,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              449.4355010986328,
+              449.25952911376953,
+              449.0137481689453,
+              448.9459228515625,
+              448.9052963256836,
+              449.0460968017578
+            ],
+            [
+              502.06687927246094,
+              501.65760040283203,
+              502.3945617675781,
+              502.2719955444336,
+              502.2719955444336,
+              501.8214416503906
+            ],
+            [
+              445.54527282714844,
+              445.56671142578125,
+              445.5731201171875,
+              445.6137466430664,
+              445.45055389404297,
+              445.2867126464844
+            ]
+          ],
+          "median_us": [
+            449.02992248535156,
+            502.16943740844727,
+            445.55599212646484
+          ]
+        },
+        {
+          "tokens": 64,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              589.2646408081055,
+              589.5107269287109,
+              589.3465423583984,
+              589.4476699829102,
+              589.4489669799805,
+              589.3260955810547
+            ],
+            [
+              663.9446258544922,
+              664.0060424804688,
+              663.7795257568359,
+              663.7197113037109,
+              663.9718627929688,
+              663.9040374755859
+            ],
+            [
+              609.8982238769531,
+              609.9660873413086,
+              609.672966003418,
+              609.6384048461914,
+              609.6527862548828,
+              609.5772933959961
+            ]
+          ],
+          "median_us": [
+            589.3971061706543,
+            663.9243316650391,
+            609.6628761291504
+          ]
+        }
+      ],
+      "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2857 MHz, 16365 MHz, 0x0000000000000400\n"
+    },
+    "glm-experts-tail-1": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-CSF/snapshots/20f4777422f833c48b67bb0e554e1bc61dc55ca1",
+      "model": "glm",
+      "layer": 3,
+      "tp": 4,
+      "geometry": [
+        288,
+        4096,
+        512
+      ],
+      "fast_math": true,
+      "serving_policy": false,
+      "serving_routes": false,
+      "atomic_control": false,
+      "comparison": "latency CSF/native",
+      "cases": [
+        {
+          "tokens": 8,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              143.5750389099121,
+              143.5750389099121,
+              143.46240043640137,
+              143.4928035736084,
+              143.43168258666992,
+              143.51360321044922
+            ],
+            [
+              154.65472221374512,
+              154.6774387359619,
+              154.43936347961426,
+              154.5564842224121,
+              154.6076774597168,
+              154.4054412841797
+            ],
+            [
+              181.82559967041016,
+              181.87231063842773,
+              181.31967544555664,
+              181.37279510498047,
+              181.18656158447266,
+              181.1555290222168
+            ]
+          ],
+          "median_us": [
+            143.5032033920288,
+            154.58208084106445,
+            181.34623527526855
+          ]
+        },
+        {
+          "tokens": 32,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              449.5052719116211,
+              449.4643020629883,
+              449.0547180175781,
+              449.9353790283203,
+              449.13665771484375,
+              448.99295806884766
+            ],
+            [
+              501.07776641845703,
+              501.18656158447266,
+              501.65760040283203,
+              501.04286193847656,
+              501.2614440917969,
+              501.20704650878906
+            ],
+            [
+              444.85633850097656,
+              444.85633850097656,
+              444.73377227783203,
+              444.8976135253906,
+              444.7129440307617,
+              444.56958770751953
+            ]
+          ],
+          "median_us": [
+            449.300479888916,
+            501.19680404663086,
+            444.7950553894043
+          ]
+        },
+        {
+          "tokens": 64,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": true,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              588.8819122314453,
+              588.5276794433594,
+              588.6912155151367,
+              588.9843368530273,
+              588.6095809936523,
+              588.3635330200195
+            ],
+            [
+              663.9644622802734,
+              664.012451171875,
+              663.6172485351562,
+              663.5417938232422,
+              663.9103698730469,
+              663.8015747070312
+            ],
+            [
+              608.3622360229492,
+              608.7104034423828,
+              608.4636688232422,
+              608.5260772705078,
+              608.5055923461914,
+              608.6489486694336
+            ]
+          ],
+          "median_us": [
+            588.6503982543945,
+            663.8559722900391,
+            608.5158348083496
+          ]
+        }
+      ],
+      "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2872 MHz, 16365 MHz, 0x0000000000000400\n"
+    }
+  },
+  "source_manifest_check": "All unchanged B12X and all vLLM Python files match within each native/final-CSF pair; exactly the three modified B12X runtime modules differ."
+}

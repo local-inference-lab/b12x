@@ -110,5 +110,7 @@ layer would violate this memory contract.
 
 The [serving report](nvfp4-serving.md) records the component qualification,
 whole-model measurements, prepared-memory cost and residual overhead.
+The [Qwen TP1/TP2 report](qwen-serving.md) qualifies paired reconstruction,
+split-gate halves, and partial-atom zero selection against matched native controls.
 [Dynamic MoE invariants](dynamic-moe-correctness.md) records independent native
 routing/addressing fixes included in the measured source.
