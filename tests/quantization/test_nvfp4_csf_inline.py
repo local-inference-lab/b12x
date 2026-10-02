@@ -21,6 +21,28 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 from .test_nvfp4_csf import _fixture
 
 
+def test_preparation_addresses_storage_beyond_two_gibibytes():
+    """A final expert must retain its byte exception past signed 32-bit offsets."""
+    from b12x._lib.quant.nvfp4_csf import Nvfp4CsfBatch
+
+    experts, rows, columns = 4096, 128, 8192
+    fixed = torch.zeros(
+        experts, 1, rows * (1 + columns // 2), dtype=torch.uint8, device="cuda"
+    )
+    assert fixed.numel() > 2**31
+    position = rows * columns - 1
+    records = torch.tensor([position | (219 << 24)], dtype=torch.uint32, device="cuda")
+    bounds = torch.zeros(experts, 2, dtype=torch.int64, device="cuda")
+    bounds[-1, -1] = 1
+    batch = Nvfp4CsfBatch(fixed, records.view(torch.uint8), bounds, rows, columns)
+    plane = prepare_inline_scales(batch)
+    payload = 1024 + fixed.numel() + experts * rows * columns // 512 * 32
+    assert payload > 2**31
+    assert plane.storage[payload:].cpu().tolist() == [0, 0, 0, 219] + [0] * 12
+    metadata = plane.storage[payload - 32:payload].view(torch.uint32)
+    assert metadata.cpu().tolist() == [0, 0, 0, 0, 0, 1 << 31, 1, 0]
+
+
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("rows,columns", [(128, 4), (640, 20), (1024, 256)])
 def test_indexed_expansion_routes_tail_and_frozen_replay(ids_dtype, rows, columns):
