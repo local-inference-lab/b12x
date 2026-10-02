@@ -13,11 +13,11 @@ from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
 # Native execution surfaces after the all-reduce manager's plan-time routing.
 # Values are supported worlds, never a set of transports to race.
 SURFACES = {
-    "OneshotAllReduce.all_reduce": (2, 4, 6, 8, 10),
-    "OneshotAllReduce.all_reduce_fused_add_rms_norm": (2, 4, 6, 8, 10),
-    "OneshotAllReducePool.all_reduce": (2, 4, 6, 8, 10),
-    "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 4, 6, 8, 10),
-    "DmaAllReduce.all_reduce": (2, 4, 6, 8, 10),
+    "OneshotAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
+    "OneshotAllReduce.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
+    "OneshotAllReducePool.all_reduce": (2, 3, 4, 6, 8, 10),
+    "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
+    "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
     "PCIeTwoShotBF16.all_reduce": (4,),
     "PCIeTwoShotBF16.reduce_scatter": (4,),
     "PCIeTwoShotBF16.all_gather": (4,),
