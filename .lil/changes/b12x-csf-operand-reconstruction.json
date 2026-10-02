@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-csf-operand-reconstruction",
+  "category": "performance",
+  "summary": "Reduce synchronization and redundant reads in NVFP4-CSF scale reconstruction",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"],
+  "compatibility": "Checkpoint schemas, activation precision, preparation API and scale storage sizes are unchanged.",
+  "details": [
+    "Reconstruct ready gate/up operands with one pair of consumer barriers.",
+    "Reconstruct only the consumed 64-row halves when a gate crosses 128-row scale atoms.",
+    "Select exact zero padding for partial K atoms inside the shared scale reader."
+  ],
+  "pull_requests": [],
+  "requires": []
+}

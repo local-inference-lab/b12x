@@ -76,6 +76,23 @@ a second barrier precedes native fragment loads. Shared-memory PTX reads declare
 side effects and a memory clobber because the same address contains different
 operands on successive pipeline iterations.
 
+When two operands are ready together, consumers retain both operands before
+either slot is overwritten and use the same two barriers for the pair. This
+applies to fused gate/up computation and to a gate whose row range straddles
+two 128-row atoms. A 64-row gate boundary requires only the upper half of the
+first atom and the lower half of the second atom; those halves are reconstructed
+in their native positions. Unused rows remain compressed and are outside that
+MMA's load range. Every consumer reaches both barriers, including consumers
+without a word to reconstruct in a half operand.
+
+For a partial K operand, the shared reader reconstructs a word from the staged
+bytes and selects zero when its atom has the invalid marker. The selection is
+part of the same PTX operation, using its existing metadata address. Padded
+atoms have zero codes and exception masks, so reconstruction cannot access an
+exception record before the zero selection. Complete operands omit this check
+at compilation. This removes a separate validity branch from partial-geometry
+scale reads without changing the native padded values.
+
 ## Complete-plane expansion for short routes
 
 When preparation selects complete-plane expansion, route lists shorter than

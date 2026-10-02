@@ -36,7 +36,7 @@ def _expect_payload(barrier, byte_count, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _shared_scale_word(stage_address, word, records_address, *, loc=None, ip=None):
+def _shared_scale_word(stage_address, word, records_address, mask_partial=False, *, loc=None, ip=None):
     """Keep bitmap lookup temporaries local to one scale-register definition."""
     return Uint32(
         llvm.inline_asm(
@@ -95,7 +95,11 @@ def _shared_scale_word(stage_address, word, records_address, *, loc=None, ip=Non
         add.u64 replacement, $3, offset;
         ld.global.u32 $0, [replacement];
         CSF_WORD_DONE:
-        }""",
+        """ + ("""
+        ld.shared.u32 test, [metadata+28];
+        setp.eq.u32 absent, test, 0;
+        selp.b32 $0, $0, 0, absent;
+        """ if mask_partial else "") + "}",
             "=&r,r,r,l,~{memory}",
             # Operand slots are reused after pipeline barriers. This read must
             # not be eliminated or hoisted when its pointer repeats.
@@ -401,43 +405,84 @@ class InlineNvfp4Reader:
 
     @cute.jit
     def shared_word(self, stage_address, word: Int32, records_address):
-        value = Uint32(0)
-        valid = True
-        if cutlass.const_expr(self.columns % 8):
-            address = stage_address + Int32(640) + (word // Int32(128)) * Int32(32) + Int32(28)
-            pointer = cute.make_ptr(cutlass.Uint32, address, cute.AddressSpace.smem)
-            valid = cute.make_tensor(pointer, cute.make_layout(1))[0] == Uint32(0)
-        if valid:
-            value = _shared_scale_word(stage_address, word, records_address)
-        return value
+        return _shared_scale_word(
+            stage_address, word, records_address, mask_partial=bool(self.columns % 8)
+        )
+
+    @cute.jit
+    def _operand_word(self, ordinal: Int32, row_half: cutlass.Constexpr):
+        if cutlass.const_expr(row_half < 0):
+            return ordinal
+        # F8_128x4 interleaves four groups of 32 rows. A 64-row half
+        # occupies two adjacent words in each four-word row group.
+        return (
+            (ordinal // Int32(64)) * Int32(128)
+            + (ordinal % Int32(64) // Int32(2)) * Int32(4)
+            + ordinal % Int32(2) + Int32(row_half * 2)
+        )
+
+    @cute.jit
+    def _read_shared_operand(
+        self, target, records_address, thread: Int32,
+        threads: cutlass.Constexpr, row_half: cutlass.Constexpr,
+    ):
+        count = 256 if row_half < 0 else 128
+        iterations = (count + threads - 1) // threads
+        values = cute.make_rmem_tensor(cute.make_layout(iterations), cutlass.Uint32)
+        for index in cutlass.range_constexpr(iterations):
+            ordinal = thread + Int32(index * threads)
+            if ordinal < Int32(count):
+                values[index] = self.shared_word(
+                    target.toint(), self._operand_word(ordinal, row_half), records_address
+                )
+        return values
+
+    @cute.jit
+    def _store_shared_operand(
+        self, target, values, thread: Int32,
+        threads: cutlass.Constexpr, row_half: cutlass.Constexpr,
+    ):
+        count = 256 if row_half < 0 else 128
+        output = cute.make_tensor(
+            cute.recast_ptr(target, dtype=cutlass.Uint32), cute.make_layout(256)
+        )
+        for index in cutlass.range_constexpr(cute.size(values)):
+            ordinal = thread + Int32(index * threads)
+            if ordinal < Int32(count):
+                output[self._operand_word(ordinal, row_half)] = values[index]
 
     @cute.jit
     def expand_shared(
         self, storage, experts: Int32, shared, stage: Int32,
-        threads: cutlass.Constexpr, barrier,
+        threads: cutlass.Constexpr, barrier, second_shared=None, second_stage: Int32 = 0,
+        row_half: cutlass.Constexpr = -1, second_row_half: cutlass.Constexpr = -1,
     ):
-        """Decode one operand slot collectively before native fragment loads.
+        """Reconstruct one or two ready operands using two consumer barriers.
 
-        All consumer lanes retain their assigned words before any compressed
-        input is overwritten. Two consumer-only barriers order input reads,
-        native stores and the subsequent MMA fragment loads.
+        All lanes retain every required input before either slot is overwritten.
+        A split gate operand needs the upper 64 rows of its first atom and the
+        lower 64 rows of its second atom. Other rows remain compressed and must
+        not be consumed by that MMA. Every consumer still reaches both barriers.
         """
         thread, _, _ = cute.arch.thread_idx()
         target = cute.recast_ptr(shared, dtype=cutlass.Uint8) + stage * Int32(1024)
         records_address = storage.toint() + Int64(_HEADER_BYTES) + Int64(experts) * Int64(
             self.fixed_bytes + self.tiles * 32
         )
-        values = cute.make_rmem_tensor(cute.make_layout(256 // threads), cutlass.Uint32)
-        for index in cutlass.range_constexpr(256 // threads):
-            values[index] = self.shared_word(
-                target.toint(), Int32(thread) + Int32(index * threads), records_address
+        values = self._read_shared_operand(
+            target, records_address, Int32(thread), threads, row_half
+        )
+        if cutlass.const_expr(second_shared is not None):
+            second_target = cute.recast_ptr(second_shared, dtype=cutlass.Uint8) + second_stage * Int32(1024)
+            second_values = self._read_shared_operand(
+                second_target, records_address, Int32(thread), threads, second_row_half
             )
         barrier.arrive_and_wait()
-        output = cute.make_tensor(
-            cute.recast_ptr(target, dtype=cutlass.Uint32), cute.make_layout(256)
-        )
-        for index in cutlass.range_constexpr(256 // threads):
-            output[Int32(thread) + Int32(index * threads)] = values[index]
+        self._store_shared_operand(target, values, Int32(thread), threads, row_half)
+        if cutlass.const_expr(second_shared is not None):
+            self._store_shared_operand(
+                second_target, second_values, Int32(thread), threads, second_row_half
+            )
         barrier.arrive_and_wait()
 
 
