@@ -32,6 +32,7 @@ from ._lib.runtime_control import (
 # the explicit private-module overrides below by tests/test_registry.py.
 _OPS: tuple[str, ...] = (
     "attention.paged",
+    "attention.paged_decode",
     "attention.dense_mla",
     "attention.sparse_mla",
     "attention.compressed_sparse_mla",
