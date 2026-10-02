@@ -2,16 +2,13 @@
   "status": "research-only",
   "ratio": "(candidate/reference - 1) * 100; positive is faster",
   "source_receipt": {
-    "base": "bb5f4c4a43b420a1451f38c8aca0b0d9e6385662",
+    "implementation": "e646d0d16d09d4c2f2c3d751d68a447c71086b75",
     "files": {
-      "b12x/_lib/quant/nvfp4_csf_inline.py": "a98b1bc29e4559c15190eccf8a01f6695c3d03bfde08b1cce16ade72d0b3d24e",
+      "b12x/_lib/quant/nvfp4_csf_inline.py": "158463e4237f2c5d947c7c729a870050232c27a78b45fa2a10b6197cbbac58be",
       "b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
       "b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+      "tests/quantization/test_nvfp4_csf_inline.py": "4296d5827c7dad3e0b3b5cb6710c553505b0bdae52782697aca83e79805c462c",
       "tests/moe/test_nvfp4_csf.py": "0465fec46e36543204edb3a3bd387cf40de4f9748ec34cf23a10fe122d537899"
-    },
-    "validation": {
-      "tail-tests-1.log": "498c7f6464f518368ddfdafcf97fb9abaad51c5a6794c575e16e7c97b85728a5",
-      "tail-inline-tests-1.log": "4e550aa671e86edf960a02b65cc070b7b37328fddadc472ee0ca3894789aa506"
     }
   },
   "arms": {
@@ -192,6 +189,14 @@
           "count": 800,
           "total_us": 5492.416,
           "mean_us": 6.86552
+        }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 72346.776,
+          "mean_us": 188.4030625
         }
       ]
     },
@@ -434,6 +439,14 @@
           "total_us": 4554.423,
           "mean_us": 5.69302875
         }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 39549.727,
+          "mean_us": 102.99408072916667
+        }
       ]
     },
     "baseline_csf_tp2": {
@@ -675,9 +688,17 @@
           "total_us": 4535.471,
           "mean_us": 5.66933875
         }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 47003.421,
+          "mean_us": 122.4047421875
+        }
       ]
     },
-    "csf_tp1": {
+    "operand_csf_tp1": {
       "directory": "qwen-csf-c8-profile-tp1-tail-select-1",
       "utc": {
         "starting": "2026-10-02T01:33:59.881905",
@@ -855,9 +876,17 @@
           "total_us": 5466.536,
           "mean_us": 6.83317
         }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 74292.051,
+          "mean_us": 193.4688828125
+        }
       ]
     },
-    "csf_tp2": {
+    "operand_csf_tp2": {
       "directory": "qwen-csf-c8-profile-tp2-tail-select-1",
       "utc": {
         "starting": "2026-10-02T01:33:59.894307",
@@ -1096,85 +1125,943 @@
           "total_us": 4547.378,
           "mean_us": 5.6842225
         }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 42812.955,
+          "mean_us": 111.4920703125
+        }
+      ]
+    },
+    "csf_tp1": {
+      "directory": "qwen-csf-c8-profile-tp1-vectors-1",
+      "utc": {
+        "starting": "2026-10-02T02:16:28.556918",
+        "healthy": "2026-10-02T02:24:10.230340",
+        "logprob-probe": "2026-10-02T02:24:10.230400",
+        "decode-1": "2026-10-02T02:24:12.402516",
+        "decode-2": "2026-10-02T02:25:41.544998",
+        "profiling": "2026-10-02T02:27:10.716876",
+        "complete": "2026-10-02T02:27:18.076886"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "d7e3d2f727c281304173e7b5bc508ab32c612e21346f950687977871cb2fa913",
+        "launch.json": "6455f726e302498fb679b8fb8daadef7492d4ffc4f7fefb2e8eb2af140f3cbea",
+        "decode-1.json": "ab5a37e4ae52e2b189f02733e09504720098c871b9dcf7c24a5e652928fdcfa1",
+        "decode-2.json": "b2c5f77d61262a5c03ca7b68cbf8b0c53bd96378197f77da5b37c7db980b51f1",
+        "server.log": "6f8c82fa8295cb80057cd6da95eaaba1767cefb28616a4bbe06e0f43869e9550",
+        "telemetry.csv": "7e881fc44a91e8d3fa1e5dff26dd66e92c4258231d4587e85b6cb7de345109fd",
+        "logprob-probes.json": "4f4dbcf773826f62446a67d45d52f1227f56a9c7120a1c92848d6d5210b09298",
+        "kernel-summary.json": "81b6ab4045dcb5144ae4e8244a1fbfb168f708dfe0baca885b853d7f14aa23fc"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "158463e4237f2c5d947c7c729a870050232c27a78b45fa2a10b6197cbbac58be"
+      },
+      "model_gib_per_rank": [
+        71.2
+      ],
+      "kv_tokens": [
+        859746
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 197.4710014105332,
+          "server_steps_per_s": 85.18286670435035,
+          "server_spec_accept_length": 2.318258099374054
+        },
+        "8": {
+          "aggregate_tps": 807.1211068705038,
+          "server_steps_per_s": 350.54607692744,
+          "server_spec_accept_length": 2.3022615256150845
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 197.3165786046821,
+            "server_steps_per_s": 85.57385661061309,
+            "server_spec_accept_length": 2.3058044409816905,
+            "measurement_seconds": 29.997479,
+            "client_output_tokens": 5919,
+            "server_output_tokens": 5919,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 197.62542421638432,
+            "server_steps_per_s": 84.79187679808761,
+            "server_spec_accept_length": 2.3307117577664176,
+            "measurement_seconds": 29.99108,
+            "client_output_tokens": 5927,
+            "server_output_tokens": 5927,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 823.2559146146444,
+            "server_steps_per_s": 355.17316878638366,
+            "server_spec_accept_length": 2.31790007513148,
+            "measurement_seconds": 29.979742,
+            "client_output_tokens": 24681,
+            "server_output_tokens": 24681,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 790.9862991263633,
+            "server_steps_per_s": 345.9189850684964,
+            "server_spec_accept_length": 2.2866229760986894,
+            "measurement_seconds": 29.995463,
+            "client_output_tokens": 23726,
+            "server_output_tokens": 23726,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-6171baff-cc22-608e-4029-507f67c392ff": {
+          "physical_index": 10,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            13365.0
+          ],
+          "graphics_mhz_median": 2805.0,
+          "graphics_mhz_range": [
+            2610.0,
+            2835.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 72328.021,
+          "mean_us": 188.35422135416667
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xsequencegdn_decode_cute_kernels_PackedRecurrentQwenKernel_object_at__ptrbf16gmem_ptrbf16gmem_ptrbf16gmem_ptrf32gmem_ptrbf16gmem_ptrf32gmem_ptri32gmem_ptri32gmem__0",
+          "count": 288,
+          "total_us": 13663.81,
+          "mean_us": 47.44378472222222
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypef8E4M3FN_tensor00o2560111100_tensorptrf8E4M3FNgmemalign1_0",
+          "count": 384,
+          "total_us": 11468.204,
+          "mean_us": 29.865114583333334
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 792,
+          "total_us": 9437.201000000001,
+          "mean_us": 11.915657828282828
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_160x128x64_2_80x32x64_tmaAB_alignCD4_bz_TNNN",
+          "count": 8,
+          "total_us": 6543.002,
+          "mean_us": 817.87525
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_32x32x128_6_32x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 800,
+          "total_us": 5473.856,
+          "mean_us": 6.84232
+        }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 72328.021,
+          "mean_us": 188.35422135416667
+        }
+      ]
+    },
+    "csf_tp2": {
+      "directory": "qwen-csf-c1-profile-tp2-vectors-1",
+      "utc": {
+        "starting": "2026-10-02T02:13:06.078852",
+        "healthy": "2026-10-02T02:19:08.929498",
+        "logprob-probe": "2026-10-02T02:19:08.929548",
+        "decode-1": "2026-10-02T02:19:10.555601",
+        "decode-2": "2026-10-02T02:21:18.290745",
+        "profiling": "2026-10-02T02:23:25.709660",
+        "complete": "2026-10-02T02:23:29.607144"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "d7e3d2f727c281304173e7b5bc508ab32c612e21346f950687977871cb2fa913",
+        "launch.json": "37a27179bda4a11b6d224fa1f6b9bf478b2ae6a81e77fb2937fd9f2960832792",
+        "decode-1.json": "d5ea3298822819725d90a235e74f757d7f55dd9a3f9c82e510debeb7a9a51dac",
+        "decode-2.json": "aeed44dcacae50ea98274732748475264645b840e4f5dbaa9d9ad700d190c956",
+        "server.log": "80c8083e6a595b816b9d2c2c3978c0f545c5f07b18085a42aaabfe1addddbdfc",
+        "telemetry.csv": "89ae019115dbbb010400f196b09af0691225263ea0193f9bef0b38fbe3adf1d0",
+        "logprob-probes.json": "d8b3581a47d89ce4f44759459b942d03314cf574302b7b5ab1a54a6b06640295",
+        "kernel-summary.json": "6fdc19f74fc63ddab5671b07b32fa8dfbf79d5972ac5a0108f8dcd6c383b377f"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "158463e4237f2c5d947c7c729a870050232c27a78b45fa2a10b6197cbbac58be"
+      },
+      "model_gib_per_rank": [
+        37.12
+      ],
+      "kv_tokens": [
+        4096315
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 275.9815320059847,
+          "server_steps_per_s": 115.53259055722596,
+          "server_spec_accept_length": 2.3890931352134728
+        },
+        "8": {
+          "aggregate_tps": 1215.5927230252837,
+          "server_steps_per_s": 520.0417614772483,
+          "server_spec_accept_length": 2.337486807788792
+        },
+        "16": {
+          "aggregate_tps": 1829.5265172187947,
+          "server_steps_per_s": 795.8574867368908,
+          "server_spec_accept_length": 2.2988630428973957
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 283.13038240670136,
+            "server_steps_per_s": 115.69879412922774,
+            "server_spec_accept_length": 2.447550432276657,
+            "measurement_seconds": 30.000313,
+            "client_output_tokens": 8494,
+            "server_output_tokens": 8494,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 268.83268160526814,
+            "server_steps_per_s": 115.36638698522418,
+            "server_spec_accept_length": 2.3306358381502887,
+            "measurement_seconds": 29.992633,
+            "client_output_tokens": 8063,
+            "server_output_tokens": 8065,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ],
+        "8": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1218.9363999088484,
+            "server_steps_per_s": 521.0292819045702,
+            "server_spec_accept_length": 2.3394777265745006,
+            "measurement_seconds": 29.986798,
+            "client_output_tokens": 36552,
+            "server_output_tokens": 36552,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1212.2490461417187,
+            "server_steps_per_s": 519.0542410499264,
+            "server_spec_accept_length": 2.3354958890030835,
+            "measurement_seconds": 29.993012,
+            "client_output_tokens": 36359,
+            "server_output_tokens": 36359,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 8,
+            "max_queue_reqs": 0
+          }
+        ],
+        "16": [
+          {
+            "pass": 1,
+            "aggregate_tps": 1845.2072611275146,
+            "server_steps_per_s": 794.1913490540336,
+            "server_spec_accept_length": 2.323378696236559,
+            "measurement_seconds": 29.977662,
+            "client_output_tokens": 55315,
+            "server_output_tokens": 55315,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 1813.8457733100745,
+            "server_steps_per_s": 797.523624419748,
+            "server_spec_accept_length": 2.274347389558233,
+            "measurement_seconds": 29.97278,
+            "client_output_tokens": 54366,
+            "server_output_tokens": 54366,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 16,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141": {
+          "physical_index": 12,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2730.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2820.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        },
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7": {
+          "physical_index": 13,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2812.0,
+          "graphics_mhz_range": [
+            2640.0,
+            2887.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 14353.147,
+          "mean_us": 37.377986979166664
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 1176,
+          "total_us": 11275.836,
+          "mean_us": 9.588295918367347
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xcommpcie_oneshot_cute_OneshotLaunch_object_at__ptri64gmem_ptri64gmem_ptri32gmemalign16_ptri32gmemalign16________0",
+          "count": 856,
+          "total_us": 6562.708,
+          "mean_us": 7.666714953271028
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_64x8x128_5_16x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 1256,
+          "total_us": 5810.904,
+          "mean_us": 4.626515923566879
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_128x8x64_5_32x8x64_tmaAB_alignCD4_bz_TNNN",
+          "count": 848,
+          "total_us": 4324.365,
+          "mean_us": 5.099487028301887
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_64x16x128_4_16x8x128_tmaAB_alignCD4_bz_TNNN",
+          "count": 8,
+          "total_us": 2572.482,
+          "mean_us": 321.56025
+        }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 14353.147,
+          "mean_us": 37.377986979166664
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libquantnvfp4_csf_Pair_object_at__ptri8_gmem_align16_ptri32_gmem_align16__ptri8_gmem_align16_ptri32_gmem_align16__tensorptri32_gmem_o_1____tensorptri32_gmem_o_1_0",
+          "count": 384,
+          "total_us": 1591.714,
+          "mean_us": 4.1450885416666665
+        }
+      ]
+    },
+    "native_tp2_c1_repeat": {
+      "directory": "qwen-native-c1-profile-tp2-c1-native-2",
+      "utc": {
+        "starting": "2026-10-02T02:01:45.740351",
+        "healthy": "2026-10-02T02:07:09.127075",
+        "logprob-probe": "2026-10-02T02:07:09.127119",
+        "decode-1": "2026-10-02T02:07:10.711383",
+        "decode-2": "2026-10-02T02:08:01.417429",
+        "profiling": "2026-10-02T02:08:51.824158",
+        "complete": "2026-10-02T02:08:55.575648"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "e3713950347a5cd5798f6f010d9484a2dab2ecec7630a7cad5acc1e50ec9c65b",
+        "launch.json": "604a61758f41bee7c98bb58eee6d058f33c1e0184290881819fa3f6229ab718b",
+        "decode-1.json": "61a17a8cc6148b4189e25d6011e09b8361bb33d77e80b41cb37a51294629fd5a",
+        "decode-2.json": "d7a648d1964191b84d1ad4464c2e9856416bb3a6ddfb9f63982f639c8ceeae7c",
+        "server.log": "332e4c536ba4452dd92d9ab651309f4fac7c2849bcc7d53bdfc24f1d0a0c66af",
+        "telemetry.csv": "833b389c25a5c7c299fb1093ce070e06322194aeeb0bb286dd7ce80cce9dcdc2",
+        "logprob-probes.json": "d74be0fd92885a81ae6cbe5a8ef0f3bfbfc41eb6b9c5a05772238b04c5e4d845",
+        "kernel-summary.json": "e02580ae3e22e4fe71ebd12d13911528ca214e6431a937795b69f480d67ca6a7"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "a98b1bc29e4559c15190eccf8a01f6695c3d03bfde08b1cce16ade72d0b3d24e"
+      },
+      "model_gib_per_rank": [
+        38.41
+      ],
+      "kv_tokens": [
+        3912966
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 274.23455261668096,
+          "server_steps_per_s": 117.79813587074139,
+          "server_spec_accept_length": 2.3283670354490074
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 272.48369503571547,
+            "server_steps_per_s": 117.6740204888764,
+            "server_spec_accept_length": 2.3159535279115895,
+            "measurement_seconds": 29.998125,
+            "client_output_tokens": 8174,
+            "server_output_tokens": 8174,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 275.9854101976465,
+            "server_steps_per_s": 117.92225125260639,
+            "server_spec_accept_length": 2.3407805429864252,
+            "measurement_seconds": 29.994339,
+            "client_output_tokens": 8278,
+            "server_output_tokens": 8278,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141": {
+          "physical_index": 12,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2782.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2820.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        },
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7": {
+          "physical_index": 13,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2857.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2887.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 15196.008,
+          "mean_us": 39.5729375
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 1176,
+          "total_us": 11132.023,
+          "mean_us": 9.466005952380952
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_64x8x128_5_16x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 1256,
+          "total_us": 5770.178,
+          "mean_us": 4.59409076433121
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_128x8x64_5_32x8x64_tmaAB_alignCD4_bz_TNNN",
+          "count": 848,
+          "total_us": 4252.045,
+          "mean_us": 5.014204009433962
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xcommpcie_oneshot_cute_OneshotLaunch_object_at__ptri64gmem_ptri64gmem_ptri32gmemalign16_ptri32gmemalign16________0",
+          "count": 856,
+          "total_us": 3768.956,
+          "mean_us": 4.402985981308412
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_64x16x128_4_16x8x128_tmaAB_alignCD4_bz_TNNN",
+          "count": 8,
+          "total_us": 2548.389,
+          "mean_us": 318.548625
+        }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 15196.008,
+          "mean_us": 39.5729375
+        }
+      ]
+    },
+    "operand_csf_tp2_c1_repeat": {
+      "directory": "qwen-csf-c1-profile-tp2-c1-tail-1",
+      "utc": {
+        "starting": "2026-10-02T01:55:20.459557",
+        "healthy": "2026-10-02T01:59:53.575946",
+        "logprob-probe": "2026-10-02T01:59:53.575997",
+        "decode-1": "2026-10-02T01:59:55.153688",
+        "decode-2": "2026-10-02T02:00:46.030603",
+        "profiling": "2026-10-02T02:01:37.103237",
+        "complete": "2026-10-02T02:01:40.744402"
+      },
+      "image": "sha256:5501c32fa048b25d53004ea9cd391477467eae9b4e9d9c2dcccc851086dac46b",
+      "sha256": {
+        "source-manifest.json": "e3713950347a5cd5798f6f010d9484a2dab2ecec7630a7cad5acc1e50ec9c65b",
+        "launch.json": "a80e0c5a4ff4678bea4abd20bb40ac51c854c0853e706d7317ea5cd1601cb7d3",
+        "decode-1.json": "654d839cb6a7dd6b79c9dbf7c470d64fcc3dfffb10ec16264c9d7a4c522f76d0",
+        "decode-2.json": "3dfe3a1654e3e1db78090bfca5093102c0ef060d3b9b29836a8206ccb4b5bec8",
+        "server.log": "f1772e0f72f2112b95f1dba1a9464dfdd88c8bf15d72cd04fccbe143869ed212",
+        "telemetry.csv": "ff083fd6063735d42fbdbdc87d70fedb05dbe9f62184cea4bcfe95ad2c44629d",
+        "logprob-probes.json": "5e97aabf690ec45366033290051bac701b9cde44c8b448586693b70404ac5cb9",
+        "kernel-summary.json": "f3dbe2f8bae264a12e5c0824d1d77b60e36c42842079316d75b5f70eb163c148"
+      },
+      "source_files": {
+        "b12x-beta/b12x/moe/fused_moe/_impl.py": "8e64ad736aef6f1c0c8f6acf1dbb5880543f70436935bc7341a027cafb17f190",
+        "b12x-beta/b12x/moe/_shared/kernels/dynamic.py": "c88383527b1148c38fc9188ceff248ec156d4bf60838c42f08ded7e798ddba59",
+        "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py": "a98b1bc29e4559c15190eccf8a01f6695c3d03bfde08b1cce16ade72d0b3d24e"
+      },
+      "model_gib_per_rank": [
+        37.12
+      ],
+      "kv_tokens": [
+        4096315
+      ],
+      "means": {
+        "1": {
+          "aggregate_tps": 269.83435408712603,
+          "server_steps_per_s": 114.06451723445177,
+          "server_spec_accept_length": 2.366027245917198
+        }
+      },
+      "windows": {
+        "1": [
+          {
+            "pass": 1,
+            "aggregate_tps": 270.2598483497113,
+            "server_steps_per_s": 114.19195418181117,
+            "server_spec_accept_length": 2.3671144859813085,
+            "measurement_seconds": 29.993357,
+            "client_output_tokens": 8106,
+            "server_output_tokens": 8106,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          },
+          {
+            "pass": 2,
+            "aggregate_tps": 269.4088598245408,
+            "server_steps_per_s": 113.93708028709237,
+            "server_spec_accept_length": 2.3649400058530876,
+            "measurement_seconds": 29.999013,
+            "client_output_tokens": 8082,
+            "server_output_tokens": 8082,
+            "aggregate_source": "openai_continuous_usage",
+            "num_errors": 0,
+            "failure_reason": "",
+            "underfilled": false,
+            "capacity_limited": false,
+            "loop_detected": false,
+            "max_running_reqs": 1,
+            "max_queue_reqs": 0
+          }
+        ]
+      },
+      "telemetry": {
+        "GPU-3304d777-8f0e-2767-419a-d72ffa553141": {
+          "physical_index": 12,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2775.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2820.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        },
+        "GPU-61b4b68d-9529-ef3e-184c-e19488aac9b7": {
+          "physical_index": 13,
+          "pstates": [
+            "P1"
+          ],
+          "memory_mhz": [
+            16365.0
+          ],
+          "graphics_mhz_median": 2857.0,
+          "graphics_mhz_range": [
+            2602.0,
+            2895.0
+          ],
+          "power_limit_w": [
+            600.0
+          ],
+          "clock_event_masks": [
+            "0x0000000000000400"
+          ]
+        }
+      },
+      "diagnostic_kernel_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 14309.023,
+          "mean_us": 37.26308072916667
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libdense_gemmDenseGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1102401_TVLayoutDst1102401_Valuetypebf16_tensor00o2560111100_tensorptrbf16gmemalign16o256012_0",
+          "count": 1176,
+          "total_us": 11278.795,
+          "mean_us": 9.590812074829932
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_64x8x128_5_16x8x128_tmaAB_alignCD4_splitK_TNNN",
+          "count": 1256,
+          "total_us": 5750.587,
+          "mean_us": 4.578492834394904
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_128x8x64_5_32x8x64_tmaAB_alignCD4_bz_TNNN",
+          "count": 848,
+          "total_us": 4307.516,
+          "mean_us": 5.079617924528302
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12xcommpcie_oneshot_cute_OneshotLaunch_object_at__ptri64gmem_ptri64gmem_ptri32gmemalign16_ptri32gmemalign16________0",
+          "count": 856,
+          "total_us": 3582.9,
+          "mean_us": 4.185630841121496
+        },
+        {
+          "name": "nvjet_sm120_tst_mma_64x16x128_4_16x8x128_tmaAB_alignCD4_bz_TNNN",
+          "count": 8,
+          "total_us": 2572.515,
+          "mean_us": 321.564375
+        }
+      ],
+      "diagnostic_csf_profile": [
+        {
+          "name": "kernel_cutlass_kernel_b12xmoe_sharedkernelssiluMoEDynamicKernelSilu_object_at__tensorptrbf16gmemalign16o256025601_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tensorptri_0",
+          "count": 384,
+          "total_us": 14309.023,
+          "mean_us": 37.26308072916667
+        },
+        {
+          "name": "kernel_cutlass_kernel_b12x_libquantnvfp4_csf_Pair_object_at__ptri8_gmem_align16_ptri32_gmem_align16__ptri8_gmem_align16_ptri32_gmem_align16__tensorptri32_gmem_o_1____tensorptri32_gmem_o_1_0",
+          "count": 384,
+          "total_us": 2142.573,
+          "mean_us": 5.5796171875
+        }
       ]
     }
   },
   "comparisons_percent": {
     "csf_tp1/native_tp1": {
       "1": {
-        "aggregate_tps": 2.6857706076809817,
-        "server_steps_per_s": -1.6371883990961122,
-        "server_spec_accept_length": 4.391952222290141
+        "aggregate_tps": 0.7397908889085869,
+        "server_steps_per_s": -1.1247132477642974,
+        "server_spec_accept_length": 1.8856552725159625
       },
       "8": {
-        "aggregate_tps": 0.6225531361895076,
-        "server_steps_per_s": 1.510050407678798,
-        "server_spec_accept_length": -0.8748098490122036
+        "aggregate_tps": 1.1444658584121914,
+        "server_steps_per_s": 1.1992243809312075,
+        "server_spec_accept_length": -0.06355608766368537
       }
     },
     "csf_tp2/native_tp2": {
       "1": {
-        "aggregate_tps": -2.5349713181181843,
-        "server_steps_per_s": -3.336400092788616,
-        "server_spec_accept_length": 0.8356472481682253
+        "aggregate_tps": 0.5092190730269452,
+        "server_steps_per_s": -2.116678471039124,
+        "server_spec_accept_length": 2.6853296615888977
       },
       "8": {
-        "aggregate_tps": -2.7135913814736234,
-        "server_steps_per_s": -1.8570884963095557,
-        "server_spec_accept_length": -0.8728060729592313
+        "aggregate_tps": -1.4423816712181514,
+        "server_steps_per_s": -1.6916096432726069,
+        "server_spec_accept_length": 0.25326273080656936
       },
       "16": {
-        "aggregate_tps": -3.294224516001887,
-        "server_steps_per_s": -1.52851904753728,
-        "server_spec_accept_length": -1.7932206462548894
+        "aggregate_tps": -2.9139782252781132,
+        "server_steps_per_s": -1.8385812378963862,
+        "server_spec_accept_length": -1.0927418319002014
       }
     },
-    "baseline_csf_tp2/native_tp2": {
+    "csf_tp1/operand_csf_tp1": {
       "1": {
-        "aggregate_tps": -0.6568888950866159,
-        "server_steps_per_s": -3.3763199641916763,
-        "server_spec_accept_length": 2.8216600267557013
+        "aggregate_tps": -1.8950821591505185,
+        "server_steps_per_s": 0.521004984496698,
+        "server_spec_accept_length": -2.4008526485234327
       },
       "8": {
-        "aggregate_tps": -4.829406959810112,
-        "server_steps_per_s": -3.7370433498369215,
-        "server_spec_accept_length": -1.1317317609203181
+        "aggregate_tps": 0.5186836409490692,
+        "server_steps_per_s": -0.30620221889287036,
+        "server_spec_accept_length": 0.8184133216923017
+      }
+    },
+    "csf_tp2/operand_csf_tp2": {
+      "1": {
+        "aggregate_tps": 3.1233668448209517,
+        "server_steps_per_s": 1.2618210194119683,
+        "server_spec_accept_length": 1.8343536873109967
+      },
+      "8": {
+        "aggregate_tps": 1.306667322092303,
+        "server_steps_per_s": 0.1686100916526323,
+        "server_spec_accept_length": 1.1359837388261074
       },
       "16": {
-        "aggregate_tps": -5.000831886531376,
-        "server_steps_per_s": -3.8281930904614625,
-        "server_spec_accept_length": -1.193286488757328
+        "aggregate_tps": 0.3931991536396895,
+        "server_steps_per_s": -0.3148751164906316,
+        "server_spec_accept_length": 0.7132693068281348
       }
     },
     "csf_tp2/baseline_csf_tp2": {
       "1": {
-        "aggregate_tps": -1.890500913594484,
-        "server_steps_per_s": 0.04131479093765211,
-        "server_spec_accept_length": -1.9315120744701986
+        "aggregate_tps": 1.1738186524902217,
+        "server_steps_per_s": 1.303657129065794,
+        "server_spec_accept_length": -0.132589150118112
       },
       "8": {
-        "aggregate_tps": 2.2231820888654052,
-        "server_steps_per_s": 1.952936954096951,
-        "server_spec_accept_length": 0.26188957546515734
+        "aggregate_tps": 3.5588990048235125,
+        "server_steps_per_s": 2.124839894537822,
+        "server_spec_accept_length": 1.4008483372822234
       },
       "16": {
-        "aggregate_tps": 1.7964445420101782,
-        "server_steps_per_s": 2.391214345267856,
-        "server_spec_accept_length": -0.6071795490184995
+        "aggregate_tps": 2.1967073003846815,
+        "server_steps_per_s": 2.0688098898220098,
+        "server_spec_accept_length": 0.10175893244914747
+      }
+    },
+    "csf_tp2/native_tp2_c1_repeat": {
+      "1": {
+        "aggregate_tps": 0.6370383938254731,
+        "server_steps_per_s": -1.9232437735698937,
+        "server_spec_accept_length": 2.6080982439589784
+      }
+    },
+    "csf_tp2/operand_csf_tp2_c1_repeat": {
+      "1": {
+        "aggregate_tps": 2.278130203122264,
+        "server_steps_per_s": 1.2870552195970442,
+        "server_spec_accept_length": 0.9748784311794045
       }
     }
   },
-  "implementation_commit": "0cb79c43d2678de8aa6e71ff9d706caea9a11b1e",
-  "correctness_receipts": {
-    "tail-tests-1.log": "498c7f6464f518368ddfdafcf97fb9abaad51c5a6794c575e16e7c97b85728a5",
-    "tail-inline-tests-1.log": "4e550aa671e86edf960a02b65cc070b7b37328fddadc472ee0ca3894789aa506",
-    "tail-racecheck-1.log": "6b738e960ccbef978ee3ab4ef21f63c2116058173ad7c7c391a229a134712324",
-    "online-composition-1.log": "5146117e5de56982966b99583abf2de6d6296149ae913e99cdcc3d2a047a420e",
-    "lint-final.json": "62295d4e3c8ea2f00f4e86f73f9113568685adf17a97fa43790b054b351d2b78"
+  "source_differences": {
+    "csf_tp1/native_tp1": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py",
+      "b12x-beta/b12x/moe/_shared/kernels/dynamic.py",
+      "b12x-beta/b12x/moe/fused_moe/_impl.py"
+    ],
+    "csf_tp2/native_tp2": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py",
+      "b12x-beta/b12x/moe/_shared/kernels/dynamic.py",
+      "b12x-beta/b12x/moe/fused_moe/_impl.py"
+    ],
+    "csf_tp1/operand_csf_tp1": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py"
+    ],
+    "csf_tp2/operand_csf_tp2": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py"
+    ],
+    "csf_tp2/baseline_csf_tp2": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py",
+      "b12x-beta/b12x/moe/_shared/kernels/dynamic.py",
+      "b12x-beta/b12x/moe/fused_moe/_impl.py"
+    ],
+    "csf_tp2/native_tp2_c1_repeat": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py"
+    ],
+    "csf_tp2/operand_csf_tp2_c1_repeat": [
+      "b12x-beta/b12x/_lib/quant/nvfp4_csf_inline.py"
+    ]
   },
-  "online_composition_base": "c41b25529b2c4153f58aeab81d91bb662f1a3e39",
-  "components": {
-    "tp2-experts-control": {
+  "validation_artifact_sha256": {
+    "vector-inline-tests-2.log": "fe67338ff2ab8abcef2a92ecdd5a8370f9212250d77af775528f33a306e71f26",
+    "vector-moe-tests-1.log": "26fd935938537683c2191940b35352ccabee388057087467d990b7e7436cf96e",
+    "vector-memcheck-1.log": "5d090f1a849c2179d437badf194122b1b56c640ec7b23b17844c5ec8a08138d1",
+    "vector-racecheck-1.log": "a5ef5779df520103c93f545e32b7750c77b746de2002ab5310c1257c788d9481",
+    "vector-online-composition-1.log": "67370e79fcd215c9cb8a5515989f4d44cbb617616e218c3d0d37a1ee7d2e7f34",
+    "tp2-small-serving-policy-3.json": "b7b6ac4e71c3636ce54804b3ac3638d15433d4fa4bfb2170594c4e152d07bf23",
+    "tp2-small-serving-vectors-1.json": "33c4f0d7f7374e4f6ed5fa5d07eeebc5337a9ab1187dd8a6db81770121a2ec02",
+    "vector-span-2.json": "3c10d73d9aa767e022bde34e4f8914481e1ab82f71758a75c5f29fa02ba5be62",
+    "tail-racecheck-1.log": "6b738e960ccbef978ee3ab4ef21f63c2116058173ad7c7c391a229a134712324"
+  },
+  "validation": {
+    "byte_and_expert_tests": 121,
+    "indexed_memcheck_cases": 16,
+    "indexed_racecheck_cases": 22,
+    "split_gate_racecheck_cases": 4,
+    "online_a4_a16_composition_cases": 4,
+    "sanitizer_errors": 0,
+    "sanitizer_warnings": 0,
+    "sanitizer_hazards": 0
+  },
+  "component_cases": {
+    "tp2-small-serving-policy-3.json": {
       "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-CSF/snapshots/4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e",
       "model": "qwen",
       "layer": 3,
@@ -1185,24 +2072,24 @@
         320
       ],
       "fast_math": true,
-      "serving_policy": false,
-      "serving_routes": false,
+      "serving_policy": true,
+      "serving_routes": true,
       "atomic_control": false,
       "comparison": "latency CSF/native",
       "cases": [
         {
-          "tokens": 8,
+          "tokens": 1,
           "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
+            "micro",
+            "micro",
+            "micro"
           ],
           "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+            "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
           ],
-          "exact": true,
+          "exact": false,
           "atomic_control_errors": [],
           "max_error": [
             0.0,
@@ -1211,501 +2098,208 @@
           ],
           "samples_us": [
             [
-              93.39903831481934,
-              93.0406379699707,
-              93.0508804321289,
-              93.27615737915039,
-              93.08159828186035,
-              92.78464317321777
+              21.025280952453613,
+              20.954880714416504,
+              21.016321182250977,
+              20.770559310913086,
+              20.770559310913086,
+              20.852479934692383
             ],
             [
-              105.4758358001709,
-              105.11327743530273,
-              105.25088310241699,
-              105.12800216674805,
-              105.27135848999023,
-              105.15872001647949
+              22.520639896392822,
+              22.51039981842041,
+              22.511680126190186,
+              22.511680126190186,
+              22.53216028213501,
+              22.511680126190186
             ],
             [
-              120.88288307189941,
-              120.70272445678711,
-              120.67232131958008,
-              120.77055931091309,
-              120.71935653686523,
-              120.71328163146973
+              22.51136064529419,
+              22.51039981842041,
+              22.510719299316406,
+              22.510719299316406,
+              22.510719299316406,
+              22.511041164398193
             ]
           ],
           "median_us": [
-            93.06623935699463,
-            105.20480155944824,
-            120.71631908416748
+            20.903680324554443,
+            22.511680126190186,
+            22.510719299316406
           ]
         },
         {
-          "tokens": 32,
+          "tokens": 4,
           "implementation": [
             "dynamic",
             "dynamic",
             "dynamic"
           ],
           "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
           ],
-          "exact": true,
+          "exact": false,
           "atomic_control_errors": [],
           "max_error": [
             0.0,
-            0.0,
-            0.0
+            1.1444091796875e-05,
+            1.33514404296875e-05
           ],
           "samples_us": [
             [
-              337.3875045776367,
-              337.23777770996094,
-              337.48992919921875,
-              337.2582244873047,
-              337.4630355834961,
-              337.5513458251953
+              38.772480487823486,
+              38.84416103363037,
+              38.80352020263672,
+              38.88511896133423,
+              38.90399932861328,
+              38.82368087768555
             ],
             [
-              369.8624038696289,
-              369.5747375488281,
-              369.7804641723633,
-              369.69791412353516,
-              369.6166229248047,
-              369.6985626220703
+              42.57184028625488,
+              42.55104064941406,
+              42.343997955322266,
+              42.30559825897217,
+              42.59200096130371,
+              42.26431846618652
             ],
             [
-              358.04161071777344,
-              358.1235122680664,
-              357.891845703125,
-              358.03550720214844,
-              358.0419158935547,
-              358.2057571411133
+              41.62975788116455,
+              41.77248001098633,
+              41.902079582214355,
+              41.85503959655762,
+              41.73215866088867,
+              41.902079582214355
             ]
           ],
           "median_us": [
-            337.4252700805664,
-            369.69823837280273,
-            358.04176330566406
-          ]
-        },
-        {
-          "tokens": 64,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              504.36126708984375,
-              504.2726516723633,
-              504.33406829833984,
-              504.10655975341797,
-              504.2115020751953,
-              504.1766357421875
-            ],
-            [
-              550.8297729492188,
-              550.9324645996094,
-              550.8230209350586,
-              550.7888031005859,
-              550.6044769287109,
-              550.8227157592773
-            ],
-            [
-              487.3052978515625,
-              487.4281692504883,
-              487.2643280029297,
-              487.3049545288086,
-              487.30464935302734,
-              487.1001434326172
-            ]
-          ],
-          "median_us": [
-            504.2420768737793,
-            550.822868347168,
-            487.30480194091797
-          ]
-        }
-      ],
-      "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2865 MHz, 16365 MHz, 0x0000000000000400\n"
-    },
-    "tp2-experts-tail-gpu14-1": {
-      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-CSF/snapshots/4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e",
-      "model": "qwen",
-      "layer": 3,
-      "tp": 2,
-      "geometry": [
-        512,
-        2560,
-        320
-      ],
-      "fast_math": true,
-      "serving_policy": false,
-      "serving_routes": false,
-      "atomic_control": false,
-      "comparison": "latency CSF/native",
-      "cases": [
-        {
-          "tokens": 8,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              93.67936134338379,
-              92.99936294555664,
-              93.01407814025879,
-              93.03423881530762,
-              93.01376342773438,
-              93.17791938781738
-            ],
-            [
-              105.02143859863281,
-              105.21599769592285,
-              104.8681640625,
-              105.31840324401855,
-              105.1750373840332,
-              105.04192352294922
-            ],
-            [
-              110.4793643951416,
-              110.88864326477051,
-              110.82719802856445,
-              110.59200286865234,
-              110.61247825622559,
-              110.74560165405273
-            ]
-          ],
-          "median_us": [
-            93.0241584777832,
-            105.10848045349121,
-            110.67903995513916
-          ]
-        },
-        {
-          "tokens": 32,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              337.51041412353516,
-              337.24414825439453,
-              337.0393753051758,
-              337.2787094116211,
-              337.38719940185547,
-              337.2585678100586
-            ],
-            [
-              369.82784271240234,
-              369.84832763671875,
-              369.48001861572266,
-              369.7660827636719,
-              369.4793701171875,
-              369.31583404541016
-            ],
-            [
-              347.4470520019531,
-              347.6377487182617,
-              347.79552459716797,
-              347.82176971435547,
-              347.71934509277344,
-              347.73983001708984
-            ]
-          ],
-          "median_us": [
-            337.26863861083984,
-            369.62305068969727,
-            347.72958755493164
-          ]
-        },
-        {
-          "tokens": 64,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              504.2726516723633,
-              504.33406829833984,
-              504.0883255004883,
-              504.33406829833984,
-              503.92478942871094,
-              504.4364929199219
-            ],
-            [
-              550.885124206543,
-              551.0076904296875,
-              550.9260940551758,
-              550.7609558105469,
-              550.6867218017578,
-              550.5369567871094
-            ],
-            [
-              484.2124938964844,
-              484.07520294189453,
-              484.3212890625,
-              484.11006927490234,
-              484.0873718261719,
-              483.94527435302734
-            ]
-          ],
-          "median_us": [
-            504.30335998535156,
-            550.8230400085449,
-            484.0987205505371
-          ]
-        }
-      ],
-      "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2872 MHz, 16365 MHz, 0x0000000000000400\n"
-    },
-    "glm-experts-baseline-gpu14": {
-      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-CSF/snapshots/20f4777422f833c48b67bb0e554e1bc61dc55ca1",
-      "model": "glm",
-      "layer": 3,
-      "tp": 4,
-      "geometry": [
-        288,
-        4096,
-        512
-      ],
-      "fast_math": true,
-      "serving_policy": false,
-      "serving_routes": false,
-      "atomic_control": false,
-      "comparison": "latency CSF/native",
-      "cases": [
-        {
-          "tokens": 8,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              143.59807968139648,
-              143.5260772705078,
-              143.45600128173828,
-              143.58943939208984,
-              143.44608306884766,
-              143.5260772705078
-            ],
-            [
-              154.63839530944824,
-              154.5958423614502,
-              154.5417594909668,
-              154.59744453430176,
-              154.41887855529785,
-              154.60351943969727
-            ],
-            [
-              183.7708854675293,
-              183.5456085205078,
-              183.42912673950195,
-              183.11391830444336,
-              183.16287994384766,
-              183.14239501953125
-            ]
-          ],
-          "median_us": [
-            143.5260772705078,
-            154.59664344787598,
-            183.2960033416748
-          ]
-        },
-        {
-          "tokens": 32,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              449.4355010986328,
-              449.25952911376953,
-              449.0137481689453,
-              448.9459228515625,
-              448.9052963256836,
-              449.0460968017578
-            ],
-            [
-              502.06687927246094,
-              501.65760040283203,
-              502.3945617675781,
-              502.2719955444336,
-              502.2719955444336,
-              501.8214416503906
-            ],
-            [
-              445.54527282714844,
-              445.56671142578125,
-              445.5731201171875,
-              445.6137466430664,
-              445.45055389404297,
-              445.2867126464844
-            ]
-          ],
-          "median_us": [
-            449.02992248535156,
-            502.16943740844727,
-            445.55599212646484
-          ]
-        },
-        {
-          "tokens": 64,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              589.2646408081055,
-              589.5107269287109,
-              589.3465423583984,
-              589.4476699829102,
-              589.4489669799805,
-              589.3260955810547
-            ],
-            [
-              663.9446258544922,
-              664.0060424804688,
-              663.7795257568359,
-              663.7197113037109,
-              663.9718627929688,
-              663.9040374755859
-            ],
-            [
-              609.8982238769531,
-              609.9660873413086,
-              609.672966003418,
-              609.6384048461914,
-              609.6527862548828,
-              609.5772933959961
-            ]
-          ],
-          "median_us": [
-            589.3971061706543,
-            663.9243316650391,
-            609.6628761291504
+            38.83392095565796,
+            42.447519302368164,
+            41.81375980377197
           ]
         }
       ],
       "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2857 MHz, 16365 MHz, 0x0000000000000400\n"
     },
-    "glm-experts-tail-1": {
-      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-CSF/snapshots/20f4777422f833c48b67bb0e554e1bc61dc55ca1",
-      "model": "glm",
+    "tp2-small-serving-vectors-1.json": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-CSF/snapshots/4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e",
+      "model": "qwen",
       "layer": 3,
-      "tp": 4,
+      "tp": 2,
       "geometry": [
-        288,
-        4096,
-        512
+        512,
+        2560,
+        320
       ],
       "fast_math": true,
-      "serving_policy": false,
-      "serving_routes": false,
+      "serving_policy": true,
+      "serving_routes": true,
       "atomic_control": false,
       "comparison": "latency CSF/native",
       "cases": [
+        {
+          "tokens": 1,
+          "implementation": [
+            "micro",
+            "micro",
+            "micro"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": false,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "samples_us": [
+            [
+              20.92384099960327,
+              20.892479419708252,
+              20.852479934692383,
+              20.934720039367676,
+              20.667200088500977,
+              20.75040102005005
+            ],
+            [
+              22.0796799659729,
+              22.03007936477661,
+              21.753599643707275,
+              21.896960735321045,
+              21.855359077453613,
+              21.896960735321045
+            ],
+            [
+              22.142720222473145,
+              22.183680534362793,
+              22.040319442749023,
+              21.895360946655273,
+              21.958398818969727,
+              22.101759910583496
+            ]
+          ],
+          "median_us": [
+            20.872479677200317,
+            21.896960735321045,
+            22.07103967666626
+          ]
+        },
+        {
+          "tokens": 4,
+          "implementation": [
+            "dynamic",
+            "dynamic",
+            "dynamic"
+          ],
+          "configs": [
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+          ],
+          "exact": false,
+          "atomic_control_errors": [],
+          "max_error": [
+            0.0,
+            1.1444091796875e-05,
+            1.9073486328125e-05
+          ],
+          "samples_us": [
+            [
+              38.81983995437622,
+              38.891520500183105,
+              38.731839656829834,
+              38.91200065612793,
+              38.870720863342285,
+              38.82368087768555
+            ],
+            [
+              41.62975788116455,
+              41.65599822998047,
+              41.656317710876465,
+              41.63616180419922,
+              41.799678802490234,
+              41.5334415435791
+            ],
+            [
+              41.08640193939209,
+              40.994558334350586,
+              41.157121658325195,
+              40.95327854156494,
+              40.91263771057129,
+              40.99487781524658
+            ]
+          ],
+          "median_us": [
+            38.847200870513916,
+            41.646080017089844,
+            40.994718074798584
+          ]
+        },
         {
           "tokens": 8,
           "implementation": [
@@ -1714,154 +2308,320 @@
             "dynamic"
           ],
           "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=188, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=188, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+            "MoeDecodeConfig(backend='dynamic', route_planner='triton', max_active_clusters=188, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
           ],
-          "exact": true,
+          "exact": false,
           "atomic_control_errors": [],
           "max_error": [
             0.0,
-            0.0,
-            0.0
+            1.1444091796875e-05,
+            1.1444091796875e-05
           ],
           "samples_us": [
             [
-              143.5750389099121,
-              143.5750389099121,
-              143.46240043640137,
-              143.4928035736084,
-              143.43168258666992,
-              143.51360321044922
+              65.53599834442139,
+              65.52576065063477,
+              65.54624080657959,
+              65.4643201828003,
+              65.46463966369629,
+              65.42304039001465
             ],
             [
-              154.65472221374512,
-              154.6774387359619,
-              154.43936347961426,
-              154.5564842224121,
-              154.6076774597168,
-              154.4054412841797
+              76.18559837341309,
+              76.15488052368164,
+              75.92959880828857,
+              76.15488052368164,
+              75.92927932739258,
+              76.07295989990234
             ],
             [
-              181.82559967041016,
-              181.87231063842773,
-              181.31967544555664,
-              181.37279510498047,
-              181.18656158447266,
-              181.1555290222168
+              74.63903903961182,
+              74.65951919555664,
+              74.8031997680664,
+              74.68031883239746,
+              74.57791805267334,
+              74.33216094970703
             ]
           ],
           "median_us": [
-            143.5032033920288,
-            154.58208084106445,
-            181.34623527526855
-          ]
-        },
-        {
-          "tokens": 32,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              449.5052719116211,
-              449.4643020629883,
-              449.0547180175781,
-              449.9353790283203,
-              449.13665771484375,
-              448.99295806884766
-            ],
-            [
-              501.07776641845703,
-              501.18656158447266,
-              501.65760040283203,
-              501.04286193847656,
-              501.2614440917969,
-              501.20704650878906
-            ],
-            [
-              444.85633850097656,
-              444.85633850097656,
-              444.73377227783203,
-              444.8976135253906,
-              444.7129440307617,
-              444.56958770751953
-            ]
-          ],
-          "median_us": [
-            449.300479888916,
-            501.19680404663086,
-            444.7950553894043
-          ]
-        },
-        {
-          "tokens": 64,
-          "implementation": [
-            "dynamic",
-            "dynamic",
-            "dynamic"
-          ],
-          "configs": [
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
-            "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=True, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=True, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
-          ],
-          "exact": true,
-          "atomic_control_errors": [],
-          "max_error": [
-            0.0,
-            0.0,
-            0.0
-          ],
-          "samples_us": [
-            [
-              588.8819122314453,
-              588.5276794433594,
-              588.6912155151367,
-              588.9843368530273,
-              588.6095809936523,
-              588.3635330200195
-            ],
-            [
-              663.9644622802734,
-              664.012451171875,
-              663.6172485351562,
-              663.5417938232422,
-              663.9103698730469,
-              663.8015747070312
-            ],
-            [
-              608.3622360229492,
-              608.7104034423828,
-              608.4636688232422,
-              608.5260772705078,
-              608.5055923461914,
-              608.6489486694336
-            ]
-          ],
-          "median_us": [
-            588.6503982543945,
-            663.8559722900391,
-            608.5158348083496
+            65.49520015716553,
+            76.11392021179199,
+            74.64927911758423
           ]
         }
       ],
       "gpu": "uuid, name, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 600.00 W, 2872 MHz, 16365 MHz, 0x0000000000000400\n"
+    },
+    "vector-span-2.json": {
+      "checkpoint": "/root/.cache/huggingface/hub/models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-CSF/snapshots/4656f502fa1a6aba3f05ff9ed14f6ecc828b3e9e",
+      "spans": [
+        4096,
+        8192,
+        16384
+      ],
+      "cases": [
+        {
+          "tokens": 1,
+          "pattern": 0,
+          "active": 10,
+          "exact": true,
+          "samples_us": [
+            [
+              1.5999999595806003,
+              1.5800000401213765,
+              1.5839999541640282,
+              1.5800000401213765,
+              1.5879999846220016,
+              1.5960000455379486,
+              1.5960624441504478,
+              1.5999999595806003
+            ],
+            [
+              1.8960625166073442,
+              1.8920624861493707,
+              1.887937542051077,
+              1.9000000320374966,
+              1.8920624861493707,
+              1.896000001579523,
+              1.9040624611079693,
+              1.9000000320374966
+            ],
+            [
+              2.5599999353289604,
+              2.5599999353289604,
+              2.552000107243657,
+              2.552000107243657,
+              2.552000107243657,
+              2.5559375062584877,
+              2.559937536716461,
+              2.551937475800514
+            ]
+          ],
+          "median_us": [
+            1.5920000150799751,
+            1.8960312590934336,
+            2.5539688067510724
+          ]
+        },
+        {
+          "tokens": 4,
+          "pattern": 0,
+          "active": 40,
+          "exact": true,
+          "samples_us": [
+            [
+              2.848000032827258,
+              2.852062461897731,
+              2.8519374318420887,
+              2.856000093743205,
+              2.848000032827258,
+              2.8519374318420887,
+              2.859999891370535,
+              2.855937462300062
+            ],
+            [
+              3.057937603443861,
+              3.0720001086592674,
+              3.0700000934302807,
+              3.0739998910576105,
+              3.0739374924451113,
+              3.069937461987138,
+              3.066000062972307,
+              3.069937461987138
+            ],
+            [
+              3.262062557041645,
+              3.2659375574439764,
+              3.262062557041645,
+              3.259937511757016,
+              3.261937526986003,
+              3.2579998951405287,
+              3.263999940827489,
+              3.2599999103695154
+            ]
+          ],
+          "median_us": [
+            2.8519999468699098,
+            3.0699687777087092,
+            3.262000042013824
+          ]
+        },
+        {
+          "tokens": 4,
+          "pattern": 1,
+          "active": 32,
+          "exact": true,
+          "samples_us": [
+            [
+              2.6360000483691692,
+              2.6519999373704195,
+              2.647999906912446,
+              2.647999906912446,
+              2.647937508299947,
+              2.6519375387579203,
+              2.647937508299947,
+              2.655999967828393
+            ],
+            [
+              2.816062420606613,
+              2.815937390550971,
+              2.816000021994114,
+              2.816062420606613,
+              2.816000021994114,
+              2.816000021994114,
+              2.816062420606613,
+              2.816000021994114
+            ],
+            [
+              3.041937481611967,
+              3.04200011305511,
+              3.04200011305511,
+              3.04200011305511,
+              3.0380000825971365,
+              3.0380000825971365,
+              3.0380000825971365,
+              3.0380000825971365
+            ]
+          ],
+          "median_us": [
+            2.647999906912446,
+            2.816000021994114,
+            3.039968782104552
+          ]
+        },
+        {
+          "tokens": 4,
+          "pattern": 2,
+          "active": 24,
+          "exact": true,
+          "samples_us": [
+            [
+              2.4680625647306442,
+              2.4639375042170286,
+              2.463999902829528,
+              2.4679999332875013,
+              2.4679999332875013,
+              2.4679999332875013,
+              2.4759999942034483,
+              2.4719375651329756
+            ],
+            [
+              2.6279999874532223,
+              2.647937508299947,
+              2.6360000483691692,
+              2.640062477439642,
+              2.6320000179111958,
+              2.6520625688135624,
+              2.6519999373704195,
+              2.647999906912446
+            ],
+            [
+              2.951999893411994,
+              2.959999954327941,
+              2.959999954327941,
+              2.960062585771084,
+              2.9599375557154417,
+              2.963937586173415,
+              2.959999954327941,
+              2.968000015243888
+            ]
+          ],
+          "median_us": [
+            2.4679999332875013,
+            2.6439999928697944,
+            2.959999954327941
+          ]
+        },
+        {
+          "tokens": 4,
+          "pattern": 3,
+          "active": 16,
+          "exact": true,
+          "samples_us": [
+            [
+              2.1440000273287296,
+              2.1440000273287296,
+              2.1440000273287296,
+              2.1439373958855867,
+              2.1440000273287296,
+              2.1439373958855867,
+              2.1440000273287296,
+              2.144062425941229
+            ],
+            [
+              2.3040000814944506,
+              2.3040000814944506,
+              2.3040000814944506,
+              2.3040000814944506,
+              2.30406248010695,
+              2.3040000814944506,
+              2.308000111952424,
+              2.3040000814944506
+            ],
+            [
+              2.908000024035573,
+              2.90793739259243,
+              2.91600008495152,
+              2.9120000544935465,
+              2.899999963119626,
+              2.899999963119626,
+              2.91600008495152,
+              2.916062483564019
+            ]
+          ],
+          "median_us": [
+            2.1440000273287296,
+            2.3040000814944506,
+            2.9100000392645597
+          ]
+        },
+        {
+          "tokens": 4,
+          "pattern": 4,
+          "active": 10,
+          "exact": true,
+          "samples_us": [
+            [
+              1.6959374770522118,
+              1.6959374770522118,
+              1.6959999920800328,
+              1.6959999920800328,
+              1.6959999920800328,
+              1.696062507107854,
+              1.6959374770522118,
+              1.6959999920800328
+            ],
+            [
+              1.9560623914003372,
+              1.955999992787838,
+              1.9560623914003372,
+              1.955999992787838,
+              1.9600000232458115,
+              1.9600000232458115,
+              1.9679374527186155,
+              1.964000053703785
+            ],
+            [
+              2.5559375062584877,
+              2.552000107243657,
+              2.552000107243657,
+              2.5520625058561563,
+              2.559937536716461,
+              2.552000107243657,
+              2.5600625667721033,
+              2.5599999353289604
+            ]
+          ],
+          "median_us": [
+            1.6959999920800328,
+            1.9580312073230743,
+            2.554000006057322
+          ]
+        }
+      ],
+      "gpu": "uuid, pstate, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\nGPU-a2f726b2-60db-8102-abef-abf76c457fe0, P1, 600.00 W, 2730 MHz, 16365 MHz, 0x0000000000000400\n"
     }
-  },
-  "source_manifest_check": "All unchanged B12X and all vLLM Python files match within each native/final-CSF pair; exactly the three modified B12X runtime modules differ."
+  }
 }

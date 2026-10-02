@@ -52,6 +52,29 @@ Conversion to global byte addresses uses Int64. Preparation rejects a stream
 requiring 2^32 replacement-word indices. None of these offsets changes the
 checkpoint's row-relative scale bases or exception encoding.
 
+## Indexed complete-plane expansion
+
+Micro execution and dynamic configurations that require complete scale planes
+can use the prepared exception-word index for short route lists. Each 256-thread
+CTA covers 4096 output bytes. A thread reconstructs four adjacent uint32 words
+from one eight-byte code load and one four-byte row-base load, then writes one
+aligned sixteen-byte vector. Matrix dimensions guarantee that even the last
+active vector is complete; inactive threads in a partial CTA perform no read
+or write.
+
+Each vector lies within one 32-word bitmap group. The thread reads that bitmap
+once. If any of its four words require replacement, one prefix/popcount lookup
+locates the first replacement; predicated reads advance through the selected
+words in order. No arithmetic is performed on exception bytes. Expert-scaled
+fixed-stream, metadata, replacement and output addresses use Int64.
+
+Repeated routes are rejected before reconstruction, so only one route owns an
+expert's output region. Fused barrier reset and route mutation remain valid
+under allocation-free graph replay. The byte tests include empty and dense
+exceptions, partial CTAs, invalid and repeated int64 routes, and an expert whose
+fixed stream lies beyond 2 GiB and output begins at 4 GiB. Checkpoint storage,
+prepared buffers, launch grids and preparation selection contracts are unchanged.
+
 ## Operand staging
 
 The native shared scale slot remains 1024 bytes:
