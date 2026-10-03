@@ -1,6 +1,9 @@
 """Host state-machine boundaries, without substituting a serving kernel."""
 import gc
 from dataclasses import replace
+import os
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -415,8 +418,6 @@ def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
     tmp_path, monkeypatch,
 ):
     """A timed-out callback holds the collective gate until it returns."""
-    from b12x.preparation import session as session_module
-
     started, release = threading.Event(), threading.Event()
     requirement = CollectiveRequirement("group/prime", (0, 1))
 
@@ -425,8 +426,9 @@ def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
         started.set()
         release.wait()
 
-    monkeypatch.setattr(session_module, "_BARRIER_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", "0.01")
     with session(tmp_path, collective_barrier=stalled) as engine:
+        monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120")
         job = engine.begin((request(name="collective", collective=requirement),))
         assert job.advance().ready_collectives == (requirement,)
         with pytest.raises(CollectiveBarrierTimeout) as error:
@@ -434,6 +436,8 @@ def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
         assert "callback timed out" in str(error.value)
         assert "never entered" not in str(error.value)
         assert error.value.arrived is None
+        assert error.value.timeout == 0.01
+        assert "after 0.01s" in str(error.value)
         assert started.is_set() and job._closed and engine._job is None
         pending = engine._pending_collective_barrier
         with pytest.raises(RuntimeError, match="previous collective barrier"):
@@ -464,16 +468,26 @@ def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkey
         engine.begin(())
 
 
-@pytest.mark.parametrize("value", ("0", "-1", "inf", "nan"))
+@pytest.mark.parametrize("value", ("0", "-1", "inf", "nan", "abc"))
 def test_collective_barrier_timeout_rejects_nonpositive_or_nonfinite_values(
-    monkeypatch, value,
+    tmp_path, monkeypatch, value,
 ):
-    """The collective wait deadline rejects values that Event.wait cannot honor."""
-    from b12x.preparation import session as session_module
-
+    """Only sessions enabling a barrier must validate its environment setting."""
     monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", value)
+    with session(tmp_path) as engine:
+        engine.prepare((request(name="no-barrier"),))
     with pytest.raises(ValueError, match="finite positive"):
-        session_module._barrier_timeout_seconds()
+        session(tmp_path, collective_barrier=lambda key, ranks: None)
+
+
+def test_preparation_import_ignores_unused_barrier_timeout():
+    """An optional barrier setting cannot prevent unrelated library imports."""
+    result = subprocess.run(
+        [sys.executable, "-c", "import b12x.preparation"],
+        env={**os.environ, "B12X_COLLECTIVE_BARRIER_TIMEOUT": "abc"},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_new_obligation_fails_after_freeze(tmp_path):
