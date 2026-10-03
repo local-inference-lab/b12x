@@ -122,7 +122,10 @@ def spin_until_eq_acquire_sys(
     """Spin until the word at ``addr`` equals ``expected`` (system scope).
 
     Returns 0 on success and 1 after ``limit`` polls without a match, so a
-    dead peer or proxy surfaces as an error instead of a hung kernel.
+    dead peer or proxy surfaces as an error instead of a hung kernel.  The
+    result register is written before the inputs are last read, so it is an
+    early-clobber output: it must never share a register with ``addr``,
+    ``expected`` or ``limit``.
     """
     return Uint32(
         _asm(
@@ -149,7 +152,7 @@ def spin_until_eq_acquire_sys(
             roce_done:
             }
             """,
-            "=r,l,r,r",
+            "=&r,l,r,r",
             loc=loc,
             ip=ip,
         )

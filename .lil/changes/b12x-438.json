@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-438",
+  "category": "fix",
+  "summary": "RoCEnante reports whether a rank is inside a collective, and a timeout at sequence 0 poisons",
+  "models": ["all"],
+  "compatibility": "No user action required. Only multi-node RoCEnante changes.",
+  "details": [
+    "The last block to finish a collective mirrors its epoch into host memory, and snapshot() returns the control record, every peer's delivered flags and the proxy counters from pinned host memory only, so a watchdog can read it while a kernel is wedged.",
+    "A timeout now sets a dedicated failed word. Before, a timeout at sequence 0 recorded 0, which read as healthy.",
+    "The system-scope spin's result register is early-clobber, so the compiler cannot assign it the register of an input still being read."
+  ],
+  "pull_requests": [438],
+  "authors": ["tobymao"],
+  "requires": []
+}

@@ -6,10 +6,13 @@
 //   flag[src][slot][hca] sequence number written on each HCA after that HCA's
 //                         payload stripe
 //   send[slot]       (SLOTS * slot_bytes)          staged by the local GPU kernel
-//   ctrl             (FLAG_STRIDE)                 {u32 seq, u32 nbytes, u32 error,
-//                                                   u32 missing_peer} doorbell; the
-//                                                  last two are set by the kernel
-//                                                  when a wait times out
+//   ctrl             (FLAG_STRIDE)                 {u32 seq, u32 nbytes, u32 error_seq,
+//                                                   u32 missing_peer, u32 nbytes[slot],
+//                                                   u32 missing_hca, u32 failed,
+//                                                   u32 completed_seq}; the kernel
+//                                                  writes all of it (CTRL_* in
+//                                                  _oneshot_cute.py), this thread
+//                                                  reads seq and nbytes[slot]
 //
 // The GPU kernel stages its input into send[seq & 1], publishes nbytes and seq
 // in ctrl, then spins on flag[peer][seq & 1][hca] for every peer and HCA.  The
