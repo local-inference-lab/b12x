@@ -1228,6 +1228,11 @@ class W4A16GemmKernel:
         )
         self.lut_e4m3_smem = False
         self.trellis_direct_lut = False
+        # Large-M route blocks only issue the MMAs of 16-row blocks that hold
+        # live routes; padded rows of a partial block are never read back.
+        self.skip_empty_m_blocks = (
+            os.environ.get("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1") == "1"
+        )
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1520,6 +1525,7 @@ class W4A16GemmKernel:
             self.lut_e4m3_smem,
             self.trellis_direct_lut,
             self.small_m_splitk,
+            self.skip_empty_m_blocks,
         )
 
     @cute.jit
@@ -2854,6 +2860,7 @@ class W4A16GemmKernel:
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
+        live_m_blocks = (block_valid_rows + Int32(15)) // Int32(16)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
             for pipe in cutlass.range(
@@ -2930,6 +2937,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     dynamic_pair_override,
+                                    live_m_blocks,
                                 )
                             else:
                                 self._dequant_and_accumulate_bundle(
@@ -2948,6 +2956,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     0,
+                                    live_m_blocks,
                                 )
                         else:
                             self._dequant_and_accumulate_bundle(
@@ -2966,6 +2975,7 @@ class W4A16GemmKernel:
                                 trellis_lut_addr,
                                 uses_m_block_8,
                                 -1,
+                                live_m_blocks,
                             )
 
                         if cutlass.const_expr(
@@ -3051,6 +3061,7 @@ class W4A16GemmKernel:
         trellis_lut_addr: Int64,
         uses_m_block_8: cutlass.Constexpr[bool],
         dynamic_pair_override: cutlass.Constexpr[int],
+        live_m_blocks: Int32,
     ):
         if cutlass.const_expr(
             uses_m_block_8
@@ -3174,6 +3185,16 @@ class W4A16GemmKernel:
                 self._scaled_dequant_b_fragment(b_frag, q, s)
             if cutlass.const_expr(uses_m_block_8):
                 self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            elif cutlass.const_expr(self.skip_empty_m_blocks and self.cta_m_blocks > 1):
+                self._mma_accumulate_large_m(acc0, a_regs_cur, 0, jj, b_frag)
+                if live_m_blocks > Int32(1):
+                    self._mma_accumulate_large_m(acc1, a_regs_cur, 1, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 2):
+                    if live_m_blocks > Int32(2):
+                        self._mma_accumulate_large_m(acc2, a_regs_cur, 2, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 3):
+                    if live_m_blocks > Int32(3):
+                        self._mma_accumulate_large_m(acc3, a_regs_cur, 3, jj, b_frag)
             else:
                 for mb in cutlass.range_constexpr(self.cta_m_blocks):
                     if cutlass.const_expr(mb == 0):
