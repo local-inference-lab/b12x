@@ -1,0 +1,11 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-preparation-launch-ownership",
+  "category": "fix",
+  "summary": "Retain compiled collective launchers and coordinate cross-rank priming",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": ["Preserves scoped program-cache reclamation and shared RoCE compile results, and rejects unsupported RoCE dtypes before launcher construction."],
+  "pull_requests": [384],
+  "requires": []
+}
