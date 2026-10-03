@@ -5,7 +5,6 @@ from __future__ import annotations
 from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 
-from b12x._lib.compile_plan import attach_programs
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute

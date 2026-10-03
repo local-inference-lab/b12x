@@ -129,33 +129,34 @@ _ADVANCE_SECONDS = 0.1
 # during preparation, and must cover the slowest rank's pre-launch round.
 def _barrier_timeout_seconds():
     """Return the finite positive collective-barrier deadline from the environment."""
-    timeout = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+    try:
+        timeout = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+    except ValueError as error:
+        raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds") from error
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds")
     return timeout
 
 
-_BARRIER_TIMEOUT_SECONDS = _barrier_timeout_seconds()
-
-
 class CollectiveBarrierTimeout(RuntimeError):
     """A collective barrier callback exceeded its deadline."""
 
-    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...] | None = None):
+    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...] | None = None, *, timeout: float = 120.0):
         """Record verified arrivals when the barrier backend supplies them."""
         if arrived is None:
-            message = f"collective barrier callback timed out for {key!r} after {_BARRIER_TIMEOUT_SECONDS:g}s"
+            message = f"collective barrier callback timed out for {key!r} after {timeout:g}s"
         else:
             waiting = tuple(sorted(set(ranks) - set(arrived)))
             message = (
                 f"collective barrier timed out for {key!r} after "
-                f"{_BARRIER_TIMEOUT_SECONDS:g}s: ranks {waiting} never entered "
+                f"{timeout:g}s: ranks {waiting} never entered "
                 f"(arrived: {tuple(sorted(arrived))})"
             )
         super().__init__(message)
         self.key = key
         self.ranks = ranks
         self.arrived = None if arrived is None else tuple(sorted(arrived))
+        self.timeout = timeout
 
 
 def _declaration_key(plan):
@@ -306,6 +307,9 @@ class PreparationSession:
         if collective_barrier is not None and not callable(collective_barrier):
             raise TypeError("collective_barrier must be callable")
         self.collective_barrier = collective_barrier
+        self._barrier_timeout = (
+            _barrier_timeout_seconds() if collective_barrier is not None else 120.0
+        )
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self._cache = None
         self._stop = threading.Event()
@@ -780,8 +784,10 @@ class PreparationJob:
             except BaseException:
                 self.session._pending_collective_barrier = None
                 raise
-            if not completed.wait(_BARRIER_TIMEOUT_SECONDS):
-                raise CollectiveBarrierTimeout(requirement.key, requirement.ranks)
+            if not completed.wait(self.session._barrier_timeout):
+                raise CollectiveBarrierTimeout(
+                    requirement.key, requirement.ranks, timeout=self.session._barrier_timeout,
+                )
             if errors:
                 raise errors[0]
         except CollectiveBarrierTimeout:
