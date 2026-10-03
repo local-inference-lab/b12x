@@ -3,7 +3,7 @@
   "id": "b12x-collective-barrier-timeout",
   "category": "fix",
   "summary": "Validate collective barrier deadlines only for sessions using a barrier",
-  "models": [],
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash", "Kimi-K3"],
   "compatibility": "The default deadline remains 120 seconds. An invalid optional barrier setting no longer prevents importing B12X or preparing a model without a barrier.",
   "details": [
     "Capture the configured timeout when a session enables collective priming and retain it for that session.",
