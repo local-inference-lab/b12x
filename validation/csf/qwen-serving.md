@@ -25,8 +25,6 @@ checks. A selected expert's fixed stream starts beyond 2 GiB and its output at
 4 GiB. Compute Sanitizer passes 16 indexed-reader memcheck cases and 22 indexed
 racecheck cases with zero errors, warnings or hazards. The four split-gate
 racecheck cases from the unchanged shared-reader implementation also pass.
-Four online A4/A16 preparation composition cases pass with
-[B12X #458](https://github.com/local-inference-lab/b12x/pull/458).
 
 **Research-only performance:** the RTX PRO 6000 Blackwell 96 GB GPUs report NVML
 clock-event mask `0x400` at 600 W. These are not clean-clock release measurements.
@@ -153,8 +151,7 @@ CUDA 13.4 / CUTLASS DSL 4.7.1. Serving uses a compatible beta vLLM overlay;
 source manifests identify all Python bytes rather than equating that overlay
 with a bare repository commit. All vLLM Python files and unchanged B12X modules
 match across controls; the only runtime differences are the three declared
-CSF modules. Online composition uses #458 commit
-`c41b25529b2c4153f58aeab81d91bb662f1a3e39` plus these runtime changes.
+CSF modules.
 
 | Checkpoint role | Hugging Face repository | Revision |
 |---|---|---|

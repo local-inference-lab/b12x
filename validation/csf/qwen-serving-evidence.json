@@ -2044,7 +2044,6 @@
     "vector-moe-tests-1.log": "26fd935938537683c2191940b35352ccabee388057087467d990b7e7436cf96e",
     "vector-memcheck-1.log": "5d090f1a849c2179d437badf194122b1b56c640ec7b23b17844c5ec8a08138d1",
     "vector-racecheck-1.log": "a5ef5779df520103c93f545e32b7750c77b746de2002ab5310c1257c788d9481",
-    "vector-online-composition-1.log": "67370e79fcd215c9cb8a5515989f4d44cbb617616e218c3d0d37a1ee7d2e7f34",
     "tp2-small-serving-policy-3.json": "b7b6ac4e71c3636ce54804b3ac3638d15433d4fa4bfb2170594c4e152d07bf23",
     "tp2-small-serving-vectors-1.json": "33c4f0d7f7374e4f6ed5fa5d07eeebc5337a9ab1187dd8a6db81770121a2ec02",
     "vector-span-2.json": "3c10d73d9aa767e022bde34e4f8914481e1ab82f71758a75c5f29fa02ba5be62",
@@ -2055,7 +2054,6 @@
     "indexed_memcheck_cases": 16,
     "indexed_racecheck_cases": 22,
     "split_gate_racecheck_cases": 4,
-    "online_a4_a16_composition_cases": 4,
     "sanitizer_errors": 0,
     "sanitizer_warnings": 0,
     "sanitizer_hazards": 0
