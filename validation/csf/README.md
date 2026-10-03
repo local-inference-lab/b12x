@@ -7,8 +7,8 @@ the [prepared scale operands](nvfp4-scale-operands.md) used by dynamic MoE.
 Independent [native routing and preparation invariants](dynamic-moe-correctness.md)
 have their own reproducers and correctness limits.
 The [Qwen TP1/TP2 operand-reconstruction report](qwen-serving.md) records
-matched native controls, reduced batch overhead, online-preparation composition,
-and the remaining single-request cost for its declared implementation.
+matched native controls, reduced batch overhead and the remaining
+single-request cost for its declared implementation.
 The loading comparisons below retain their original source and precision scope.
 
 vLLM reads compressed FP4 checkpoints, validates their manifests and model
