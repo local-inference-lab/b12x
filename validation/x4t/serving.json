@@ -1,0 +1,273 @@
+{
+  "purpose": "Qualify exact MXFP4 scale expansion and measure DS4.1 X4T serving overhead.",
+  "implementation_status": "implemented",
+  "correctness_status": "qualified",
+  "performance_status": "research-only",
+  "source": {
+    "artifact_root": "/root/vllm/kimi/ds41-x4t-opt-20260929",
+    "master_base": "a489f972e0dde54fedd5f83bf73a7d3754fc60d6",
+    "serving_b12x": "6380e581f075df7f01a72d4b67f016225f260c86",
+    "serving_vllm": "ec49d5781a0ebf7960c7711ac3e0f42376b1a127",
+    "serving_image": "local/ds41-x4t:tp4-scale-pair-6380e581f0",
+    "serving_image_id": "sha256:15f3c16f2ea12c7c31a7f579a55a7bc6d0a5d7d1beaa8ca2db7d354c24cffed5",
+    "sealed_evidence_sha256": "f2ba82b8ca9a5bc35eb34c9f77c7f0bd0191cc0e2c1109f533b0b8dc4e8a59ff",
+    "sealed_evidence_path": "/root/vllm/kimi/ds41-x4t-opt-20260929/evidence/qualification.json",
+    "serving_b12x_url": "https://github.com/local-inference-lab/b12x/tree/6380e581f075df7f01a72d4b67f016225f260c86",
+    "serving_vllm_url": "https://github.com/local-inference-lab/vllm/tree/ec49d5781a0ebf7960c7711ac3e0f42376b1a127"
+  },
+  "scope": {
+    "correctness": "Byte-exact scale expansion and selected real-layer parity; not a full-model KLD qualification.",
+    "master_port": "The master-based patch passes 67 tests including existing Kimi TP12 X4T coverage. The real DS4.1 layer result below was obtained on this port.",
+    "serving": "E2E results measure the identified beta-based serving composition. A full master-based model restart was not performed.",
+    "configuration": "TP4/DCP1, DSpark K7 adaptive verification, W4A16 routed experts, p4096, FP8 KV 6 GiB/GPU, max-num-seqs 32, max-model-len 65536, Engram in mapped host RAM.",
+    "conditions": "Frank1, RTX PRO 6000 Blackwell, serving GPUs 2-5 and isolated component GPU 6; driver 615.71.09, 450 W, loaded memory clock about 13365 MHz. Both arms report driver event mask 0x400 (Reliability), so these are comparative measurements, not an unthrottled release qualification.",
+    "requests": "Three uncached 32768-token prefills and three CC1 coding requests generating 4096 tokens each; identical stored prompt token IDs, temperature 0, seed 315, unique cache salts, no preemptions. Profiler captures are separate from timed requests.",
+    "control_note": "Preserved same-day matched A16 measurement, not reloaded during this optimization task. Native default W4A8 is not the comparator.",
+    "no_additional_quantization": "E2M1 weight nibbles remain unchanged. Expanded E8M0 scale bytes match native preparation, including its BF16 clamp.",
+    "limits": [
+      "No full-model KLD, capability, vision, maximum-context, or CC32 stress qualification in this optimization task.",
+      "E2E correctness and performance measured on TP4 only; other TP sizes have scale-kernel coverage, not full-model serving coverage."
+    ],
+    "canonical_runtime": "The master-based component port is qualified by the included checks; deploying the complete vLLM/B12X master composition requires separate integration validation."
+  },
+  "component_command": "PYTHONPATH=. .venv/bin/python -m pytest -q tests/quantization/test_exact_mxfp4_checkpoint.py tests/quantization/test_x4t_packed_scales.py tests/quantization/test_x4t_scales.py",
+  "layer_command": "PYTHONPATH=. .venv/bin/python validation/x4t/validate_layer.py --checkpoint /data/DeepSeek-V4.1-Flash-X4T --original /path/to/official-DS4.1-snapshot --native-default-packing --x4t-default-packing --layer 0 --rank 0 --graph-mutations 8 --output /tmp/x4t-layer0.json",
+  "master_layer": {
+    "status": "qualified",
+    "graph_mutations": 8,
+    "routing_dtype": "int32",
+    "layer": 0,
+    "tp": 4,
+    "rank": 0,
+    "native_packing": "source_native",
+    "x4t_packing": "source_native",
+    "nibbles_and_scales_exact": true,
+    "cases": [
+      {
+        "tokens": 1,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      },
+      {
+        "tokens": 8,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      },
+      {
+        "tokens": 129,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      },
+      {
+        "tokens": 4096,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      }
+    ]
+  },
+  "serving_measurements": [
+    {
+      "directory": "ds41-x4t-serving-20260929/evidence/native-a16-isolated",
+      "prefill_median_tokens_s": 18041.393089377758,
+      "decode_median_tokens_s": 351.84988901388283,
+      "pooled_decode_tokens_s": 357.5299757955758,
+      "pooled_ms_per_step": 12.840342029147143,
+      "pooled_output_tokens_per_step": 4.5908071748878925,
+      "pooled_acceptance": 0.5982081752006471,
+      "runs": [
+        {
+          "run": 1,
+          "decode_tokens_s": 351.84988901388283,
+          "decode_s": 11.638485978997778,
+          "output_tokens": 4095,
+          "speculative_steps": 907,
+          "ms_per_step": 12.831847826899425,
+          "output_tokens_per_step": 4.514884233737597,
+          "accepted": 3192,
+          "proposed": 5495,
+          "preemptions": 0
+        },
+        {
+          "run": 2,
+          "decode_tokens_s": 348.26328508554536,
+          "decode_s": 11.758345410984475,
+          "output_tokens": 4095,
+          "speculative_steps": 919,
+          "ms_per_step": 12.794717530995076,
+          "output_tokens_per_step": 4.455930359085963,
+          "accepted": 3178,
+          "proposed": 5437,
+          "preemptions": 0
+        },
+        {
+          "run": 3,
+          "decode_tokens_s": 373.49766788003376,
+          "decode_s": 10.9639238800155,
+          "output_tokens": 4095,
+          "speculative_steps": 850,
+          "ms_per_step": 12.898733976488824,
+          "output_tokens_per_step": 4.817647058823529,
+          "accepted": 3245,
+          "proposed": 5141,
+          "preemptions": 0
+        }
+      ]
+    },
+    {
+      "directory": "ds41-x4t-opt-20260929/evidence/x4t-unmodified",
+      "prefill_median_tokens_s": 17760.97245979464,
+      "decode_median_tokens_s": 318.75943794904833,
+      "pooled_decode_tokens_s": 312.6756004610537,
+      "pooled_ms_per_step": 14.882546268552577,
+      "pooled_output_tokens_per_step": 4.653409090909091,
+      "pooled_acceptance": 0.60325,
+      "runs": [
+        {
+          "run": 1,
+          "decode_tokens_s": 299.4798700317485,
+          "decode_s": 13.67370701598702,
+          "output_tokens": 4095,
+          "speculative_steps": 930,
+          "ms_per_step": 14.702910769878516,
+          "output_tokens_per_step": 4.403225806451613,
+          "accepted": 3168,
+          "proposed": 5498,
+          "preemptions": 0
+        },
+        {
+          "run": 2,
+          "decode_tokens_s": 320.6850882230233,
+          "decode_s": 12.769536690000677,
+          "output_tokens": 4095,
+          "speculative_steps": 852,
+          "ms_per_step": 14.987719119719104,
+          "output_tokens_per_step": 4.806338028169014,
+          "accepted": 3244,
+          "proposed": 5219,
+          "preemptions": 0
+        },
+        {
+          "run": 3,
+          "decode_tokens_s": 318.75943794904833,
+          "decode_s": 12.846678442991106,
+          "output_tokens": 4095,
+          "speculative_steps": 858,
+          "ms_per_step": 14.972818698124833,
+          "output_tokens_per_step": 4.7727272727272725,
+          "accepted": 3240,
+          "proposed": 5283,
+          "preemptions": 0
+        }
+      ]
+    },
+    {
+      "directory": "ds41-x4t-opt-20260929/evidence/x4t-fused",
+      "prefill_median_tokens_s": 17906.507849370642,
+      "decode_median_tokens_s": 367.114369690696,
+      "pooled_decode_tokens_s": 355.6463924919808,
+      "pooled_ms_per_step": 12.874669235918141,
+      "pooled_output_tokens_per_step": 4.578829668281774,
+      "pooled_acceptance": 0.6027225393639044,
+      "runs": [
+        {
+          "run": 1,
+          "decode_tokens_s": 370.6830616238989,
+          "decode_s": 11.0471732429869,
+          "output_tokens": 4095,
+          "speculative_steps": 854,
+          "ms_per_step": 12.93580005033595,
+          "output_tokens_per_step": 4.795081967213115,
+          "accepted": 3241,
+          "proposed": 5190,
+          "preemptions": 0
+        },
+        {
+          "run": 2,
+          "decode_tokens_s": 367.114369690696,
+          "decode_s": 11.154562005976913,
+          "output_tokens": 4095,
+          "speculative_steps": 862,
+          "ms_per_step": 12.940327153105468,
+          "output_tokens_per_step": 4.750580046403712,
+          "accepted": 3234,
+          "proposed": 5190,
+          "preemptions": 0
+        },
+        {
+          "run": 3,
+          "decode_tokens_s": 331.8206979305449,
+          "decode_s": 12.341002311004559,
+          "output_tokens": 4095,
+          "speculative_steps": 967,
+          "ms_per_step": 12.762153372290133,
+          "output_tokens_per_step": 4.234746639089969,
+          "accepted": 3133,
+          "proposed": 5561,
+          "preemptions": 0
+        }
+      ]
+    }
+  ],
+  "fixed_input_layer_m8": {
+    "unmodified_x4t_us": 269.06944274902344,
+    "paired_scale_x4t_us": 221.07423782348633,
+    "native_mxfp4_us": 208.72575759887695,
+    "note": "Identical inputs and routes, no speculation; the speedup is not an acceptance effect."
+  },
+  "interpretation": "Pooled serving decode improves about 13.7%, median about 15.2%. Acceptance is nearly equal; mean speculative step time decreases about 13.5%. Generated continuations differ, so step normalization is not fixed-token replay. The isolated real-layer A/B independently proves reduced kernel overhead. Candidate pooled throughput is within 0.6% of the preserved native A16 reference.",
+  "overlap_probes": {
+    "status": "research-only",
+    "two_streams": "On unmodified scale grids at M=8, median 51.22 -> 49.15 us; no large benefit. Graph captures contain explicit fork/join events to protect shared scratch reuse.",
+    "pdl": "With grouped routes and coalesced tasks at M=8, fused single-grid and two-kernel PDL both measure about 8.19 us. At M=4096, PDL measures about 60.95 us vs 62.30 us for the fused grid, a small component-level difference not E2E-qualified. The serving runtime keeps the fused grid. The independent PDL prototype is preserved rather than discarded.",
+    "pdl_scope": "Tests overlap the two scale planes, not scale expansion with FC1/FC2 execution. Overlap into the cooperative native MoE kernel would require a separately validated dependency point before scale reads; it is not implemented here.",
+    "cuda_contract": "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html",
+    "evidence": [
+      "benchmark-scales.py",
+      "pdl-scale-probe.py",
+      "evidence/scale-schedules-control.json",
+      "evidence/scale-schedules-fused.json",
+      "evidence/scale-schedules-pdl.json"
+    ]
+  },
+  "master_layer_repeat": {
+    "status": "qualified",
+    "graph_mutations": 8,
+    "routing_dtype": "int32",
+    "layer": 0,
+    "tp": 4,
+    "rank": 0,
+    "native_packing": "source_native",
+    "x4t_packing": "source_native",
+    "nibbles_and_scales_exact": true,
+    "cases": [
+      {
+        "tokens": 1,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      },
+      {
+        "tokens": 8,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      },
+      {
+        "tokens": 129,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0,
+        "poisoned_graph_last_relative_l2": 0
+      },
+      {
+        "tokens": 4096,
+        "native_repeat_relative_l2": 0,
+        "x4t_relative_l2": 0.00000380726146431698,
+        "poisoned_graph_last_relative_l2": 0.000003138189413220971
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-456-block-codec-shared-memory",
+  "category": "fix",
+  "summary": "Reserve Trellis lookup-table shared memory only for Trellis weights",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Block-codec and ordinary FP4 expert kernels do not allocate an unused Trellis codebook table.",
+    "IQ2_XS and Q8_0 tuning candidates retain the shared-memory capacity checked by their preparation contract; Trellis table selection is unchanged."
+  ],
+  "pull_requests": [456],
+  "requires": []
+}
