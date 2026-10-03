@@ -9,6 +9,6 @@
     "Capture the configured timeout when a session enables collective priming and retain it for that session.",
     "Report the captured deadline in timeout exceptions while preserving callback containment and launcher ownership."
   ],
-  "pull_requests": [466],
+  "pull_requests": [466, 467],
   "requires": []
 }
