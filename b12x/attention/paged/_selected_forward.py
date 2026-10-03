@@ -23,6 +23,7 @@ from cutlass import (
     Float8E4M3FN,
     Int32,
     Int64,
+    Uint8,
     Uint32,
     const_expr,
 )
@@ -42,7 +43,10 @@ from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compiler import run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
 from b12x._lib.intrinsics import (
+    cvt_e4m3_to_f32_via_f16,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
+    ld_global_nc_f32,
+    ld_global_nc_u32,
     ld_global_nc_v4_u32,
     shared_ptr_to_u32,
     st_shared_v4_u32,
@@ -51,9 +55,38 @@ from b12x._lib.intrinsics import (
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
+from ._nvfp4_kv import (
+    GROUP_SIZE as _NVFP4_GROUP_SIZE,
+    is_nvfp4_cache as _is_nvfp4_cache,
+    nvfp4x8_scaled_to_bfloat2x4,
+    outer_scale_offset as _nvfp4_outer_scale_offset,
+    scale_offset as _nvfp4_scale_offset,
+)
 from ._selected_forward_config import HEAD_DIM as _HEAD_DIM
 from ._selected_forward_config import MAX_SPLITS as _NUM_SPLITS
 from ._selected_forward_config import SELECTION_WIDTH as _SELECTION_WIDTH
+
+_KV_FORMATS = ("bf16", "fp8", "nvfp4")
+_NVFP4_SCALE_OFFSET = _nvfp4_scale_offset(_HEAD_DIM)
+_NVFP4_OUTER_SCALE_OFFSET = _nvfp4_outer_scale_offset(_HEAD_DIM)
+
+
+def _kv_format(cache: torch.Tensor) -> str:
+    """Name the K/V storage format of a ``[pages, page, heads, row]`` view."""
+    if cache.dtype == torch.bfloat16:
+        return "bf16"
+    if cache.dtype == torch.float8_e4m3fn:
+        return "fp8"
+    if _is_nvfp4_cache(cache, _HEAD_DIM):
+        return "nvfp4"
+    raise TypeError(
+        "selected-position K/V caches must be BF16, FP8 E4M3FN, or uint8 "
+        f"NVFP4 records; got {cache.dtype} rows of width {int(cache.shape[-1])}"
+    )
+
+
+def _kv_pointer_type(kv_format: str) -> type[cutlass.Numeric]:
+    return {"bf16": BFloat16, "fp8": Float8E4M3FN, "nvfp4": Uint8}[kv_format]
 
 
 _THREADS = 128
@@ -127,7 +160,7 @@ class _SelectedPositionPagedForwardKernel:
         *,
         q_heads: int,
         kv_heads: int,
-        kv_is_fp8: bool,
+        kv_format: str,
         direct_output: bool,
         return_lse: bool,
         kv_warps: int,
@@ -142,7 +175,13 @@ class _SelectedPositionPagedForwardKernel:
             raise ValueError("selected-position capacity must cover the QSA selection")
         self.kv_heads = int(kv_heads)
         self.heads_per_kv = self.q_heads // self.kv_heads
-        self.kv_is_fp8 = bool(kv_is_fp8)
+        if kv_format not in _KV_FORMATS:
+            raise ValueError(f"unsupported selected-position K/V format {kv_format!r}")
+        self.kv_format = kv_format
+        # FP8 folds its per-tensor scales into the softmax and output scales;
+        # NVFP4 records carry their own scales and widen to BF16 in the loader.
+        self.kv_is_fp8 = kv_format == "fp8"
+        self.kv_is_nvfp4 = kv_format == "nvfp4"
         self.direct_output = bool(direct_output)
         self.return_lse = bool(return_lse)
         self.kv_warps = int(kv_warps)
@@ -220,6 +259,65 @@ class _SelectedPositionPagedForwardKernel:
         )
         st_shared_v4_u32(destination0, y00, y01, y10, y11)
         st_shared_v4_u32(destination1, y20, y21, y30, y31)
+
+    @cute.jit
+    def _load_nvfp4_vector_to_bf16_shared(
+        self,
+        source: cute.Pointer,
+        record_base: Int64,
+        destination: cute.Tensor,
+        token: Int32,
+        dimension_base: Int32,
+    ) -> None:
+        """Widen one 16-value NVFP4 group of a K or V record into BF16 smem.
+
+        ``record_base`` is the record's byte offset, or negative for a masked
+        column (which stores zeros). The group's E4M3 scale times the record's
+        fp32 outer scale multiplies each exact E2M1 value in fp32, and the
+        product is rounded to BF16 once, so the tile holds exactly the values
+        an NVFP4 round trip produces.
+        """
+        group = dimension_base // Int32(_NVFP4_GROUP_SIZE)
+        low = Uint32(0)
+        high = Uint32(0)
+        scale_word = Uint32(0)
+        outer = Float32(0.0)
+        if record_base >= Int64(0):
+            data = record_base + (group * Int32(_NVFP4_GROUP_SIZE // 2)).to(Int64)
+            low = ld_global_nc_u32(_pointer_as_int64(source, data))
+            high = ld_global_nc_u32(_pointer_as_int64(source, data + Int64(4)))
+            scale_word = ld_global_nc_u32(
+                _pointer_as_int64(
+                    source,
+                    record_base
+                    + Int64(_NVFP4_SCALE_OFFSET)
+                    + (group & Int32(~3)).to(Int64),
+                )
+            )
+            outer = ld_global_nc_f32(
+                _pointer_as_int64(
+                    source, record_base + Int64(_NVFP4_OUTER_SCALE_OFFSET)
+                )
+            )
+        scale_byte = (scale_word >> ((group & Int32(3)) * Int32(8)).to(Uint32)) & Uint32(
+            0xFF
+        )
+        factor = cvt_e4m3_to_f32_via_f16(scale_byte) * outer
+        y0, y1, y2, y3 = nvfp4x8_scaled_to_bfloat2x4(low, factor)
+        y4, y5, y6, y7 = nvfp4x8_scaled_to_bfloat2x4(high, factor)
+        destination0 = shared_ptr_to_u32(
+            destination.iterator
+            + cute.crd2idx((token, dimension_base), destination.layout)
+        )
+        destination1 = shared_ptr_to_u32(
+            destination.iterator
+            + cute.crd2idx(
+                (token, dimension_base + Int32(8)),
+                destination.layout,
+            )
+        )
+        st_shared_v4_u32(destination0, y0, y1, y2, y3)
+        st_shared_v4_u32(destination1, y4, y5, y6, y7)
 
     def _shared_layouts(
         self,
@@ -415,7 +513,7 @@ class _SelectedPositionPagedForwardKernel:
                 value_bases[column] = value_base
         cute.arch.sync_threads()
 
-        if const_expr(not self.kv_is_fp8):
+        if const_expr(self.kv_format == "bf16"):
             vectors_per_row = _HEAD_DIM // 8
             for vector_iter in cutlass.range_constexpr(
                 self.tile_n * vectors_per_row // self.threads
@@ -478,20 +576,36 @@ class _SelectedPositionPagedForwardKernel:
                 value_base = key_base
                 if const_expr(not self.shared_cache_strides):
                     value_base = Int64(value_bases[token])
-                self._load_fp8_vector_to_bf16_shared(
-                    key_cache,
-                    key_base,
-                    shared_key,
-                    token,
-                    dimension_base,
-                )
-                self._load_fp8_vector_to_bf16_shared(
-                    value_cache,
-                    value_base,
-                    shared_value,
-                    token,
-                    dimension_base,
-                )
+                if const_expr(self.kv_is_nvfp4):
+                    self._load_nvfp4_vector_to_bf16_shared(
+                        key_cache,
+                        key_base,
+                        shared_key,
+                        token,
+                        dimension_base,
+                    )
+                    self._load_nvfp4_vector_to_bf16_shared(
+                        value_cache,
+                        value_base,
+                        shared_value,
+                        token,
+                        dimension_base,
+                    )
+                else:
+                    self._load_fp8_vector_to_bf16_shared(
+                        key_cache,
+                        key_base,
+                        shared_key,
+                        token,
+                        dimension_base,
+                    )
+                    self._load_fp8_vector_to_bf16_shared(
+                        value_cache,
+                        value_base,
+                        shared_value,
+                        token,
+                        dimension_base,
+                    )
         cute.arch.sync_threads()
 
         if thread < Int32(self.qk_warps * 32):
@@ -1166,7 +1280,7 @@ def _cache_key(
         int(query.shape[1]),
         int(key_cache.shape[2]),
         int(request_ids.element_size() * 8),
-        key_cache.dtype,
+        _kv_format(key_cache),
         int(key_cache.shape[1]),
         tuple(map(int, key_cache.stride()[:3])),
         tuple(map(int, value_cache.stride()[:3])),
@@ -1228,7 +1342,7 @@ def _compile(
             q_heads,
             kv_heads,
             request_id_bits,
-            kv_dtype,
+            kv_format,
             page_size,
             key_strides,
             value_strides,
@@ -1238,11 +1352,11 @@ def _compile(
             selection_width,
         ) = key
         request_id_type = Int32 if request_id_bits == 32 else Int64
-        kv_type = Float8E4M3FN if kv_dtype == torch.float8_e4m3fn else BFloat16
+        kv_type = _kv_pointer_type(kv_format)
         kernel = _SelectedPositionPagedForwardKernel(
             q_heads=q_heads,
             kv_heads=kv_heads,
-            kv_is_fp8=kv_dtype == torch.float8_e4m3fn,
+            kv_format=kv_format,
             direct_output=direct_output,
             return_lse=return_lse,
             kv_warps=kv_warps,
@@ -1280,12 +1394,12 @@ def _compile(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.paged.selected_forward",
-                    4,
+                    5,
                     (
                         q_heads,
                         kv_heads,
                         request_id_bits,
-                        str(kv_dtype),
+                        kv_format,
                         page_size,
                         key_strides,
                         value_strides,
@@ -1298,7 +1412,7 @@ def _compile(
                         "q_heads",
                         "kv_heads",
                         "request_id_bits",
-                        "kv_dtype",
+                        "kv_format",
                         "page_size",
                         "key_strides",
                         "value_strides",
@@ -1388,7 +1502,7 @@ def launch_sparse_gqa_split(
                 selection_width=int(selected_positions.shape[1]),
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
-        kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
+        kv_type = _kv_pointer_type(_kv_format(key_cache))
         run_compiled(
             raw,
             (
@@ -1473,7 +1587,7 @@ def launch_selected_paged_gqa_direct(
                 selection_width=int(selected_positions.shape[1]),
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
-        kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
+        kv_type = _kv_pointer_type(_kv_format(key_cache))
         run_compiled(
             raw,
             (

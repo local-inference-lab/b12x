@@ -30,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention import qsa
+from b12x.attention.qsa import _contract as qsa_contract
+from b12x.attention.paged import _nvfp4_kv as nvfp4_kv
 from b12x.preparation import PreparedCall, PreparationResult, PreparationSession
 from b12x.preparation.types import require_prepared
 from b12x.attention.qsa.reference import (
@@ -466,9 +468,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--kv-cache-dtype",
-        choices=("bf16", "fp8_e4m3"),
+        choices=("bf16", "fp8_e4m3", "nvfp4"),
         default="bf16",
-        help="main K/V cache storage dtype (default: bf16)",
+        help="main K/V cache storage format (default: bf16)",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--eager-replays", type=int, default=20)
@@ -544,24 +546,27 @@ def _resolve_cases(args: argparse.Namespace) -> tuple[BenchmarkCase, ...]:
     return tuple(cases)
 
 
+def _kv_dtype(kv_cache_dtype: str) -> torch.dtype:
+    return {
+        "bf16": torch.bfloat16,
+        "fp8_e4m3": torch.float8_e4m3fn,
+        "nvfp4": nvfp4_kv.NVFP4_KV_DTYPE,
+    }[kv_cache_dtype]
+
 def _cache_capacity_bytes(
     case: BenchmarkCase,
     *,
     kv_cache_dtype: str = "bf16",
 ) -> dict[str, int]:
     element_bytes = torch.bfloat16.itemsize
-    kv_element_bytes = (
-        torch.float8_e4m3fn.itemsize
-        if kv_cache_dtype == "fp8_e4m3"
-        else torch.bfloat16.itemsize
-    )
+    storage_dtype, row_width = nvfp4_kv.kv_storage(_kv_dtype(kv_cache_dtype), HEAD_DIM)
     main_kv = (
         2
         * case.main_pages_capacity
         * case.main_page_size
         * case.profile.kv_heads
-        * HEAD_DIM
-        * kv_element_bytes
+        * row_width
+        * storage_dtype.itemsize
     )
     compressed = (
         case.planned_batch
@@ -855,9 +860,9 @@ def _prepare_case(
     main_cache_layout: str,
     kv_cache_dtype: str,
 ) -> PreparedCase:
-    kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
+    kv_dtype = _kv_dtype(kv_cache_dtype)
+    storage_dtype, row_width = nvfp4_kv.kv_storage(kv_dtype, HEAD_DIM)
     caps = _make_caps(case, device, kv_dtype=kv_dtype)
-    declaration = qsa.plan(caps)
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
@@ -872,7 +877,9 @@ def _prepare_case(
             generator=generator,
             device=device,
         )
-        main_kv = torch.empty_like(main_kv_source, dtype=kv_dtype)
+        main_kv = torch.empty(
+            (*main_kv_source.shape[:-1], row_width), dtype=storage_dtype, device=device
+        )
         main_k, main_v = main_kv.unbind(1)
         source_k, source_v = main_kv_source.unbind(1)
     elif main_cache_layout == "separate":
@@ -886,8 +893,10 @@ def _prepare_case(
             generator=generator,
             device=device,
         )
-        main_k = torch.empty_like(source_k, dtype=kv_dtype)
-        main_v = torch.empty_like(source_v, dtype=kv_dtype)
+        main_k = torch.empty(
+            (*source_k.shape[:-1], row_width), dtype=storage_dtype, device=device
+        )
+        main_v = torch.empty_like(main_k)
     else:
         raise BenchmarkFailure(f"unknown main-cache layout {main_cache_layout!r}")
     k_descale = None
@@ -897,6 +906,13 @@ def _prepare_case(
         v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
         main_k.copy_((source_k.float() / k_descale).clamp(-448.0, 448.0))
         main_v.copy_((source_v.float() / v_descale).clamp(-448.0, 448.0))
+    elif kv_dtype == nvfp4_kv.NVFP4_KV_DTYPE:
+        # Encode page chunks: the host reference materializes float
+        # temporaries several times the size of its input.
+        for start in range(0, int(main_k.shape[0]), 256):
+            stop = start + 256
+            main_k[start:stop].copy_(nvfp4_kv.quantize_nvfp4_kv_torch(source_k[start:stop]))
+            main_v[start:stop].copy_(nvfp4_kv.quantize_nvfp4_kv_torch(source_v[start:stop]))
     else:
         main_k.copy_(source_k)
         main_v.copy_(source_v)
@@ -1104,6 +1120,20 @@ def _prepare_case(
             slot = prior % caps.raw_ring_capacity
             raw_tags[request, slot] = prior
             raw_rope[request, slot, :] = prior
+    # Declare the exact ABI of the tensors this case binds and passes: the
+    # interleaved main cache's page stride spans K and V, and the benchmark's
+    # RoPE tables are BF16, unlike the canonical contiguous FP32 declaration.
+    operands = dict(qsa_contract._canonical_abi(caps))
+    for name, tensor in (*binding_args.items(), *dynamic.items()):
+        if name in operands and isinstance(tensor, torch.Tensor):
+            operands[name] = {
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+                "strides": tuple(map(int, tensor.stride())),
+            }
+    declaration = qsa.plan(
+        caps, invocation=qsa.invocation_from_descriptors(caps, operands=operands)
+    )
+
     def prepare_call(state):
         (spec,) = state.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -1124,7 +1154,7 @@ def _prepare_case(
                 value.copy_(original)
 
         return PreparedCall(
-            run=lambda: qsa.run(binding, **dynamic),
+            run=lambda: state.run_for_preparation(binding, **dynamic),
             reset=restore,
             restore=restore,
             owners=(binding,),
@@ -1340,7 +1370,7 @@ def _validate_correctness(
             is_prefilling=bool(prepared.dynamic["is_prefilling"][request]),
             compress_ratio=COMPRESS_RATIO,
             key_norm_weight=binding.index_k_norm_weight,
-            eps=binding.plan.caps.rms_norm_eps,
+            eps=binding.state.caps.rms_norm_eps,
             rope=_identity_rope,
         )
         paged_store_compressed_reference(
@@ -1367,7 +1397,7 @@ def _validate_correctness(
 
     actual = prepared.run().clone()
     selected = binding.selected_positions[: case.rows].clone()
-    torch.cuda.synchronize(binding.plan.caps.device)
+    torch.cuda.synchronize(binding.state.caps.device)
 
     if not bool(torch.all(torch.isfinite(actual))):
         raise BenchmarkFailure(f"{case.name}: eager output is non-finite")
@@ -1396,11 +1426,11 @@ def _validate_correctness(
     prepared_query = gemma_rmsnorm_reference(
         prepared.dynamic["index_query"],
         binding.index_q_norm_weight,
-        binding.plan.caps.rms_norm_eps,
+        binding.state.caps.rms_norm_eps,
     )
-    final_workspace_rows = case.rows % binding.plan.workspace_q_rows
+    final_workspace_rows = case.rows % binding.state.workspace_q_rows
     if final_workspace_rows == 0:
-        final_workspace_rows = min(case.rows, binding.plan.workspace_q_rows)
+        final_workspace_rows = min(case.rows, binding.state.workspace_q_rows)
     torch.testing.assert_close(
         binding.prepared_index_query[:final_workspace_rows],
         prepared_query[-final_workspace_rows:],
@@ -1416,8 +1446,17 @@ def _validate_correctness(
     ).reshape(case.planned_batch, -1, INDEX_HEAD_DIM)[
         : case.request_count, : case.groups
     ]
-    reference_k_cache = binding.main_k_cache.float()
-    reference_v_cache = binding.main_v_cache.float()
+    if binding.main_k_cache.dtype == torch.uint8:
+        # NVFP4 records: attention reads exactly the decoded BF16 values.
+        reference_k_cache = nvfp4_kv.dequantize_nvfp4_kv_torch(
+            binding.main_k_cache, HEAD_DIM
+        ).to(torch.bfloat16).float()
+        reference_v_cache = nvfp4_kv.dequantize_nvfp4_kv_torch(
+            binding.main_v_cache, HEAD_DIM
+        ).to(torch.bfloat16).float()
+    else:
+        reference_k_cache = binding.main_k_cache.float()
+        reference_v_cache = binding.main_v_cache.float()
     sparse_gqa_atol = 2e-2
     if binding.k_descale is not None:
         assert binding.v_descale is not None
@@ -1488,7 +1527,7 @@ def _validate_correctness(
             sequence_length // COMPRESS_RATIO,
             case.groups,
         )
-        expanded_count = min(eligible, binding.plan.caps.group_budget) * COMPRESS_RATIO
+        expanded_count = min(eligible, binding.state.caps.group_budget) * COMPRESS_RATIO
         tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
         expected_tail = torch.arange(
             tail_start,
@@ -1514,7 +1553,7 @@ def _validate_correctness(
         main_v_cache=main_v_before,
     )
     prepared.state_restore.restore()
-    torch.cuda.synchronize(binding.plan.caps.device)
+    torch.cuda.synchronize(binding.state.caps.device)
     prepared.state_restore.assert_restored()
     return (
         actual,

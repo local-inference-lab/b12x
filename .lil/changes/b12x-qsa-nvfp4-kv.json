@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-qsa-nvfp4-kv",
+  "category": "feature",
+  "summary": "Serve QSA sparse attention from an NVFP4 main K/V cache",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "QSA plans accept kv_dtype=NVFP4 (torch.float4_e2m1fn_x2): each token, KV head and side stores one 148-byte record of E2M1 values, one E4M3 scale per 16 values, and an fp32 per-row outer scale amax/(6*448), the two-level recipe of the NVFP4 MLA K/V records in b12x/attention/_shared/mla/kv_cache.py. FP8 E4M3 uses 256 bytes and BF16 512.",
+    "NVFP4 plans own a capture-safe main-cache writer: qsa.bind_kv_writer checks the caches once and returns a binding whose write() only launches; BF16 and FP8 plans keep their existing caller-side writers.",
+    "Selected-position attention widens NVFP4 records to BF16 in shared memory and is bitwise identical to BF16 attention over the decoded cache; top-k selection and the BF16 selector cache are unchanged."
+  ],
+  "requires": [],
+  "pull_requests": [
+    434
+  ]
+}
