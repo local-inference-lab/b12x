@@ -794,7 +794,7 @@ def a4_prefill_warps() -> int:
 def a4_prefill_supported(*, prepared_layout: str, scale_format: str, activation: str,
                          is_gated: bool, dtype: torch.dtype, hidden_size: int,
                          intermediate_size: int) -> bool:
-    return (prepared_layout == "packed" and scale_format in ("e4m3_k16", "e4m3_k16_csf")
+    return (prepared_layout == "packed" and scale_format == "e4m3_k16"
             and activation == "silu" and bool(is_gated) and dtype == torch.bfloat16
             and hidden_size % 256 == 0 and intermediate_size % 128 == 0)
 

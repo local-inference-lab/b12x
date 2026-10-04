@@ -50,9 +50,7 @@ stays inside each 16-group, so block scales are unchanged.
 W4A16 scales are lifted E4M3 bytes (`s * f * 2**7` as FP16 bits 14..7, i.e.
 `lifted = e4m3(s * f) + 120` for every kept scale, 0 for flushed ones). The
 kernels restore `e4m3(s * f)` bytewise and fold `1 / f` back through the
-packed global scale (`g * 2**119 / f`) into the per-expert alpha. Compressed
-(NVFP4-CSF) experts expand their scales into the W4A16 scale scratch for this
-path, like every W4A16 call above the stage-read limit.
+packed global scale (`g * 2**119 / f`) into the per-expert alpha.
 
 ## Contract
 
@@ -71,7 +69,8 @@ path, like every W4A16 call above the stage-read limit.
 
 ## Measured
 
-GLM-5.3-Flash NVFP4 QAD (stored FP4-CSF checkpoint) in vLLM, TP2/DCP2, MTP3,
+GLM-5.3-Flash NVFP4 QAD in vLLM (measured on the Karmic beta branch, which
+serves the stored FP4-CSF checkpoint), TP2/DCP2, MTP3,
 eight request slots, two RTX PRO 6000 Max-Q (325 W), threshold 1536; vLLM
 keeps the decode rows of mixed steps on W4A16. Prefill is tok/s for one 8K or
 32K prompt; decode is aggregate output tok/s of two runs at 1 and 8 requests.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
