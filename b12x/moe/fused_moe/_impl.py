@@ -12857,6 +12857,19 @@ def _finalize_trellis_output(
 W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
 
 
+# Token capacity up to which compact W4A8 kernels read MXFP4-CSF scales inline.
+# Larger calls are compute bound: rebuilding scale words in every stage costs
+# more than expanding every expert's scales once (DeepSeek-V4.1 TP4 MoE layer:
+# inline -7 to -10% against the expansion up to 1024 tokens, +2.5 to +6% at
+# 2048 and 4096).
+W4A8_CSF_INLINE_MAX_TOKENS = int(os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536"))
+
+
+def _w4a8_reads_inline_scales(tokens: int) -> bool:
+    """Whether a compact W4A8 plan of this token capacity reads inline scales."""
+    return int(tokens) <= W4A8_CSF_INLINE_MAX_TOKENS
+
+
 def _w4a16_reads_stage_scales(binding, tokens: int) -> bool:
     """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
     launch = getattr(binding, "fused_launch", None)
@@ -12918,6 +12931,20 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     # Inline MXFP4-CSF experts read compressed scales inside the W4A8 kernels;
     # other CSF experts expand their routed experts' scales into scratch first.
     csf_inline = experts.mxfp4_csf_inline
+    if (
+        csf_inline is not None
+        and binding.implementation == "dynamic"
+        and not _w4a8_reads_inline_scales(plan.routed_rows // plan.num_topk)
+    ):
+        # Plans above the inline limit run the native kernels over every
+        # expert's scales, expanded once from the inline storage.
+        from b12x._lib.quant.mxfp4_csf_inline import expand_mxfp4_csf_inline
+
+        for plane, scales in zip(csf_inline, (w1_blockscale, w2_blockscale)):
+            expand_mxfp4_csf_inline(
+                plane, scales.view(torch.uint8).view(plane.num_experts, -1)
+            )
+        csf_inline = None
     if experts.mxfp4_csf is not None and csf_inline is None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
     # The A4 prefill path (when present) reads expanded (W4A16-layout) scales.

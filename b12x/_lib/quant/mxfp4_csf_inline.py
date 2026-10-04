@@ -41,6 +41,9 @@ import cutlass
 import cutlass.cute as cute
 import numpy as np
 import torch
+import triton as tr
+import triton.language as tl
+from triton import cdiv as triton_cdiv
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
@@ -321,6 +324,102 @@ def decode_mxfp4_csf_inline(
     return native
 
 
+@tr.jit
+def _expand_tiles(
+    Storage,
+    Words,
+    NativeWords,
+    NativeHalves,
+    total,
+    TILES_PER_EXPERT: tl.constexpr,
+    K_TILES: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    TILES_PER_GROUP: tl.constexpr,
+    GROUP_ROWS: tl.constexpr,
+    COLUMNS: tl.constexpr,
+    PLANE_BYTES: tl.constexpr,
+    TILES_BYTES: tl.constexpr,
+    RAW_WORDS: tl.constexpr,
+    TILES: tl.constexpr,
+):
+    """Native words of ``TILES`` tile blocks: rows are tiles, columns are slots."""
+    index = tl.program_id(0) * TILES + tl.arange(0, TILES)
+    live = index < total
+    expert, tile = index // TILES_PER_EXPERT, index % TILES_PER_EXPERT
+    block, k_tile = tile // K_TILES, tile % K_TILES
+    group, group_tile = block // TILES_PER_GROUP, block % TILES_PER_GROUP
+    tile_rows = tl.minimum(128, GROUP_ROWS - group_tile * 128)
+    tile_columns = tl.minimum(4, COLUMNS - k_tile * 4)
+    first = (
+        expert * PLANE_BYTES
+        + group * (GROUP_ROWS * COLUMNS)
+        + group_tile * (128 * COLUMNS)
+        + k_tile * tile_rows * 4
+    )
+    header = tl.load(Words + index * 24 + 16, live, 0)
+    heavy = header < 0
+    count = tl.where(heavy, 0, header)
+    slot = tl.arange(0, 128)[None, :]
+    block_words = (index * 24)[:, None]
+    present = live[:, None]
+    selectors = tl.load(Words + block_words + slot // 8, present, 0).to(tl.uint32)
+    selectors = (selectors >> ((slot % 8) * 4).to(tl.uint32)) & 15
+    bases = TILES_BYTES + (expert * BLOCKS + block) * 128
+    base = tl.load(Storage + bases[:, None] + slot, present, 0)
+    word = base.to(tl.uint32) * 0x01010101 + ((selectors * 0x00204081) & 0x01010101)
+    for record in tl.static_range(7):
+        active = live & (record < count)
+        patch = tl.load(Words + index * 24 + 17 + record, active, 0)[:, None]
+        shift = (((patch >> 8) & 3) * 8).to(tl.uint32)
+        value = ((patch >> 16) & 255).to(tl.uint32) << shift
+        hit = active[:, None] & (slot == (patch & 127))
+        word = tl.where(hit, (word & ~(tl.full((), 255, tl.uint32) << shift)) | value, word)
+    raw_tile = (RAW_WORDS + (header & 0x7FFFFFFF) * 128)[:, None]
+    raw = tl.load(Words + raw_tile + slot, (live & heavy)[:, None], 0)
+    word = tl.where(heavy[:, None], raw.to(tl.uint32), word)
+    row = (slot // 32) * 32 + (slot % 4) * 8 + (slot // 4) % 8
+    offset = first[:, None] + row * tile_columns[:, None]
+    keep = present & (row < tile_rows[:, None])
+    full = (tile_columns == 4)[:, None]
+    tl.store(NativeWords + offset // 4, word.to(tl.int32, bitcast=True), keep & full)
+    # K tail tiles hold two columns: the low half of each word.
+    half = (word & 0xFFFF).to(tl.uint16).to(tl.int16, bitcast=True)
+    tl.store(NativeHalves + offset // 2, half, keep & ~full)
+
+
+def expand_mxfp4_csf_inline(plane: Mxfp4CsfInlinePlane, native: torch.Tensor) -> None:
+    """Write every expert's native compact scale bytes into ``native``.
+
+    ``native`` is the ``[E, rows * columns]`` uint8 view of the compact scale
+    plane the storage was built from. Calls above the inline token limit run
+    the native kernels over it.
+    """
+    if native.dtype != torch.uint8 or not native.is_contiguous():
+        raise TypeError("inline W4A8 expansion requires contiguous uint8 storage")
+    if native.shape != (plane.num_experts, plane.rows * plane.columns):
+        raise ValueError("inline W4A8 expansion target does not match the plane")
+    blocks, k_tiles = plane.geometry
+    total, tiles_per_program = plane.num_experts * blocks * k_tiles, 8
+    _expand_tiles[(triton_cdiv(total, tiles_per_program),)](
+        plane.storage,
+        plane.storage.view(torch.int32),
+        native.view(torch.int32),
+        native.view(torch.int16),
+        total,
+        TILES_PER_EXPERT=blocks * k_tiles,
+        K_TILES=k_tiles,
+        BLOCKS=blocks,
+        TILES_PER_GROUP=(plane.group_rows + 127) // 128,
+        GROUP_ROWS=plane.group_rows,
+        COLUMNS=plane.columns,
+        PLANE_BYTES=plane.rows * plane.columns,
+        TILES_BYTES=plane.tiles_bytes,
+        RAW_WORDS=(plane.tiles_bytes + plane.bases_bytes) // 4,
+        TILES=tiles_per_program,
+        num_warps=4,
+    )
+
+
 @cute.jit
 def stage_inline_tile(
     storage: Int64,
@@ -403,6 +502,7 @@ __all__ = [
     "TILE_BYTES",
     "build_mxfp4_csf_inline",
     "decode_mxfp4_csf_inline",
+    "expand_mxfp4_csf_inline",
     "inline_geometry",
     "inline_row_bases",
     "inline_scale_words",
