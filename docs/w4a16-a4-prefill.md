@@ -26,9 +26,15 @@ made: the kernels read the W4A16 packed layout directly.
 
 `B12X_W4A16_A4_PREFILL_TERMS=2` quantizes the input and the intermediate as
 an NVFP4 value plus an NVFP4 residual (`x ~ q1 + q2`, same global scale) and
-contracts both planes into the same accumulators: about 8-bit activation
-precision (lower error than MXFP8 activations) at FP8 MMA cost, with exact
-NVFP4 weights.
+contracts both planes into the same accumulators, at twice the QMMA work. On
+synthetic activations its error is a tenth of one plane's, but in GLM serving
+it did not reduce needle-checksum near misses (see Measured): both planes
+share the per-16 block scale, so small values next to an outlier are lost in
+both. It stays an experiment.
+
+`B12X_W4A16_A4_PREFILL_WARPS` selects the GEMM CTA: 8 warps with 64-row warp
+tiles (default; 210 to 230 registers per thread, no spills) or 16 warps with
+32-row tiles (128 registers per thread, which spills).
 
 ## Operand mapping
 
@@ -62,6 +68,33 @@ path, like every W4A16 call above the stage-read limit.
   per-route FC2 rows). Bind admits the path only when they fit.
 - One compiled pipeline per model geometry serves every live token count;
   token counts are runtime launch arguments.
+
+## Measured
+
+GLM-5.3-Flash NVFP4 QAD (stored FP4-CSF checkpoint) in vLLM, TP2/DCP2, MTP3,
+eight request slots, two RTX PRO 6000 Max-Q (325 W), threshold 1536; vLLM
+keeps the decode rows of mixed steps on W4A16. Prefill is tok/s for one 8K or
+32K prompt; decode is aggregate output tok/s of two runs at 1 and 8 requests.
+
+| Activations of calls >= 1536 tokens | Prefill 8K | Prefill 32K | Decode 1 | Decode 8 |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 (W4A16) | 7,490 | 7,728 | 174, 168 | 529, 543 |
+| NVFP4, 8-warp GEMMs (default) | 9,528 | 9,784 | 174, 163 | 523, 539 |
+| NVFP4, 16-warp GEMMs | 8,965 | 9,194 | 175, 176 | 527, 538 |
+| NVFP4 value + residual, 8 warps | 8,482 | 8,731 | 175, 173 | 529, 530 |
+
+Needle checksum (500 probes at eight requests, four runs): 0.53% near misses
+with BF16 activations, 1.75% with NVFP4 and 1.85% with value + residual. The
+warp count does not change the per-element accumulation order.
+
+One MoE layer of that geometry (uniform routing, microseconds; W4A16 from
+separate runs of the same benchmark):
+
+| Tokens | NVFP4, 8 warps | NVFP4, 16 warps | Value + residual, 8 warps | W4A16 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1,340 | 1,545 | 1,453 | 1,435 |
+| 3,072 | 1,684 | 1,930 | 2,371 | 4,114 |
+| 8,192 | 3,201 | 4,494 | 5,577 | 8,735 |
 
 ## Validation
 
