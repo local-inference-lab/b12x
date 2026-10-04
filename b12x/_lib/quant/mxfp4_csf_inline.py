@@ -33,6 +33,7 @@ it decodes to that plane exactly.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -126,6 +127,15 @@ def _as_int32_bits(values: torch.Tensor) -> torch.Tensor:
     return torch.where(values >= 1 << 31, values - (1 << 32), values).to(torch.int32)
 
 
+@contextmanager
+def _allocations_from(pool):
+    if pool is None:
+        yield
+    else:
+        with torch.cuda.use_mem_pool(pool):
+            yield
+
+
 def build_mxfp4_csf_inline(
     native: torch.Tensor, *, rows: int, columns: int, group_rows: int
 ) -> Mxfp4CsfInlinePlane:
@@ -137,6 +147,45 @@ def build_mxfp4_csf_inline(
         raise TypeError("inline W4A8 scales require uint8 [experts, bytes] storage")
     if native.shape[1] != rows * columns or not native.is_contiguous():
         raise ValueError("inline W4A8 scales require one contiguous native plane")
+    # Encoding and verification allocate many times the storage they produce.
+    # They run in a private pool, and only the storage is copied out: in the
+    # caller's pool it would otherwise sit between their freed blocks, which an
+    # allocator that does not split large blocks (vLLM loads weights with
+    # max_split_size_mb:20) can neither reuse nor release, about 20 MiB per plane.
+    pool = torch.cuda.MemPool() if native.is_cuda else None
+    with _allocations_from(pool):
+        staged, heavy_tiles = _encode_inline_storage(
+            native, rows=rows, columns=columns, group_rows=group_rows
+        )
+    storage = staged.clone()
+    del staged
+    plane = Mxfp4CsfInlinePlane(
+        storage,
+        native.shape[0],
+        int(rows),
+        int(columns),
+        int(group_rows),
+        heavy_tiles,
+    )
+    with _allocations_from(pool):
+        exact = all(
+            torch.equal(
+                decode_mxfp4_csf_inline(plane, e0, min(e0 + _EXPERT_CHUNK, plane.num_experts)),
+                native[e0 : e0 + _EXPERT_CHUNK],
+            )
+            for e0 in range(0, plane.num_experts, _EXPERT_CHUNK)
+        )
+    del pool
+    if not exact:
+        raise RuntimeError(
+            "inline MXFP4-CSF scales do not reproduce the native scale plane"
+        )
+    return plane
+
+
+def _encode_inline_storage(
+    native: torch.Tensor, *, rows: int, columns: int, group_rows: int
+) -> tuple[torch.Tensor, int]:
     blocks, k_tiles = inline_geometry(rows, columns, group_rows)
     experts, tiles = native.shape[0], blocks * k_tiles
     device = native.device
@@ -223,16 +272,7 @@ def build_mxfp4_csf_inline(
     storage[tiles_bytes:bases_end] = bases.view(-1)
     if heavy_tiles:
         storage[bases_end:] = torch.cat(raw).view(-1)
-    plane = Mxfp4CsfInlinePlane(
-        storage, experts, int(rows), int(columns), int(group_rows), heavy_tiles
-    )
-    for e0 in range(0, experts, _EXPERT_CHUNK):
-        e1 = min(experts, e0 + _EXPERT_CHUNK)
-        if not torch.equal(decode_mxfp4_csf_inline(plane, e0, e1), native[e0:e1]):
-            raise RuntimeError(
-                "inline MXFP4-CSF scales do not reproduce the native scale plane"
-            )
-    return plane
+    return storage, heavy_tiles
 
 
 def decode_mxfp4_csf_inline(

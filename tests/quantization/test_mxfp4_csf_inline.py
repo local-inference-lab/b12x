@@ -1,5 +1,10 @@
 """Inline MXFP4-CSF storage reproduces the native compact W4A8 scale words."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -167,3 +172,66 @@ def test_build_rejects_noncompact_geometry():
     native = torch.zeros(1, 256 * 8, dtype=torch.uint8)
     with pytest.raises(ValueError):
         inline.build_mxfp4_csf_inline(native, rows=256, columns=8, group_rows=96)
+
+
+STRANDING_SCRIPT = """
+import gc
+import torch
+from b12x._lib.quant.mxfp4_csf_inline import build_mxfp4_csf_inline
+
+device = torch.device("cuda")
+experts, hidden, inter = 384, 5120, 576
+generator = torch.Generator(device=device).manual_seed(0)
+
+
+def plane(rows, columns):
+    base = torch.randint(100, 130, (experts, rows, 1), device=device, generator=generator)
+    bump = torch.rand(experts, rows, columns, device=device, generator=generator) < 0.4
+    return (base + bump).to(torch.uint8).view(experts, -1).contiguous()
+
+
+def stranded():
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    return torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+
+
+before = stranded()
+w13 = torch.empty(experts, 2 * inter * hidden // 32, dtype=torch.uint8, device=device)
+w2 = torch.empty(experts, hidden * inter // 32, dtype=torch.uint8, device=device)
+planes = []
+for layer in range(4):
+    # The native scale preparation that precedes every build.
+    staging = (torch.empty_like(w13), torch.empty_like(w2))
+    w13.copy_(plane(2 * inter, hidden // 32))
+    w2.copy_(plane(hidden, inter // 32))
+    del staging
+    planes.append(build_mxfp4_csf_inline(w13, rows=2 * inter, columns=hidden // 32, group_rows=inter))
+    planes.append(build_mxfp4_csf_inline(w2, rows=hidden, columns=inter // 32, group_rows=hidden))
+print(stranded() - before)
+"""
+
+
+def test_build_does_not_strand_allocator_pages():
+    """Weight loading must keep the storage clear of freed encoding blocks.
+
+    vLLM loads weights with expandable segments and max_split_size_mb:20. Built
+    in the caller's pool, each plane's storage kept pages of its freed
+    intermediates mapped: 115 MiB over these eight DeepSeek-V4.1 TP4 planes
+    (15 MiB with the private pool), about 1 GiB of KV cache over the model.
+    """
+    require_b12x()
+    environment = dict(
+        os.environ,
+        PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:20",
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", STRANDING_SCRIPT],
+        check=True,
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert int(completed.stdout.strip().splitlines()[-1]) < 40 << 20
