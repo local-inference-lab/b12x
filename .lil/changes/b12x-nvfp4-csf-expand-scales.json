@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-nvfp4-csf-expand-scales",
+  "category": "performance",
+  "summary": "NVFP4-CSF scales can be expanded ahead of the MoE call, off the critical path",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required; callers that do not use it expand as before.",
+  "details": [
+    "expand_scales(experts) expands every expert's NVFP4-CSF scales into the shared scratch on the current stream, and bind(..., scales_expanded=True) skips the per-call expansion. vLLM uses it to expand the next layer's scales on a side stream during its attention: GLM-5.3-Flash glm53-tp2 prefill +2-3% with A4 and +1-2% with A16 prefill activations."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    477
+  ],
+  "requires": []
+}

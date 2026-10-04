@@ -1003,6 +1003,7 @@ class TPMoEScratchPlan:
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
         a4_prefill: bool | None = None,
+        scales_expanded: bool = False,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
         """Bind live tensors to this scratch plan.
@@ -1011,6 +1012,10 @@ class TPMoEScratchPlan:
         None applies ``B12X_W4A16_A4_PREFILL_MIN_TOKENS``, True takes it for any
         call within the prepared capacity, False keeps the call on W4A16. Layers
         without A4 scales stay W4A16 either way.
+
+        ``scales_expanded`` states that ``expand_scales(experts)`` ran on this
+        call's stream (or one it waits for) after the last other use of the
+        shared NVFP4-CSF scratch; the call then skips its own expansion.
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -1152,7 +1157,7 @@ class TPMoEScratchPlan:
                 raise RuntimeError(
                     "W4A16 route-id/map specialization was not materialized"
                 )
-        return _build_tp_moe_fp4_binding_from_views(
+        binding = _build_tp_moe_fp4_binding_from_views(
             plan=self._core_workspace_plan,
             execution_plan=self.launch_plan,
             tensors=tensors,
@@ -1179,6 +1184,7 @@ class TPMoEScratchPlan:
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
         )
+        return replace(binding, scales_expanded=True) if scales_expanded else binding
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1276,6 +1282,8 @@ class TPMoEFP4Binding:
     # Opt-in NVFP4-activation prefill over the W4A16 packed weights (selected at
     # bind for calls at or above its token threshold).
     a4_prefill_launches: object | None = None
+    # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
+    scales_expanded: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
 
@@ -13211,7 +13219,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         and plan.decode_config.nvfp4_inline_scales
     ):
         inline_scales = experts.nvfp4_csf.inline_scales
-    if experts.nvfp4_csf is not None and inline_scales is None and not stage_scales:
+    if (
+        experts.nvfp4_csf is not None
+        and inline_scales is None
+        and not stage_scales
+        and not (binding.scales_expanded and not csf_reset_barriers)
+    ):
         barriers = (
             (
                 _require_binding_field(binding, "barrier_count"),

@@ -306,3 +306,111 @@ def test_a16_stage_scales_reuse_the_planned_launch_for_live_counts():
             torch.testing.assert_close(compressed[1], native[1], rtol=0, atol=0)
             # Stage reads leave the shared expansion scratch untouched.
             assert all(torch.all(buf.view(torch.uint8) == 0x7F) for buf in buffers)
+
+
+@pytest.mark.parametrize("activation_mode", ["a16", "a4"])
+def test_prefetched_scales_replace_the_per_call_expansion(activation_mode):
+    """expand_scales() fills the shared scratch for a later scales_expanded call."""
+    from b12x.moe.fused_moe._impl import W4A16_CSF_STAGE_MAX_TOKENS
+
+    device = require_b12x()
+    e, h, n, topk = 8, 256, 128, 2
+    # A16 expands only above the stage-read limit; A4 expands every call.
+    tokens = W4A16_CSF_STAGE_MAX_TOKENS + 64 if activation_mode == "a16" else 33
+    domain = _build_domain(E=e, K=h, n=n, m=tokens, top_k=topk, seed=937)
+    weight_plan = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=moe.ActivationSpec(
+            mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16,
+            swiglu_limit=10.0,
+        ),
+        geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
+    )
+    s13 = domain["w13_sfb"].view(torch.float8_e4m3fn).view(e, 2 * n, h // 16)
+    s2 = domain["w2_sfb"].view(torch.float8_e4m3fn).view(e, h, n // 16)
+    one = torch.ones(e, device=device)
+    packed = moe.PackedWeights(
+        w13=domain["w13_packed"], w2=domain["w2_packed"],
+        w13_block_scales=s13, w2_block_scales=s2,
+        w13_global_scales=one, w2_global_scales=one,
+        input_scale=one, intermediate_scale=one, immutable_input_scales=True,
+    )
+    buffers = (torch.empty_like(s13), torch.empty_like(s2))
+    compressed = moe.Nvfp4CsfWeights(
+        packed=replace(packed, w13=packed.w13.clone(), w2=packed.w2.clone(),
+                       w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
+        w13_scales=compress_fixture(s13, 2 * n, h // 16),
+        w2_scales=compress_fixture(s2, h, n // 16),
+    )
+    experts = [
+        moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
+    ]
+    assert not moe.expand_scales(experts[0])
+    plans = [
+        moe.plan_execution(
+            experts=owner,
+            capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+            invocation={"fast_math": False},
+            routing=moe.RoutingSpec(deterministic_output=True),
+        )
+        for owner in experts
+    ]
+    source, ids, probabilities = domain["x"], domain["topk_ids"], domain["topk_weights"]
+    scratches = [
+        tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in p.scratch_specs())
+        for p in plans
+    ]
+
+    def call(index, **kwargs):
+        output = torch.full_like(source, float("nan"))
+        binding = moe.bind(
+            plans[index], a=source, topk_ids=ids, topk_weights=probabilities,
+            output=output, scratch=scratches[index], input_scales_static=True, **kwargs,
+        )
+        moe.run(binding=binding)
+        torch.cuda.synchronize()
+        return output
+
+    def prepare(state):
+        scratch = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(source)
+        binding = state.bind(
+            a=source, topk_ids=ids, topk_weights=probabilities, output=output,
+            scratch=scratch, input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+        )
+
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        session.prepare(
+            tuple(
+                p.request(name=f"nvfp4-scale-prefetch-{i}", prepare_call=prepare)
+                for i, p in enumerate(plans)
+            )
+        )
+        reference = call(0)
+        assert torch.isfinite(reference).all() and torch.count_nonzero(reference)
+        poison = lambda: [b.view(torch.uint8).fill_(0x7F) for b in buffers]  # noqa: E731
+        poison()
+        stale = call(1, scales_expanded=True)
+        if activation_mode == "a4":
+            # Small FP4-activation calls run the micro kernel, whose barrier
+            # reset is fused into the expansion: they expand regardless.
+            torch.testing.assert_close(stale, reference, rtol=0, atol=0)
+            return
+        # The flag skips the expansion: poisoned scales change the output ...
+        assert not torch.equal(stale, reference)
+        # ... and a prefetch on a side stream restores the native result.
+        poison()
+        side = torch.cuda.Stream(device)
+        with torch.cuda.stream(side):
+            assert moe.expand_scales(experts[1])
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.testing.assert_close(call(1, scales_expanded=True), reference, rtol=0, atol=0)
+        # Without the flag the call still expands its own routed experts.
+        poison()
+        torch.testing.assert_close(call(1), reference, rtol=0, atol=0)
