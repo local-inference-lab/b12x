@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-w4a16-skip-empty-row-blocks",
+  "category": "performance",
+  "summary": "Faster W4A16 MoE prefill by skipping empty 16-row blocks",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Large-M W4A16 route blocks issue the MMAs of a 16-row block only when it holds a live route; outputs are bit-identical.",
+    "GLM-5.3-Flash TP2 on 2x RTX PRO 6000 Max-Q: MoE layer 1-8% faster at 1K-8K tokens, prefill +2.1-2.4% at 8K/32K, decode unchanged.",
+    "B12X_W4A16_SKIP_EMPTY_M_BLOCKS=0 restores the full-block schedule."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [469],
+  "requires": []
+}
