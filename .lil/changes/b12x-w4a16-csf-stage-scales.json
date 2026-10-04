@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-w4a16-csf-stage-scales",
+  "category": "performance",
+  "summary": "Faster W4A16 decode on NVFP4-CSF checkpoints: compressed expert scales are read inside the MoE kernel",
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required. Calls above the stage-read token limit keep the per-layer scale expansion.",
+  "details": [
+    "W4A16 MoE kernels rebuild each pipeline stage's E4M3 expert scales in shared memory from stage-readable NVFP4-CSF storage instead of expanding all routed experts' scales into scratch before the MoE.",
+    "GLM-5.3-Flash stored QAD CSF checkpoint, TP2/DCP2 MTP3 on 2x RTX PRO 6000 Max-Q: decode C8 +10% and C1 +1.6% per step versus the per-layer expansion; prefill and needle-checksum exactness unchanged."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [],
+  "requires": []
+}
