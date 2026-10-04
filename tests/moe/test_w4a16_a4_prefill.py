@@ -221,7 +221,8 @@ def test_a4_prefill_threshold_and_scale_gating(monkeypatch):
     # Without calibrated scales (or with invalid ones) the weights stay W4A16 only.
     bad = a1g.clone()
     bad[3] = float("nan")
-    for scales in ((None, None), (bad, a2g)):
+    ones = torch.ones_like(a1g)
+    for scales in ((None, None), (bad, a2g), (ones, ones)):
         plain = _prepare(case, scales[0], scales[1])
         assert not plain._impl.a4_prefill_scales
         xp_plain = _plan(plain, 256)

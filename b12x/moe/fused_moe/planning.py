@@ -769,6 +769,11 @@ def prepare_weights(
                 bool((torch.isfinite(scale) & (scale > 0)).all())
                 for scale in (input_scale, intermediate_scale)
             )
+            # Unit scales are the W4A16 placeholder of integrations that do not
+            # pass calibrated activation scales; quantizing with them is wrong.
+            and not all(
+                bool((scale == 1).all()) for scale in (input_scale, intermediate_scale)
+            )
         )
         if keep_activation_scales:
             # The A4 prefill quantizes each token once for all routed experts:
