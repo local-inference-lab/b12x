@@ -758,7 +758,23 @@ def prepare_weights(
             )
         input_scale = weights.input_scale
         intermediate_scale = weights.intermediate_scale
-        if plan.activation.mode is ActivationMode.A16:
+        from b12x.moe._shared.kernels.w4a16.prefill_a4 import a4_prefill_min_tokens
+
+        # The opt-in A4 prefill path quantizes activations with the supplied scales.
+        keep_activation_scales = (
+            a4_prefill_min_tokens() > 0
+            and input_scale is not None
+            and intermediate_scale is not None
+            and all(
+                bool((torch.isfinite(scale) & (scale > 0)).all())
+                for scale in (input_scale, intermediate_scale)
+            )
+        )
+        if keep_activation_scales:
+            # The A4 prefill quantizes each token once for all routed experts:
+            # use the widest calibrated input range (smallest global scale).
+            input_scale = input_scale.detach().reshape(-1).amin().reshape(1).contiguous()
+        if plan.activation.mode is ActivationMode.A16 and not keep_activation_scales:
             input_scale = torch.ones(
                 plan.geometry.num_experts,
                 dtype=torch.float32,
@@ -793,6 +809,8 @@ def prepare_weights(
             a1_gscale=input_scale,
             a2_gscale=intermediate_scale,
         )
+        if plan.activation.mode is ActivationMode.A16 and keep_activation_scales:
+            prepared = replace(prepared, a4_prefill_scales=True)
     return PreparedExperts(plan=plan, _impl=prepared)
 
 
