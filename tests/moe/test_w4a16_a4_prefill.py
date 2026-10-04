@@ -124,11 +124,11 @@ def _plan(experts, tokens):
         invocation={"fast_math": True})
 
 
-def _bind(xp, x, ids, wts, out, scratch):
+def _bind(xp, x, ids, wts, out, scratch, **kwargs):
     from b12x.moe import fused_moe as moe
 
     return moe.bind(xp, a=x, topk_ids=ids, topk_weights=wts, output=out, scratch=scratch,
-                    input_scales_static=True)
+                    input_scales_static=True, **kwargs)
 
 
 def _emulate(case, x, ids, wts, a1g, a2g, terms):
@@ -231,6 +231,43 @@ def test_a4_prefill_threshold_and_scale_gating(monkeypatch):
                               for s in xp_plain.scratch_specs())
         binding = _bind(xp_plain, x, ids, wts, torch.empty_like(x), scratch_plain)
         assert getattr(binding, "_impl", binding).a4_prefill_launches is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a4_prefill_per_call_choice_overrides_the_threshold(monkeypatch):
+    """A caller that knows which rows are prefill picks the path per call."""
+    require_b12x()
+    _env(monkeypatch, 128, 1)
+    case = _make_case(13)
+    a1g, a2g = _scales(case)
+    experts = _prepare(case, a1g, a2g)
+    xp = _plan(experts, 256)
+    dev = torch.device("cuda")
+    scratch = tuple(torch.empty(s.shape, dtype=s.dtype, device=dev) for s in xp.scratch_specs())
+    for tokens, choice, expect_a4 in ((48, True, True), (48, None, False), (256, False, False),
+                                      (256, None, True)):
+        x, ids, wts = _inputs(tokens, tokens)
+        binding = _bind(xp, x, ids, wts, torch.empty_like(x), scratch, a4_prefill=choice)
+        launches = getattr(binding, "_impl", binding).a4_prefill_launches
+        assert (launches is not None) == expect_a4, (tokens, choice)
+    # A forced call below the threshold computes the same A4 math.
+    from b12x.moe import fused_moe as moe
+
+    x, ids, wts = _inputs(48, 21)
+    out = torch.empty_like(x)
+    moe.run(binding=_bind(xp, x, ids, wts, out, scratch, a4_prefill=True))
+    torch.cuda.synchronize()
+    ref = _emulate(case, x, ids, wts, a1g, a2g, 1)
+    rel = ((out.double() - ref).norm() / ref.norm()).item()
+    assert rel < 4e-3, rel
+    # Weights without calibrated scales stay W4A16 even when A4 is asked for.
+    plain = _prepare(case, None, None)
+    xp_plain = _plan(plain, 256)
+    scratch_plain = tuple(torch.empty(s.shape, dtype=s.dtype, device=dev)
+                          for s in xp_plain.scratch_specs())
+    x, ids, wts = _inputs(256, 4)
+    binding = _bind(xp_plain, x, ids, wts, torch.empty_like(x), scratch_plain, a4_prefill=True)
+    assert getattr(binding, "_impl", binding).a4_prefill_launches is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

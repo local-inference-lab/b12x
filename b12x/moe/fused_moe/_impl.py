@@ -1002,8 +1002,16 @@ class TPMoEScratchPlan:
         layer_idx: int | None = None,
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
+        a4_prefill: bool | None = None,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
+        """Bind live tensors to this scratch plan.
+
+        ``a4_prefill`` chooses the opt-in A4 prefill of W4A16 plans per call:
+        None applies ``B12X_W4A16_A4_PREFILL_MIN_TOKENS``, True takes it for any
+        call within the prepared capacity, False keeps the call on W4A16. Layers
+        without A4 scales stay W4A16 either way.
+        """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
         weight_plan = experts.plan
@@ -1097,6 +1105,7 @@ class TPMoEScratchPlan:
                                    or output_expert_map is not None),
                     activation_amax=activation_amax,
                     apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                    force=a4_prefill,
                 )
                 if a4_prefill_launches is not None:
                     from b12x.moe._shared.kernels.w4a16.prefill_a4 import a4_prefill_fits
