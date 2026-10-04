@@ -1,0 +1,169 @@
+"""Inline MXFP4-CSF storage reproduces the native compact W4A8 scale words."""
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import numpy as np
+import pytest
+import torch
+from cutlass.cutlass_dsl import Int32, Int64, Uint32
+
+from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.quant import mxfp4_csf_inline as inline
+from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe.fused_moe._impl import _e8m0_scale_to_w4a8_n64_sfb_inplace
+from ..conftest import require_b12x
+
+
+def logical_scales(rows, columns, *, experts=4, seed=0):
+    """E8M0 grids with sparse and dense exceptions, clamped and zero rows."""
+    rng = np.random.default_rng(seed + rows + columns)
+    base = rng.integers(100, 140, (experts, rows, 1))
+    grid = base + rng.integers(0, 2, (experts, rows, columns))
+    flat = grid.reshape(experts, -1)
+    flat[:, ::97] = rng.integers(0, 248, flat[:, ::97].shape)
+    for expert in range(experts):
+        # Dense exception rows overflow a tile's records: raw (heavy) tiles.
+        for row in rng.choice(rows - 4, 3, replace=False):
+            grid[expert, row : row + 4] = rng.integers(0, 248, (4, columns))
+    grid[:, 0] = 250  # native preparation clamps E8M0 bytes above 247
+    grid[:, 1] = 0
+    grid[:, 2, ::2] = 247
+    return torch.from_numpy(np.minimum(grid, 255).astype(np.uint8))
+
+
+def native_plane(grid, group_rows, rotation=0):
+    device = require_b12x()
+    experts, rows, columns = grid.shape
+    native = _e8m0_scale_to_w4a8_n64_sfb_inplace(
+        grid.clone().to(device),
+        weight_E=experts,
+        rows=rows,
+        k_dim=columns * 32,
+        row_rotation=rotation,
+        group_rows=group_rows,
+    )
+    return native.view(torch.uint8).view(experts, rows * columns).contiguous()
+
+
+def staged_words(native, rows, columns, group_rows):
+    """Words of every tile as the native compact stages write them, per row."""
+    blocks, k_tiles = inline.inline_geometry(rows, columns, group_rows)
+    offsets = torch.from_numpy(inline._slot_offsets(rows, columns, group_rows))
+    offsets = offsets.to(native.device).view(blocks * k_tiles, 128, 4)
+    values = native[:, offsets.clamp_min(0).view(-1)].view(-1, blocks * k_tiles, 128, 4)
+    values = torch.where(offsets >= 0, values, 0)
+    slot = torch.arange(128, device=native.device)
+    row = (slot >> 5) * 32 + (slot & 3) * 8 + ((slot >> 2) & 7)
+    words = torch.zeros_like(values)
+    words[:, :, row] = values
+    return words.contiguous().view(torch.int32).view(-1)
+
+
+GEOMETRIES = [
+    (1152, 160, 576, 576),  # DS4.1 TP4 W13 (w31), N64 group tails
+    (1152, 160, 576, 0),  # DS4.1 TP4 W13 (w13)
+    (5120, 18, 5120, 0),  # DS4.1 TP4 W2, K64 tail tiles
+    (384, 112, 192, 192),  # Kimi TP16 W13
+    (3584, 6, 3584, 0),
+]
+
+
+@pytest.mark.parametrize("rows,columns,group,rotation", GEOMETRIES)
+def test_storage_reproduces_native_bytes(rows, columns, group, rotation):
+    native = native_plane(logical_scales(rows, columns), group, rotation)
+    plane = inline.build_mxfp4_csf_inline(
+        native, rows=rows, columns=columns, group_rows=group
+    )
+    assert plane.heavy_tiles > 0
+    tiles = plane.storage[: plane.tiles_bytes].view(-1, inline.TILE_BYTES)
+    header = tiles.view(torch.int32)[:, inline.SELECTOR_BYTES // 4]
+    assert bool(((header > 0) & (header <= inline.RECORDS)).any())
+    assert torch.equal(inline.decode_mxfp4_csf_inline(plane), native)
+    assert torch.equal(inline.decode_mxfp4_csf_inline(plane, 1, 3), native[1:3])
+
+
+class _WordProbe:
+    """Stage each tile block like a compact kernel and store its rows' words."""
+
+    def __init__(self, experts, blocks, k_tiles, first, tail):
+        self.experts, self.blocks, self.k_tiles = experts, blocks, k_tiles
+        self.first, self.tail = first, tail
+
+    @cute.jit
+    def __call__(self, storage: cute.Pointer, out: cute.Pointer, stream: cuda.CUstream):
+        tiles = self.experts * self.blocks * self.k_tiles
+        self.kernel(
+            cute.make_tensor(storage, cute.make_layout((1,))),
+            cute.make_tensor(out, cute.make_layout((tiles * 128,))),
+        ).launch(grid=(tiles, 1, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, storage: cute.Tensor, out: cute.Tensor):
+        tid, _, _ = cute.arch.thread_idx()
+        tile, _, _ = cute.arch.block_idx()
+        tid = Int32(tid)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Shared:
+            words: cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, 128], 128]
+
+        shared = shared_ptr_to_u32(smem.allocate(Shared).words.data_ptr())
+        base = get_ptr_as_int64(storage, Int32(0))
+        inline.stage_inline_tile(base, Int64(tile), shared, tid, self.first)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+        warp, quad = tid // Int32(32), (tid & Int32(31)) >> Int32(2)
+        slot = warp * Int32(32) + quad * Int32(4)
+        tiles_bytes = Int64(self.experts * self.blocks * self.k_tiles * inline.TILE_BYTES)
+        raw = tiles_bytes + Int64(self.experts * self.blocks * inline.BASE_BYTES)
+        bases = inline.inline_row_bases(
+            base, tiles_bytes, Int64(Int32(tile) // Int32(self.k_tiles)), slot
+        )
+        words = inline.inline_scale_words(shared, bases, slot, base + raw)
+        mask = Uint32(0xFFFFFFFF)
+        if cutlass.const_expr(self.tail):
+            mask = Uint32(
+                cutlass.select_(
+                    Int32(tile) % Int32(self.k_tiles) == Int32(self.k_tiles - 1),
+                    Uint32(0xFFFF),
+                    mask,
+                )
+            )
+        if (tid & Int32(3)) == Int32(0):
+            for nt in cutlass.range_constexpr(4):
+                row = warp * Int32(32) + Int32(nt * 8) + quad
+                out[Int64(tile) * Int64(128) + Int64(row)] = words[nt] & mask
+
+
+@pytest.mark.parametrize("first", [0, 32])
+@pytest.mark.parametrize("rows,columns,group,rotation", GEOMETRIES)
+def test_device_words_match_native_stages(rows, columns, group, rotation, first):
+    native = native_plane(logical_scales(rows, columns, seed=7), group, rotation)
+    plane = inline.build_mxfp4_csf_inline(
+        native, rows=rows, columns=columns, group_rows=group
+    )
+    blocks, k_tiles = plane.geometry
+    probe = _WordProbe(plane.num_experts, blocks, k_tiles, first, bool(columns % 4))
+    out = torch.full(
+        (plane.num_experts * blocks * k_tiles * 128,),
+        -1,
+        dtype=torch.int32,
+        device=native.device,
+    )
+
+    def ptr(tensor, dtype):
+        return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    args = (ptr(plane.storage, cutlass.Uint8), ptr(out, cutlass.Int32), current_cuda_stream())
+    cute.compile(probe, *args)(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, staged_words(native, rows, columns, group))
+
+
+def test_build_rejects_noncompact_geometry():
+    native = torch.zeros(1, 256 * 8, dtype=torch.uint8)
+    with pytest.raises(ValueError):
+        inline.build_mxfp4_csf_inline(native, rows=256, columns=8, group_rows=96)
