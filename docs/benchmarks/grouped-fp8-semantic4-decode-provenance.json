@@ -1,39 +1,27 @@
 {
-  "boundaries": [
-    "semantic version 4 candidate version 8: decode 446 only; earlier semantic 3 prefill/decode 819 uses different dirty source and must not be combined as same-source 819",
-    "not a semantic 4 full-matrix prefill/decode, whole-upstream-suite or SM121 qualification",
-    "GPU case memory peaks cover both sides plus preparation/oracle/timing, not a b12x workspace metric",
-    "no hashes, snapshots, or new GPU task created"
-  ],
-  "case_memory_scope": {
-    "interpretation": "Whole-case measurements including DeepGEMM and b12x, input preparation, oracle, and timing; NOT a b12x workspace metric.",
-    "peak_allocated_bytes": 42324218880,
-    "peak_reserved_bytes": 51776585728
+  "status": "historical_bounded_observations",
+  "measurement_date": "2026-10-02",
+  "measured_contract": {
+    "component_id": "gemm.mgroup_fp8_gemm",
+    "semantic_version": 4,
+    "candidate_contract_version": 8,
+    "config_schema_version": 2,
+    "source_path": "../../b12x/gemm/mgroup_fp8_gemm/_tuning.py",
+    "definition": "semantic_version is TUNING.semantic_version (operation semantics); candidate_contract_version is TUNING.candidate_contract_version (candidate enumeration/eligibility, not a candidate index); config_schema_version is TUNING.config_schema_version (serialized config). Historical measured dirty sources are not identified by the current definition."
   },
   "export": {
     "cases": 446,
     "confirmations": 6,
     "file": "grouped-fp8-semantic4-decode-cases.jsonl.gz",
-    "included_fields": [
-      "case ID, static shape, corpus, dtype, mode, task/attempt and slice",
-      "per-phase two-sided raw samples and medians, ratio, cache and timing mode",
-      "original block order, sample ranges, monotonic start/end per block",
-      "per-side pre/post output and amplitude checks and input restoration",
-      "per-case parity, closed bundle, correctness/graph/live-mutation summary and counts"
-    ],
-    "not_a_full_lifecycle_export": [
-      "does not include raw lifecycle bindings, capture or allocator addresses, raw mutation input tensors, full live-mutation checks/amplitudes or detailed memory stats",
-      "does not include original logs, GPU process observations, wall-clock timing epochs, untracked input inventory, full original selection/bundles/records or failed historical attempts",
-      "original private lifecycle evidence was checked during aggregation but cannot be fully replayed from this export alone"
-    ],
+    "included_fields": ["case ID, shape, corpus, dtype, kind and measurement_context", "per-phase two-sided raw samples and medians, ratio, cache and timing mode", "original block order, sample ranges, monotonic start/end per block", "per-side pre/post output and amplitude checks and input restoration", "per-case parity, closed, correctness/graph/live-mutation summary and counts"],
+    "not_a_full_lifecycle_export": ["No raw lifecycle bindings, capture or allocator addresses, mutation input tensors, full mutation checks/amplitudes or detailed memory stats.", "Original logs, process observations, wall-clock epochs, untracked inventory and complete selection/bundles/records are not published in this repository; full lifecycle gates cannot be independently replayed."],
     "phases": 458,
-    "ratio_direction": "b12x median / DeepGEMM median",
+    "ratio_direction": "b12x median / DeepGEMM median (lower is better)",
     "raw_sample_values": 31560,
     "side_records": 916,
-    "threshold_inclusive": 1.01
+    "threshold_inclusive": 1.01,
+    "threshold_definition": "Every required phase of every case must have ratio <=1.01, not only the aggregate geomean. A paired phase has one side record per arm; a confirmation is a case with both additional paired phases. See ../grouped-fp8.md for raw field definitions."
   },
-  "hardware_identity": "gpu-1 is a run-local pseudonym; all tasks in this round used one card. The same pseudonym in another export does not establish cross-round device identity. Snapshot clocks do not establish sustained clocks or absence of throttling.",
-  "minimal_documentation_text": "The masked-owned semantic 4 candidate (contract 8) passed 446/446 decode cases under interleaved-v1 timing on a PRO 6000 Server (188 SMs): 56 slices, six confirmations, 458 phases, 916 two-sided records, 31,560 raw latency samples. Initial-ratio geomean 0.7318103372125201, per-case maximum-phase geomean 0.7318186491252202 and worst phase 0.990327380952381; all phases meet <=1.01. Source used b12x base 56c00e61 plus dirty and declared untracked inputs; the harness root was also dirty. Neither recorded source identity nor a later commit proves an exact clean measurement revision. This is decode only: do not combine with the earlier semantic 3 prefill/decode 819 as a same-source 819 result. Case memory peaks include both sides and preparation/oracle/timing, not b12x workspace.",
   "qualification": {
     "candidate_contract_version": 8,
     "config_schema_version": 2,
@@ -41,200 +29,38 @@
     "max_phase_ratio_geomean": 0.7318186491252202,
     "scope": "decode only",
     "semantic_version": 4,
-    "slices": 56,
     "worst_phase_ratio": 0.990327380952381
   },
-  "redaction": {
-    "executed_request": "recorded python -c wrapper with any workspace root redacted; embedded subprocess calls identify formal slice scripts and actual task slice ranges",
-    "removed": [
-      "private evidence paths and task-file inventory",
-      "declared untracked path list including experimental directories (counts only)",
-      "absolute workspace/worker paths",
-      "GPU UUID",
-      "hostnames",
-      "PIDs and allocator addresses",
-      "logs",
-      "endpoint URLs",
-      "process observations",
-      "large routing length lists",
-      "wall-clock timing epochs"
-    ],
-    "reproduction": "A suggested reproduction is not an exact historical invocation: use a managed benchmark-profile task with the formal slice scripts, interleaved-v1, identical case IDs and current source/lock, and compare against this exported raw evidence; the historical dirty source is not reconstructed.",
-    "retained_monotonic": "Raw monotonic start/end times for every block, for within-task/block and cross-phase order checks; not wall-clock timestamps and not a cross-host shared epoch. No missing timing boundary was synthesized.",
-    "workspace": "<WORKSPACE>"
-  },
-  "round": "masked-owned-semantic4-interleaved-v1-20261002",
-  "source_files": {
-    "case_summary": "Private aggregate; individual source path omitted.",
-    "private_evidence": "Retained internally; private source paths and task-file inventory omitted from this publication draft.",
-    "shape_source": "Case geometry is included in the companion cases export; originally selected from the external harness geometry table."
-  },
-  "source_limitations": {
-    "b12x_revision_is_base_plus_dirty_and_declared_untracked": true,
-    "harness_dirty_at_measurement": true,
-    "harness_root_git_base": "ffccc4a8c07d58c44c1b37209b158e19780b8e32",
-    "later_commits_do_not_retroactively_identify_dirty_source": true,
-    "later_jj_state_not_measurement_source_proof": true,
-    "public_exact_harness_revision": null,
-    "source_identity_is_immutable_proof": false
-  },
-  "status": "historical_bounded_observations",
-  "tasks": [
-    {
-      "attempt_id": "955d4024-2920-446d-af2b-24b29d597da4",
+  "measurement_context_definition": "File-local context-1 joins each companion case to the environment observations below and its monotonic clock domain. It is not a task address or source identity. File line order is not timing order; clocks cannot be compared across contexts or collections.",
+  "monitoring_limits": "monitor_observations and monitor_conflicts retain original observation/conflict counts. Monitoring method and coverage are not published; zero conflicts does not prove continuous exclusivity or absence of interference. exclusive_visibility:null means unknown/not provided, not an exclusive-device verdict.",
+  "measurement_contexts": {
+    "context-1": {
       "declared_untracked": true,
       "declared_untracked_count": 57,
-      "declared_untracked_description": "Additional declared untracked inputs, including experimental directories, were present at measurement; omitted from publication draft. Not reconstructible from this summary.",
-      "executed_request": {
-        "argv": [
-          "python",
-          "-c",
-          "import json,pathlib,subprocess,sys\nout=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)\nsys.path.insert(0,str(pathlib.Path('validation/megajob/wi004_route_tp_20260922').resolve()))\nimport formal_decode_slice as decode\nfrom b12x.gemm.mgroup_fp8_gemm._tuning import TUNING\nassert (TUNING.semantic_version,TUNING.candidate_contract_version,TUNING.config_schema_version)==(4,8,2)\nmanifest=[dict(mode='decode',index=i,ids=[c.id for c in decode.cases(i)]) for i in range(56)]\nids=[c for s in manifest for c in s['ids']];assert len(ids)==len(set(ids))==446\n(out/'matrix-manifest.json').write_text(json.dumps(dict(round='masked-owned-semantic4-interleaved-v1-20261002',semantic_version=4,candidate_contract_version=8,config_schema_version=2,slices=manifest,total=446,prefill_included=False)))\nroot=pathlib.Path('<PRIVATE_SCRATCH>')\n(out/'dense-paths.json').write_text(json.dumps(dict(cwd=str(pathlib.Path.cwd()),paths={str(p):p.exists() for p in [root/'before',root/'after',root/'venv-before/bin/python',root/'venv-after/bin/python']})))\nresults=[]\nfor index in range(56):\n dst=out/('decode-'+str(index).zfill(2));dst.mkdir()\n with (dst/'run.log').open('w') as f:\n  rc=subprocess.run([sys.executable,'validation/megajob/wi004_route_tp_20260922/formal_decode_slice.py',str(dst),str(index)],stdout=f,stderr=subprocess.STDOUT).returncode\n results.append(dict(mode='decode',index=index,exit_status=rc));(out/'progress.json').write_text(json.dumps(results));print(results[-1],flush=True)\n if rc:sys.exit(rc)\n",
-          "{outputs}"
-        ],
-        "argv_redaction": "workspace root replaced with <WORKSPACE> if present; private scratch root replaced with <PRIVATE_SCRATCH> if present; {outputs} is the original runtime placeholder",
-        "cwd": "<WORKSPACE>",
-        "profile": "benchmark"
-      },
-      "executed_slice_commands": [
-        {
-          "arguments": [
-            "<OUTPUTS>/<MODE>-<SLICE>",
-            "<SLICE>"
-          ],
-          "executable": "sys.executable",
-          "script": "validation/megajob/wi004_route_tp_20260922/formal_decode_slice.py"
-        }
-      ],
-      "gpu": {
-        "compute_capability": [
-          12,
-          0
-        ],
-        "cuda_runtime_reported": "13.0",
-        "driver_version": "595.58.03",
-        "exclusive_visibility": null,
-        "memory_bytes": 101975851008,
-        "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-        "monitor_conflicts": 0,
-        "monitor_observations": 1086,
-        "power_state_snapshot": "P0",
-        "power_w_snapshot": "67.52 W",
-        "pseudonym": "gpu-1",
-        "same_physical_gpu_within_run": true,
-        "sm_clock_mhz_snapshot": "2362 MHz",
-        "sm_count": 188,
-        "temperature_c_snapshot": 38,
-        "throttle_reason": "not recorded in result.json (do not infer from P-state/clock)"
-      },
-      "native_preparation": [
-        {
-          "argv": [
-            "pixi",
-            "install",
-            "--locked",
-            "--all"
-          ],
-          "exit_status": 0
-        },
-        {
-          "argv": [
-            "pixi",
-            "run",
-            "build"
-          ],
-          "exit_status": 0
-        },
-        {
-          "argv": [
-            "pixi",
-            "run",
-            "check"
-          ],
-          "exit_status": 0
-        }
-      ],
-      "number": 635,
-      "observed_preparation_check_versions": {
-        "cuda": "13.0",
-        "python": "3.12.14",
-        "torch": "2.14.0+cu130"
-      },
-      "recorded_source_identity": "3ae4cc6e2b24a101aa33e100d24b279d7a542d6fa9b3839efc1d457543d701d8",
-      "result": {
-        "artifact_state": "complete",
-        "service_outcome": "success",
-        "termination_confirmed": true,
-        "workload_exit_status": 0
-      },
-      "slice_range": {
-        "mode": "decode",
-        "start": 0,
-        "stop_exclusive": 56
-      },
-      "source_identity_is_immutable_proof": false,
-      "source_repositories": [
-        {
-          "dirty": true,
-          "path": ".",
-          "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"
-        },
-        {
-          "dirty": false,
-          "path": "DeepGEMM",
-          "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"
-        },
-        {
-          "dirty": false,
-          "path": "DeepGEMM/third-party/cutlass",
-          "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
-        },
-        {
-          "dirty": false,
-          "path": "DeepGEMM/third-party/deep_jit",
-          "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
-        },
-        {
-          "dirty": true,
-          "path": "b12x",
-          "revision": "56c00e61a86195cac0c3505502ec1095fe8faa5b"
-        },
-        {
-          "dirty": false,
-          "path": "flashinfer",
-          "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"
-        },
-        {
-          "dirty": false,
-          "path": "flashinfer/3rdparty/cccl",
-          "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
-        },
-        {
-          "dirty": false,
-          "path": "flashinfer/3rdparty/cutlass",
-          "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"
-        },
-        {
-          "dirty": false,
-          "path": "flashinfer/3rdparty/nixl",
-          "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"
-        },
-        {
-          "dirty": false,
-          "path": "flashinfer/3rdparty/spdlog",
-          "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"
-        }
-      ],
-      "task_id": "8e8d360d-717f-4f54-9edb-aa8b46236062"
+      "declared_untracked_description": "Additional inputs, including experimental directories, were present but are not published; the exact measured tree cannot be reconstructed.",
+      "gpu": {"compute_capability": [12, 0], "cuda_runtime_reported": "13.0", "driver_version": "595.58.03", "exclusive_visibility": null, "memory_bytes": 101975851008, "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "monitor_conflicts": 0, "monitor_observations": 1086, "power_state_snapshot": "P0", "power_w_snapshot": "67.52 W", "pseudonym": "gpu-1", "same_physical_gpu_within_run": true, "sm_clock_mhz_snapshot": "2362 MHz", "sm_count": 188, "temperature_c_snapshot": 38, "throttle_reason": "not recorded (do not infer from P-state/clock)"},
+      "native_preparation": [{"argv": ["pixi", "install", "--locked", "--all"], "exit_status": 0}, {"argv": ["pixi", "run", "build"], "exit_status": 0}, {"argv": ["pixi", "run", "check"], "exit_status": 0}],
+      "observed_preparation_check_versions": {"cuda": "13.0", "python": "3.12.14", "torch": "2.14.0+cu130"},
+      "result": {"artifact_state": "complete", "service_outcome": "success", "termination_confirmed": true, "workload_exit_status": 0}
     }
+  },
+  "source_repositories_coordinate_system": "Paths are relative to the historical external multi-repository workspace, not this b12x checkout; '.' is the external harness repository. Revisions are repository Git bases, not exact dirty-source revisions.",
+  "source_repositories": [
+    {"dirty": true, "path": ".", "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"},
+    {"dirty": false, "path": "DeepGEMM", "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"},
+    {"dirty": false, "path": "DeepGEMM/third-party/cutlass", "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"},
+    {"dirty": false, "path": "DeepGEMM/third-party/deep_jit", "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"},
+    {"dirty": true, "path": "b12x", "revision": "56c00e61a86195cac0c3505502ec1095fe8faa5b"},
+    {"dirty": false, "path": "flashinfer", "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"},
+    {"dirty": false, "path": "flashinfer/3rdparty/cccl", "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"},
+    {"dirty": false, "path": "flashinfer/3rdparty/cutlass", "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"},
+    {"dirty": false, "path": "flashinfer/3rdparty/nixl", "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"},
+    {"dirty": false, "path": "flashinfer/3rdparty/spdlog", "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"}
   ],
-  "version_notes": {
-    "current_workspace_lock_not_historical_proof": {
-      "cuda_nvcc": "13.3.73",
-      "nvidia_cutlass_dsl": "4.7.1",
-      "torch": "2.14.0+cu130",
-      "triton": "3.8.0"
-    },
-    "recorded_during_preparation": "Each task preparation.log check reports CUDA runtime 13.0, Python 3.12.14 and torch 2.14.0+cu130; result.json reports the driver and CUDA runtime separately. nvcc/CUTLASS DSL/triton versions are not individually emitted by these task result/check records."
-  }
+  "source_limitations": {"b12x_revision_is_base_plus_dirty_and_declared_untracked": true, "harness_dirty_at_measurement": true, "harness_root_git_base": "ffccc4a8c07d58c44c1b37209b158e19780b8e32", "later_commits_do_not_retroactively_identify_dirty_source": true, "public_exact_harness_revision": null, "exact_public_b12x_revision": null},
+  "evidence_availability": "Companion raw timings and selected correctness summaries are published. Exact dirty/untracked sources, complete logs and lifecycle records are not. The external harness/corpus/formal drivers have no public fetch entry here and are not provided by this repository; these paired measurements cannot be reproduced from this repository alone.",
+  "hardware_identity": "gpu-1 is run-local. The same pseudonym in another collection does not establish cross-collection card identity. Snapshot clocks do not establish sustained clocks or absence of throttling.",
+  "case_memory_scope": {"interpretation": "Whole-case measurements including DeepGEMM and b12x, input preparation, oracle, and timing; NOT a b12x workspace metric.", "peak_allocated_bytes": 42324218880, "peak_reserved_bytes": 51776585728},
+  "version_notes": {"current_workspace_lock_not_historical_proof": {"cuda_nvcc": "13.3.73", "nvidia_cutlass_dsl": "4.7.1", "torch": "2.14.0+cu130", "triton": "3.8.0"}, "recorded_during_preparation": "Preparation checks report CUDA runtime 13.0, Python 3.12.14 and torch 2.14.0+cu130; driver/runtime observations are separate. nvcc/CUTLASS DSL/triton versions were not individually recorded."},
+  "boundaries": ["TUNING.semantic_version 4, candidate_contract_version 8: decode 446 only; semantic-3 prefill/decode uses different dirty sources and must not be combined as same-source 819", "not a semantic-4 full matrix, whole-upstream-suite, SM121 or EP1/EP8 scaling qualification", "Earlier failed performance attempts remain failures and are excluded from passing phases; complete failure records are not published."]
 }

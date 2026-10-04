@@ -17,24 +17,45 @@
   "gates": {
     "all_passed": true,
     "docs_api_smoke": "masked and contiguous eager/live-activity graph oracle passed",
+    "all_passed_scope": "Only the listed finite checks and measured phases; not unrerun sanitizers, the full matrix or earlier failed attempts.",
     "grouped": [
       {
-        "actual_scope_count": 2,
         "cases": 8,
         "passed": true,
-        "scope": "decode-0"
+        "case_ids": [
+          "grouped_gemm/masked-decode-g8-live-a",
+          "grouped_gemm/masked-decode-g8-live-b",
+          "grouped_gemm/m-dsv41-flash-w13-ep1-bs1-balanced",
+          "grouped_gemm/m-dsv41-flash-w13-ep1-bs1-zipf",
+          "grouped_gemm/m-dsv41-flash-w13-ep1-bs1-hot",
+          "grouped_gemm/m-dsv41-flash-w13-ep1-bs4-balanced",
+          "grouped_gemm/m-dsv41-flash-w13-ep1-bs4-zipf",
+          "grouped_gemm/m-dsv41-flash-w13-ep1-bs4-hot"
+        ]
       },
       {
-        "actual_scope_count": 2,
         "cases": 8,
         "passed": true,
-        "scope": "decode-53"
+        "case_ids": [
+          "grouped_gemm/rt1-glm-5.3-flash-w2-tp1-ep8-r2-decode-t128-hot",
+          "grouped_gemm/rt1-glm-5.3-flash-w2-tp1-ep8-r3-decode-t128-hot",
+          "grouped_gemm/rt1-glm-5.3-flash-w2-tp1-ep8-r4-decode-t128-hot",
+          "grouped_gemm/rt1-glm-5.3-flash-w2-tp1-ep8-r5-decode-t128-hot",
+          "grouped_gemm/rt1-glm-5.3-flash-w2-tp1-ep8-r6-decode-t128-hot",
+          "grouped_gemm/rt1-glm-5.3-flash-w2-tp1-ep8-r7-decode-t128-hot",
+          "grouped_gemm/rt1-glm-5.3-w13-tp1-ep4-r0-decode-t1-disjoint",
+          "grouped_gemm/rt1-glm-5.3-w13-tp1-ep4-r1-decode-t1-disjoint"
+        ]
       },
       {
-        "actual_scope_count": 7,
         "cases": 4,
         "passed": true,
-        "scope": "prefill-representatives"
+        "case_ids": [
+          "grouped_gemm/contiguous-labels-g5",
+          "grouped_gemm/c-dsv41-flash-w13-ep1-t1024-balanced",
+          "grouped_gemm/rt1-dsv4-flash-w13-tp4-ep4-r0-prefill-t8192-zipf",
+          "grouped_gemm/rt1-dsv41-flash-w2-tp8-ep1-r0-prefill-t1024-balanced"
+        ]
       }
     ],
     "nongrouped": {
@@ -62,6 +83,7 @@
     "same_card_within_run": true,
     "sm_count": 188
   },
+  "monitoring_limits": "Historical monitor_observations/monitor_conflicts fields in the other collections are retained original counts, not continuous no-interference proof; method/coverage are not published. exclusive_visibility:null means unknown/not provided. This review summary does not publish those counts or an exclusivity verdict; do not infer them from same_card_within_run or clock snapshots.",
   "measurement_date": "2026-10-04",
   "observed_versions": {
     "after": {
@@ -111,11 +133,21 @@
     "threshold_inclusive": 1.01
   },
   "redaction": "Allowlisted fields only; no private absolute paths, endpoints, hostnames, GPU UUIDs, PIDs, allocator/capture bindings or source snapshots. Grouped original monotonic block times retained; nongrouped wall-clock block timestamps omitted, original order and ranges retained.",
-  "reproduction": "Requires the external xcheck corpus and formal drivers, matching dependencies, independent before/after environments and corresponding measured dirty sources. The exports preserve raw timing, shapes and selected correctness summaries, not a self-contained replay of lifecycle oracles.",
-  "resource_scope": "Observed nongrouped objects: no increased dynamic SMEM, static SMEM 1024 bytes, frame/stack 0, no LDL/STL. Positive GPR deltas remain; all corresponding measured phases pass. Not a census of all production objects.",
+  "reproduction": "The external xcheck corpus and formal drivers have no public fetch entry here and are not provided by this repository. Exact dirty/untracked after sources, safety sources, original sanitizer logs and full lifecycle records are not published. These measurements cannot be reproduced from this repository alone; clean before is distinct from dirty after. Published exports are raw timing and selected correctness summaries, not self-contained lifecycle replay.",
+  "comparison": "Nongrouped A=clean before_b12x_base, B=after_b12x_base plus dirty/untracked inputs; ABBA/BAAB uses those arms. Grouped A=DeepGEMM, B=b12x measured after tree, not before/after. Ratios are median B / median A, lower is better; every required phase must be <=1.01. Case IDs join the companion exports; shape and recorded kernel_id describe each case, not an execution address.",
+  "measurement_context_definition": "File-local context-1 joins both review exports to source, hardware and observed_versions in this provenance. It identifies this collection's monotonic clock domain only, not a task or source revision. Grouped case file order is not timing order.",
+  "measurement_contexts": {"context-1": {"environment_fields": ["source", "hardware", "observed_versions"], "monotonic_scope": "grouped blocks in this collection only"}},
+  "resource_scope": "Observed nongrouped objects: no increased dynamic SMEM, static SMEM 1024 bytes, frame/stack 0, no LDL/STL. Positive GPR deltas remain; case (and kernel where specified) joins the nongrouped resources. Not a census of all production objects. Units and opaque CuTe program keys are defined in ../grouped-fp8.md.",
+  "safety_behavior": {
+    "source_path": "../../b12x/quantization/mxfp6/fp6_dense_weights.py",
+    "predecessor": "Caller-output direct_out eligibility checked overlap/gradient state against original inputs and all derived a_codes, a_scale, alpha and row-scale tensors. Ineligible output used an internal result followed by copy semantics.",
+    "measured_after": "The fresh_internal predicate skips only the derived-buffer overlap/gradient checks when the large-M per-row quantization branch created those buffers internally. Original x/x_bf16, weight, scale_storage and global_scale checks remain; the normal direct_out layout/dtype/device/shape/alignment/correction/version checks still apply. Small-M/persistent or otherwise nonfresh paths still check derived buffers. This is host eligibility behavior, not a changed GEMM kernel.",
+    "test_nodes": ["tests/quantization/test_fp6_dense_weights_pipeline.py::test_caller_out_direct_and_correction_fallback", "tests/quantization/test_fp6_dense_weights_pipeline.py::test_caller_out_fallback_copy_semantics", "tests/quantization/test_fp6_dense_weights_pipeline.py::test_caller_out_inference_and_capture_versions", "tests/gemm/test_fp6_dense_op.py::test_caller_out_eligibility_cpu", "tests/gemm/test_fp6_dense_op.py::test_caller_out_version_primitive_cpu"],
+    "count_unit": "Parameterized test instances, not unique functions or a production-kernel census. Original sanitizer command/node subsets and logs are not published; the counts below are historical summaries, not independently replayable coverage."
+  },
   "safety_boundaries": [
-    "Separate caller-output predecessor source: normal 20 caller-output + 5 FP6 regressions; memcheck 5, racecheck 3, synccheck 3, all passed without skips/errors.",
-    "Fresh-internal source used for this formal: normal 20 caller-output + 5 FP6 regressions; memcheck 5 direct/alias/capture cases, all passed without skips/errors. Racecheck/synccheck were not repeated for this host-only predicate change.",
+    "Separate predecessor source: normal 20 caller-output + 5 FP6 regressions; memcheck 5, racecheck 3, synccheck 3, all passed without skips/errors.",
+    "Measured after source: normal 20 caller-output + 5 FP6 regressions; memcheck 5 direct/alias/capture instances, all passed without skips/errors. Racecheck/synccheck were not repeated for this host-only predicate change; predecessor coverage does not qualify after for those tools.",
     "Formal performance data are not a sanitizer matrix. Historical failed performance attempts remain failures and are not included as passing phases."
   ],
   "scope_limits": "10 nongrouped cases and 20 grouped representatives only. Neither a new 819-case nor 446-case matrix, SM121 qualification, whole-upstream suite, or EP1/EP8 scaling acceptance. Historical semantic 3 and semantic 4 exports remain separate.",

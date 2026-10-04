@@ -182,6 +182,87 @@ bounded observations of that measured tree, not a new full grouped matrix.
 Positive allocated-GPR deltas remain visible in the provenance alongside the
 per-case phase results. EP1/EP8 scaling is not independently established here.
 
+### Reading the raw exports
+
+The table's semantic versions are historical values of
+[`TUNING.semantic_version`](../b12x/gemm/mgroup_fp8_gemm/_tuning.py);
+`candidate_contract_version=8` versions candidate enumeration and eligibility,
+not an eighth candidate. `TUNING.config_schema_version` versions serialized
+configs: only semantic 4 separately recorded its value (2). Current definitions
+do not identify either dirty historical tree. The old
+[CSV](benchmarks/wi004-grouped-fp8-upstream-interleaved-20260930.csv) contains
+**semantic-3 timings only**. Join it to semantic-3 raw records by `case` and the
+file-local `measurement_context`, defined in that provenance. Contexts retain
+original environment observations and clock-domain boundaries without private
+execution IDs; they are not independently queryable jobs.
+
+Case IDs are stable joins, not full tensor descriptions. `c` denotes contiguous
+labels prefill, `m` masked decode, `rt1` the synthetic rank-local route-tp-v1
+corpus; `dsv4-flash`/`dsv41-flash` denote DeepSeek-V4-Flash/V4.1-Flash, and
+`glm-5.3`/`glm-5.3-flash` denote GLM-5.3/GLM-5.3-Flash. `w13` is the joined
+expert gate/up projection, `w2` the expert down projection. EP/TP are expert/
+tensor parallel degrees; `r` in rt1 is EP rank (`tp_rank` is separate), `t`
+is global token count and `bs` a synthetic legacy decode batch label.
+`groups` is local expert count. N/K are stored output/reduction dimensions;
+`logical_k` excludes reduction padding. `m_cap` is per-group masked row
+capacity, `m_capacity` the contiguous row-buffer capacity, `expected_m` a
+planning hint, and local M the actual rank-local activation rows, including
+padding where applicable. Neither global tokens nor a case name determines
+local M or the live per-expert distribution. The exports omit actual M for
+**289 historical semantic-3 prefill cases and two review prefill cases**;
+full live distributions are also absent. These are missing recorded fields,
+not values reconstructed from today's generator. Historical `alignment=64`
+is retained as recorded, not rewritten to the current 128-alignment contract.
+
+Grouped A=DeepGEMM and B=b12x. `initial` and `confirm-deepgemm` start A-B-B-A;
+`confirm-b12x` starts B-A-A-B. Both confirmations measure **both arms**; their
+names identify the first arm, not a single-arm measurement. Nongrouped review
+A=clean before, B=dirty after; `confirm_abba`/`confirm_baab` describe those
+orders. Ratios are median B / median A, lower is better. Every required
+phase of every case must be <=1.01; an aggregate geomean alone is not a pass.
+Historical fixed-risk/history confirmation membership is represented by the
+recorded `confirmation_required` and phases, not a publicly supplied selector.
+
+`samples_us`/`raw_us`, all latency medians and min/max fields are microseconds;
+`monotonic` block endpoints are host monotonic **seconds**, not wall-clock time
+or GPU latency. Compare them only within the provenance's context, never across
+collections. `sample_range`/`range` are zero-based **[start, stop)** indices into
+that arm's sample array. `blocks` and their `index` or `block`/`step` retain
+execution order; JSONL/CSV row order and phase-object key order do not establish
+time order. A paired phase is two side records; raw sample counts sum both arms;
+a confirmed case has both additional phases. Prefill `events` times the full
+eager API; decode `graph_replay`/nongrouped `graph` times the retained graph.
+`cold_l2_flush` describes cache conditioning, and warmup counts are per arm.
+`monitor_observations`/`monitor_conflicts` retain original observation/conflict
+counts; monitoring method and coverage are not published. Zero conflicts does
+not prove continuous exclusivity or no interference. `exclusive_visibility:null`
+means unknown/not provided, not an exclusive-device verdict.
+
+`closed` means lifecycle ended/cleanup, **not pass**. Read `status`, `ok`,
+`parity`, per-phase ratios, pre/post output and amplitude checks separately.
+`parity` is paired acceptance: record validity plus every required phase's
+performance gate, not bitwise equality.
+`exact:false` selects a tolerance/cosine comparison mode, not a failed check;
+zero `max_abs_delta` does not change that mode. `graph_replay_equal` concerns
+replay consistency; `live_mutation_ok` and its counts summarize separate live
+input checks. The published summaries do not include the full lifecycle inputs.
+
+Nongrouped `program_key`/`program_keys` are opaque CuTe compilation-cache joins
+to `resources`, not public downloadable artifacts, Git revisions or source
+proof. `kernel_id` is the recorded component label. `allocated_gpr` counts
+allocated general-purpose registers per thread; SMEM, frame and stack fields
+are **bytes**. `dynamic_smem_bytes` is the list of observed launch shared-memory
+sizes for that object, not a sum. `local_load_instructions`/`local_store_instructions`
+are static LDL/STL instruction counts, not dynamic accesses or measured traffic.
+Positive GPR deltas remain observations, not a complete production-object census.
+
+The external corpus/harness and formal drivers have **no public fetch entry**
+in this repository. Exact dirty sources, full logs and lifecycle/sanitizer
+records are not published. These paired measurements cannot be reproduced from
+this repository alone; the test commands below exercise current code, not the
+historical paired measurement. The three collections remain distinct, and no
+SM121 or EP1/EP8 scaling acceptance is implied.
+
 From a configured b12x checkout, run its existing tests with:
 
 ```sh
