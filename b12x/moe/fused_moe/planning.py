@@ -394,9 +394,11 @@ def prepare_weights(
         intermediate_scale = weights.intermediate_scale
         from b12x.moe._shared.kernels.w4a16.prefill_a4 import a4_prefill_min_tokens
 
-        # The opt-in A4 prefill path quantizes activations with the supplied scales.
+        # The opt-in A4 prefill path quantizes activations of W4A16 weights with
+        # the supplied scales; FP4-activation plans keep their own scale handling.
         keep_activation_scales = (
-            a4_prefill_min_tokens() > 0
+            plan.activation.mode is ActivationMode.A16
+            and a4_prefill_min_tokens() > 0
             and input_scale is not None
             and intermediate_scale is not None
             and all(
@@ -448,7 +450,7 @@ def prepare_weights(
             a1_gscale=input_scale,
             a2_gscale=intermediate_scale,
         )
-        if plan.activation.mode is ActivationMode.A16 and keep_activation_scales:
+        if keep_activation_scales:
             prepared = replace(prepared, a4_prefill_scales=True)
     return PreparedExperts(plan=plan, _impl=prepared)
 
