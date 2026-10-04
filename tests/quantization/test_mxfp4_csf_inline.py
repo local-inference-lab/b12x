@@ -101,6 +101,32 @@ def test_expansion_reproduces_native_bytes(rows, columns, group, rotation):
     assert torch.equal(expanded, native)
 
 
+def test_expansion_launches_the_program_preparation_compiles(tmp_path, monkeypatch):
+    """Frozen serving finds the expansion program among fused-MoE preparation's.
+
+    An empty Triton cache and three experts, a specialization no other test
+    launches, leave the compile job's program as the only one to reuse.
+    """
+    from b12x.moe.fused_moe._preparation import compile_inline_scale_expansion
+    from b12x.preparation._measurement import no_compilation
+
+    require_b12x()
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    rows, columns, group = 5120, 18, 5120
+    native = native_plane(logical_scales(rows, columns, experts=3, seed=2), group)
+    plane = inline.build_mxfp4_csf_inline(
+        native, rows=rows, columns=columns, group_rows=group
+    )
+    compile_inline_scale_expansion(
+        inline.expansion_payload(plane), torch.cuda.current_device()
+    )
+    expanded = torch.full_like(native, 0xFF)
+    with no_compilation():
+        inline.expand_mxfp4_csf_inline(plane, expanded)
+    torch.cuda.synchronize()
+    assert torch.equal(expanded, native)
+
+
 class _WordProbe:
     """Stage each tile block like a compact kernel and store its rows' words."""
 

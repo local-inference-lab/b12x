@@ -387,6 +387,47 @@ def _expand_tiles(
     tl.store(NativeHalves + offset // 2, half, keep & ~full)
 
 
+def expansion_payload(plane: Mxfp4CsfInlinePlane) -> dict[str, int]:
+    """Program identity of a plane's expansion: geometry only, never its contents."""
+    blocks, k_tiles = plane.geometry
+    return {
+        "total": plane.num_experts * blocks * k_tiles,
+        "TILES_PER_EXPERT": blocks * k_tiles,
+        "K_TILES": k_tiles,
+        "BLOCKS": blocks,
+        "TILES_PER_GROUP": (plane.group_rows + 127) // 128,
+        "GROUP_ROWS": plane.group_rows,
+        "COLUMNS": plane.columns,
+        "PLANE_BYTES": plane.rows * plane.columns,
+        "TILES_BYTES": plane.tiles_bytes,
+        "RAW_WORDS": (plane.tiles_bytes + plane.bases_bytes) // 4,
+    }
+
+
+_TILES_PER_PROGRAM = 8
+
+
+def compile_expansion(payload: dict[str, int]):
+    """Compile one plane geometry's expansion ahead of serving."""
+    from triton.runtime.jit import MockTensor
+
+    payload = dict(payload)
+    total = int(payload.pop("total"))
+    storage_bytes = payload["RAW_WORDS"] * 4 + RAW_TILE_BYTES
+    native_bytes = total // payload["TILES_PER_EXPERT"] * payload["PLANE_BYTES"]
+    return _expand_tiles.warmup(
+        MockTensor(torch.uint8, (storage_bytes,)),
+        MockTensor(torch.int32, (storage_bytes // 4,)),
+        MockTensor(torch.int32, (native_bytes // 4,)),
+        MockTensor(torch.int16, (native_bytes // 2,)),
+        total,
+        **payload,
+        TILES=_TILES_PER_PROGRAM,
+        num_warps=4,
+        grid=(triton_cdiv(total, _TILES_PER_PROGRAM),),
+    )
+
+
 def expand_mxfp4_csf_inline(plane: Mxfp4CsfInlinePlane, native: torch.Tensor) -> None:
     """Write every expert's native compact scale bytes into ``native``.
 
@@ -398,24 +439,22 @@ def expand_mxfp4_csf_inline(plane: Mxfp4CsfInlinePlane, native: torch.Tensor) ->
         raise TypeError("inline W4A8 expansion requires contiguous uint8 storage")
     if native.shape != (plane.num_experts, plane.rows * plane.columns):
         raise ValueError("inline W4A8 expansion target does not match the plane")
-    blocks, k_tiles = plane.geometry
-    total, tiles_per_program = plane.num_experts * blocks * k_tiles, 8
-    _expand_tiles[(triton_cdiv(total, tiles_per_program),)](
+    from b12x._lib.compile_plan import launch_triton
+
+    payload = expansion_payload(plane)
+    total = payload.pop("total")
+    # Fused-MoE preparation compiles this program (compile_expansion); frozen
+    # serving launches it without lowering.
+    launch_triton(
+        _expand_tiles,
+        (triton_cdiv(total, _TILES_PER_PROGRAM),),
         plane.storage,
         plane.storage.view(torch.int32),
         native.view(torch.int32),
         native.view(torch.int16),
         total,
-        TILES_PER_EXPERT=blocks * k_tiles,
-        K_TILES=k_tiles,
-        BLOCKS=blocks,
-        TILES_PER_GROUP=(plane.group_rows + 127) // 128,
-        GROUP_ROWS=plane.group_rows,
-        COLUMNS=plane.columns,
-        PLANE_BYTES=plane.rows * plane.columns,
-        TILES_BYTES=plane.tiles_bytes,
-        RAW_WORDS=(plane.tiles_bytes + plane.bases_bytes) // 4,
-        TILES=tiles_per_program,
+        **payload,
+        TILES=_TILES_PER_PROGRAM,
         num_warps=4,
     )
 
@@ -502,7 +541,9 @@ __all__ = [
     "TILE_BYTES",
     "build_mxfp4_csf_inline",
     "decode_mxfp4_csf_inline",
+    "compile_expansion",
     "expand_mxfp4_csf_inline",
+    "expansion_payload",
     "inline_geometry",
     "inline_row_bases",
     "inline_scale_words",

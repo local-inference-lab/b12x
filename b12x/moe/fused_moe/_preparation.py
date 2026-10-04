@@ -1033,6 +1033,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
     )
     mx_csf = experts._impl.mxfp4_csf
     mx_payload = () if mx_csf is None else (mx_csf.first.geometry, mx_csf.second.geometry)
+    mx_inline = experts._impl.mxfp4_csf_inline
 
     def child(tokens):
         query = _query(experts, capacity, tokens, routing, controls, invocation)
@@ -1086,6 +1087,13 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                     )
                     for payload in _dynamic_route_plan_payloads(launch_plan, caps)
                 ),
+                *(
+                    CompileJob.create(
+                        "b12x.moe.fused_moe._preparation:compile_inline_scale_expansion",
+                        payload, device.ordinal,
+                    )
+                    for payload in _inline_expansion_payloads(launch_plan, mx_inline)
+                ),
             )
 
         def memory(config, device):
@@ -1120,6 +1128,10 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             launchers.extend(
                 compile_dynamic_route_plan(payload, device.ordinal)
                 for payload in _dynamic_route_plan_payloads(scratch.launch_plan, caps)
+            )
+            launchers.extend(
+                compile_inline_scale_expansion(payload, device.ordinal)
+                for payload in _inline_expansion_payloads(scratch.launch_plan, mx_inline)
             )
             launchers = tuple(launchers)
             carrier_tree = attach_programs(scratch, *launchers)
@@ -1184,6 +1196,30 @@ def _dynamic_route_plan_payloads(plan, caps):
         {"num_experts": int(plan.weight_E), "tile_m": tile, "ids_dtype": ids_dtype}
         for tile in tiles for ids_dtype in ("int32", "int64")
     )
+
+
+def _inline_expansion_payloads(plan, inline):
+    """Inline MXFP4-CSF plane expansions a launch plan above the inline limit runs."""
+    from . import _impl
+
+    if (
+        inline is None
+        or plan.implementation != "dynamic"
+        or _impl._w4a8_reads_inline_scales(plan.routed_rows // plan.num_topk)
+    ):
+        return ()
+    from b12x._lib.quant.mxfp4_csf_inline import expansion_payload
+
+    return tuple(expansion_payload(plane) for plane in inline)
+
+
+@program_cache(scope="preparation")
+def compile_inline_scale_expansion(payload, ordinal):
+    """Compile the Triton expansion of one inline MXFP4-CSF plane geometry."""
+    from b12x._lib.quant.mxfp4_csf_inline import compile_expansion
+
+    with torch.cuda.device(ordinal):
+        return compile_expansion(payload)
 
 
 @program_cache(scope="preparation")
