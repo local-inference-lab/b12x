@@ -637,7 +637,9 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             and plan.decode_config.nvfp4_inline_scales
         ),
         "w4a8_csf_inline": bool(
-            n64_repacked and getattr(caps.weight_plan, "w4a8_csf_inline", False)
+            n64_repacked
+            and getattr(caps.weight_plan, "w4a8_csf_inline", False)
+            and _impl._w4a8_reads_inline_scales(plan.routed_rows // plan.num_topk)
         ),
     }
 

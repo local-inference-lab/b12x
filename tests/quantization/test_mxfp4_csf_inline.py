@@ -88,6 +88,19 @@ def test_storage_reproduces_native_bytes(rows, columns, group, rotation):
     assert torch.equal(inline.decode_mxfp4_csf_inline(plane, 1, 3), native[1:3])
 
 
+@pytest.mark.parametrize("rows,columns,group,rotation", GEOMETRIES)
+def test_expansion_reproduces_native_bytes(rows, columns, group, rotation):
+    """Calls above the inline limit expand the storage back to the native plane."""
+    native = native_plane(logical_scales(rows, columns, seed=1), group, rotation)
+    plane = inline.build_mxfp4_csf_inline(
+        native, rows=rows, columns=columns, group_rows=group
+    )
+    assert plane.heavy_tiles > 0
+    expanded = torch.full_like(native, 0xFF)
+    inline.expand_mxfp4_csf_inline(plane, expanded)
+    assert torch.equal(expanded, native)
+
+
 class _WordProbe:
     """Stage each tile block like a compact kernel and store its rows' words."""
 

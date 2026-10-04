@@ -460,6 +460,97 @@ def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
             _assert_bitwise(expected, actual)
 
 
+@pytest.mark.parametrize("tokens", [17, 512])
+def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypatch):
+    """Plans above the inline token limit run native kernels over expanded scales.
+
+    The limit is lowered so that small capacities take the large-call path: the
+    poisoned scratch receives every expert's native scales from the inline
+    storage before each replay, and outputs equal native scales bit for bit.
+    """
+    from b12x.moe.fused_moe import _impl
+
+    device = require_b12x()
+    e, h, n, topk = 8, 5120, 576, 6
+    (native, _, inline), scratch = _prepare_arms(h, n, "w31", monkeypatch, seed=5)
+    monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 16)
+    plans = [
+        moe.plan_execution(
+            experts=owner,
+            capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+            invocation={"fast_math": False},
+            routing=moe.RoutingSpec(deterministic_output=True),
+        )
+        for owner in (native, inline)
+    ]
+    source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
+    ids = torch.stack(
+        [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
+    ).to(torch.int32)
+    probabilities = torch.softmax(torch.randn(tokens, topk, device=device), -1)
+
+    def bind(plan):
+        buffers = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in plan.scratch_specs()
+        )
+        output = torch.empty_like(source)
+        binding = moe.bind(
+            plan,
+            a=source,
+            topk_ids=ids,
+            topk_weights=probabilities,
+            output=output,
+            scratch=buffers,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: moe.run(binding=binding),
+            output=output,
+            owners=(buffers, binding),
+        )
+
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        session.prepare(
+            tuple(
+                p.request(
+                    name=f"csf-inline-large-{i}",
+                    prepare_call=lambda state, p=p: bind(p),
+                )
+                for i, p in enumerate(plans)
+            )
+        )
+        calls = [bind(plan) for plan in plans]
+        session.freeze()
+        graphs = []
+        for call in calls:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call.run()
+            graphs.append(graph)
+        for _ in range(2):
+            source.neg_()
+            ids.add_(1).remainder_(e)
+            for buffer in scratch[1]:
+                buffer.view(torch.uint8).fill_(0xFF)
+            for call in calls:
+                call.output.fill_(float("nan"))
+            for graph in graphs:
+                graph.replay()
+            torch.cuda.synchronize()
+            _assert_bitwise(calls[0].output, calls[1].output)
+            reference = native._impl.representation.value
+            for buffer, expected in zip(
+                scratch[1], (reference.w13_sfb, reference.w2_sfb), strict=True
+            ):
+                assert torch.equal(
+                    buffer.view(torch.uint8).view(-1),
+                    expected.view(torch.uint8).view(-1),
+                )
+        for graph in graphs:
+            graph.reset()
+
+
 def test_inline_requires_compact_split_kernels():
     """Inline storage is accepted only by the compact N64 kernels that read it."""
     from b12x.moe._shared.kernels.w4a8_compact_projection import (
