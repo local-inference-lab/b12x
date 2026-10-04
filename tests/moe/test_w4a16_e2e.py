@@ -235,6 +235,107 @@ def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [70, 300])
+def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
+    """Large-M route blocks skip the MMAs of 16-row blocks without live routes.
+
+    Skewed routes end expert blocks at varied fills (block 32 at 70 tokens,
+    block 64 at 300); the output must equal the full-block schedule exactly.
+    """
+    from b12x.moe import fused_moe
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
+
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "0")
+    torch.manual_seed(5150 + tokens)
+    experts, hidden, intermediate, topk = 8, 256, 192, 2
+    x = (torch.randn(tokens, hidden, device="cuda") * 0.125).to(torch.bfloat16)
+    shares = torch.arange(1, experts + 1, dtype=torch.float32, device="cuda")
+    ids = torch.multinomial(shares.expand(tokens, -1), topk).to(torch.int32)
+    weights = torch.softmax(torch.randn(tokens, topk, device="cuda"), dim=-1)
+    raw = _make_weights(
+        experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation="silu",
+    )
+    outputs = {}
+    for skip in ("0", "1"):
+        monkeypatch.setenv("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", skip)
+        weight_plan = fused_moe.plan_weights(
+            source=fused_moe.PackedSource(format=fused_moe.PackedSourceFormat("modelopt_nvfp4")),
+            activation=fused_moe.ActivationSpec(
+                mode=fused_moe.ActivationMode.A16,
+                nonlinearity="silu",
+                io_dtype=x.dtype,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=experts,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+            ),
+        )
+        prepared = fused_moe.prepare_weights(
+            plan=weight_plan,
+            weights=fused_moe.PackedWeights(
+                w13=raw[0].clone(),
+                w13_block_scales=raw[1].clone(),
+                w13_global_scales=raw[2].clone(),
+                w2=raw[3].clone(),
+                w2_block_scales=raw[4].clone(),
+                w2_global_scales=raw[5].clone(),
+            ),
+        )
+        plan = fused_moe.plan_execution(
+            experts=prepared,
+            capacity=fused_moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+            routing=fused_moe.RoutingSpec(),
+        )
+        output = torch.empty_like(x)
+
+        def allocate(state):
+            return tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                for spec in state.scratch.scratch_specs()
+            )
+
+        def primer(state, output=output, prepared=prepared):
+            scratch = allocate(state)
+            binding = state.bind(
+                scratch=scratch,
+                a=x,
+                experts=prepared,
+                topk_weights=weights,
+                topk_ids=ids,
+                output=output,
+            )
+            return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+
+        with PreparationSession(device=x.device, autotune=False) as session:
+            request = plan.request(name=f"skip-empty-rows-{skip}", prepare_call=primer)
+            session.prepare((request,))
+            state = require_prepared(request.plan, "moe.decode")
+            binding = fused_moe.bind(
+                request.plan,
+                scratch=allocate(state),
+                a=x,
+                experts=prepared,
+                topk_weights=weights,
+                topk_ids=ids,
+                output=output,
+            )
+            assert binding.fused_launch.moe_block_size > 16
+            outputs[skip] = binding.run().clone()
+    assert torch.isfinite(outputs["1"]).all() and torch.count_nonzero(outputs["1"])
+    assert torch.equal(outputs["0"], outputs["1"])
+    _assert_matches_oracle(
+        outputs["1"],
+        _reference_w4a16(x, *raw, ids, weights, activation="silu"),
+        activation="silu",
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("host_barrier_reset", [False, True])
 def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
     host_barrier_reset: bool,
