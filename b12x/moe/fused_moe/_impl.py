@@ -454,6 +454,9 @@ class B12XFP4ExpertWeights:
     # planned above the stage-scale token limit (nvfp4_csf expands into it).
     w4a16_expanded: object | None = None
     mxfp4_csf: object | None = None
+    # W4A16 weights prepared with calibrated activation scales: the opt-in A4
+    # prefill path (B12X_W4A16_A4_PREFILL_MIN_TOKENS) may quantize with them.
+    a4_prefill_scales: bool = False
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
@@ -1072,6 +1075,7 @@ class TPMoEScratchPlan:
         fused_launch = None
         topk_sum_launch = None
         route_pack_launches = None
+        a4_prefill_launches = None
         if (
             self.caps.quant_mode == "w4a16"
             and not self._core_workspace_plan.full_rotation
@@ -1085,6 +1089,24 @@ class TPMoEScratchPlan:
                 has_route_map=route_expert_map is not None,
                 activation_amax=activation_amax,
             )
+            select_a4 = getattr(_w4a16_launches, "select_a4", None)
+            if select_a4 is not None and experts.a4_prefill_scales:
+                a4_prefill_launches = select_a4(
+                    tokens=int(a.shape[0]), route_ids_dtype=topk_ids.dtype,
+                    has_route_map=(route_expert_map is not None
+                                   or output_expert_map is not None),
+                    activation_amax=activation_amax,
+                    apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                )
+                if a4_prefill_launches is not None:
+                    from b12x.moe._shared.kernels.w4a16.prefill_a4 import a4_prefill_fits
+
+                    if not a4_prefill_fits(
+                        a4_prefill_launches, tokens=int(a.shape[0]),
+                        intermediate_cache13=tensors["intermediate_cache13"],
+                        intermediate_cache2=tensors["intermediate_cache2"],
+                    ):
+                        a4_prefill_launches = None
         elif self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation:
             route_pack_launches = self._prewarmed_route_pack_launches
             tokens = int(a.shape[0])
@@ -1146,6 +1168,7 @@ class TPMoEScratchPlan:
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
+            a4_prefill_launches=a4_prefill_launches,
         )
 
 
@@ -1241,6 +1264,9 @@ class TPMoEFP4Binding:
     fused_launch: object | None = None
     topk_sum_launch: object | None = None
     route_pack_launches: object | None = None
+    # Opt-in NVFP4-activation prefill over the W4A16 packed weights (selected at
+    # bind for calls at or above its token threshold).
+    a4_prefill_launches: object | None = None
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
 
@@ -2948,6 +2974,7 @@ def _build_tp_moe_fp4_binding_from_views(
     fused_launch: object | None = None,
     topk_sum_launch: object | None = None,
     route_pack_launches: object | None = None,
+    a4_prefill_launches: object | None = None,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -3150,6 +3177,7 @@ def _build_tp_moe_fp4_binding_from_views(
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
+            a4_prefill_launches=a4_prefill_launches,
         )
 
     if plan.implementation == "micro":
@@ -13154,8 +13182,11 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     topk_ids = binding.topk_ids
     if experts.mxfp4_csf is not None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
-    stage_scales = experts.w4a16_expanded is not None and _w4a16_reads_stage_scales(
-        binding, topk_ids.shape[0]
+    # The A4 prefill path reads expanded (W4A16-layout) scales.
+    stage_scales = (
+        experts.w4a16_expanded is not None
+        and binding.a4_prefill_launches is None
+        and _w4a16_reads_stage_scales(binding, topk_ids.shape[0])
     )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None
@@ -13438,6 +13469,18 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
             topk_ids = topk_ids.contiguous()
+        a4_launches = binding.a4_prefill_launches
+        if a4_launches is not None:
+            # Bind admitted this call (token threshold, scratch fit, plain routing).
+            from b12x.moe._shared.kernels.w4a16.prefill_a4 import run_w4a16_a4_prefill
+
+            return run_w4a16_a4_prefill(
+                a, prepared, topk_weights, topk_ids,
+                a1_gscale=a1_gscale, a2_gscale=a2_gscale,
+                intermediate_cache13=intermediate_cache13,
+                intermediate_cache2=intermediate_cache2,
+                output=scatter_output, launches=a4_launches,
+            )
         result = run_w4a16_moe(
             a,
             prepared,
