@@ -454,6 +454,11 @@ class _Pair:
             from b12x._lib.quant.nvfp4_csf_inline import IndexedNvfp4Plane
 
             plane = IndexedNvfp4Plane
+        if first[3] == 2 or second[3] == 2:
+            # Stage-readable W4A16 storage (nvfp4_csf_packed.py).
+            from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
+
+            plane = PackedStoragePlane
         self.first, self.second = plane(first), plane(second)
 
     @cute.jit
