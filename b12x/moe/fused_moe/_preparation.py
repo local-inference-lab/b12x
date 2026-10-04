@@ -200,6 +200,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
     return {
         "quant_modes": tuple(plan.quant_modes), "source_format": plan.source_format,
         "nvfp4_inline_scales": plan.nvfp4_inline_scales,
+        "w4a16_compressed_scales": plan.w4a16_compressed_scales,
         "activation": plan.activation, "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts, "hidden_size": plan.hidden_size,
         "intermediate_size": plan.intermediate_size, "w13_layout": plan.w13_layout,
@@ -247,6 +248,14 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
+    from ._impl import W4A16_CSF_STAGE_MAX_TOKENS
+
+    if (
+        getattr(weight_plan, "w4a16_compressed_scales", False)
+        and query.num_tokens > W4A16_CSF_STAGE_MAX_TOKENS
+    ):
+        # Large calls read the scales expanded once per call (see b12x_moe_fp4).
+        weight_plan = replace(weight_plan, w4a16_compressed_scales=False)
     mode = query.quant_mode
     if mode == "nvfp4_auto":
         mode = "w4a16" if config.backend == "w4a16" else "nvfp4"
