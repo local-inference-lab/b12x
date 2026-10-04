@@ -7484,3 +7484,15 @@ def packed_dequant_trellis_stream_to_bfloat2x4(
 def packed_dequant_trellis3_to_bfloat2x4(win_a, win_b, *, loc=None, ip=None):
     """Compatibility wrapper for the former 3-bpw bf16 primitive."""
     return packed_dequant_trellis_to_bfloat2x4(win_a, win_b, 3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def dense_named_stage_barrier(stage, empty: bool, wait: bool, *, loc=None, ip=None):
+    operation = "sync" if wait else "arrive"
+    barrier = Int32(stage) * 2 + (4 if empty else 3)
+    llvm.inline_asm(
+        None, [barrier.ir_value(loc=loc, ip=ip)],
+        f"barrier.cta.{operation} $0, 96;", "r,~{memory}",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )

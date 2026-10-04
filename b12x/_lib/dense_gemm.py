@@ -81,6 +81,7 @@ from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     cp_async_bulk_g2s_mbar,
     cp_async4_shared_global,
+    dense_named_stage_barrier,
     cvt_f32x4_to_e4m3x4,
     elem_pointer,
     fabs_f32,
@@ -1169,10 +1170,9 @@ class DenseGemmKernel:
             barrier_id=2,
             num_threads=self.num_mma_warps * self.num_threads_per_warp,
         )
-        # Pool constraint (per-SM register file accounted in warpgroup slots):
-        # 256*mma + 128*load <= 64512.
-        self.load_register_requirement = 56
-        self.mma_register_requirement = 224
+        # Grouped pool constraint: 256*mma + 128*load <= 64512.
+        self.load_register_requirement = 56 if self.mgroup_labels or self.mgroup_masked else 40
+        self.mma_register_requirement = 224 if self.mgroup_labels or self.mgroup_masked else 232
 
     def _setup_attributes(self):
         self.direct_shared_publication = self.load_path == "tma" and (
@@ -1343,6 +1343,53 @@ class DenseGemmKernel:
                 ab_stage_cap=16 if self.mgroup_donor_warpgroup else 0,
             )
 
+        self.fp6_named_publication = (
+            self.mxfp6_fmt_a is not None and self.mxfp6_fmt_b is not None
+            and self.use_m1_non_tma_a and self.use_m1_non_tma_sfa
+            and self.load_path == "tma" and self.threads_per_cta == 96
+            and self.num_mma_warps == 2 and self.ab_stage == 4
+            and not self.mgroup_labels and not self.mgroup_masked
+            and not self.b_packed and not self.swap_ab
+            and self.split_k_slices == 1 and self.cluster_shape_mnk == (1, 1, 1)
+        )
+        self.wo_b_named_publication = (
+            getattr(self, "wo_b_geometry", None) == (4096, 4096, 1)
+            and self.fused_quant_a and self.fused_quant_a_inner_span == 1024
+            and self.mxfp6_fmt_a is None and self.mxfp6_fmt_b is None
+            and self.a_dtype == cutlass.Float8E4M3FN and not self.plain_fp8
+            and self.sf_dtype == cutlass.Float8E8M0FNU and self.sf_vec_size == 32
+            and self.single_work_tile_per_cta and self.load_path == "tma"
+            and self.threads_per_cta == 96 and self.num_mma_warps == 2
+            and self.ab_stage == 4 and self.cluster_shape_mnk == (1, 1, 1)
+            and not self.mgroup_labels and not self.mgroup_masked
+            and not self.b_packed and not self.swap_ab and not self.b_tile_major
+            and not self.manual_bk64_sf and not self.mgroup_compact_sfb
+            and not self.mgroup_deferred_wait and not self.mgroup_sfb_stage_reuse
+            and not self.direct_sfa_prefix and not self.direct_sfb_representative
+            and not self.fused_quant_a_inv_rope
+            and self.fused_quant_a_row_stride == 0 and self.fused_quant_a_l_stride == 0
+            and not self.quantize_c and not self.row_scale
+            and self.c_dtype == cutlass.BFloat16
+            and (
+                (self.tile_shape_mnk == (16, 64, 128) and self.fused_quant_a_wide
+                 and self.split_k_slices == 2 and self.split_k_atomic_bf16
+                 and self.direct_one_m_tile_scheduler and self.use_m1_non_tma_c)
+                or (self.tile_shape_mnk == (16, 128, 128) and not self.fused_quant_a_wide
+                    and self.split_k_slices == 1 and not self.direct_one_m_tile_scheduler
+                    and not self.use_m1_non_tma_c)
+            )
+        )
+        self.wo_b_packed_a_stores = (
+            self.wo_b_named_publication and not self.fused_quant_a_wide
+            and self.split_k_slices == 1 and self.tile_shape_mnk == (16, 128, 128)
+            and self.a_layout.is_k_major_a()
+        )
+        self.wo_b_wide_packed_a_stores = (
+            self.wo_b_named_publication and self.fused_quant_a_wide
+            and self.split_k_slices == 2 and self.split_k_atomic_bf16
+            and self.tile_shape_mnk == (16, 64, 128) and self.a_layout.is_k_major_a()
+        )
+        self.named_publication = self.fp6_named_publication or self.wo_b_named_publication
         assert self.epi_stage > 0, (
             "epi_stage <= 0, not enough shared memory. This configuration will be skipped."
         )
@@ -1500,6 +1547,7 @@ class DenseGemmKernel:
 
         if cutlass.const_expr(self.mgroup_joint):
             self.smem_capacity -= (self.mgroup_capacity_tiles + 1) * 4 + 128
+        self.wo_b_geometry = (cute.size(b.shape[0]), cute.size(b.shape[1]), cute.size(b.shape[2]))
         self._setup_attributes()
 
         # Regular block-FP8 carries compact FP32 scales directly. Native MX
@@ -1613,6 +1661,12 @@ class DenseGemmKernel:
             self.sched_raster_along_m,
         )
 
+        self.mgroup_mask_storage_len = 0
+        if cutlass.const_expr(self.mgroup_labels or self.mgroup_masked):
+            self.mgroup_mask_storage_len = max(self.mgroup_mask_len + int(self.mgroup_compact_masked), 1)
+        if cutlass.const_expr(self.mgroup_joint):
+            self.mgroup_mask_storage_len = self.mgroup_capacity_tiles + 1
+
         @cute.struct
         class SharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
@@ -1651,7 +1705,7 @@ class DenseGemmKernel:
             ]
             mgroup_mask_buf: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Int32, self.mgroup_capacity_tiles + 1 if self.mgroup_joint else max(self.mgroup_mask_len + int(self.mgroup_compact_masked), 1)
+                    cutlass.Int32, self.mgroup_mask_storage_len
                 ],
                 16,
             ]
@@ -2209,7 +2263,7 @@ class DenseGemmKernel:
         # Pipeline setup
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 if self.direct_shared_publication else 1
+            pipeline.Agent.Thread, 32 if self.direct_shared_publication and not self.named_publication else 1
         )
         mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.num_mma_warps * (32 if self.direct_shared_publication else 1)
@@ -2276,8 +2330,9 @@ class DenseGemmKernel:
             # referenced inside the warp-dispatch branches - only this Int32
             # address may cross into them.
             sb_base_addr = shared_ptr_to_u32(storage.sB.data_ptr())
-        if cutlass.const_expr(self.a_bf16_fused):
+        if cutlass.const_expr(self.a_bf16_fused or self.wo_b_packed_a_stores or self.wo_b_wide_packed_a_stores):
             sa_base_addr = shared_ptr_to_u32(storage.sA.data_ptr())
+        if cutlass.const_expr(self.a_bf16_fused):
             ssfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
@@ -2874,6 +2929,8 @@ class DenseGemmKernel:
                         mainloop_consumer_state
                     )
 
+                if cutlass.const_expr(self.named_publication):
+                    dense_named_stage_barrier(mainloop_consumer_state.index, False, True)
                 mainloop_pipeline.consumer_wait(
                     mainloop_consumer_state, peek_ab_full_status
                 )
@@ -3002,7 +3059,9 @@ class DenseGemmKernel:
                                 packed_b_lookahead_state.advance()
 
                         if k_block_idx == num_k_blocks - 1:
-                            if cutlass.const_expr(self.direct_shared_publication):
+                            if cutlass.const_expr(self.named_publication):
+                                dense_named_stage_barrier(mainloop_consumer_state.index, True, False)
+                            elif cutlass.const_expr(self.direct_shared_publication):
                                 cute.arch.sync_warp()
                                 cute.arch.mbarrier_arrive(mainloop_pipeline.sync_object_empty.get_barrier(mainloop_consumer_state.index))
                             else:
@@ -3028,6 +3087,8 @@ class DenseGemmKernel:
                                     None, None, None, mainloop_consumer_state.index
                                 ]
                             if cutlass.const_expr(not self.mgroup_deferred_wait):
+                                if cutlass.const_expr(self.named_publication):
+                                    dense_named_stage_barrier(mainloop_consumer_state.index, False, True)
                                 mainloop_pipeline.consumer_wait(
                                     mainloop_consumer_state, peek_ab_full_status
                                 )
@@ -3213,7 +3274,9 @@ class DenseGemmKernel:
                     )
 
                     if k_block_idx == num_k_blocks - 1:
-                        if cutlass.const_expr(self.direct_shared_publication):
+                        if cutlass.const_expr(self.named_publication):
+                            dense_named_stage_barrier(mainloop_consumer_state.index, True, False)
+                        elif cutlass.const_expr(self.direct_shared_publication):
                             cute.arch.sync_warp()
                             cute.arch.mbarrier_arrive(mainloop_pipeline.sync_object_empty.get_barrier(mainloop_consumer_state.index))
                         else:
@@ -3996,6 +4059,8 @@ class DenseGemmKernel:
                 mgroup_stride = Int32(cute.arch.grid_dim()[2])
                 work_tile = self._mgroup_joint_tile(mgroup_ord, sPrefix, mgroup_nt, mgroup_hi)
 
+            # Unlike the per-tile K count, publication lifetime spans all work tiles.
+            named_produced = Int32(0)
             while work_tile.is_valid_tile:
                 _ik_tile = self._iket_begin("p_tile")
                 tile_coord_mnl = work_tile.tile_idx
@@ -4115,7 +4180,11 @@ class DenseGemmKernel:
 
                 for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
                     if cutlass.const_expr(self.direct_shared_publication):
-                        mainloop_pipeline.sync_object_empty.wait(mainloop_producer_state.index, mainloop_producer_state.phase)
+                        if cutlass.const_expr(self.named_publication):
+                            if named_produced >= self.ab_stage:
+                                dense_named_stage_barrier(mainloop_producer_state.index, True, True)
+                        else:
+                            mainloop_pipeline.sync_object_empty.wait(mainloop_producer_state.index, mainloop_producer_state.phase)
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_expect_tx(mainloop_pipeline.producer_get_barrier(mainloop_producer_state), tma_copy_bytes)
                     else:
@@ -4422,27 +4491,33 @@ class DenseGemmKernel:
                                 values[7] * inv_scale,
                             )
                             if scale_group_raw < Int32(4):
-                                for byte in cutlass.range_constexpr(4):
-                                    raw0 = cutlass.Uint8(
-                                        payload0 >> cutlass.Uint32(byte * 8)
-                                    )
-                                    raw1 = cutlass.Uint8(
-                                        payload1 >> cutlass.Uint32(byte * 8)
-                                    )
-                                    sA[
-                                        (
-                                            Int32(0),
-                                            k_local0 + elem0 + Int32(byte),
-                                            mainloop_producer_state.index,
+                                if cutlass.const_expr(self.wo_b_wide_packed_a_stores):
+                                    offset = mainloop_producer_state.index * Int32(2048) + k_local0 + elem0
+                                    offset = offset ^ ((offset >> Int32(3)) & Int32(0x70))
+                                    st_shared_u32(sa_base_addr + offset, payload0)
+                                    st_shared_u32(sa_base_addr + offset + Int32(4), payload1)
+                                else:
+                                    for byte in cutlass.range_constexpr(4):
+                                        raw0 = cutlass.Uint8(
+                                            payload0 >> cutlass.Uint32(byte * 8)
                                         )
-                                    ] = raw0.bitcast(cutlass.Float8E4M3FN)
-                                    sA[
-                                        (
-                                            Int32(0),
-                                            k_local0 + elem0 + Int32(4 + byte),
-                                            mainloop_producer_state.index,
+                                        raw1 = cutlass.Uint8(
+                                            payload1 >> cutlass.Uint32(byte * 8)
                                         )
-                                    ] = raw1.bitcast(cutlass.Float8E4M3FN)
+                                        sA[
+                                            (
+                                                Int32(0),
+                                                k_local0 + elem0 + Int32(byte),
+                                                mainloop_producer_state.index,
+                                            )
+                                        ] = raw0.bitcast(cutlass.Float8E4M3FN)
+                                        sA[
+                                            (
+                                                Int32(0),
+                                                k_local0 + elem0 + Int32(4 + byte),
+                                                mainloop_producer_state.index,
+                                            )
+                                        ] = raw1.bitcast(cutlass.Float8E4M3FN)
                                 if lane4 == Int32(0):
                                     sSFA[
                                         (
@@ -4571,17 +4646,23 @@ class DenseGemmKernel:
                             if max_abs == cutlass.Float32(0.0):
                                 scale_byte = cutlass.Uint32(127)
                             for word in cutlass.range_constexpr(8):
-                                for byte in cutlass.range_constexpr(4):
-                                    raw_byte = cutlass.Uint8(
-                                        payload[word] >> cutlass.Uint32(byte * 8)
-                                    )
-                                    sA[
-                                        (
-                                            row_local,
-                                            k_local0 + Int32(word * 4 + byte),
-                                            mainloop_producer_state.index,
+                                if cutlass.const_expr(self.wo_b_packed_a_stores):
+                                    offset = (mainloop_producer_state.index * Int32(2048)
+                                              + row_local * Int32(128) + k_local0 + Int32(word * 4))
+                                    offset = offset ^ ((offset >> Int32(3)) & Int32(0x70))
+                                    st_shared_u32(sa_base_addr + offset, payload[word])
+                                else:
+                                    for byte in cutlass.range_constexpr(4):
+                                        raw_byte = cutlass.Uint8(
+                                            payload[word] >> cutlass.Uint32(byte * 8)
                                         )
-                                    ] = raw_byte.bitcast(cutlass.Float8E4M3FN)
+                                        sA[
+                                            (
+                                                row_local,
+                                                k_local0 + Int32(word * 4 + byte),
+                                                mainloop_producer_state.index,
+                                            )
+                                        ] = raw_byte.bitcast(cutlass.Float8E4M3FN)
                             sSFA[
                                 (
                                     row_local,
@@ -5110,7 +5191,12 @@ class DenseGemmKernel:
                     if cutlass.const_expr(self.load_path == "cpasync"):
                         cute.arch.cp_async_commit_group()
                         cute.arch.cp_async_wait_group(0)
-                    if cutlass.const_expr(self.direct_shared_publication):
+                    if cutlass.const_expr(self.named_publication):
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mainloop_pipeline.producer_get_barrier(mainloop_producer_state))
+                        dense_named_stage_barrier(mainloop_producer_state.index, False, False)
+                        named_produced += 1
+                    elif cutlass.const_expr(self.direct_shared_publication):
                         cute.arch.sync_warp()
                         cute.arch.mbarrier_arrive(mainloop_pipeline.producer_get_barrier(mainloop_producer_state))
                     else:
@@ -5148,7 +5234,12 @@ class DenseGemmKernel:
                     )
                 self._iket_end(_ik_tile)
 
-            mainloop_pipeline.producer_tail(mainloop_producer_state)
+            if cutlass.const_expr(self.named_publication):
+                for named_stage in cutlass.range_constexpr(4):
+                    if named_produced > named_stage:
+                        dense_named_stage_barrier(Int32(named_stage), True, True)
+            else:
+                mainloop_pipeline.producer_tail(mainloop_producer_state)
         return
 
     @staticmethod

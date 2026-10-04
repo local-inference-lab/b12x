@@ -1,0 +1,813 @@
+{
+  "boundaries": [
+    "semantic version 3 candidate version 8 for this round only; the completed semantic 4 decode round covers 446 cases with different dirty sources and is separate",
+    "historical 599/617 failures remain private historical evidence and are not rewritten",
+    "not a whole-upstream-suite or SM121 qualification",
+    "no hashes, snapshots, or new GPU task created"
+  ],
+  "export": {
+    "cases": 819,
+    "confirmations": 216,
+    "file": "grouped-fp8-semantic3-cases.jsonl.gz",
+    "included_fields": [
+      "case ID, static shape, corpus, dtype, mode, task/attempt and slice",
+      "per-phase two-sided raw samples and medians, ratio, cache and timing mode",
+      "original block order, sample ranges, monotonic start/end per block",
+      "per-side pre/post output and amplitude checks and input restoration",
+      "per-case parity, closed bundle, correctness/graph/live-mutation summary and counts"
+    ],
+    "not_a_full_lifecycle_export": [
+      "does not include raw lifecycle bindings, capture or allocator addresses, raw mutation input tensors, full live-mutation checks/amplitudes or detailed memory stats",
+      "does not include original logs, GPU process observations, wall-clock timing epochs, untracked input inventory, full original selection/bundles/records or failed historical attempts",
+      "original private lifecycle evidence was checked during aggregation but cannot be fully replayed from this export alone"
+    ],
+    "phases": 1251,
+    "ratio_direction": "b12x median / DeepGEMM median",
+    "raw_sample_values": 221940,
+    "side_records": 2502,
+    "threshold_inclusive": 1.01
+  },
+  "hardware_identity": "gpu-1 is a run-local pseudonym; all tasks in this round used one card. The same pseudonym in another export does not establish cross-round device identity. Snapshot clocks do not establish sustained clocks or absence of throttling.",
+  "minimal_documentation_text": "The upstream-adapted active-group candidate (semantic 3, candidate 8) passed 819/819 interleaved-v1 paired cases on one RTX PRO 6000 Blackwell Server Edition (188 SMs): 373 prefill/446 decode, 216 confirmations, 1,251 phases and 221,940 raw latency samples. The sanitized case-level export provides all raw samples, pre/post correctness checkpoints, block order and phase medians. b12x at measurement used base a489f972 plus dirty and declared untracked inputs; the harness root was also dirty, so no exact public commit identifies the measured source. The recorded source identity is not immutable proof. The earlier sequential baseline and failures 599/617 remain separate historical evidence; no SM121 or whole-upstream-suite qualification is claimed.",
+  "redaction": {
+    "executed_request": "recorded python -c wrapper with any workspace root redacted; embedded subprocess calls identify formal slice scripts and actual task slice ranges",
+    "removed": [
+      "private evidence paths and task-file inventory",
+      "declared untracked path list including experimental directories (counts only)",
+      "absolute workspace/worker paths",
+      "GPU UUID",
+      "hostnames",
+      "PIDs and allocator addresses",
+      "logs",
+      "endpoint URLs",
+      "process observations",
+      "large routing length lists",
+      "wall-clock timing epochs"
+    ],
+    "reproduction": "A suggested reproduction is not an exact historical invocation: use a managed benchmark-profile task with the formal slice scripts, interleaved-v1, identical case IDs and current source/lock, and compare against this exported raw evidence; the historical dirty source is not reconstructed.",
+    "retained_monotonic": "Raw monotonic start/end times for every block, for within-task/block and cross-phase order checks; not wall-clock timestamps and not a cross-host shared epoch. No missing timing boundary was synthesized.",
+    "workspace": "<WORKSPACE>"
+  },
+  "round": "upstream-active-groups-interleaved-v1-20260930",
+  "source_files": {
+    "case_summary": "Private 819-case aggregate; individual source path omitted.",
+    "private_evidence": "Retained internally; private source paths and task-file inventory omitted from this publication draft.",
+    "shape_source": "Case geometry is included in the companion cases export; originally selected from the external harness geometry table."
+  },
+  "source_limitations": {
+    "b12x_revision_is_base_plus_dirty_and_declared_untracked": true,
+    "harness_dirty_at_measurement": true,
+    "harness_root_git_base": "ffccc4a8c07d58c44c1b37209b158e19780b8e32",
+    "later_commits_do_not_retroactively_identify_dirty_source": true,
+    "later_jj_state_not_measurement_source_proof": true,
+    "public_exact_harness_revision": null,
+    "source_identity_is_immutable_proof": false
+  },
+  "status": "historical_bounded_observations",
+  "tasks": [
+    {
+      "attempt_id": "67d58f3d-8eee-42e7-ad0b-cf4423df6e60",
+      "declared_untracked": true,
+      "declared_untracked_count": 76,
+      "declared_untracked_description": "Additional declared untracked inputs, including experimental directories, were present at measurement; omitted from publication draft. Not reconstructible from this summary.",
+      "executed_request": {
+        "argv": [
+          "python",
+          "-c",
+          "import json,pathlib,subprocess,sys\nout=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)\nsys.path.insert(0,str(pathlib.Path('validation/megajob/wi004_route_tp_20260922').resolve()))\nimport formal_prefill_slice as prefill,formal_decode_slice as decode\nmanifest=[dict(mode=mode,index=i,ids=[c.id for c in module.cases(i)]) for mode,module,count in [('prefill',prefill,47),('decode',decode,56)] for i in range(count)]\nids=[c for s in manifest for c in s['ids']];assert len(ids)==len(set(ids))==819\n(out/'matrix-manifest.json').write_text(json.dumps(dict(round='upstream-active-groups-interleaved-v1-20260930',slices=manifest,total=819)))\nresults=[]\nfor index in range(16):\n dst=out/('prefill-'+str(index).zfill(2));dst.mkdir()\n with (dst/'run.log').open('w') as f:\n  rc=subprocess.run([sys.executable,'validation/megajob/wi004_route_tp_20260922/formal_prefill_slice.py',str(dst),str(index)],stdout=f,stderr=subprocess.STDOUT).returncode\n results.append(dict(mode='prefill',index=index,exit_status=rc));(out/'progress.json').write_text(json.dumps(results));print(results[-1],flush=True)\n if rc:sys.exit(rc)\n",
+          "{outputs}"
+        ],
+        "argv_redaction": "workspace root replaced with <WORKSPACE> if present; {outputs} is the original runtime placeholder",
+        "cwd": "<WORKSPACE>",
+        "profile": "benchmark"
+      },
+      "executed_slice_commands": [
+        {
+          "arguments": [
+            "<OUTPUTS>/<MODE>-<SLICE>",
+            "<SLICE>"
+          ],
+          "executable": "sys.executable",
+          "script": "validation/megajob/wi004_route_tp_20260922/formal_prefill_slice.py"
+        }
+      ],
+      "gpu": {
+        "compute_capability": [
+          12,
+          0
+        ],
+        "cuda_runtime_reported": "13.0",
+        "driver_version": "595.84.01",
+        "exclusive_visibility": null,
+        "memory_bytes": 101975851008,
+        "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "monitor_conflicts": 0,
+        "monitor_observations": 689,
+        "power_state_snapshot": "P0",
+        "power_w_snapshot": "51.21 W",
+        "pseudonym": "gpu-1",
+        "same_physical_gpu_across_five_tasks": true,
+        "sm_clock_mhz_snapshot": "1717 MHz",
+        "sm_count": 188,
+        "temperature_c_snapshot": 33,
+        "throttle_reason": "not recorded in result.json (do not infer from P-state/clock)"
+      },
+      "native_preparation": [
+        {
+          "argv": [
+            "pixi",
+            "install",
+            "--locked",
+            "--all"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "build"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "check"
+          ],
+          "exit_status": 0
+        }
+      ],
+      "number": 622,
+      "observed_preparation_check_versions": {
+        "cuda": "13.0",
+        "python": "3.12.14",
+        "torch": "2.14.0+cu130"
+      },
+      "recorded_source_identity": "abe2892dd6ea735079448399d1c92ed6074d9abaf8e55c4f39eb88b8d6b06b95",
+      "result": {
+        "artifact_state": "complete",
+        "service_outcome": "success",
+        "termination_confirmed": true,
+        "workload_exit_status": 0
+      },
+      "slice_range": {
+        "mode": "prefill",
+        "start": 0,
+        "stop_exclusive": 16
+      },
+      "source_identity_is_immutable_proof": false,
+      "source_repositories": [
+        {
+          "dirty": true,
+          "path": ".",
+          "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM",
+          "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/cutlass",
+          "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/deep_jit",
+          "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
+        },
+        {
+          "dirty": true,
+          "path": "b12x",
+          "revision": "a489f972e0dde54fedd5f83bf73a7d3754fc60d6"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer",
+          "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cccl",
+          "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cutlass",
+          "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/nixl",
+          "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/spdlog",
+          "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"
+        }
+      ],
+      "task_id": "610be777-acc6-4750-b313-56b5accd16c1"
+    },
+    {
+      "attempt_id": "40de4940-aef6-48e6-bf9c-0894af222558",
+      "declared_untracked": true,
+      "declared_untracked_count": 76,
+      "declared_untracked_description": "Additional declared untracked inputs, including experimental directories, were present at measurement; omitted from publication draft. Not reconstructible from this summary.",
+      "executed_request": {
+        "argv": [
+          "python",
+          "-c",
+          "import json,pathlib,subprocess,sys\nout=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)\nsys.path.insert(0,str(pathlib.Path('validation/megajob/wi004_route_tp_20260922').resolve()))\nimport formal_prefill_slice as prefill,formal_decode_slice as decode\nmanifest=[dict(mode=mode,index=i,ids=[c.id for c in module.cases(i)]) for mode,module,count in [('prefill',prefill,47),('decode',decode,56)] for i in range(count)]\nids=[c for s in manifest for c in s['ids']];assert len(ids)==len(set(ids))==819\n(out/'matrix-manifest.json').write_text(json.dumps(dict(round='upstream-active-groups-interleaved-v1-20260930',slices=manifest,total=819)))\nresults=[]\nfor index in range(16,32):\n dst=out/('prefill-'+str(index).zfill(2));dst.mkdir()\n with (dst/'run.log').open('w') as f:\n  rc=subprocess.run([sys.executable,'validation/megajob/wi004_route_tp_20260922/formal_prefill_slice.py',str(dst),str(index)],stdout=f,stderr=subprocess.STDOUT).returncode\n results.append(dict(mode='prefill',index=index,exit_status=rc));(out/'progress.json').write_text(json.dumps(results));print(results[-1],flush=True)\n if rc:sys.exit(rc)\n",
+          "{outputs}"
+        ],
+        "argv_redaction": "workspace root replaced with <WORKSPACE> if present; {outputs} is the original runtime placeholder",
+        "cwd": "<WORKSPACE>",
+        "profile": "benchmark"
+      },
+      "executed_slice_commands": [
+        {
+          "arguments": [
+            "<OUTPUTS>/<MODE>-<SLICE>",
+            "<SLICE>"
+          ],
+          "executable": "sys.executable",
+          "script": "validation/megajob/wi004_route_tp_20260922/formal_prefill_slice.py"
+        }
+      ],
+      "gpu": {
+        "compute_capability": [
+          12,
+          0
+        ],
+        "cuda_runtime_reported": "13.0",
+        "driver_version": "595.84.01",
+        "exclusive_visibility": null,
+        "memory_bytes": 101975851008,
+        "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "monitor_conflicts": 0,
+        "monitor_observations": 627,
+        "power_state_snapshot": "P0",
+        "power_w_snapshot": "50.66 W",
+        "pseudonym": "gpu-1",
+        "same_physical_gpu_across_five_tasks": true,
+        "sm_clock_mhz_snapshot": "1837 MHz",
+        "sm_count": 188,
+        "temperature_c_snapshot": 33,
+        "throttle_reason": "not recorded in result.json (do not infer from P-state/clock)"
+      },
+      "native_preparation": [
+        {
+          "argv": [
+            "pixi",
+            "install",
+            "--locked",
+            "--all"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "build"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "check"
+          ],
+          "exit_status": 0
+        }
+      ],
+      "number": 623,
+      "observed_preparation_check_versions": {
+        "cuda": "13.0",
+        "python": "3.12.14",
+        "torch": "2.14.0+cu130"
+      },
+      "recorded_source_identity": "abe2892dd6ea735079448399d1c92ed6074d9abaf8e55c4f39eb88b8d6b06b95",
+      "result": {
+        "artifact_state": "complete",
+        "service_outcome": "success",
+        "termination_confirmed": true,
+        "workload_exit_status": 0
+      },
+      "slice_range": {
+        "mode": "prefill",
+        "start": 16,
+        "stop_exclusive": 32
+      },
+      "source_identity_is_immutable_proof": false,
+      "source_repositories": [
+        {
+          "dirty": true,
+          "path": ".",
+          "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM",
+          "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/cutlass",
+          "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/deep_jit",
+          "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
+        },
+        {
+          "dirty": true,
+          "path": "b12x",
+          "revision": "a489f972e0dde54fedd5f83bf73a7d3754fc60d6"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer",
+          "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cccl",
+          "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cutlass",
+          "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/nixl",
+          "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/spdlog",
+          "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"
+        }
+      ],
+      "task_id": "ef07e51b-05ec-44b5-895b-16a46962d579"
+    },
+    {
+      "attempt_id": "3f488d20-1527-42a4-a124-088ab8ad6bdf",
+      "declared_untracked": true,
+      "declared_untracked_count": 76,
+      "declared_untracked_description": "Additional declared untracked inputs, including experimental directories, were present at measurement; omitted from publication draft. Not reconstructible from this summary.",
+      "executed_request": {
+        "argv": [
+          "python",
+          "-c",
+          "import json,pathlib,subprocess,sys\nout=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)\nsys.path.insert(0,str(pathlib.Path('validation/megajob/wi004_route_tp_20260922').resolve()))\nimport formal_prefill_slice as prefill,formal_decode_slice as decode\nmanifest=[dict(mode=mode,index=i,ids=[c.id for c in module.cases(i)]) for mode,module,count in [('prefill',prefill,47),('decode',decode,56)] for i in range(count)]\nids=[c for s in manifest for c in s['ids']];assert len(ids)==len(set(ids))==819\n(out/'matrix-manifest.json').write_text(json.dumps(dict(round='upstream-active-groups-interleaved-v1-20260930',slices=manifest,total=819)))\nresults=[]\nfor index in range(32,47):\n dst=out/('prefill-'+str(index).zfill(2));dst.mkdir()\n with (dst/'run.log').open('w') as f:\n  rc=subprocess.run([sys.executable,'validation/megajob/wi004_route_tp_20260922/formal_prefill_slice.py',str(dst),str(index)],stdout=f,stderr=subprocess.STDOUT).returncode\n results.append(dict(mode='prefill',index=index,exit_status=rc));(out/'progress.json').write_text(json.dumps(results));print(results[-1],flush=True)\n if rc:sys.exit(rc)\n",
+          "{outputs}"
+        ],
+        "argv_redaction": "workspace root replaced with <WORKSPACE> if present; {outputs} is the original runtime placeholder",
+        "cwd": "<WORKSPACE>",
+        "profile": "benchmark"
+      },
+      "executed_slice_commands": [
+        {
+          "arguments": [
+            "<OUTPUTS>/<MODE>-<SLICE>",
+            "<SLICE>"
+          ],
+          "executable": "sys.executable",
+          "script": "validation/megajob/wi004_route_tp_20260922/formal_prefill_slice.py"
+        }
+      ],
+      "gpu": {
+        "compute_capability": [
+          12,
+          0
+        ],
+        "cuda_runtime_reported": "13.0",
+        "driver_version": "595.84.01",
+        "exclusive_visibility": null,
+        "memory_bytes": 101975851008,
+        "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "monitor_conflicts": 0,
+        "monitor_observations": 498,
+        "power_state_snapshot": "P0",
+        "power_w_snapshot": "52.94 W",
+        "pseudonym": "gpu-1",
+        "same_physical_gpu_across_five_tasks": true,
+        "sm_clock_mhz_snapshot": "1207 MHz",
+        "sm_count": 188,
+        "temperature_c_snapshot": 33,
+        "throttle_reason": "not recorded in result.json (do not infer from P-state/clock)"
+      },
+      "native_preparation": [
+        {
+          "argv": [
+            "pixi",
+            "install",
+            "--locked",
+            "--all"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "build"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "check"
+          ],
+          "exit_status": 0
+        }
+      ],
+      "number": 624,
+      "observed_preparation_check_versions": {
+        "cuda": "13.0",
+        "python": "3.12.14",
+        "torch": "2.14.0+cu130"
+      },
+      "recorded_source_identity": "abe2892dd6ea735079448399d1c92ed6074d9abaf8e55c4f39eb88b8d6b06b95",
+      "result": {
+        "artifact_state": "complete",
+        "service_outcome": "success",
+        "termination_confirmed": true,
+        "workload_exit_status": 0
+      },
+      "slice_range": {
+        "mode": "prefill",
+        "start": 32,
+        "stop_exclusive": 47
+      },
+      "source_identity_is_immutable_proof": false,
+      "source_repositories": [
+        {
+          "dirty": true,
+          "path": ".",
+          "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM",
+          "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/cutlass",
+          "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/deep_jit",
+          "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
+        },
+        {
+          "dirty": true,
+          "path": "b12x",
+          "revision": "a489f972e0dde54fedd5f83bf73a7d3754fc60d6"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer",
+          "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cccl",
+          "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cutlass",
+          "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/nixl",
+          "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/spdlog",
+          "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"
+        }
+      ],
+      "task_id": "7063ee67-17ea-4c98-ad10-5667b325b998"
+    },
+    {
+      "attempt_id": "a8cfdb3c-84fd-47b2-9ab6-a8d967d184a1",
+      "declared_untracked": true,
+      "declared_untracked_count": 76,
+      "declared_untracked_description": "Additional declared untracked inputs, including experimental directories, were present at measurement; omitted from publication draft. Not reconstructible from this summary.",
+      "executed_request": {
+        "argv": [
+          "python",
+          "-c",
+          "import json,pathlib,subprocess,sys\nout=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)\nsys.path.insert(0,str(pathlib.Path('validation/megajob/wi004_route_tp_20260922').resolve()))\nimport formal_prefill_slice as prefill,formal_decode_slice as decode\nmanifest=[dict(mode=mode,index=i,ids=[c.id for c in module.cases(i)]) for mode,module,count in [('prefill',prefill,47),('decode',decode,56)] for i in range(count)]\nids=[c for s in manifest for c in s['ids']];assert len(ids)==len(set(ids))==819\n(out/'matrix-manifest.json').write_text(json.dumps(dict(round='upstream-active-groups-interleaved-v1-20260930',slices=manifest,total=819)))\nresults=[]\nfor index in range(28):\n dst=out/('decode-'+str(index).zfill(2));dst.mkdir()\n with (dst/'run.log').open('w') as f:\n  rc=subprocess.run([sys.executable,'validation/megajob/wi004_route_tp_20260922/formal_decode_slice.py',str(dst),str(index)],stdout=f,stderr=subprocess.STDOUT).returncode\n results.append(dict(mode='decode',index=index,exit_status=rc));(out/'progress.json').write_text(json.dumps(results));print(results[-1],flush=True)\n if rc:sys.exit(rc)\n",
+          "{outputs}"
+        ],
+        "argv_redaction": "workspace root replaced with <WORKSPACE> if present; {outputs} is the original runtime placeholder",
+        "cwd": "<WORKSPACE>",
+        "profile": "benchmark"
+      },
+      "executed_slice_commands": [
+        {
+          "arguments": [
+            "<OUTPUTS>/<MODE>-<SLICE>",
+            "<SLICE>"
+          ],
+          "executable": "sys.executable",
+          "script": "validation/megajob/wi004_route_tp_20260922/formal_decode_slice.py"
+        }
+      ],
+      "gpu": {
+        "compute_capability": [
+          12,
+          0
+        ],
+        "cuda_runtime_reported": "13.0",
+        "driver_version": "595.84.01",
+        "exclusive_visibility": null,
+        "memory_bytes": 101975851008,
+        "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "monitor_conflicts": 0,
+        "monitor_observations": 445,
+        "power_state_snapshot": "P0",
+        "power_w_snapshot": "52.26 W",
+        "pseudonym": "gpu-1",
+        "same_physical_gpu_across_five_tasks": true,
+        "sm_clock_mhz_snapshot": "1552 MHz",
+        "sm_count": 188,
+        "temperature_c_snapshot": 33,
+        "throttle_reason": "not recorded in result.json (do not infer from P-state/clock)"
+      },
+      "native_preparation": [
+        {
+          "argv": [
+            "pixi",
+            "install",
+            "--locked",
+            "--all"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "build"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "check"
+          ],
+          "exit_status": 0
+        }
+      ],
+      "number": 625,
+      "observed_preparation_check_versions": {
+        "cuda": "13.0",
+        "python": "3.12.14",
+        "torch": "2.14.0+cu130"
+      },
+      "recorded_source_identity": "abe2892dd6ea735079448399d1c92ed6074d9abaf8e55c4f39eb88b8d6b06b95",
+      "result": {
+        "artifact_state": "complete",
+        "service_outcome": "success",
+        "termination_confirmed": true,
+        "workload_exit_status": 0
+      },
+      "slice_range": {
+        "mode": "decode",
+        "start": 0,
+        "stop_exclusive": 28
+      },
+      "source_identity_is_immutable_proof": false,
+      "source_repositories": [
+        {
+          "dirty": true,
+          "path": ".",
+          "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM",
+          "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/cutlass",
+          "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/deep_jit",
+          "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
+        },
+        {
+          "dirty": true,
+          "path": "b12x",
+          "revision": "a489f972e0dde54fedd5f83bf73a7d3754fc60d6"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer",
+          "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cccl",
+          "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cutlass",
+          "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/nixl",
+          "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/spdlog",
+          "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"
+        }
+      ],
+      "task_id": "05e452b7-fe1e-49bc-b1ea-0c01cd7fb220"
+    },
+    {
+      "attempt_id": "f05f535f-8df9-441e-b661-0bc9dc6e4fce",
+      "declared_untracked": true,
+      "declared_untracked_count": 76,
+      "declared_untracked_description": "Additional declared untracked inputs, including experimental directories, were present at measurement; omitted from publication draft. Not reconstructible from this summary.",
+      "executed_request": {
+        "argv": [
+          "python",
+          "-c",
+          "import json,pathlib,subprocess,sys\nout=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)\nsys.path.insert(0,str(pathlib.Path('validation/megajob/wi004_route_tp_20260922').resolve()))\nimport formal_prefill_slice as prefill,formal_decode_slice as decode\nmanifest=[dict(mode=mode,index=i,ids=[c.id for c in module.cases(i)]) for mode,module,count in [('prefill',prefill,47),('decode',decode,56)] for i in range(count)]\nids=[c for s in manifest for c in s['ids']];assert len(ids)==len(set(ids))==819\n(out/'matrix-manifest.json').write_text(json.dumps(dict(round='upstream-active-groups-interleaved-v1-20260930',slices=manifest,total=819)))\nresults=[]\nfor index in range(28,56):\n dst=out/('decode-'+str(index).zfill(2));dst.mkdir()\n with (dst/'run.log').open('w') as f:\n  rc=subprocess.run([sys.executable,'validation/megajob/wi004_route_tp_20260922/formal_decode_slice.py',str(dst),str(index)],stdout=f,stderr=subprocess.STDOUT).returncode\n results.append(dict(mode='decode',index=index,exit_status=rc));(out/'progress.json').write_text(json.dumps(results));print(results[-1],flush=True)\n if rc:sys.exit(rc)\n",
+          "{outputs}"
+        ],
+        "argv_redaction": "workspace root replaced with <WORKSPACE> if present; {outputs} is the original runtime placeholder",
+        "cwd": "<WORKSPACE>",
+        "profile": "benchmark"
+      },
+      "executed_slice_commands": [
+        {
+          "arguments": [
+            "<OUTPUTS>/<MODE>-<SLICE>",
+            "<SLICE>"
+          ],
+          "executable": "sys.executable",
+          "script": "validation/megajob/wi004_route_tp_20260922/formal_decode_slice.py"
+        }
+      ],
+      "gpu": {
+        "compute_capability": [
+          12,
+          0
+        ],
+        "cuda_runtime_reported": "13.0",
+        "driver_version": "595.84.01",
+        "exclusive_visibility": null,
+        "memory_bytes": 101975851008,
+        "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "monitor_conflicts": 0,
+        "monitor_observations": 346,
+        "power_state_snapshot": "P0",
+        "power_w_snapshot": "56.51 W",
+        "pseudonym": "gpu-1",
+        "same_physical_gpu_across_five_tasks": true,
+        "sm_clock_mhz_snapshot": "2325 MHz",
+        "sm_count": 188,
+        "temperature_c_snapshot": 33,
+        "throttle_reason": "not recorded in result.json (do not infer from P-state/clock)"
+      },
+      "native_preparation": [
+        {
+          "argv": [
+            "pixi",
+            "install",
+            "--locked",
+            "--all"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "build"
+          ],
+          "exit_status": 0
+        },
+        {
+          "argv": [
+            "pixi",
+            "run",
+            "check"
+          ],
+          "exit_status": 0
+        }
+      ],
+      "number": 626,
+      "observed_preparation_check_versions": {
+        "cuda": "13.0",
+        "python": "3.12.14",
+        "torch": "2.14.0+cu130"
+      },
+      "recorded_source_identity": "abe2892dd6ea735079448399d1c92ed6074d9abaf8e55c4f39eb88b8d6b06b95",
+      "result": {
+        "artifact_state": "complete",
+        "service_outcome": "success",
+        "termination_confirmed": true,
+        "workload_exit_status": 0
+      },
+      "slice_range": {
+        "mode": "decode",
+        "start": 28,
+        "stop_exclusive": 56
+      },
+      "source_identity_is_immutable_proof": false,
+      "source_repositories": [
+        {
+          "dirty": true,
+          "path": ".",
+          "revision": "ffccc4a8c07d58c44c1b37209b158e19780b8e32"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM",
+          "revision": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/cutlass",
+          "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+        },
+        {
+          "dirty": false,
+          "path": "DeepGEMM/third-party/deep_jit",
+          "revision": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
+        },
+        {
+          "dirty": true,
+          "path": "b12x",
+          "revision": "a489f972e0dde54fedd5f83bf73a7d3754fc60d6"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer",
+          "revision": "3c6eea360ebdea16d51992e48f9d58bfe3e9af67"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cccl",
+          "revision": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/cutlass",
+          "revision": "b46b16d003484063bca4ed365e44095c4c6ed633"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/nixl",
+          "revision": "b20f4d0adb95f53c4a1272915ef8d86cec304584"
+        },
+        {
+          "dirty": false,
+          "path": "flashinfer/3rdparty/spdlog",
+          "revision": "c3aed4b68373955e1cc94307683d44dca1515d2b"
+        }
+      ],
+      "task_id": "5bcfe3a4-3aa7-4649-9833-63d109713525"
+    }
+  ],
+  "version_notes": {
+    "current_workspace_lock_not_historical_proof": {
+      "cuda_nvcc": "13.3.73",
+      "nvidia_cutlass_dsl": "4.7.1",
+      "torch": "2.14.0+cu130",
+      "triton": "3.8.0"
+    },
+    "recorded_during_preparation": "Each task preparation.log check reports CUDA runtime 13.0, Python 3.12.14 and torch 2.14.0+cu130; result.json reports the driver and CUDA runtime separately. nvcc/CUTLASS DSL/triton versions are not individually emitted by these task result/check records."
+  }
+}

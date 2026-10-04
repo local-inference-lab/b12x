@@ -11,7 +11,9 @@ from . import META
 
 
 def is_supported(device=None) -> bool:
-    """Check SM120/SM121 capability and CUTLASS DSL >= 4.6.0 / Triton availability.
+    """Check SM120/SM121 capability and compiler/Triton availability.
+
+    The supported package configuration pins CUTLASS DSL 4.7.1.
 
     This is an availability gate, not proof of correctness or performance on
     the device or support for every implementation/configuration. Defaults
@@ -31,7 +33,9 @@ def masked_mm(lhs, rhs, d, masked_m, *, plan: Plan, expected_m=None, stream=None
     SFA/SFB must be contiguous CUDA float32 tensors on the plan's device.
     Callers guarantee positive powers of two representable in UE8M0; there
     is no general scale-value validation. ``expected_m`` at execution does
-    not replan; the query's fixed ``expected_m`` is a planning hint."""
+    not replan; the query's fixed ``expected_m`` is a planning hint.
+    The plan owns mutable capacity-sized scale buffers: serialize calls and
+    graph replays, or use separate plans and outputs for concurrent execution."""
     state = require_prepared(plan, META.qualname)
     return state.run_masked(lhs, rhs, d, masked_m, expected_m=expected_m, stream=stream)
 

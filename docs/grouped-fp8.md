@@ -24,10 +24,10 @@ Scale values are a caller contract, not generally range-validated.
   Eager row views may vary within capacity; captured tensor shapes/addresses
   stay fixed while their contents change.
 - Prepare before capture, keep operands/plans alive, and destroy graphs before
-  releasing the session. Contiguous plans own mutable, fixed-capacity scale
+  releasing the session. Both modes own private, mutable, fixed-capacity scale
   workspaces: serialize calls/replays or use separate plans and outputs.
-  Masked eager calls allocate scale-packing buffers; graph replay reuses the
-  captured allocations. No general allocation-free eager claim is made.
+  Masked calls repack into the existing buffers using the current tensor row
+  stride; eager packing and graph replay do not allocate scale storage.
 
 ## Prepared public API example
 
@@ -116,47 +116,71 @@ if __name__ == "__main__":
     example("contiguous")
 ```
 
-## Qualification, not a universal performance promise
+## Qualification and evidence limits
 
-The upstream-adapted active-group candidate (semantic version 3, candidate
-contract 8) was measured with the mega-repository's xcheck and its specified
-DeepGEMM fork (`d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7`), not an arbitrary
-upstream DeepGEMM installation. The tested combination is CUDA toolkit 13.3,
-CUTLASS DSL 4.7.1, and RTX PRO 6000 Blackwell Server Edition (SM120, 188 SMs).
-Dependencies now pin DSL 4.7.1, matching that tested compiler. SM121 and
-other compiler versions are **not qualified**. The 819-case evidence describes
-the 2026-09-30 candidate before the upstream 1.5 merge; it does not qualify
-all newly merged upstream runtime paths.
+These bounded grouped FP8 measurements compare with a clean DeepGEMM fork base
+`d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7`. Ratios are b12x median / DeepGEMM
+median (lower is better) on NVIDIA RTX PRO 6000 Blackwell Server Edition
+(SM120, 188 SMs). Each round used one physical card; its run-local `gpu-1`
+pseudonym does not establish whether both rounds used the same card.
 
-The independent 2026-09-30 round passed **819/819** cases: 373 prefill and 446
-decode across 47/56 slices. All phases satisfy b12x/DeepGEMM <=1.01. Initial
-geometric mean is 0.8213204489; geometric mean of each case's worst phase is
-0.8215264918; worst phase is 1.0055542348. The
-[819-row performance table](benchmarks/wi004-grouped-fp8-upstream-interleaved-20260930.csv)
-includes geometry, initial/confirmation ratios and task/attempt references.
-It is a summary, not the raw samples or a standalone benchmark harness.
+The measured cases cover DeepSeek-V4-Flash, DeepSeek-V4.1-Flash, GLM-5.3 and
+GLM-5.3-Flash expert GEMMs (w13/w2), plus small contract cases. Model geometries
+include EP1/4/8; legacy expert lengths are synthetic. The separate rank-local
+route-tp-v1 corpus includes TP1/4/8, TP rank 0, representative EP ranks and global
+token counts 1/128 for decode or 1024/8192 for prefill. These are neither
+production routing traces nor TP collective benchmarks.
 
-`interleaved-v1` uses cold-L2 CUDA events (retained graph replay for decode):
-A=DeepGEMM, B=b12x; initial five-sample ABBA blocks repeated three times give
-30 samples per side. Fixed risk/history or initial ratio >=0.99 requires
-separate ten-sample ABBA x10 and BAAB x10 confirmations, 200 samples per side
-per phase. Each phase has pre/post correctness checks and five warmups per
-side, without block rewarmup. All raw samples per side are pooled for the
-median; every phase, including initial, must pass without trimming or drift
-exemptions. This round contains 1,251 paired phases, 2,502 records and 221,940
-raw samples. Representative/A/A diagnostics are excluded.
+| Measured tree (contract 8) | Paired cases | Initial ratio geomean | Per-case worst-phase geomean | Worst phase |
+|---|---:|---:|---:|---:|
+| Semantic 3: prefill + decode | 819 (373 + 446) | 0.8213204489 | 0.8215264918 | 1.0055542348 |
+| Semantic 4: decode only | 446 | 0.7318103372 | 0.7318186491 | 0.9903273810 |
 
-Earlier sequential-protocol failures remain failures: task 599's GLM disjoint
-case reached 1.0137543356; task 617's DSV4.1 disjoint case reached 1.0225888823.
-The new approved-protocol round does not retroactively qualify those runs.
+Separate sanitized observations are available for
+[semantic 3 raw cases](benchmarks/grouped-fp8-semantic3-cases.jsonl.gz) and
+[provenance](benchmarks/grouped-fp8-semantic3-provenance.json), and for
+[semantic 4 decode raw cases](benchmarks/grouped-fp8-semantic4-decode-cases.jsonl.gz)
+and [provenance](benchmarks/grouped-fp8-semantic4-decode-provenance.json).
+They retain raw latencies, phase medians, block ordering and selected correctness
+summaries, not full private lifecycle bindings, mutation tensors or memory
+traces; they cannot independently replay the complete private correctness gate.
 
-Validation also includes 202 grouped tests and targeted memcheck, racecheck
-and synccheck on two active-marker/joint graph cases each. Those sanitizer
-checks do not cover all 819 cases. Existing GPU regression evidence covers
-additional dense paths, but is not qualification of the entire upstream suite.
-The final combined working tree was tested; intermediate commits in the local
-series were not separately GPU-qualified. EP1/EP8 scaling acceptance remains
-unchanged and is not independently concluded by this performance table.
+Every measured phase passed the <=1.01 threshold with pre/post correctness
+checks. Semantic 3 includes 216 confirmed cases, 1,251 paired phases and 221,940
+raw samples; semantic 4 includes six confirmations, 458 phases and 31,560 raw
+samples. Interleaved-v1 uses cold-L2 events around the full eager API for prefill
+and retained CUDA-graph replay for decode. After five warmups per side, the
+initial five-sample ABBA x3 schedule yields 30 samples per side. **Fixed
+risk/history OR initial ratio >=0.99** triggers both ten-sample ABBA x10 and
+BAAB x10 confirmations (200 samples per side per phase). Medians include every
+sample; no drift or trimming exemption applies.
+
+At measurement, semantic 3 used b12x Git base
+`a489f972e0dde54fedd5f83bf73a7d3754fc60d6`, and semantic 4 used
+`56c00e61a86195cac0c3505502ec1095fe8faa5b`, each with dirty/untracked inputs;
+the harness root was dirty too. Neither has an exact public measurement
+revision. Results apply **only to the measured trees**: semantic 3 prefill and
+semantic 4 decode cannot be combined into a same-source 819-case claim.
+Reproducing either round exactly from a clean public commit is not supported
+by this evidence.
+
+Preparation checks reported Python 3.12.14, PyTorch 2.14.0+cu130 and CUDA
+**runtime 13.0**; task results reported driver versions and snapshot clocks/P-state.
+The workspace lock associated with these exports lists CUDA **toolkit/nvcc
+13.3.73**, CUTLASS DSL 4.7.1 and Triton 3.8.0; those lock values are not
+independent historical runtime observations. Throttling-reason telemetry was
+not recorded for these two rounds. Only the pinned CUTLASS DSL 4.7.1 is qualified
+for this op. These results do not establish SM121 or whole-upstream-suite
+qualification, all live distributions, or performance of another source tree.
+
+A separate [PR review regression export](benchmarks/pr451-review-provenance.json)
+contains [10 nongrouped dense cases](benchmarks/pr451-review-nongrouped-cases.jsonl.gz)
+and [20 grouped representatives](benchmarks/pr451-review-grouped-cases.jsonl.gz).
+The nongrouped comparison uses clean base `e4084d2e` versus a dirty tree based on
+`56c00e61`; the grouped comparison uses the specified DeepGEMM fork. These are
+bounded observations of that measured tree, not a new full grouped matrix.
+Positive allocated-GPR deltas remain visible in the provenance alongside the
+per-case phase results. EP1/EP8 scaling is not independently established here.
 
 From a configured b12x checkout, run its existing tests with:
 
@@ -165,9 +189,7 @@ python -m pytest tests/gemm/test_mgroup*.py -q
 python -m pytest tests/test_registry.py tests/preparation -q
 ```
 
-GPU cases need the target hardware and supported dependencies. Full 819
-reproduction additionally needs the mega-repository's xcheck corpus, formal
-prefill/decode drivers, frozen b12x candidate and the specified DeepGEMM fork;
-it cannot be reproduced by an independent b12x-only command. Optimized defaults
-are identity/geometry-scoped; availability alone is not performance evidence
-for other devices, configurations or live distributions.
+GPU tests require suitable hardware and dependencies; repeating these paired
+measurements additionally requires the external corpus, formal drivers, matched
+DeepGEMM fork and corresponding measured sources. Public commit IDs alone do not
+reconstruct those dirty trees.

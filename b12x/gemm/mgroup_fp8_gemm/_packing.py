@@ -5,11 +5,11 @@ The fork/xcheck contract hands the op plain f32 block scales whose values are
 exact powers of two (``per_token_cast_to_fp8(use_ue8m0=True)``), so widening
 granularity (masked/SFB gran-128 -> gran-32 by repeating each byte across
 four K32 blocks) and the f32->UE8M0 exponent-byte cast are both exact.
-Run paths pack with a single Triton kernel per operand into a fresh
-caching-allocator buffer per call (``pack_grouped_scales_fast``; the
-``masked_m`` variant skips groups with zero live rows — the GEMM never reads
-their atoms). The torch composition (``pack_grouped_scales``) stays as the
-allocating reference the GPU tests diff against.
+Masked plans pack with a single Triton kernel per operand into private
+capacity-sized buffers (``pack_grouped_scales_into``), using the current
+row count for group strides. Groups with zero live rows are skipped because
+the GEMM never reads their atoms. ``pack_grouped_scales_fast`` allocates an
+exact-sized destination; ``pack_grouped_scales`` is the torch reference.
 """
 from __future__ import annotations
 

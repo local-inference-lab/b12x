@@ -1,0 +1,136 @@
+{
+  "architecture": "Automatic architecture in independent before/after workers with new compile caches. Actual program keys are in the nongrouped export; explicit-architecture safety objects were not reused as formal evidence.",
+  "exports": {
+    "pr451-review-grouped-cases.jsonl.gz": {
+      "cases": 20,
+      "decode": 16,
+      "paired_phases": 28,
+      "prefill": 4,
+      "raw_samples": 4400
+    },
+    "pr451-review-nongrouped-cases.jsonl.gz": {
+      "cases": 10,
+      "paired_phases": 30,
+      "raw_samples": 8600
+    }
+  },
+  "gates": {
+    "all_passed": true,
+    "docs_api_smoke": "masked and contiguous eager/live-activity graph oracle passed",
+    "grouped": [
+      {
+        "actual_scope_count": 2,
+        "cases": 8,
+        "passed": true,
+        "scope": "decode-0"
+      },
+      {
+        "actual_scope_count": 2,
+        "cases": 8,
+        "passed": true,
+        "scope": "decode-53"
+      },
+      {
+        "actual_scope_count": 7,
+        "cases": 4,
+        "passed": true,
+        "scope": "prefill-representatives"
+      }
+    ],
+    "nongrouped": {
+      "failed": [],
+      "pass_all": true,
+      "phases": 30,
+      "ratio_direction": "after/before",
+      "raw_counts_per_arm": [
+        30,
+        200,
+        200
+      ],
+      "threshold": 1.01
+    }
+  },
+  "hardware": {
+    "capability": [
+      12,
+      0
+    ],
+    "cross_round_identity_not_implied": true,
+    "driver": "595.58.03",
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "pseudonym": "gpu-1",
+    "same_card_within_run": true,
+    "sm_count": 188
+  },
+  "measurement_date": "2026-10-04",
+  "observed_versions": {
+    "after": {
+      "cuda_runtime": "13.0",
+      "cute_dsl_arch_environment": null,
+      "python": "3.12.14",
+      "torch": "2.14.0+cu130"
+    },
+    "before": {
+      "cuda_runtime": "13.0",
+      "cute_dsl_arch_environment": null,
+      "python": "3.12.14",
+      "torch": "2.14.0+cu130"
+    }
+  },
+  "positive_allocated_gpr_deltas": [
+    {
+      "after": 55,
+      "before": 50,
+      "case": "fused_m8",
+      "delta": 5
+    },
+    {
+      "after": 112,
+      "before": 111,
+      "case": "wo_b_t4",
+      "delta": 1
+    },
+    {
+      "after": 72,
+      "before": 64,
+      "case": "fp6_m1_unfused",
+      "delta": 8,
+      "kernel": "gemm.dense.mxfp6"
+    },
+    {
+      "after": 161,
+      "before": 160,
+      "case": "mxfp8_prefill_m4096",
+      "delta": 1
+    }
+  ],
+  "protocol": {
+    "clock_limits": "Snapshot clocks/P-state are not a sustained-clock guarantee. Nongrouped initial/final snapshots reported P0 and throttle mask 0; initial idle-before SM clock was 180 MHz, initial after 2370 MHz, final both 2407 MHz. Memory clock was 12481 MHz; no clock setting was applied.",
+    "grouped": "interleaved-v1: initial 30 per side; fixed risk/history OR initial ratio >=0.99 requires both 200-sample orders. All four prefill representatives require both confirmations. These 16 decode cases did not trigger confirmation.",
+    "nongrouped": "Each case: 30/200/200 per side, ABBA x3 / ABBA x10 / BAAB x10; graph decode and original eager paths, including FP6 prefill; cold L2; no trimming.",
+    "threshold_inclusive": 1.01
+  },
+  "redaction": "Allowlisted fields only; no private absolute paths, endpoints, hostnames, GPU UUIDs, PIDs, allocator/capture bindings or source snapshots. Grouped original monotonic block times retained; nongrouped wall-clock block timestamps omitted, original order and ranges retained.",
+  "reproduction": "Requires the external xcheck corpus and formal drivers, matching dependencies, independent before/after environments and corresponding measured dirty sources. The exports preserve raw timing, shapes and selected correctness summaries, not a self-contained replay of lifecycle oracles.",
+  "resource_scope": "Observed nongrouped objects: no increased dynamic SMEM, static SMEM 1024 bytes, frame/stack 0, no LDL/STL. Positive GPR deltas remain; all corresponding measured phases pass. Not a census of all production objects.",
+  "safety_boundaries": [
+    "Separate caller-output predecessor source: normal 20 caller-output + 5 FP6 regressions; memcheck 5, racecheck 3, synccheck 3, all passed without skips/errors.",
+    "Fresh-internal source used for this formal: normal 20 caller-output + 5 FP6 regressions; memcheck 5 direct/alias/capture cases, all passed without skips/errors. Racecheck/synccheck were not repeated for this host-only predicate change.",
+    "Formal performance data are not a sanitizer matrix. Historical failed performance attempts remain failures and are not included as passing phases."
+  ],
+  "scope_limits": "10 nongrouped cases and 20 grouped representatives only. Neither a new 819-case nor 446-case matrix, SM121 qualification, whole-upstream suite, or EP1/EP8 scaling acceptance. Historical semantic 3 and semantic 4 exports remain separate.",
+  "source": {
+    "after_b12x_base": "56c00e61a86195cac0c3505502ec1095fe8faa5b",
+    "after_declared_untracked": true,
+    "after_dirty": true,
+    "before_b12x_base": "e4084d2eef4932e0fa06db3f7a94deb83ad132d7",
+    "before_dirty": false,
+    "deepgemm_base": "d5e3bbfb91ebb83ea8d4aff4befacbba61d711e7",
+    "deepgemm_dirty": false,
+    "exact_public_after_revision": null,
+    "harness_base": "ffccc4a8c07d58c44c1b37209b158e19780b8e32",
+    "harness_dirty": true,
+    "reproduction_limit": "Git bases plus dirty/untracked inputs identify the measurement context, not a reconstructible clean source. A later commit does not retroactively identify this tree."
+  },
+  "status": "bounded_review_regression_observations"
+}

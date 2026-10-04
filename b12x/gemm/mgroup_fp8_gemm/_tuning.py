@@ -192,7 +192,7 @@ TUNING = TuningContract(
     validate_config=validate_config,
     default_config=_default_config,
     candidate_contract_version=8,
-    semantic_version=3,
+    semantic_version=4,
     knobs=(
         Knob(name="implementation", values=("single", "joint_v1", "masked_compact"), binding=ParameterBinding.COMPILE),
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),

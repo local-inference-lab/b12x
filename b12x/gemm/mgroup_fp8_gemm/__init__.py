@@ -32,23 +32,17 @@ cache keys. ``query_from_call`` derives the static query from operand
 metadata without reading device tensors. A captured graph keeps tensor shapes
 fixed; live activity within that capacity changes through labels or masks.
 Unseen tensor row lengths can reuse a prepared plan outside that capture.
-A contiguous plan is not reentrant: serialize its calls and graph replays.
-Concurrent execution requires separate plans and output buffers.
+Both modes own private capacity-sized scale buffers and are not reentrant:
+serialize calls and graph replays. Concurrent execution requires separate
+plans and output buffers. Masked packing retains the current tensor row stride
+within its capacity allocation.
 
 ``joint_v1`` uses GPU selection between full BK64 and narrow BK128 bodies,
 compact B scales, and a band-local/half-line B cache policy. Its full body uses
 packed scale-factor registers with MMA byte selectors; the narrow body does not.
 Direct shared-scale publication uses all-lane arrivals in both producer/full
-and consumer/empty directions. The upstream-adapted active-group candidate
-(tuning semantic version 3, candidate contract version 8) passed 819/819 paired
-legacy and route-tp-v1 cases under interleaved-v1 timing on one RTX PRO 6000
-Blackwell Server Edition (SM120, 188 SMs): 373 prefill and 446 decode, every
-measured phase within 1.01 b12x/DeepGEMM. This bounded matrix does not qualify
-all live distributions, newly merged upstream 1.5 runtime paths, the whole
-upstream suite, or SM121. The older edeaa8af
-sequential baseline is separate; WI closure still awaits EP scaling wording
-owner disposition. Candidate contract version 8 excludes unsupported N16/N32
-MXFP8 tiles; default dispatch and serialized configuration fields are unchanged.
+and consumer/empty directions. Supported MXFP8 tiles have N64 or N128 width.
+See ``docs/grouped-fp8.md`` for bounded measurements and qualification limits.
 The optimized defaults require the exact NVIDIA RTX PRO 6000 Blackwell Server Edition
 identity (normalized vendor/product name, SM120, 188 SMs): masked mode selects
 ``masked_compact``; contiguous mode selects ``joint_v1`` for capacity

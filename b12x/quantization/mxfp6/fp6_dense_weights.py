@@ -534,6 +534,7 @@ def dense_fp6_linear_expanded(
     else:
         a_gs_pr = None
     inv_gs_pr = None
+    fresh_internal = False
 
     if _fused_quant:
         # The producer warp quantizes directly in shared memory with an
@@ -588,6 +589,7 @@ def dense_fp6_linear_expanded(
                 x, a_fmt, global_scale
             )
             inv_gs_pr = inv_gs_pr[:m].view(m, 1)
+            fresh_internal = True
         elif _per_row:
             # x is already pre-scaled; pass unit activation global scale.
             a_codes, a_scale = _quantize_matrix_fp6_bytes(x, a_fmt, _gs_unit)
@@ -615,7 +617,6 @@ def dense_fp6_linear_expanded(
     # read tiles. Padded rows are never computed or written. The activation is
     # a byte-container (the quantizer emits it directly); the weight is either
     # pre-expanded at load or 3:4-packed and expanded in smem by the kernel.
-    y = torch.empty((m, n, 1), device=x.device, dtype=torch.bfloat16)
     # ``inv_gs_pr`` is a contiguous bf16 (m,) buffer that both per-row quant
     # kernels write; the (m, 1) view exists only for the broadcast multiply.
     _row_scale = (
@@ -623,6 +624,21 @@ def dense_fp6_linear_expanded(
         if _ROW_SCALE_EPILOGUE and inv_gs_pr is not None
         else None
     )
+    needs_host_correction = (inv_gs_pr is not None and _row_scale is None) or a_gs_pr is not None
+    direct_out = (
+        type(out) is torch.Tensor and out.layout == torch.strided
+        and out.dtype == torch.bfloat16 and out.is_contiguous()
+        and out.shape == (m, n) and out.is_cuda and out.device == x.device
+        and m > 0 and out.data_ptr() % 16 == 0
+        and not out.is_neg() and not out.is_conj() and not needs_host_correction
+        and not out.requires_grad and out.grad_fn is None
+        and (not out.is_inference() or torch.is_inference_mode_enabled())
+        and all(t is None or (not t.requires_grad and not torch._C._overlaps(out, t))
+                for t in (x_bf16, x, weight, scale_storage, global_scale))
+        and (fresh_internal or all(t is None or (not t.requires_grad and not torch._C._overlaps(out, t))
+                                   for t in (a_codes, a_scale, alpha, _row_scale)))
+    )
+    y = out.unsqueeze(-1) if direct_out else torch.empty((m, n, 1), device=x.device, dtype=torch.bfloat16)
     dense_gemm(
         (a_codes[:m].unsqueeze(-1), a_sf),
         (weight, b_sf),
@@ -660,7 +676,10 @@ def dense_fp6_linear_expanded(
             (1.0 / a_gs_pr[:m].double()).float().to(torch.bfloat16)
         )
     if out is not None:
-        out.copy_(result)
+        if direct_out:
+            torch.autograd.graph.increment_version(out)
+        else:
+            out.copy_(result)
         return out
     return result
 

@@ -168,3 +168,94 @@ def test_custom_op_fake_tensor_shape():
             out = torch.ops.b12x.fp6_dense_linear(fx, *fargs)
             assert tuple(out.shape) == (7, w.out_features)
             assert out.dtype == torch.bfloat16
+
+
+def test_caller_out_eligibility_cpu():
+    import ast
+    from pathlib import Path
+    from types import SimpleNamespace
+    from b12x.quantization.mxfp6 import fp6_dense_weights as fw
+
+    tree = ast.parse(Path(fw.__file__).read_text())
+    expr = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'direct_out' for t in n.targets))
+
+    class Tensor:
+        layout = torch.strided
+        dtype = torch.bfloat16
+        shape = (128, 256)
+        device = 'cuda:0'
+        is_cuda = True
+        requires_grad = False
+        grad_fn = None
+        contiguous = True
+        negative = False
+        conjugate = False
+        inference = False
+        address = 4096
+        def is_contiguous(self): return self.contiguous
+        def is_neg(self): return self.negative
+        def is_conj(self): return self.conjugate
+        def is_inference(self): return self.inference
+        def data_ptr(self): return self.address
+
+    def accepts(field=None, value=None, *, alias=None, grad=None, correction=False,
+                inference_mode=False, output=None, m=128, fresh=False, calls=None):
+        out = Tensor() if output is None else output
+        if field is not None:
+            setattr(out, field, value)
+        tensors = {name: Tensor() for name in ('x_bf16', 'x', 'weight', 'scale_storage',
+                   'global_scale', 'a_codes', 'a_scale', 'alpha', '_row_scale')}
+        if alias:
+            tensors[alias] = out
+        if grad:
+            tensors[grad].requires_grad = True
+        def overlaps(a, b):
+            if calls is not None:
+                calls.append(next(name for name, t in tensors.items() if t is b))
+            return a is b
+        facade = SimpleNamespace(Tensor=Tensor, strided=torch.strided, bfloat16=torch.bfloat16,
+            is_inference_mode_enabled=lambda: inference_mode,
+            _C=SimpleNamespace(_overlaps=overlaps))
+        return eval(compile(ast.Expression(expr), '<out-scope>', 'eval'),
+                    dict(torch=facade, out=out, m=m, n=256, fresh_internal=fresh,
+                         needs_host_correction=correction, **tensors))
+
+    assert accepts()
+    for field, value in [('dtype', torch.float32), ('contiguous', False),
+                         ('shape', (1, 128, 256)), ('device', 'cuda:1'), ('is_cuda', False),
+                         ('address', 4098), ('negative', True), ('conjugate', True),
+                         ('requires_grad', True), ('grad_fn', object()), ('inference', True)]:
+        assert not accepts(field, value), field
+    assert accepts('inference', True, inference_mode=True)
+    assert not accepts(correction=True)
+    assert not accepts(m=0)
+    class SubTensor(Tensor):
+        pass
+    assert not accepts(output=SubTensor())
+    for name in ('x_bf16', 'x', 'weight', 'scale_storage', 'global_scale',
+                 'a_codes', 'a_scale', 'alpha', '_row_scale'):
+        assert not accepts(alias=name), name
+        assert not accepts(grad=name), name
+    for name in ('x_bf16', 'x', 'weight', 'scale_storage', 'global_scale'):
+        assert not accepts(alias=name, fresh=True), name
+        assert not accepts(grad=name, fresh=True), name
+    calls = []
+    assert accepts(fresh=True, calls=calls)
+    assert calls == ['x_bf16', 'x', 'weight', 'scale_storage', 'global_scale']
+    calls.clear()
+    assert accepts(fresh=False, calls=calls)
+    assert len(calls) == 9
+
+
+def test_caller_out_version_primitive_cpu():
+    base = torch.zeros(8)
+    view = base[2:6]
+    version = base._version
+    torch.autograd.graph.increment_version(view)
+    assert base._version == view._version == version + 1
+    with torch.inference_mode():
+        inference = torch.zeros(8)
+        torch.autograd.graph.increment_version(inference)
+    with pytest.raises(RuntimeError):
+        inference.copy_(torch.ones(8))

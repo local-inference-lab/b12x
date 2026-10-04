@@ -14,9 +14,10 @@ argument. Whole padding tiles (label -1 on the first row) are skipped like
 masked dead tiles; straddling padding rows are computed against a clamped
 group and then zero-filled by a small Triton cleanup over the live span.
 
-Contiguous plans own capacity-sized scale buffers and validate label values
-and 128-row run starts on the GPU during combined packing. Invalid labels
-raise an asynchronous CUDA device error. Masked packing remains unchanged.
+Both modes own private capacity-sized scale buffers. Masked packing uses the
+current tensor row count for group strides within those buffers. Contiguous
+packing validates label values and 128-row run starts on the GPU; invalid
+labels raise an asynchronous CUDA device error.
 """
 from __future__ import annotations
 
@@ -33,6 +34,14 @@ from ._tuning import (
     TUNING,
     validate_query,
 )
+
+def _masked_workspace_sizes(query, config):
+    return (
+        query.num_groups * ((query.m_capacity + 127) // 128) * (query.k // 128) * 512,
+        query.num_groups * ((query.n + 127) // 128)
+        * ((query.k + 511) // 512 if config.implementation == "masked_compact" else query.k // 128) * 512,
+    )
+
 
 def _mgroup_policy():
     from b12x._lib import dense_gemm as dense
@@ -56,7 +65,7 @@ def compile_mgroup_fp8(query_payload, config_payload, ordinal, sm_count):
     from b12x._lib import dense_gemm as dense
     from b12x._lib.compile_plan import compile_only_launches
     from ._contiguous_packing import normalize_g1, pack_contiguous, workspace_sizes, zero_padding
-    from ._packing import pack_grouped_scales_fast
+    from ._packing import pack_grouped_scales_into
 
     with torch.cuda.device(ordinal):
         if config.implementation == "joint_v1":
@@ -82,12 +91,13 @@ def compile_mgroup_fp8(query_payload, config_payload, ordinal, sm_count):
             sfb = empty((g, n, k // 128))
             if query.mode == "masked":
                 masked_m = empty((g,), torch.int32)
-                for name, scales, rows, compact in (
+                sizes = _masked_workspace_sizes(query, config)
+                for size, (name, scales, rows, compact) in zip(sizes, (
                     ("pack_a", empty((g, m, k // 128)), m, False),
                     ("pack_b", sfb, n, config.implementation == "masked_compact"),
-                ):
-                    programs[name] = pack_grouped_scales_fast(
-                        normalize_g1(scales, rows, k // 128, g), rows=rows, k=k,
+                ), strict=True):
+                    programs[name] = pack_grouped_scales_into(
+                        normalize_g1(scales, rows, k // 128, g), empty(size, torch.uint8), rows=rows, k=k,
                         num_groups=g, gran=128, masked_m=masked_m, compact128=compact,
                     )
             else:
@@ -160,7 +170,7 @@ class _MGroupFP8ExecutionState:
 
     def run_masked(self, lhs, rhs, d, masked_m, *, expected_m=None, stream=None):
         from b12x._lib.utils import cuda_stream_to_int
-        from ._packing import pack_grouped_scales_fast
+        from ._packing import pack_grouped_scales_into
 
         q = self.query
         if q.mode != "masked":
@@ -192,13 +202,13 @@ class _MGroupFP8ExecutionState:
         selected_stream = (torch.cuda.current_stream(self.device) if stream_int is None
                            else torch.cuda.ExternalStream(stream_int, device=self.device))
         with torch.cuda.stream(selected_stream):
-            sfa_mma = pack_grouped_scales_fast(
-                normalize_g1(sfa, m_cap, q.k // 128, q.num_groups),
+            sfa_mma = pack_grouped_scales_into(
+                normalize_g1(sfa, m_cap, q.k // 128, q.num_groups), self.sfa_workspace,
                 rows=m_cap, k=q.k, num_groups=q.num_groups, gran=128,
                 masked_m=masked_m,
             )
-            sfb_mma = pack_grouped_scales_fast(
-                normalize_g1(sfb, q.n, q.k // 128, q.num_groups),
+            sfb_mma = pack_grouped_scales_into(
+                normalize_g1(sfb, q.n, q.k // 128, q.num_groups), self.sfb_workspace,
                 rows=q.n, k=q.k, num_groups=q.num_groups, gran=128,
                 masked_m=masked_m, compact128=self.config.implementation == "masked_compact",
             )
@@ -285,6 +295,12 @@ def plan(query, *, invocation=FrozenMapping(), override=None) -> Plan:
             owned = 0 if existing is None else _owned_tensor_nbytes((existing.sfa_workspace, existing.sfb_workspace, existing.selector))
             selector_bytes = 4 * (query.num_groups + 1 if config.implementation == "joint_v1" else 1)
             persistent.append(PersistentMemory(("mgroup.contiguous", current_plan()), sum(sizes) + selector_bytes, owned))
+        else:
+            from b12x.preparation.types import current_plan, current_prepared_state, _owned_tensor_nbytes
+            sizes = _masked_workspace_sizes(query, config)
+            existing = current_prepared_state()
+            owned = 0 if existing is None else _owned_tensor_nbytes((existing.sfa_workspace, existing.sfb_workspace))
+            persistent.append(PersistentMemory(("mgroup.masked", current_plan()), sum(sizes), owned))
         return MemoryRequirements(persistent=tuple(persistent))
 
     def materialize(selection, device):
@@ -303,13 +319,16 @@ def plan(query, *, invocation=FrozenMapping(), override=None) -> Plan:
             workspaces = (*[torch.empty(size, device=resolved_device, dtype=torch.uint8) for size in sizes],
                           torch.empty(query.num_groups + 1 if config.implementation == "joint_v1" else 1,
                                       device=resolved_device, dtype=torch.int32))
+        else:
+            workspaces = (*[torch.empty(size, device=resolved_device, dtype=torch.uint8)
+                            for size in _masked_workspace_sizes(query, config)], None)
         return _MGroupFP8ExecutionState(
             query, config, resolved_device, programs["gemm"], alpha_one, *workspaces,
             selector_ctas=device.identity.sm_count,
         )
 
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override,
-                shared=query.mode != "contiguous", _compile_jobs=compile_jobs, _memory_requirements=memory,
+                shared=False, _compile_jobs=compile_jobs, _memory_requirements=memory,
                 _materialize=materialize)
 
 

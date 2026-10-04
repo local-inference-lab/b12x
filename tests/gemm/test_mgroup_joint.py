@@ -21,7 +21,7 @@ def test_joint_static_contract_and_device_scope():
             _JointLaunch(*args, packed_sf=True, **{flag: True})
     assert TUNING.decode_config(TUNING.config_payload(cfg))==cfg
     assert TUNING.config_schema_version==2 and TUNING.candidate_contract_version==8
-    assert TUNING.semantic_version==3
+    assert TUNING.semantic_version==4
     assert default_config(q,None).implementation=='single'
     spark=DeviceIdentity(vendor='nvidia',product_name='NVIDIA GB10',compute_capability=(12,1),sm_count=48)
     assert default_config(q,spark).implementation=='single'
