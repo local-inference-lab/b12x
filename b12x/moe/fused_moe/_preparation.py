@@ -291,12 +291,19 @@ class _W4A16PrimaryLaunches:
         has_route_map: bool,
         activation_amax: object | None,
         apply_router_weight_on_input: bool,
+        force: bool | None = None,
     ) -> object | None:
-        """The A4 prefill launch set for calls at or above its threshold."""
+        """The A4 prefill launch set for calls at or above its threshold.
+
+        ``force`` overrides the threshold: True takes the A4 launches for any
+        call within their capacity (the caller knows the rows are prefill),
+        False never does.
+        """
         launches = self.a4_prefill
         if (
             launches is None
-            or int(tokens) < launches.min_tokens
+            or force is False
+            or (force is None and int(tokens) < launches.min_tokens)
             or int(tokens) > launches.tokens
             or route_ids_dtype not in (torch.int32, torch.int64)
             or has_route_map
