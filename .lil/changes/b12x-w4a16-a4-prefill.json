@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-w4a16-a4-prefill",
+  "category": "feature",
+  "summary": "Opt-in faster W4A16 MoE prefill: NVFP4 activations for large calls over the same packed weights",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Opt-in through B12X_W4A16_A4_PREFILL_MIN_TOKENS; without it nothing changes. The weights must be prepared with calibrated activation scales. B12X_W4A16_A4_PREFILL_TERMS=2 (value plus residual planes) and B12X_W4A16_A4_PREFILL_WARPS=16 are experiments.",
+  "details": [
+    "W4A16 MoE calls of at least B12X_W4A16_A4_PREFILL_MIN_TOKENS tokens run with NVFP4 activations over the packed W4A16 weights (no second weight copy); smaller calls, i.e. decode, stay on the exact W4A16 path.",
+    "GLM-5.3-Flash stored QAD CSF checkpoint, TP2/DCP2 MTP3 on 2x RTX PRO 6000 Max-Q with a 1536-token threshold: prefill 9,528 and 9,784 tok/s at 8K and 32K tokens versus 7,490 and 7,728 for W4A16 (+27%), decode unchanged; needle-checksum near misses 1.75% versus 0.53% for W4A16.",
+    "B12X_W4A16_A4_PREFILL_TERMS=2 adds an NVFP4 residual plane: +13% prefill and 1.85% near misses on the same setup, so it brings no quality gain there."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    472
+  ],
+  "requires": [
+    "b12x-w4a16-csf-stage-scales"
+  ]
+}
