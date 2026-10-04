@@ -13,7 +13,9 @@
   "authors": [
     "voipmonitor"
   ],
-  "pull_requests": [],
+  "pull_requests": [
+    473
+  ],
   "requires": [
     "b12x-w4a16-a4-prefill"
   ]
