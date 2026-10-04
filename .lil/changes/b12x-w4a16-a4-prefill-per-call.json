@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-w4a16-a4-prefill-per-call",
+  "category": "feature",
+  "summary": "The W4A16 A4 prefill can be chosen per call instead of by call size",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Callers that do not choose keep the B12X_W4A16_A4_PREFILL_MIN_TOKENS threshold.",
+  "details": [
+    "bind(..., a4_prefill=True) takes the NVFP4-activation prefill for any call within the prepared capacity and a4_prefill=False keeps a call on W4A16, so an integration can run prefill rows A4 and decode rows W4A16 whatever their count. Weights without calibrated activation scales stay W4A16."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    476
+  ],
+  "requires": [
+    "b12x-w4a16-a4-prefill"
+  ]
+}
