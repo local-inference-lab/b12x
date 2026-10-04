@@ -201,6 +201,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "quant_modes": tuple(plan.quant_modes), "source_format": plan.source_format,
         "nvfp4_inline_scales": plan.nvfp4_inline_scales,
         "w4a16_compressed_scales": plan.w4a16_compressed_scales,
+        "w4a8_csf_inline": plan.w4a8_csf_inline,
         "activation": plan.activation, "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts, "hidden_size": plan.hidden_size,
         "intermediate_size": plan.intermediate_size, "w13_layout": plan.w13_layout,
@@ -635,6 +636,9 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             and quant_mode == "nvfp4"
             and plan.decode_config.nvfp4_inline_scales
         ),
+        "w4a8_csf_inline": bool(
+            n64_repacked and getattr(caps.weight_plan, "w4a8_csf_inline", False)
+        ),
     }
 
 
@@ -643,6 +647,8 @@ class _CompactLaunches:
     kernels: object
     quantize: object
     topk_sum: object
+    # The kernels read inline MXFP4-CSF scale storage (mxfp4_csf_inline).
+    csf_inline: bool = False
 
 
 def _compact_launches(plan, caps):
@@ -663,18 +669,22 @@ def _compact_launches(plan, caps):
     quantize = _get_compiled_mxfp8_rows_quant(
         plan.k, torch.bfloat16, subgroup, threads, "linear", device_ordinal=ordinal, sm_count=sms,
     )
+    csf_inline = bool(getattr(caps.weight_plan, "w4a8_csf_inline", False))
     kernels = {
         dtype: _compiled_direct_w4a8_compact(
             ordinal, m, plan.num_topk, plan.k, plan.n, plan.weight_E, dtype,
             plan.weight_E, plan.weight_E, plan.swiglu_limit, caps.w4a16_fast_math,
+            csf_inline,
         ) for dtype in (torch.int32, torch.int64)
     }
     # The compact kernels write router-weighted routes: an unweighted sum.
     topk_sum = compile_w4a16_topk_sum(
         m=m, topk=plan.num_topk, hidden_size=plan.k, apply_topk_weights=False
     )
-    return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
-                           tuple(kernels.values()), quantize, topk_sum)
+    return attach_programs(
+        _CompactLaunches(MappingProxyType(kernels), quantize, topk_sum, csf_inline),
+        tuple(kernels.values()), quantize, topk_sum,
+    )
 
 
 def _program_carriers(
@@ -772,6 +782,7 @@ def _program_carriers(
                 swiglu_beta=plan.swiglu_beta, trellis_bits=caps.weight_plan.trellis_bits or 0,
                 trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
+                w4a8_csf_inline=dynamic["w4a8_csf_inline"],
             )
             launches.append(launch)
         if plan.deterministic_output:
