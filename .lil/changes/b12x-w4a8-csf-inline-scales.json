@@ -2,14 +2,15 @@
   "schema": "local-inference-release-change/v1",
   "id": "b12x-w4a8-csf-inline-scales",
   "category": "performance",
-  "summary": "Faster W4A8 MoE on MXFP4-CSF checkpoints: compact W4A8 kernels read the compressed expert scales inline",
+  "summary": "DeepSeek-V4.1-Flash on the lossless MXFP4-CSF checkpoint decodes 3-4% faster, as fast as the uncompressed checkpoint: compact W4A8 kernels read the compressed expert scales inline",
   "models": [
     "DeepSeek-V4.1-Flash"
   ],
-  "compatibility": "No user action required. B12X_W4A8_CSF_INLINE=0 at weight preparation restores the per-call scale expansion.",
+  "compatibility": "No user action required. B12X_W4A8_CSF_INLINE=0 at weight preparation restores the per-call scale expansion; B12X_W4A8_CSF_INLINE_MAX_TOKENS (default 1536) sets the largest planned call that reads inline scales.",
   "details": [
-    "Compact W4A8 MoE kernels (intermediate size 64 mod 128: micro FC1/FC2 and split M16 FC1/FC2) stage 96-byte compressed scale tiles and rebuild each thread's E8M0 scale words in registers, so no routed-expert scale expansion runs before the MoE; outputs are bit-identical.",
-    "DeepSeek-V4.1-Flash TP4 MoE layer (384 experts, top-6) on one RTX PRO 6000, real checkpoint layers: 8 tokens 9% faster than the per-call expansion (3% faster than uncompressed scales), 64 and 128 tokens 9-10% faster (2-4% faster than uncompressed scales)."
+    "Compact W4A8 MoE kernels (intermediate size 64 mod 128: micro FC1/FC2 and split M16 FC1/FC2) stage 96-byte compressed scale tiles and rebuild each thread's E8M0 scale words in registers, so calls planned for up to 1536 tokens run no routed-expert scale expansion. Larger, compute-bound calls expand every expert's scales once from the same storage and run the native kernels. Outputs are bit-identical.",
+    "DeepSeek-V4.1-Flash TP4 with DSpark on four RTX PRO 6000 Max-Q, lossless CSF checkpoint, against the per-call expansion: decode C8 816 vs 787, C16 1,108 vs 1,069, C32 1,645 vs 1,581 tok/s (the uncompressed checkpoint: 807, 1,105, 1,612); 8K/32K prefill unchanged. KV cache 12.79M tokens vs 13.11M (inline storage 0.33 GiB per GPU) and 9.73M uncompressed.",
+    "The inline storage is built outside the caller's allocator pool: built inside it under vLLM's load-time allocator settings, it kept about 1 GiB per GPU of freed pages mapped."
   ],
   "authors": [
     "voipmonitor"
