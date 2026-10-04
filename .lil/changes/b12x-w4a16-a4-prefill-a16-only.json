@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-w4a16-a4-prefill-a16-only",
+  "category": "fix",
+  "summary": "The A4 prefill option no longer changes the input scales of FP4-activation MoE plans",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Only matters with B12X_W4A16_A4_PREFILL_MIN_TOKENS set; W4A16 plans behave as before.",
+  "details": [
+    "With B12X_W4A16_A4_PREFILL_MIN_TOKENS set, weight preparation reduced the input scale to the smallest expert scale for every MoE plan, so FP4-activation (W4A4) plans would have quantized all experts with the widest calibrated range. The option now applies to W4A16 plans only."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    473
+  ],
+  "requires": [
+    "b12x-w4a16-a4-prefill"
+  ]
+}

@@ -13182,10 +13182,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     topk_ids = binding.topk_ids
     if experts.mxfp4_csf is not None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
-    # The A4 prefill path reads expanded (W4A16-layout) scales.
+    # The A4 prefill path (when present) reads expanded (W4A16-layout) scales.
     stage_scales = (
         experts.w4a16_expanded is not None
-        and binding.a4_prefill_launches is None
+        and getattr(binding, "a4_prefill_launches", None) is None
         and _w4a16_reads_stage_scales(binding, topk_ids.shape[0])
     )
     csf_reset_barriers = (

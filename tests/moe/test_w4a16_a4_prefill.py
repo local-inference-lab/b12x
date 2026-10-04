@@ -234,6 +234,30 @@ def test_a4_prefill_threshold_and_scale_gating(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a4_prefill_option_leaves_fp4_activation_plans_alone(monkeypatch):
+    """The option keeps calibrated scales for W4A16 weights only: an FP4-activation
+    plan prepares the same per-expert input scales with or without it."""
+    require_b12x()
+    from b12x.moe import fused_moe as moe
+
+    case = _make_case(13)
+    a1g, a2g = _scales(case)
+    a1g = a1g * torch.linspace(0.9, 1.1, E, device=a1g.device)
+    case["plan"] = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=moe.ActivationSpec(mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16),
+        geometry=moe.MoEGeometry(num_experts=E, hidden_size=H, intermediate_size=I),
+    )
+    _env(monkeypatch, 0, 1)
+    without = _prepare(case, a1g, a2g)._impl
+    _env(monkeypatch, 128, 1)
+    with_option = _prepare(case, a1g, a2g)._impl
+    assert not with_option.a4_prefill_scales
+    assert torch.equal(without.a1_gscale, with_option.a1_gscale)
+    assert torch.equal(without.a2_gscale, with_option.a2_gscale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("terms", [1, 2])
 def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
     require_b12x()
