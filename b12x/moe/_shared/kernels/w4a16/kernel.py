@@ -427,6 +427,9 @@ _W4A16_REGS_SM121 = {
     (256, 1, 32, 2, True): 118,
     (128, 1, 4, 8, True): 118,
     (128, 1, 8, 4, True): 120,
+    # K32 FC2 tile of intermediate sizes 32 mod 64 (2048/TP6 = 352): one warp
+    # row of four 64-column warps, the per-warp work of the N64/K128 tile.
+    (128, 1, 16, 2, True): 128,
     (256, 1, 8, 8, False): 158,
     # The wide-N single-route tile is already above the one-CTA/SM register
     # threshold in the narrower N=128 schedule. The architectural cap keeps
@@ -434,6 +437,10 @@ _W4A16_REGS_SM121 = {
     (256, 1, 16, 4, False): 255,
     (128, 1, 4, 8, False): 154,
     (128, 1, 8, 4, False): 143,
+    (128, 1, 16, 2, False): 160,
+    (128, 2, 16, 2, False): 220,
+    (128, 3, 16, 2, False): 255,
+    (128, 4, 16, 2, False): 255,
     (256, 2, 16, 4, False): 212,
     (128, 2, 4, 8, False): 215,
     (128, 2, 8, 4, False): 214,
@@ -468,6 +475,11 @@ _LARGE_BATCH_TILE_CONFIGS = (
     (64, 128, 128),
     (128, 64, 128),
 )
+# Packed NVFP4 shards whose K is 32 mod 64 (FC2 of 2048/TP6 = 352 channels)
+# have no dividing K64/K128 tile. They fall back to whole K32 stages; the
+# 128-thread tile pairs with the N64/K128 FC1 tile of the same shard.
+_K32_FALLBACK_TILE_CONFIGS = ((32, 256, 128),)
+_K32_TILE_SCALE_FORMATS = ("e4m3_k16", _CSF_SCALE_FORMAT)
 
 
 def _covering_count(total: int, quantum: int) -> int:
@@ -765,6 +777,7 @@ def _candidate_tile_fits(
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
     allow_qualified_fc2_tile: bool = False,
+    allow_k32_tile: bool = False,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
     small_m_occupancy: int | None = None,
@@ -802,10 +815,20 @@ def _candidate_tile_fits(
         and int(tile_n) == 512
         and int(cta_threads) == 256
     )
+    # Packed NVFP4 K that is 32 mod 64 has no dividing K64 tile; whole K32
+    # stages with two K16 steps per warp (N = 2 x cta_threads) cover it.
+    k32_tile = (
+        allow_k32_tile
+        and weight_layout == "packed"
+        and _normalize_scale_format(scale_format) in _K32_TILE_SCALE_FORMATS
+        and int(tile_k) == 32
+        and int(problem_k) % 64 == 32
+        and int(tile_n) == 2 * int(cta_threads)
+    )
     if (
         int(tile_n) < 64
         or int(cta_threads) < 128
-        or (int(tile_k) < 64 and not wide_n_fc2_tile)
+        or (int(tile_k) < 64 and not (wide_n_fc2_tile or k32_tile))
     ):
         return False
     smem_bytes = _shared_memory_footprint(
@@ -845,7 +868,14 @@ def _select_tile_config(
     )
     best_occupancy = 0
     best_tile_config: tuple[int, int, int, int] | None = None
-    for tile_k, tile_n, cta_threads in configs:
+    candidates = tuple((config, False) for config in configs)
+    if (
+        weight_layout == "packed"
+        and not allow_logical_tail
+        and int(problem_k) % 64 == 32
+    ):
+        candidates += tuple((config, True) for config in _K32_FALLBACK_TILE_CONFIGS)
+    for (tile_k, tile_n, cta_threads), k32_fallback in candidates:
         if required_cta_threads is not None and int(cta_threads) != int(
             required_cta_threads
         ):
@@ -863,6 +893,7 @@ def _select_tile_config(
             weight_bits=weight_bits,
             allow_logical_tail=allow_logical_tail,
             small_m_occupancy=small_m_occupancy,
+            allow_k32_tile=k32_fallback,
         ):
             continue
         occupancy_problem_n = (
@@ -1683,6 +1714,15 @@ class W4A16GemmKernel:
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
         row = i // Int32(self.a_gl_rd_delta_o)
+        if cutlass.const_expr(self.a_gl_rd_delta_o < 8):
+            # K32 rows hold four 16-byte vectors: an XOR with row & 7 would
+            # leave the row (colliding rows 7 and 8 and overrunning the
+            # stage). Pairs of rows share one 128-byte line, so XOR the
+            # vector with the pair index to keep ldmatrix conflict free.
+            return Int32(self.a_gl_rd_delta_o) * row + (
+                (i - row * Int32(self.a_gl_rd_delta_o))
+                ^ ((row >> Int32(1)) & Int32(self.a_gl_rd_delta_o - 1))
+            )
         return Int32(self.a_gl_rd_delta_o) * row + (
             (i - row * Int32(self.a_gl_rd_delta_o)) ^ (row & Int32(7))
         )
@@ -10701,6 +10741,7 @@ def compile_w4a16_fused_moe(
                 weight_bits=weight_bits,
                 allow_logical_tail=allow_native_logical_tail,
                 allow_qualified_fc2_tile=name == "fc2",
+                allow_k32_tile=name == "fc2",
                 uses_m_block_8=moe_block_size == 8,
                 pipeline_stages=pipeline_stages,
                 small_m_occupancy=small_m_occupancy,
