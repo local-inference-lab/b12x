@@ -343,7 +343,7 @@ def _expand_tiles(
     TILES: tl.constexpr,
 ):
     """Native words of ``TILES`` tile blocks: rows are tiles, columns are slots."""
-    index = tl.program_id(0) * TILES + tl.arange(0, TILES)
+    index = tl.program_id(0).to(tl.int64) * TILES + tl.arange(0, TILES)
     live = index < total
     expert, tile = index // TILES_PER_EXPERT, index % TILES_PER_EXPERT
     block, k_tile = tile // K_TILES, tile % K_TILES
@@ -374,7 +374,7 @@ def _expand_tiles(
         value = ((patch >> 16) & 255).to(tl.uint32) << shift
         hit = active[:, None] & (slot == (patch & 127))
         word = tl.where(hit, (word & ~(tl.full((), 255, tl.uint32) << shift)) | value, word)
-    raw_tile = (RAW_WORDS + (header & 0x7FFFFFFF) * 128)[:, None]
+    raw_tile = (RAW_WORDS + (header.to(tl.int64) & 0x7FFFFFFF) * 128)[:, None]
     raw = tl.load(Words + raw_tile + slot, (live & heavy)[:, None], 0)
     word = tl.where(heavy[:, None], raw.to(tl.uint32), word)
     row = (slot // 32) * 32 + (slot % 4) * 8 + (slot // 4) % 8
@@ -439,6 +439,8 @@ def expand_mxfp4_csf_inline(plane: Mxfp4CsfInlinePlane, native: torch.Tensor) ->
         raise TypeError("inline W4A8 expansion requires contiguous uint8 storage")
     if native.shape != (plane.num_experts, plane.rows * plane.columns):
         raise ValueError("inline W4A8 expansion target does not match the plane")
+    if native.device != plane.storage.device:
+        raise ValueError("inline W4A8 expansion storage must share one device")
     from b12x._lib.compile_plan import launch_triton
 
     payload = expansion_payload(plane)

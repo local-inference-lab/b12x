@@ -274,3 +274,19 @@ def test_build_does_not_strand_allocator_pages():
         text=True,
     )
     assert int(completed.stdout.strip().splitlines()[-1]) < 40 << 20
+
+
+def test_expansion_writes_experts_past_signed_32bit_byte_offsets():
+    device = require_b12x()
+    experts, rows, columns = 32769, 128, 512
+    blocks, k_tiles = inline.inline_geometry(rows, columns, rows)
+    tiles_bytes = experts * blocks * k_tiles * inline.TILE_BYTES
+    bases_bytes = experts * blocks * inline.BASE_BYTES
+    storage = torch.zeros(tiles_bytes + bases_bytes, dtype=torch.uint8, device=device)
+    storage[tiles_bytes:].fill_(127)
+    plane = inline.Mxfp4CsfInlinePlane(storage, experts, rows, columns, rows, 0)
+    native = torch.zeros(experts, rows * columns, dtype=torch.uint8, device=device)
+    assert (experts - 1) * rows * columns >= 2**31
+    inline.expand_mxfp4_csf_inline(plane, native)
+    torch.cuda.synchronize()
+    assert bool((native == 127).all())

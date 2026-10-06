@@ -690,8 +690,8 @@ def prepare_weights(
             if _w4a8_csf_inline(plan):
                 # The scratch now holds every expert's native scales. Keep them
                 # as inline storage that the compact W4A8 kernels read per
-                # pipeline stage: no call expands scales into the scratch, which
-                # remains only the canonical (unread) scale storage.
+                # pipeline stage. Larger planned capacities expand this storage
+                # into the shared scratch before execution.
                 from b12x._lib.quant.mxfp4_csf_inline import build_mxfp4_csf_inline
 
                 inline = tuple(

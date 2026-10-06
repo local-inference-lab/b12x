@@ -101,6 +101,7 @@ def _control_snapshot() -> FrozenMapping:
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
@@ -271,6 +272,12 @@ def _lower_caps(
                             if config.w4a16_block_size_m is not None
                             else query.w4a16_block_size_m),
         w4a16_fast_math=query.fast_math,
+        w4a8_csf_inline=bool(
+            weight_plan.w4a8_csf_inline
+            and (config.backend != "dynamic" or query.num_tokens <= int(
+                query.controls.get("w4a8_csf_inline_max_tokens", 1536)
+            ))
+        ),
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
@@ -565,8 +572,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         ),
         "w4a8_csf_inline": bool(
             n64_repacked
-            and getattr(caps.weight_plan, "w4a8_csf_inline", False)
-            and _impl._w4a8_reads_inline_scales(plan.routed_rows // plan.num_topk)
+            and caps.w4a8_csf_inline
         ),
     }
 
@@ -1014,7 +1020,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                         "b12x.moe.fused_moe._preparation:compile_inline_scale_expansion",
                         payload, device.ordinal,
                     )
-                    for payload in _inline_expansion_payloads(launch_plan, mx_inline)
+                    for payload in _inline_expansion_payloads(launch_plan, mx_inline, caps)
                 ),
             )
 
@@ -1052,7 +1058,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             )
             launchers.extend(
                 compile_inline_scale_expansion(payload, device.ordinal)
-                for payload in _inline_expansion_payloads(scratch.launch_plan, mx_inline)
+                for payload in _inline_expansion_payloads(scratch.launch_plan, mx_inline, caps)
             )
             launchers = tuple(launchers)
             carrier_tree = attach_programs(scratch, *launchers)
@@ -1119,14 +1125,12 @@ def _dynamic_route_plan_payloads(plan, caps):
     )
 
 
-def _inline_expansion_payloads(plan, inline):
+def _inline_expansion_payloads(plan, inline, caps):
     """Inline MXFP4-CSF plane expansions a launch plan above the inline limit runs."""
-    from . import _impl
-
     if (
         inline is None
         or plan.implementation != "dynamic"
-        or _impl._w4a8_reads_inline_scales(plan.routed_rows // plan.num_topk)
+        or caps.w4a8_csf_inline
     ):
         return ()
     from b12x._lib.quant.mxfp4_csf_inline import expansion_payload

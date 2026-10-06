@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -37,6 +38,8 @@ sys.path.insert(0, str(ROOT))
 from b12x._lib.quant.x4t_scales import make_x4t_scale_batch  # noqa: E402
 from b12x.moe import fused_moe as moe  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
+from b12x.preparation._measurement import _prepare_race, measure_race_steps  # noqa: E402
+from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_w4a8_mx  # noqa: E402
 
 
 def synthetic_planes(rng, experts, rows, columns, exceptions, dense_rows, device):
@@ -112,8 +115,8 @@ def main() -> None:
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--rank", type=int, default=0)
-    parser.add_argument("--replays", type=int, default=20, help="calls per captured graph")
-    parser.add_argument("--rounds", type=int, default=50, help="interleaved timed replays")
+    parser.add_argument("--replays", type=int, default=20, help="samples per balanced timing round")
+    parser.add_argument("--rounds", type=int, default=15, help="balanced cold-L2 timing rounds")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     device = torch.device("cuda")
@@ -159,7 +162,6 @@ def main() -> None:
             ),
         )
     os.environ.pop("B12X_W4A8_CSF_INLINE")
-    del w13, w2
     stored = arms["inline"]._impl.mxfp4_csf_inline
     assert stored is not None and arms["expand"]._impl.mxfp4_csf is not None
     native_bytes = sum(g.numel() for g in grids)
@@ -179,6 +181,10 @@ def main() -> None:
             [torch.randperm(e, device=device)[: args.topk] for _ in range(tokens)]
         ).to(torch.int32)
         weights = torch.softmax(torch.randn(tokens, args.topk, device=device), dim=-1).float()
+        reference = moe_reference_w4a8_mx(
+            x, w13, grids[0], None, one, w2, grids[1], None, one,
+            ids, weights, e, h, n, w13_layout=args.w13_layout,
+        )
         plans = {
             name: moe.plan_execution(
                 experts=experts,
@@ -223,8 +229,7 @@ def main() -> None:
             for name, binding in bindings.items():
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    for _ in range(args.replays):
-                        moe.run(binding=binding)
+                    moe.run(binding=binding)
                 graphs[name] = graph
             for graph in graphs.values():
                 graph.replay()
@@ -232,22 +237,47 @@ def main() -> None:
             for name in ("expand", "inline"):
                 if not torch.equal(outputs[name].view(torch.int16), outputs["native"].view(torch.int16)):
                     raise AssertionError(f"{name} output differs from native")
-            samples = {name: [] for name in graphs}
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            for _ in range(args.rounds):
-                for name, graph in graphs.items():
-                    start.record()
+            oracle_metrics = {}
+            for name, output in outputs.items():
+                assert torch.isfinite(output).all() and torch.count_nonzero(output)
+                metrics = compare_to_reference(output, reference)
+                assert metrics.cos >= 0.9975, (name, metrics)
+                oracle_metrics[name] = vars(metrics)
+            for _ in range(150):
+                for graph in graphs.values():
                     graph.replay()
-                    end.record()
-                    end.synchronize()
-                    samples[name].append(start.elapsed_time(end) * 1000 / args.replays)
+            for output in outputs.values():
+                output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            for graph in graphs.values():
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            for name, output in outputs.items():
+                assert torch.isfinite(output).all() and torch.count_nonzero(output)
+                assert torch.equal(output.view(torch.int16), outputs["native"].view(torch.int16))
+            calls = tuple(PreparedCall(run=graph.replay, produce=lambda: None,
+                                      owners=(graph, bindings, owners)) for graph in graphs.values())
+            race = _prepare_race(calls, device_ordinal=torch.cuda.current_device(),
+                                 samples=args.replays, primed=True)
+            raw_rounds, seen = [], 0
+            try:
+                for _ in measure_race_steps(race, device_ordinal=torch.cuda.current_device(), rounds=args.rounds):
+                    if race.completed_rounds != seen:
+                        seen = race.completed_rounds
+                        raw_rounds.append(tuple(race.latest_round_us))
+                if race.completed_rounds != seen:
+                    raw_rounds.append(tuple(race.latest_round_us))
+            finally:
+                race.close()
+            samples = {name: [row[i] for row in raw_rounds] for i, name in enumerate(graphs)}
             for graph in graphs.values():
                 graph.reset()
         row = {
             "tokens": tokens,
             "backend": backends,
             **{name: statistics.median(v) for name, v in samples.items()},
-            "samples_us": samples,
+            "samples_us": samples, "oracle_metrics": oracle_metrics,
         }
         results.append(row)
         print(
@@ -260,7 +290,12 @@ def main() -> None:
     if args.json:
         args.json.write_text(json.dumps(
             {"args": {k: str(v) for k, v in vars(args).items()},
-             "device": torch.cuda.get_device_name(), "results": results},
+             "device": torch.cuda.get_device_name(), "results": results,
+             "uuid": str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
+             "torch": torch.__version__, "cuda": torch.version.cuda,
+             "source": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+             "diff": subprocess.check_output(["git", "diff", "--binary"], text=True),
+             "method": "balanced cold-L2 graph replay using preparation timing; lower microseconds is better"},
             indent=1,
         ))
 

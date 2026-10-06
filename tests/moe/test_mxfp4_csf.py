@@ -270,7 +270,7 @@ def _assert_bitwise(expected, actual):
     ],
 )
 def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
-    h, n, tokens, layout, ids_dtype, monkeypatch
+    h, n, tokens, layout, ids_dtype, monkeypatch, after_plan=None
 ):
     """Inline reads equal native scales and per-call expansion bit for bit.
 
@@ -302,6 +302,8 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
         )
         for owner in arms
     ]
+    if after_plan is not None:
+        after_plan()
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
@@ -483,6 +485,7 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
         )
         for owner in (native, inline)
     ]
+    monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536)
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
@@ -565,3 +568,13 @@ def test_inline_requires_compact_split_kernels():
         W4A8MaterializedPhase1Kernel(source_tile_m=16, csf_inline=True)
     with pytest.raises(ValueError):
         W4A8MaterializedPhase2Kernel(source_tile_m=16, csf_inline=True)
+
+
+def test_inline_capacity_control_is_retained_after_declaration(monkeypatch):
+    from b12x.moe.fused_moe import _impl
+
+    monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536)
+    test_inline_scales_match_native_and_expansion_under_poisoned_replay(
+        1024, 320, 17, "w31", torch.int32, monkeypatch,
+        after_plan=lambda: monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0),
+    )

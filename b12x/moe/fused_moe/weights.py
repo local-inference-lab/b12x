@@ -243,8 +243,9 @@ class Mxfp4CsfWeights:
     Buffers may be shared only by serialized layer executions on one CUDA
     stream. Concurrent model execution lanes require separate buffers.
     Compact W4A8 preparation (intermediate size 64 mod 128) uses the buffers
-    once while it builds inline scale storage; its calls never read or write
-    them (B12X_W4A8_CSF_INLINE=0 keeps the per-call expansion).
+    once to build inline storage. Plans above the inline capacity expand into
+    those buffers before each call; smaller plans read inline storage directly.
+    B12X_W4A8_CSF_INLINE=0 keeps routed-expert expansion at all capacities.
     """
 
     w13: torch.Tensor

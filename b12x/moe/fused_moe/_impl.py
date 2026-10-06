@@ -849,6 +849,7 @@ class TPMoEScratchCaps:
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
     w4a16_prefill_fused_sum: bool | None = None
+    w4a8_csf_inline: bool = False
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -1155,7 +1156,10 @@ class TPMoEScratchPlan:
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
         )
-        return replace(binding, scales_expanded=True) if scales_expanded else binding
+        return replace(
+            binding, scales_expanded=bool(scales_expanded),
+            w4a8_csf_inline=self.caps.w4a8_csf_inline,
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1252,6 +1256,7 @@ class TPMoEFP4Binding:
     route_pack_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
+    w4a8_csf_inline: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
 
@@ -12857,17 +12862,8 @@ def _finalize_trellis_output(
 W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
 
 
-# Token capacity up to which compact W4A8 kernels read MXFP4-CSF scales inline.
-# Larger calls are compute bound: rebuilding scale words in every stage costs
-# more than expanding every expert's scales once (DeepSeek-V4.1 TP4 MoE layer:
-# inline -7 to -10% against the expansion up to 1024 tokens, +2.5 to +6% at
-# 2048 and 4096).
+# Planned token capacity limit for compact W4A8 inline scale reads.
 W4A8_CSF_INLINE_MAX_TOKENS = int(os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536"))
-
-
-def _w4a8_reads_inline_scales(tokens: int) -> bool:
-    """Whether a compact W4A8 plan of this token capacity reads inline scales."""
-    return int(tokens) <= W4A8_CSF_INLINE_MAX_TOKENS
 
 
 def _w4a16_reads_stage_scales(binding, tokens: int) -> bool:
@@ -12934,7 +12930,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     if (
         csf_inline is not None
         and binding.implementation == "dynamic"
-        and not _w4a8_reads_inline_scales(plan.routed_rows // plan.num_topk)
+        and not binding.w4a8_csf_inline
     ):
         # Plans above the inline limit run the native kernels over every
         # expert's scales, expanded once from the inline storage.
