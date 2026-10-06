@@ -13,6 +13,7 @@ from b12x._lib.quant.nvfp4_csf_packed import (
     PackedCsfPlane,
     build_packed_csf_scales,
     expand_packed_csf_scales,
+    inline_words,
     packed_slab_position,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import _process_nvfp4_packed_scales
@@ -170,7 +171,7 @@ def test_records_spill_past_their_inline_words():
     logical = _logical_scales(experts, rows, columns, 9, outliers=0.5)
     batch = repack_nvfp4_csf_batch(_native_batch(logical, device), row_rotation=0, value_lut=lut)
     scales = build_packed_csf_scales(batch)
-    assert scales.max_atom_words > 24
+    assert scales.max_atom_words > inline_words(scales.slab_rows)
     assert torch.equal(
         expand_packed_csf_scales(scales), _w4a16_scale_bytes(logical, lut, 0).to(device)
     )
