@@ -52,6 +52,29 @@ Conversion to global byte addresses uses Int64. Preparation rejects a stream
 requiring 2^32 replacement-word indices. None of these offsets changes the
 checkpoint's row-relative scale bases or exception encoding.
 
+## Indexed complete-plane expansion
+
+Micro execution and dynamic configurations that require complete scale planes
+can use the prepared exception-word index for short route lists. Each 256-thread
+CTA covers 4096 output bytes. A thread reconstructs four adjacent uint32 words
+from one eight-byte code load and one four-byte row-base load, then writes one
+aligned sixteen-byte vector. Matrix dimensions guarantee that even the last
+active vector is complete; inactive threads in a partial CTA perform no read
+or write.
+
+Each vector lies within one 32-word bitmap group. The thread reads that bitmap
+once. If any of its four words require replacement, one prefix/popcount lookup
+locates the first replacement; predicated reads advance through the selected
+words in order. No arithmetic is performed on exception bytes. Expert-scaled
+fixed-stream, metadata, replacement and output addresses use Int64.
+
+Repeated routes are rejected before reconstruction, so only one route owns an
+expert's output region. Fused barrier reset and route mutation remain valid
+under allocation-free graph replay. The byte tests include empty and dense
+exceptions, partial CTAs, invalid and repeated int64 routes, and an expert whose
+fixed stream lies beyond 2 GiB and output begins at 4 GiB. Checkpoint storage,
+prepared buffers, launch grids and preparation selection contracts are unchanged.
+
 ## Operand staging
 
 The native shared scale slot remains 1024 bytes:
@@ -76,6 +99,23 @@ a second barrier precedes native fragment loads. Shared-memory PTX reads declare
 side effects and a memory clobber because the same address contains different
 operands on successive pipeline iterations.
 
+When two operands are ready together, consumers retain both operands before
+either slot is overwritten and use the same two barriers for the pair. This
+applies to fused gate/up computation and to a gate whose row range straddles
+two 128-row atoms. A 64-row gate boundary requires only the upper half of the
+first atom and the lower half of the second atom; those halves are reconstructed
+in their native positions. Unused rows remain compressed and are outside that
+MMA's load range. Every consumer reaches both barriers, including consumers
+without a word to reconstruct in a half operand.
+
+For a partial K operand, the shared reader reconstructs a word from the staged
+bytes and selects zero when its atom has the invalid marker. The selection is
+part of the same PTX operation, using its existing metadata address. Padded
+atoms have zero codes and exception masks, so reconstruction cannot access an
+exception record before the zero selection. Complete operands omit this check
+at compilation. This removes a separate validity branch from partial-geometry
+scale reads without changing the native padded values.
+
 ## Complete-plane expansion for short routes
 
 When preparation selects complete-plane expansion, route lists shorter than
@@ -93,5 +133,7 @@ layer would violate this memory contract.
 
 The [serving report](nvfp4-serving.md) records the component qualification,
 whole-model measurements, prepared-memory cost and residual overhead.
+The [Qwen TP1/TP2 report](qwen-serving.md) qualifies paired reconstruction,
+split-gate halves, and partial-atom zero selection against matched native controls.
 [Dynamic MoE invariants](dynamic-moe-correctness.md) records independent native
 routing/addressing fixes included in the measured source.
