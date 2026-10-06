@@ -209,6 +209,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "quant_modes": tuple(plan.quant_modes), "source_format": plan.source_format,
         "nvfp4_inline_scales": plan.nvfp4_inline_scales,
         "w4a16_compressed_scales": plan.w4a16_compressed_scales,
+        "w4a16_csf_inline_words": plan.w4a16_csf_inline_words,
         "w4a8_csf_inline": plan.w4a8_csf_inline,
         "activation": plan.activation, "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts, "hidden_size": plan.hidden_size,
