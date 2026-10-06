@@ -383,6 +383,63 @@ def test_cuda_storage_rejects_and_closes_a_mismatched_region():
     assert region.closed == 1
 
 
+@pytest.mark.parametrize("failure", ["allocate", "validate", "cleanup"])
+def test_cuda_storage_closes_all_regions_after_allocation_failure(failure):
+    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
+    regions = []
+
+    def allocate(name, shape, dtype):
+        if name == "weight_scale" and failure == "allocate":
+            raise OSError("scale allocation failed")
+        region = _TrackedAllocation(MappedHostAllocation(shape, dtype, caps.device))
+        regions.append(region)
+        if name == "weight_scale":
+            region.host_view = region.host_view.reshape(-1)[:1]
+            if failure == "cleanup":
+                close = region.close
+
+                def failing_close():
+                    close()
+                    raise OSError("scale cleanup failed")
+
+                region.close = failing_close
+        return region
+
+    expected = OSError if failure == "allocate" else ValueError
+    with pytest.raises(expected, match="scale allocation failed|host_allocator returned weight_scale") as info:
+        layout.allocate_storage(host_allocator=allocate)
+    assert all(region.closed == 1 for region in regions)
+    if failure == "cleanup":
+        assert any("scale cleanup failed" in note for note in info.value.__notes__)
+
+
+def test_cuda_storage_close_attempts_every_region_once():
+    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
+    regions = []
+
+    def allocate(name, shape, dtype):
+        region = _TrackedAllocation(MappedHostAllocation(shape, dtype, caps.device))
+        regions.append(region)
+        if name == "weight_scale":
+            close = region.close
+
+            def failing_close():
+                close()
+                raise OSError("scale cleanup failed")
+
+            region.close = failing_close
+        return region
+
+    storage = layout.allocate_storage(host_allocator=allocate)
+    with pytest.raises(OSError, match="scale cleanup failed"):
+        storage.close()
+    assert [region.closed for region in regions] == [1, 1]
+    storage.close()
+    assert [region.closed for region in regions] == [1, 1]
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_cuda_prepared_execution_compiles_fullgraph(resources, quant_mode):

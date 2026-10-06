@@ -51,8 +51,18 @@ class TableStorage:
 
     def close(self) -> None:
         """Synchronize and release any mapped-host allocations."""
-        for allocation in reversed(self._mapped_allocations):
-            allocation.close()
+        allocations, self._mapped_allocations = self._mapped_allocations, ()
+        error = None
+        for allocation in reversed(allocations):
+            try:
+                allocation.close()
+            except BaseException as failure:
+                if error is None:
+                    error = failure
+                else:
+                    error.add_note(f"additional region cleanup failed: {failure!r}")
+        if error is not None:
+            raise error
 
 
 def _device_tensor(
@@ -124,19 +134,19 @@ def allocate_storage(
             )
         else:
             allocation = host_allocator(name, shape, dtype)
-            try:
-                _require_host_region(name, allocation, shape, dtype, caps.device)
-            except BaseException:
-                allocation.close()
-                raise
         allocations.append(allocation)
+        if host_allocator is not None:
+            _require_host_region(name, allocation, shape, dtype, caps.device)
         return allocation.device_view, allocation.host_view
 
     try:
         return _allocate_tables(layout, table_tensor, allocations)
-    except BaseException:
+    except BaseException as error:
         for allocation in reversed(allocations):
-            allocation.close()
+            try:
+                allocation.close()
+            except BaseException as cleanup:
+                error.add_note(f"region cleanup failed: {cleanup!r}")
         raise
 
 
