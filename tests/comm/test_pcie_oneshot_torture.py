@@ -709,3 +709,80 @@ def test_tp2_graph_rollover_clears_unused_shape_capacity(dtype_name, retained_ta
         _shape_growth_wrap_worker,
         args=(2, _free_port(), dtype_name, retained_tag), nprocs=2, join=True,
     )
+
+
+def _prepared_plain_worker(rank: int, world_size: int, port: int) -> None:
+    from b12x.comm.pcie._oneshot_preparation import (
+        _prepare_plain_call, plan, query_from_runtime,
+    )
+    from b12x.preparation import CollectiveRequirement, PreparationSession
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}",
+                            rank=rank, world_size=world_size)
+    pool = PCIeOneshotAllReducePool.from_process_group(
+        process_group=dist.group.WORLD, device=device,
+        max_input_bytes=128 * 1024, max_size=128 * 1024,
+        max_concurrent_channels=1,
+    )
+    streams = []
+    try:
+        pool.prepare_channels(tuple(
+            f"prepared:{dtype}:{elements}"
+            for dtype in (torch.float16, torch.bfloat16, torch.float32)
+            for elements in (8, 4096, 32768)
+        ))
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for elements in (8, 4096, 32768):
+                stream = torch.cuda.Stream(device=device)
+                streams.append(stream)
+                with torch.cuda.stream(stream):
+                    inp = torch.full((elements,), float(rank), dtype=dtype, device=device)
+                    out = torch.empty_like(inp)
+                    channel_id = f"prepared:{dtype}:{elements}"
+                    channel = pool.for_stream(channel_id=channel_id)
+                    query = query_from_runtime(
+                        channel, surface="OneshotAllReducePool.all_reduce", call={"inp": inp},
+                    )
+                    declaration = plan(query, runtime=channel)
+                    collective = CollectiveRequirement(key=channel_id, ranks=tuple(range(world_size)))
+                    with PreparationSession(device=device, autotune=False) as session:
+                        request = declaration.request(
+                            name=channel_id, collective=collective,
+                            prepare_call=lambda state: _prepare_plain_call(state, inp=inp, out=out),
+                        )
+                        result = session.prepare(
+                            (request,), coordinator=lambda progress: (
+                                collective.key if progress.ready_collectives else None
+                            ),
+                        )
+                        with result:
+                            for iteration in range(16):
+                                inp.fill_(rank + iteration)
+                                pool.all_reduce(inp, plan=declaration, out=out, channel_id=channel_id)
+                                torch.cuda.synchronize(device)
+                                _assert_constant(out, _rank_sum(world_size) + world_size * iteration)
+                            graph = torch.cuda.CUDAGraph()
+                            with pool.capture(channel_id=channel_id):
+                                with torch.cuda.graph(graph):
+                                    pool.all_reduce(inp, plan=declaration, out=out, channel_id=channel_id)
+                            with kernel_resolution_guard("prepared TP3 plain all-reduce replay"):
+                                for iteration in range(16):
+                                    inp.fill_(rank - iteration)
+                                    out.fill_(float("nan"))
+                                    graph.replay()
+                                    torch.cuda.synchronize(device)
+                                    _assert_constant(out, _rank_sum(world_size) - world_size * iteration)
+                    dist.barrier()
+    finally:
+        pool.close()
+        dist.destroy_process_group()
+
+
+def test_pcie_oneshot_prepared_plain_eager_and_graph():
+    world_size = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CUDA devices")
+    mp.spawn(_prepared_plain_worker, args=(world_size, _free_port()),
+             nprocs=world_size, join=True)
