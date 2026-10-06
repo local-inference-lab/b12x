@@ -310,8 +310,8 @@ def test_a16_stage_scales_reuse_the_planned_launch_for_live_counts():
             assert all(torch.all(buf.view(torch.uint8) == 0x7F) for buf in buffers)
 
 
-@pytest.mark.parametrize("activation_mode", ["a16", "a4"])
-def test_prefetched_scales_replace_the_per_call_expansion(activation_mode):
+@pytest.mark.parametrize("activation_mode,backend", [("a16", None), ("a4", None), ("a4", "dynamic")])
+def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backend):
     """expand_scales() fills the shared scratch for a later scales_expanded call."""
     from b12x.moe.fused_moe._impl import W4A16_CSF_STAGE_MAX_TOKENS
 
@@ -348,11 +348,17 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode):
         moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
     ]
     assert not moe.expand_scales(experts[0])
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    override = None if backend is None else MoeDecodeConfig(
+        backend="dynamic", route_planner="internal", max_active_clusters=None,
+        dynamic_tile_m=16, dynamic_route_mode="grouped", nvfp4_inline_scales=False,
+    )
     plans = [
         moe.plan_execution(
             experts=owner,
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
-            invocation={"fast_math": False},
+            invocation={"fast_math": False}, override=override,
             routing=moe.RoutingSpec(deterministic_output=True),
         )
         for owner in experts
@@ -399,16 +405,16 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode):
         poison = lambda: [b.view(torch.uint8).fill_(0x7F) for b in buffers]  # noqa: E731
         poison()
         stale = call(1, scales_expanded=True)
-        if activation_mode == "a4":
+        if activation_mode == "a4" and backend is None:
             # Small FP4-activation calls run the micro kernel, whose barrier
             # reset is fused into the expansion: they expand regardless.
             torch.testing.assert_close(stale, reference, rtol=0, atol=0)
-            return
-        # The flag skips the expansion: poisoned scales change the output ...
-        assert not torch.equal(stale, reference)
+        else:
+            assert not torch.equal(stale, reference)
         # ... and a prefetch on a side stream restores the native result.
         poison()
         side = torch.cuda.Stream(device)
+        side.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(side):
             assert moe.expand_scales(experts[1])
         torch.cuda.current_stream(device).wait_stream(side)
@@ -416,6 +422,27 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode):
         # Without the flag the call still expands its own routed experts.
         poison()
         torch.testing.assert_close(call(1), reference, rtol=0, atol=0)
+
+        output = torch.empty_like(source)
+        binding = moe.bind(
+            plans[1], a=source, topk_ids=ids, topk_weights=probabilities,
+            output=output, scratch=scratches[1], input_scales_static=True,
+            scales_expanded=True,
+        )
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            moe.expand_scales(experts[1])
+            moe.run(binding=binding)
+        for _ in range(3):
+            poison()
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        graph.reset()
 
 
 @pytest.mark.parametrize("declared,changed,tokens", [(64, 1536, 300), (1536, 0, 33)])

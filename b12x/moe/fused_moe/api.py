@@ -174,23 +174,25 @@ def run(*, binding: Binding):
 
 
 def expand_scales(experts: PreparedExperts) -> bool:
-    """Expand every expert's NVFP4-CSF scales into its scratch on the current stream.
+    """Expand every expert's NVFP4-CSF scales into its scratch on the experts' device stream.
 
     A later ``bind(..., scales_expanded=True)`` for these experts skips the
     per-call expansion. Callers that share one scratch across layers may run
     this for the next layer on a side stream while other work proceeds; they
     order it after the previous user of the scratch and before the bound call.
-    Returns False, doing nothing, for experts without compressed scales.
+    Micro-kernel calls still expand scales to reset their synchronization state.
+    Returns False, doing nothing, for experts without NVFP4-CSF scales.
     """
     impl = experts._impl
     decoder = getattr(impl, "nvfp4_csf", None)
     if decoder is None:
         return False
     expanded = impl.w4a16_expanded
-    if expanded is None:
-        decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
-    else:
-        decoder.decode_all(expanded.w13_scale, expanded.w2_scale)
+    with torch.cuda.device(experts.device):
+        if expanded is None:
+            decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
+        else:
+            decoder.decode_all(expanded.w13_scale, expanded.w2_scale)
     return True
 
 
