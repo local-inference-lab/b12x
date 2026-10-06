@@ -346,7 +346,7 @@ def quant_dequant_mxfp8_scaled_torch(
     blocked = x.to(torch.float32).reshape(-1, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
     block_max = blocked.abs().amax(dim=-1, keepdim=True)
     gs = torch.as_tensor(global_scale, dtype=torch.float32, device=x.device)
-    gs = gs.reshape(-1, 1) if gs.ndim else gs.reshape(1, 1)
+    gs = gs.reshape(-1, 1, 1)
     if gs.shape[0] not in (1, blocked.shape[0]):
         raise ValueError(
             f"global_scale has {gs.shape[0]} rows, expected 1 or {blocked.shape[0]}"

@@ -128,6 +128,8 @@ def _validate_e8m0_scale_grid(
     k: int,
 ) -> torch.Tensor:
     """Apply the canonical UE8M0 grid rule (dtype, extent, finite bytes)."""
+    if isinstance(scale, torch.Tensor):
+        scale = scale.contiguous()
     return validate_e8m0_scale_grid(
         scale,
         name=name,
