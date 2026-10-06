@@ -2,6 +2,8 @@
 
 - ``paged``: paged-KV self-attention (decode + extend, FP8 KV, MSA
   block-sparse variant) with on-device graph-replay metadata staging.
+- ``paged_decode``: warp-specialized split-KV paged decode/verify (192/128 or
+  128/128 heads, FP8 KV, sinks, windows, non-causal, ragged verify).
 - ``dense_mla``: dense compressed-cache MLA with strided physical records and
   optional causal sliding-window masking.
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
@@ -21,6 +23,7 @@ from typing import Any
 
 _OP_MODULES = (
     "paged",
+    "paged_decode",
     "dense_mla",
     "sparse_mla",
     "compressed_sparse_mla",

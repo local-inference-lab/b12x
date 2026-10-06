@@ -69,15 +69,19 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
 @pytest.mark.parametrize("fused_sum", [False, True])
 @pytest.mark.parametrize("mapped", [False, True])
 @pytest.mark.parametrize("capacity", [14, 129])
+@pytest.mark.parametrize("fp32_topk_weights", [False, True])
 def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
-    source_format, fused_sum, mapped, capacity, monkeypatch
+    source_format, fused_sum, mapped, capacity, fp32_topk_weights, monkeypatch
 ):
     """One declared capacity serves changed inputs and live lengths without JIT."""
     from b12x.moe import fused_moe
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x.preparation.types import require_prepared
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", str(int(fused_sum)))
+    monkeypatch.setenv("B12X_W4A16_FP32_TOPK_WEIGHTS", str(int(fp32_topk_weights)))
+    monkeypatch.setattr(w4a16_kernel, "_FP32_TOPK_WEIGHTS", fp32_topk_weights)
     torch.manual_seed(81281)
     experts, hidden, intermediate, topk = 8, 256, 192, 4
     x = (torch.randn(capacity, hidden, device="cuda") * 0.125).to(torch.bfloat16)
@@ -3379,6 +3383,84 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
     torch.cuda.synchronize()
 
     _assert_matches_oracle(buffers.output, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("fp32_topk_weights", [False, True])
+def test_w4a16_topk_combine_router_weight_precision(
+    monkeypatch: pytest.MonkeyPatch, fp32_topk_weights: bool
+) -> None:
+    """B12X_W4A16_FP32_TOPK_WEIGHTS=1 combines as bf16(sum_k w_k * bf16(y_k)).
+
+    By default FC2 multiplies each routed row by its router weight before the
+    BF16 store and the top-k sum adds the stored rows.  The opt-in stores the
+    unweighted BF16 expert rows and applies the FP32 weights inside the sum's
+    FP32 accumulation, the reference MoE combine.
+    """
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    monkeypatch.setattr(w4a16_kernel, "_FP32_TOPK_WEIGHTS", fp32_topk_weights)
+    torch.manual_seed(20260923)
+    experts, hidden_size, intermediate_size, topk, m = 8, 256, 128, 4, 24
+    activation = "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.stack(
+        [torch.randperm(experts, device="cuda")[:topk] for _ in range(m)]
+    ).to(torch.int32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    prepared = prepare_w4a16_weights(*weights, activation=activation, params_dtype=x.dtype)
+    buffers = make_w4a16_buffers(
+        prepared, m=m, topk=topk, dtype=x.dtype, device=x.device
+    )
+    out = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        fast_math=True,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+    )
+    torch.cuda.synchronize()
+    # FC2's BF16 rows, one per (token, route), are what the top-k sum reads.
+    routes = buffers.intermediate_cache13.reshape(-1)[: m * topk * hidden_size]
+    routes = routes.view(m, topk, hidden_size).float()
+    if not fp32_topk_weights:
+        expected = routes.sum(dim=1).to(torch.bfloat16)
+        assert torch.equal(out, expected)
+        return
+    weight = topk_weights.float()
+    fused = torch.zeros(m, hidden_size, dtype=torch.float64, device="cuda")
+    unfused = torch.zeros(m, hidden_size, device="cuda")
+    for route in range(topk):
+        product = routes[:, route] * weight[:, route, None]
+        unfused = unfused + product
+        exact = routes[:, route].double() * weight[:, route, None].double()
+        fused = (fused + exact).float().double()
+    # Sequential FP32 accumulation; the product may or may not be contracted.
+    matches = (out == unfused.to(torch.bfloat16)) | (
+        out == fused.float().to(torch.bfloat16)
+    )
+    assert matches.all()
+    # The rows really are unweighted: the reference below would otherwise be off.
+    reference = _reference_w4a16(
+        x, *weights, topk_ids, topk_weights, activation=activation
+    )
+    _assert_matches_oracle(out, reference, activation=activation)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
