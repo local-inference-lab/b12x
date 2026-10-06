@@ -12811,19 +12811,16 @@ def _finalize_trellis_output(
     return target
 
 
-# Token capacity up to which W4A16 rebuilds NVFP4-CSF scales per pipeline stage.
-# Larger calls are compute bound: expanding the routed experts once costs less
-# there (GLM-5.3 TP2 MoE: stage reads +0.3% at 128 tokens, both +10% at 1536,
-# expansion +3% against stage reads +12% at 8192).
+# Planned token capacity limit for W4A16 per-stage compressed-scale reads.
 W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
 
 
-def _w4a16_reads_stage_scales(binding, tokens: int) -> bool:
+def _w4a16_reads_stage_scales(binding) -> bool:
     """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
     launch = getattr(binding, "fused_launch", None)
     if launch is not None:
         return getattr(launch, "scale_format", None) == "e4m3_k16_csf"
-    return int(tokens) <= W4A16_CSF_STAGE_MAX_TOKENS
+    raise RuntimeError("Compressed W4A16 scales require a prepared fused launch")
 
 
 def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
@@ -12882,7 +12879,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     stage_scales = (
         experts.w4a16_expanded is not None
         and getattr(binding, "a4_prefill_launches", None) is None
-        and _w4a16_reads_stage_scales(binding, topk_ids.shape[0])
+        and _w4a16_reads_stage_scales(binding)
     )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None

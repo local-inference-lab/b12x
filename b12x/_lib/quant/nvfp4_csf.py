@@ -454,12 +454,10 @@ class _Pair:
             from b12x._lib.quant.nvfp4_csf_inline import IndexedNvfp4Plane
 
             plane = IndexedNvfp4Plane
-        if first[3] == 2 or second[3] == 2:
-            # Stage-readable W4A16 storage (nvfp4_csf_packed.py).
-            from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
+        from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
 
-            plane = PackedStoragePlane
-        self.first, self.second = plane(first), plane(second)
+        self.first = (PackedStoragePlane if first[3] == 2 else plane)(first)
+        self.second = (PackedStoragePlane if second[3] == 2 else plane)(second)
 
     @cute.jit
     def __call__(
@@ -598,7 +596,7 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         0,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 6, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 7, key),
     )
 
 

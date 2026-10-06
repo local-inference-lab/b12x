@@ -114,3 +114,22 @@ def test_index_matches_the_expansion_pass(rows, columns, rotation, table):
     torch.cuda.synchronize()
     for out, expected in zip(again, (out13, out2), strict=True):
         assert torch.equal(out[[1, 3]], expected[[1, 3]])
+
+
+@pytest.mark.parametrize("packed_index", [0, 1])
+def test_pair_decodes_each_projection_storage_layout(packed_index):
+    device = require_b12x()
+    lut = _value_table("w4a16", device)
+    planes = [repack_nvfp4_csf_batch(
+        _native_batch(_logical_scales(3, 256, 16, seed), device),
+        row_rotation=0, value_lut=lut,
+    ) for seed in (9, 13)]
+    expected = [torch.empty(3, 16, 256, dtype=torch.float8_e4m3fn, device=device) for _ in planes]
+    ids = torch.arange(3, device=device, dtype=torch.int32)
+    Nvfp4CsfDecoder.prepare(*planes, *expected).decode(ids, *expected)
+    planes[packed_index] = PackedCsfPlane.of(build_packed_csf_scales(planes[packed_index]))
+    actual = [torch.empty_like(t) for t in expected]
+    Nvfp4CsfDecoder.prepare(*planes, *actual).decode(ids, *actual)
+    torch.cuda.synchronize()
+    for output, reference in zip(actual, expected):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))

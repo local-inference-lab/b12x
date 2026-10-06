@@ -661,7 +661,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=16,
+    query_schema_version=19,
     config_schema_version=9,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
@@ -671,7 +671,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=18,
+    candidate_contract_version=21,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),
