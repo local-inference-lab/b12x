@@ -154,11 +154,15 @@ def _parameters(query, _device):
         query.cache_format == "mxfp4" and query.mode == "prefill"
         and query.num_q_heads == 32 and query.max_q_rows >= 64
     )
+    # "auto" picks the merge per launch from the live length: serial below the
+    # threshold, cooperative above it. Startup trials run one short length, so
+    # tuning a fixed merge picked serial, which made GLM-5.3 128K-token decode
+    # indexer launches 3x slower. Fixed merges remain valid overrides.
     return ParameterSpace.create(
         TUNING.knobs,
         values={
             "backend": (_BACKEND,),
-            "fused_merge": (FUSED_MERGE_AUTO,) if query.cache_format == "mxfp4" else FUSED_MERGE_CHOICES,
+            "fused_merge": (FUSED_MERGE_AUTO,),
             "mxfp4_score_kind": ("score", "score_tensorcore") if query.cache_format == "mxfp4" else (None,),
         },
         exhaustive=query.exhaustive,
@@ -177,7 +181,7 @@ TUNING = TuningContract(
         Knob(name="fused_merge", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="mxfp4_score_kind", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=4, equivalence_key=_equivalence, parameters=_parameters,
+    candidate_contract_version=5, equivalence_key=_equivalence, parameters=_parameters,
     materialize=lambda query, device, choice: DsaIndexerConfig.from_config(choice),
 )
 
