@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-nvfp4-csf-tp6-residency",
+  "category": "feature",
+  "summary": "Run compressed NVFP4 expert scales with TP6 shard geometry and bounded cooperative residency",
+  "models": [
+    "GLM-5.3",
+    "NVFP4-CSF MoE models"
+  ],
+  "compatibility": "Requires the matching vLLM CSF loader for padded TP6 experts. Inline replacement words remain opt-in; windowed stage reads are the default.",
+  "details": [
+    "K32 down-projection tiles support 352-channel shards, while 64-row slabs retain whole compressed-scale storage units.",
+    "The fused kernel accounts for all of its shared-memory regions when choosing cooperative residency."
+  ],
+  "pull_requests": [
+    489
+  ],
+  "requires": []
+}

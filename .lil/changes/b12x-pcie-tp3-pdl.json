@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-pcie-tp3-pdl",
+  "category": "feature",
+  "summary": "Prepare PCIe all-reduce for three ranks and honor dependent-launch controls",
+  "models": [
+    "Tensor-parallel models using B12X PCIe collectives"
+  ],
+  "compatibility": "PCIe one-shot and DMA all-reduce support TP3. DCP all-to-all retains its existing supported world sizes. PDL remains controlled by the existing B12X_PCIE_ONESHOT_PDL and B12X_MHC_PDL settings.",
+  "details": [
+    "One-shot launches release dependent MHC work after the cross-rank barrier, and dependent MHC kernels wait before reading the reduced input."
+  ],
+  "pull_requests": [
+    427,
+    428
+  ],
+  "requires": []
+}
