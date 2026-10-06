@@ -91,7 +91,6 @@ from b12x._lib.intrinsics import (
     st_shared_f32,
     st_shared_i32,
     st_shared_u32,
-    st_shared_u64,
     st_shared_v4_f32,
     st_shared_v4_u32,
     threadfence,
@@ -707,14 +706,14 @@ def _csf_extra_shared_bytes(
     tile_n: int, tile_k: int, stages: int, slab_rows: int, inline_words: int,
     problem_k: int,
 ) -> int:
-    """Compressed-scale stages, the tile's row bases and record table, and the storage address."""
+    """Compressed-scale stages, the tile's row bases and (windowed) its record table."""
     csf = _csf_stage(tile_n, tile_k, slab_rows, inline_words)
     table = (
         csf.slabs * _covering_count(int(problem_k), 64) * csf.record_bytes
         if csf.windowed
         else 0
     )
-    return stages * csf.bytes + _covering_count(tile_n, 16) * 16 + table + 16
+    return stages * csf.bytes + _covering_count(tile_n, 16) * 16 + table
 
 
 def _shared_memory_footprint(
@@ -1770,9 +1769,7 @@ class W4A16GemmKernel:
                 if self.csf.windowed
                 else 0
             )
-            # The storage address, for replacement words past a record or window.
-            self.sh_csf_address_off = self.sh_csf_table_off + table_bytes // 16
-            self.shared_int4 = self.sh_csf_address_off + 1
+            self.shared_int4 = self.sh_csf_table_off + table_bytes // 16
         self.shared_words = self.shared_int4 * 4
         if self.csf_scales:
             # The persistent grid, and with it the split-K schedule and the
@@ -3359,7 +3356,9 @@ class W4A16GemmKernel:
                             # Store the next stage's scale words once this
                             # step's MMAs are issued, then load its fragments.
                             if tile_idx + Int32(1) < k_tiles:
-                                self._csf_word_store(smem_base, tid, csf_word)
+                                self._csf_word_store(
+                                    scales_i32_flat, smem_base, tid, csf_word
+                                )
                             self._load_next_fragment_bundle(
                                 b_scale_next,
                                 a_regs_next,
@@ -5653,16 +5652,11 @@ class W4A16GemmKernel:
     ):
         """Issue the tile's row bases (and, windowed, the records of its K range).
 
-        Joins the current commit group; also stores the storage address.
+        Joins the current commit group.
         """
         csf = self.csf
         block = self._csf_expert_block(scales_i32_flat, expert_idx)
         slab0 = output_n_tile * Int32(csf.slabs)
-        if tid == Int32(0):
-            st_shared_u64(
-                smem_base + Int32(self.sh_csf_address_off * 16),
-                get_ptr_as_int64(scales_i32_flat, Int64(0)).to(Uint64),
-            )
         chunks_per_slab = csf.slab_rows // 16
         for i in cutlass.range_constexpr(
             _covering_count(csf.slabs * chunks_per_slab, self.cta_threads)
@@ -5940,7 +5934,9 @@ class W4A16GemmKernel:
         )
 
     @cute.jit
-    def _csf_word_store(self, smem_base: Int32, tid: Int32, state):
+    def _csf_word_store(
+        self, scales_i32_flat: cute.Tensor, smem_base: Int32, tid: Int32, state
+    ):
         """Select this lane's scale word and store it where the register loads read it.
 
         Replacement words past the record's inline words, or past the stage's
@@ -5959,19 +5955,14 @@ class W4A16GemmKernel:
             value = replacement
         if cutlass.const_expr(csf.windowed):
             if flagged and index - aligned >= Uint32(csf.window_words):
-                slot = smem_base + Int32(self.sh_csf_address_off * 16)
-                address = ld_shared_u32(slot).to(Uint64) | (
-                    ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
+                value = ld_global_nc_u32(
+                    get_ptr_as_int64(scales_i32_flat, Int64(0))
+                    + index.to(Int64) * Int64(4)
                 )
-                value = ld_global_nc_u32(address.to(Int64) + index.to(Int64) * Int64(4))
         else:
             if flagged and index >= Uint32(csf.inline_words):
-                slot = smem_base + Int32(self.sh_csf_address_off * 16)
-                address = ld_shared_u32(slot).to(Uint64) | (
-                    ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
-                )
                 value = ld_global_nc_u32(
-                    address.to(Int64)
+                    get_ptr_as_int64(scales_i32_flat, Int64(0))
                     + (ld_shared_u32(record).to(Int64) + index.to(Int64)) * Int64(4)
                 )
         st_shared_u32(
@@ -5985,9 +5976,13 @@ class W4A16GemmKernel:
         cute.arch.sync_warp()
 
     @cute.jit
-    def _expand_csf_warp(self, smem_base: Int32, tid: Int32, pipe: Int32, tile_idx: Int32):
+    def _expand_csf_warp(
+        self, scales_i32_flat: cute.Tensor, smem_base: Int32, tid: Int32, pipe: Int32,
+        tile_idx: Int32,
+    ):
         """Rebuild the packed scale words this warp reads from one staged k-tile."""
         self._csf_word_store(
+            scales_i32_flat,
             smem_base,
             tid,
             self._csf_word_pick(self._csf_word_reads(smem_base, tid, pipe, tile_idx)),
@@ -6109,7 +6104,9 @@ class W4A16GemmKernel:
         cute.arch.sync_threads()
         if cutlass.const_expr(self.csf_scales):
             if k_tiles > Int32(0):
-                self._expand_csf_warp(smem_base, tid, Int32(0), reduce_k_tile)
+                self._expand_csf_warp(
+                    scales_i32_flat, smem_base, tid, Int32(0), reduce_k_tile
+                )
 
     @cute.jit
     def _prefetch_lookahead_tile(
@@ -7477,13 +7474,19 @@ class W4A16FusedMoeKernel:
             self.smem_carveout = 100
         elif self.blocks_per_sm > 1:
             shared_mem_per_sm = _device_shared_mem_per_sm()
-            if self.blocks_per_sm * (
-                self.shared_words * 4 + _CTA_RESERVED_SHARED_MEM
-            ) > shared_mem_per_sm:
-                raise ValueError(
-                    "fused W4A16 plan does not fit its residency: "
-                    f"{self.blocks_per_sm} CTAs of {self.shared_words * 4} shared bytes"
-                )
+            resident = _resident_cta_shared_bytes(self.shared_words * 4)
+            if self.blocks_per_sm * resident > shared_mem_per_sm:
+                # GEMM residency counts only GEMM shared regions; regions only
+                # the fused kernel stages (the E4M3 value table) can leave
+                # fewer CTAs room. Compressed-scale GEMMs plan native residency
+                # from their own footprint, so they may need fewer here.
+                fitting = shared_mem_per_sm // resident
+                if not (self.fc1.csf_scales or self.fc2.csf_scales) or fitting < 1:
+                    raise ValueError(
+                        "fused W4A16 plan does not fit its residency: "
+                        f"{self.blocks_per_sm} CTAs of {self.shared_words * 4} shared bytes"
+                    )
+                self.blocks_per_sm = fitting
             self.smem_carveout = _cooperative_smem_carveout(
                 blocks_per_sm=self.blocks_per_sm,
                 shared_bytes=self.shared_words * 4,
