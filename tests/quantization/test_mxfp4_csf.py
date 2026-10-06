@@ -14,6 +14,35 @@ from b12x.moe.fused_moe._impl import (
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("partial_overlap", [False, True])
+def test_preparation_rejects_overlapping_scale_storage(partial_overlap):
+    batch, _ = fixture(128, 16)
+    plane = repack_mxfp4_csf_batch(batch, compact=False, group_rows=128)
+    size = plane.num_experts * plane.rows * plane.columns
+    storage = torch.empty(size + 16, dtype=torch.uint8, device=batch.fixed.device)
+    first = storage[:size]
+    offset = 16 if partial_overlap else 0
+    with pytest.raises(ValueError, match="must not overlap"):
+        Mxfp4CsfDecoder.prepare(plane, plane, first, storage[offset:offset + size])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
+def test_preparation_rejects_projections_on_different_devices():
+    from dataclasses import fields, replace
+
+    batch, _ = fixture(128, 16)
+    first = repack_mxfp4_csf_batch(batch, compact=False, group_rows=128)
+    second = replace(first, **{
+        f.name: getattr(first, f.name).to("cuda:1")
+        for f in fields(first) if isinstance(getattr(first, f.name), torch.Tensor)
+    })
+    size = first.num_experts * first.rows * first.columns
+    outputs = (torch.empty(size, dtype=torch.uint8, device="cuda:0"),
+               torch.empty(size, dtype=torch.uint8, device="cuda:1"))
+    with pytest.raises(ValueError, match="one CUDA device"):
+        Mxfp4CsfDecoder.prepare(first, second, *outputs)
+
+
 def fixture(rows, columns, *, experts=8, finite_scales=False):
     device = require_b12x()
     rng = np.random.default_rng(12987 + rows + columns)

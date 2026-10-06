@@ -845,6 +845,9 @@ class TPMoEScratchCaps:
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
     w4a16_prefill_fused_sum: bool | None = None
+    trellis_decode_table: str = "auto"
+    w4a16_skip_empty_m_blocks: bool = True
+    w4a16_small_m_occupancy: int = 1
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -898,6 +901,8 @@ class TPMoEScratchCaps:
                 raise ValueError("w4a16_block_size_m must be one of 8, 16, 32, 48, 64")
             object.__setattr__(self, "w4a16_block_size_m", block_size_m)
         object.__setattr__(self, "w4a16_fast_math", bool(self.w4a16_fast_math))
+        if self.trellis_decode_table not in {"auto", "compact", "full"}:
+            raise ValueError("trellis decode table must be auto, compact, or full")
         if self.w4a16_prefill_fused_sum is None:
             from b12x.moe._shared.kernels.w4a16.host import prefill_fused_sum_enabled
 
@@ -8182,6 +8187,9 @@ def _plan_full_rotation_w4a16_launches(
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
                 trellis_codebook=core_plan.trellis_codebook or LUT_E4M3,
+                trellis_decode_table=caps.trellis_decode_table,
+                skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
+                small_m_occupancy=caps.w4a16_small_m_occupancy,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,

@@ -282,7 +282,6 @@ __all__ = [
     "Mxfp4CsfWeights",
     "CsfScalePlanes",
     "Nvfp4CsfWeights",
-    "Mxfp4CsfWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
     "PreparedExperts",

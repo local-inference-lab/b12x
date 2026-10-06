@@ -1,0 +1,218 @@
+# ROCE arm of the serving A/B for local-inference-lab/b12x#457, exactly as deployed (LLMKube Model +
+# InferenceService, three-node TP3 via spec.multiNode). The NCCL arm is this file with
+# VLLM_ENABLE_ROCE_ALLREDUCE set to "0"; nothing else differs. Flags follow the fork's TP3 Spark
+# launcher (scripts/serve-ds41-flash-dspark-tp3-rdma.sh) with DSpark off and an 8K context; the
+# served config.json is the unmodified checkpoint one (the fork pads heads for TP3 itself).
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: dsv41-flash-mxfp4
+  namespace: default
+spec:
+  source: s3://models/deepseek-ai/DeepSeek-V4.1-Flash
+  sourceSecretRef: {name: rustfs-models}
+  format: safetensors
+  refreshPolicy: IfNotPresent
+  hardware:
+    accelerator: cuda
+    gpu: {count: 1, enabled: true, vendor: nvidia}
+  files:
+  - "config.json"
+  - "model-00001-of-00048.safetensors"
+  - "model-00002-of-00048.safetensors"
+  - "model-00003-of-00048.safetensors"
+  - "model-00004-of-00048.safetensors"
+  - "model-00005-of-00048.safetensors"
+  - "model-00006-of-00048.safetensors"
+  - "model-00007-of-00048.safetensors"
+  - "model-00008-of-00048.safetensors"
+  - "model-00009-of-00048.safetensors"
+  - "model-00010-of-00048.safetensors"
+  - "model-00011-of-00048.safetensors"
+  - "model-00012-of-00048.safetensors"
+  - "model-00013-of-00048.safetensors"
+  - "model-00014-of-00048.safetensors"
+  - "model-00015-of-00048.safetensors"
+  - "model-00016-of-00048.safetensors"
+  - "model-00017-of-00048.safetensors"
+  - "model-00018-of-00048.safetensors"
+  - "model-00019-of-00048.safetensors"
+  - "model-00020-of-00048.safetensors"
+  - "model-00021-of-00048.safetensors"
+  - "model-00022-of-00048.safetensors"
+  - "model-00023-of-00048.safetensors"
+  - "model-00024-of-00048.safetensors"
+  - "model-00025-of-00048.safetensors"
+  - "model-00026-of-00048.safetensors"
+  - "model-00027-of-00048.safetensors"
+  - "model-00028-of-00048.safetensors"
+  - "model-00029-of-00048.safetensors"
+  - "model-00030-of-00048.safetensors"
+  - "model-00031-of-00048.safetensors"
+  - "model-00032-of-00048.safetensors"
+  - "model-00033-of-00048.safetensors"
+  - "model-00034-of-00048.safetensors"
+  - "model-00035-of-00048.safetensors"
+  - "model-00036-of-00048.safetensors"
+  - "model-00037-of-00048.safetensors"
+  - "model-00038-of-00048.safetensors"
+  - "model-00039-of-00048.safetensors"
+  - "model-00040-of-00048.safetensors"
+  - "model-00041-of-00048.safetensors"
+  - "model-00042-of-00048.safetensors"
+  - "model-00043-of-00048.safetensors"
+  - "model-00044-of-00048.safetensors"
+  - "model-00045-of-00048.safetensors"
+  - "model-00046-of-00048.safetensors"
+  - "model-00047-of-00048.safetensors"
+  - "model-00048-of-00048.safetensors"
+  - "model.safetensors.index.json"
+  - "tokenizer_config.json"
+  - "tokenizer.json"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: dsv41-b12x-smoke
+  namespace: default
+spec:
+  modelRef: dsv41-flash-mxfp4
+  runtime: vllm
+  image: registry.defilan.net/llmkube/llmkube-vllm-cuda-gb10-dsv41-b12x@sha256:ca51aa5681ecd86ebc1961148f586c2591e3056c1582ca74691a7fab2741565f
+  imagePullSecrets:
+  - name: turboquant-registry-cred
+  replicas: 1
+  containerPort: 8080
+  priority: normal
+  resources: {cpu: "8", gpu: 1, memory: 110Gi}
+  # b12x's disk-backed Engram tables use io_uring; upstream's scripts/seccomp/spark-io-uring.json = Moby default +
+  # io_uring_{setup,enter,register} ALLOW (sha256 823b6605), installed in each node's kubelet seccomp directory.
+  securityContext:
+    seccompProfile: {type: Localhost, localhostProfile: spark-io-uring.json}
+  vllmConfig:
+    tensorParallelSize: 3
+    pipelineParallelSize: 1
+    maxModelLen: 8192
+    gpuMemoryUtilization: 0.82
+    kvCacheCustomDtype: fp8
+  multiNode:
+    ibGIDIndex: 3
+    rdmaResource: rdma/rdma_shared_device_a
+    members:
+    - node: ahazidgx1
+      modelCache: {claimName: dsv41-mxfp4-dgx1}
+      fabric: {address: 192.168.1.28, ibHCA: "rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1", socketInterface: enP7s7}
+    - node: ahazidgx2
+      modelCache: {claimName: dsv41-mxfp4-dgx2}
+      fabric: {address: 192.168.1.86, ibHCA: "rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1", socketInterface: enP7s7}
+    - node: ahazidgx3
+      modelCache: {claimName: dsv41-mxfp4-dgx3}
+      fabric: {address: 192.168.1.220, ibHCA: "rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1", socketInterface: enP7s7}
+  extraArgs:
+  - --served-model-name
+  - DeepSeek-V4.1-Flash
+  - --trust-remote-code
+  - --decode-context-parallel-size
+  - "1"
+  - --block-size
+  - "256"
+  - --load-format
+  - b12x
+  - --moe-backend
+  - b12x
+  - --linear-backend
+  - b12x
+  - --attention-backend
+  - B12X
+  - --kv-cache-memory-bytes
+  - "6442450944"
+  - --max-num-seqs
+  - "2"
+  - --max-num-batched-tokens
+  - "1024"
+  - --enable-chunked-prefill
+  - --enable-prefix-caching
+  - --tokenizer-mode
+  - deepseek_v41
+  - --tool-call-parser
+  - deepseek_v41
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - deepseek_v41
+  - --engram-config
+  - '{"table_memory":"disk","disk_resident_scales":false}'
+  - --limit-mm-per-prompt
+  - '{"image":0}'
+  - --compilation-config
+  - '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2]}'
+  env:
+  # upstream launcher (serve-ds4-flash-dspark-tp4-rdma.sh cluster_args)
+  - {name: CUDA_HOME, value: /usr/local/cuda}
+  - {name: TRITON_PTXAS_PATH, value: /usr/local/cuda/bin/ptxas}
+  - {name: CUTE_DSL_ARCH, value: sm_121a}
+  - {name: B12X_COMPILE_CACHE_DIR, value: /cache/b12x}
+  - {name: B12X_WEIGHTS_COMPILE_WORKERS, value: "4"}
+  - {name: B12X_STATE_COMPILE_WORKERS, value: "4"}
+  - {name: B12X_BIND_COMPILE_WORKERS, value: "4"}
+  - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+  - {name: SAFETENSORS_FAST_GPU, value: "1"}
+  - {name: OMP_NUM_THREADS, value: "16"}
+  - {name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn}
+  - {name: HF_HUB_OFFLINE, value: "1"}
+  - {name: TRANSFORMERS_OFFLINE, value: "1"}
+  - {name: VLLM_PLUGINS, value: b12x_loader}
+  - {name: DG_JIT_USE_NVRTC, value: "0"}
+  - {name: USE_CUDNN, value: "1"}
+  - {name: VLLM_ALLOW_LONG_MAX_MODEL_LEN, value: "1"}
+  - {name: VLLM_USE_AOT_COMPILE, value: "1"}
+  - {name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "0"}
+  - {name: VLLM_USE_MEGA_AOT_ARTIFACT, value: "1"}
+  - {name: VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS, value: "1"}
+  - {name: VLLM_USE_FLASHINFER_SAMPLER, value: "1"}
+  - {name: VLLM_USE_V2_MODEL_RUNNER, value: "1"}
+  - {name: VLLM_USE_B12X_WO_PROJECTION, value: "1"}
+  - {name: VLLM_USE_B12X_MHC, value: "1"}
+  - {name: VLLM_USE_B12X_FP8_GEMM, value: "1"}
+  - {name: VLLM_USE_B12X_MOE, value: "1"}
+  - {name: VLLM_USE_B12X_SPARSE_INDEXER, value: "1"}
+  - {name: B12X_MLA_SM120_UNIFIED, value: "1"}
+  - {name: B12X_DENSE_SPLITK_TURBO, value: "1"}
+  - {name: B12X_W4A16_TC_DECODE, value: "1"}
+  - {name: B12X_MOE_FORCE_A8, value: "1"}
+  - {name: VLLM_ENABLE_PCIE_ALLREDUCE, value: "0"}
+  - {name: VLLM_ENABLE_ROCE_ALLREDUCE, value: "1"}
+  - {name: VLLM_ROCE_ALLREDUCE_MAX_SIZE, value: 2MB}
+  - {name: VLLM_ROCE_ALLGATHER_MAX_SIZE, value: 16MB}
+  - {name: B12X_ROCE_CACHE_DIR, value: /cache/b12x/roce}
+  - {name: B12X_ROCE_TRAFFIC_CLASS, value: "106"}
+  # NCCL on this ring: RoCE v2 over IPv4 (GID index 3), all four port functions listed, and NCCL 2.30's subnet-aware
+  # routing, which picks the device on each peer's point-to-point subnet (without it every channel's QP times out).
+  - {name: NCCL_NET, value: IB}
+  - {name: NCCL_IB_DISABLE, value: "0"}
+  - {name: NCCL_IB_ROCE_VERSION_NUM, value: "2"}
+  - {name: NCCL_IB_ADDR_FAMILY, value: AF_INET}
+  - {name: NCCL_IB_TC, value: "106"}
+  - {name: NCCL_IB_TIMEOUT, value: "22"}
+  - {name: NCCL_IB_SUBNET_AWARE_ROUTING, value: "1"}
+  - {name: NCCL_IB_MERGE_NICS, value: "0"}
+  - {name: NCCL_NET_PLUGIN, value: none}
+  - {name: NCCL_NVLS_ENABLE, value: "0"}
+  - {name: NCCL_MAX_NCHANNELS, value: "8"}
+  - {name: NCCL_CUMEM_ENABLE, value: "0"}
+  - {name: NCCL_IGNORE_CPU_AFFINITY, value: "1"}
+  - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}
+  - {name: NCCL_DEBUG, value: INFO}
+  - {name: NCCL_DEBUG_SUBSYS, value: "INIT,NET"}
+  - {name: MN_IF_NAME, value: enP7s7}
+  - {name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600"}
+  - {name: HF_HOME, value: /cache/huggingface}
+  - {name: VLLM_CACHE_ROOT, value: /cache/vllm}
+  - {name: TRITON_CACHE_DIR, value: /cache/triton}
+  - {name: TORCHINDUCTOR_CACHE_DIR, value: /cache/torchinductor}
+  - {name: CUDA_CACHE_PATH, value: /cache/jit}
+  extraVolumes:
+  - {name: cache, hostPath: {path: /var/lib/vllm-cache/dsv41-b12x, type: DirectoryOrCreate}}
+  - {name: shm, emptyDir: {medium: Memory, sizeLimit: 8Gi}}
+  extraVolumeMounts:
+  - {name: cache, mountPath: /cache}
+  - {name: shm, mountPath: /dev/shm}
