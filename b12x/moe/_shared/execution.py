@@ -316,6 +316,10 @@ class MoEWeightPreparationPlan:
     # storage. Kernels rebuild each pipeline stage from it; calls planned above
     # the stage-read token limit expand their routed experts into scratch first.
     w4a16_compressed_scales: bool = False
+    # Inline replacement words per 128-row record of that storage
+    # (B12X_NVFP4_CSF_INLINE_WORDS at preparation); 0 keeps every replacement
+    # word in the spill area and kernels copy per-stage windows of it.
+    w4a16_csf_inline_words: int = 0
     # Compact (N64) W4A8 experts prepared from MXFP4-CSF checkpoints keep their
     # E8M0 scales as inline storage (b12x._lib.quant.mxfp4_csf_inline). Every
     # compact W4A8 launch rebuilds its scale words from it; no call expands
@@ -580,7 +584,8 @@ class MoEWeightPreparationPlan:
         if self.w4a16_weight_layout is None:
             return None
         if self.w4a16_compressed_scales:
-            return "e4m3_k16_csf"
+            words = int(self.w4a16_csf_inline_words)
+            return "e4m3_k16_csf" if words == 0 else f"e4m3_k16_csf_i{words}"
         return self.specs[0].source_weight_scale.value
 
     def required_weight_layout(self, quant_mode: str) -> PreparedWeightLayout | None:

@@ -152,6 +152,7 @@ _W4A16_SCALE_FORMATS = {
     "q8_0": "q8_0",
     "e4m3_k16": "e4m3_k16",
     "e4m3_k16_csf": "e4m3_k16_csf",
+    **{f"e4m3_k16_csf_i{words}": f"e4m3_k16_csf_i{words}" for words in range(4, 65, 4)},
     "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
 }
@@ -6681,6 +6682,7 @@ def plan_b12x_fp4_moe_weights(
     intermediate_size: int,
     nvfp4_inline_scales: bool = False,
     w4a16_compressed_scales: bool = False,
+    w4a16_csf_inline_words: int = 0,
     w4a8_csf_inline: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
@@ -6729,6 +6731,7 @@ def plan_b12x_fp4_moe_weights(
         result,
         nvfp4_inline_scales=bool(nvfp4_inline_scales),
         w4a16_compressed_scales=bool(w4a16_compressed_scales),
+        w4a16_csf_inline_words=int(w4a16_csf_inline_words),
         w4a8_csf_inline=bool(w4a8_csf_inline),
     )
 
@@ -13185,7 +13188,7 @@ def _w4a16_reads_stage_scales(binding, tokens: int) -> bool:
     """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
     launch = getattr(binding, "fused_launch", None)
     if launch is not None:
-        return getattr(launch, "scale_format", None) == "e4m3_k16_csf"
+        return str(getattr(launch, "scale_format", None)).startswith("e4m3_k16_csf")
     return int(tokens) <= W4A16_CSF_STAGE_MAX_TOKENS
 
 

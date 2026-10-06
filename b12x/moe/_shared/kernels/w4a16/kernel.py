@@ -50,6 +50,7 @@ from b12x._lib.intrinsics import (
     ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u16_zx,
+    ld_shared_u16_zx_ordered,
     ld_shared_u32,
     ld_shared_v2_u32,
     ld_shared_v4_f32,
@@ -100,6 +101,10 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
+from b12x._lib.quant.nvfp4_csf_packed import (
+    MAX_INLINE_WORDS as _CSF_MAX_INLINE_WORDS,
+    record_bytes as csf_record_bytes,
+)
 from b12x._lib.quant.lut_e4m3 import (
     lut_e4m3_direct_table,
     lut_e4m3_value_table,
@@ -181,7 +186,7 @@ def _w4a16_small_m_double_occupancy(
     return (
         uses_m_block_8
         and weight_layout == "packed"
-        and scale_format in ("e4m3_k16", _CSF_SCALE_FORMAT)
+        and (scale_format == "e4m3_k16" or _is_csf_scale_format(scale_format))
         and _w4a16_small_m_occupancy() == 2
     )
 
@@ -223,6 +228,37 @@ def _lut_e4m3_smem_enabled() -> bool:
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 256 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
+_DEFAULT_SHARED_MEM_PER_SM = 102_400
+# Shared memory the driver reserves per resident CTA.
+_CTA_RESERVED_SHARED_MEM = 1024
+
+
+def _resident_cta_shared_bytes(shared_bytes: int) -> int:
+    """Shared memory one resident CTA occupies: its 1 KiB-aligned allocation and the reservation."""
+    return _covering_count(int(shared_bytes), 1024) * 1024 + _CTA_RESERVED_SHARED_MEM
+
+
+def _device_shared_mem_per_sm() -> int:
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return int(getattr(props, "shared_memory_per_multiprocessor", _DEFAULT_SHARED_MEM_PER_SM))
+    return _DEFAULT_SHARED_MEM_PER_SM
+
+
+def _cooperative_smem_carveout(
+    *, blocks_per_sm: int, shared_bytes: int, shared_mem_per_sm: int
+) -> int:
+    """Preferred shared-memory carveout (percent) that admits ``blocks_per_sm`` CTAs.
+
+    CUTLASS derives the automatic carveout from the CTAs' dynamic shared
+    memory alone, without the per-CTA reservation: two CTAs of just under
+    32 KiB get a 64 KiB carveout they do not fit in, and the cooperative
+    launch is rejected (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE). Wherever
+    the automatic carveout admits the CTAs this selects the same carveout
+    size, since the driver rounds a preference up to a supported size.
+    """
+    needed = int(blocks_per_sm) * _resident_cta_shared_bytes(shared_bytes)
+    return min(100, _covering_count(100 * needed, int(shared_mem_per_sm)))
 _SCALAR_ACC_FRAGMENT_WIDTH = 1
 _WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256", "iq2_xs", "iq2_xxs", "q8_0"}
 _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
@@ -238,9 +274,34 @@ _LUT_E4M3_SMEM_REGION_BYTES = _LUT_E4M3_VALUE_TABLE_ENTRIES
 # shared memory from compressed bytes instead of a pre-expanded scale copy.
 _CSF_SCALE_FORMAT = "e4m3_k16_csf"
 _CSF_HEADER_BYTES = 1024
+
+
+def _csf_scale_format(inline_words: int) -> str:
+    """Scale format of CSF storage whose 128-row records hold ``inline_words`` words.
+
+    The plain format has 32-byte records (header only): every replacement
+    word sits in the spill area and kernels copy each stage's window of it.
+    """
+    words = int(inline_words)
+    return _CSF_SCALE_FORMAT if words == 0 else f"{_CSF_SCALE_FORMAT}_i{words}"
+
+
+def _is_csf_scale_format(scale_format: str) -> bool:
+    return str(scale_format).startswith(_CSF_SCALE_FORMAT)
+
+
+def _csf_format_inline_words(scale_format: str) -> int:
+    fmt = str(scale_format)
+    return 0 if fmt == _CSF_SCALE_FORMAT else int(fmt[len(_CSF_SCALE_FORMAT) + 2 :])
+
+
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     _CSF_SCALE_FORMAT: _CSF_SCALE_FORMAT,
+    **{
+        _csf_scale_format(words): _csf_scale_format(words)
+        for words in range(4, _CSF_MAX_INLINE_WORDS + 1, 4)
+    },
     "e8m0_k32": "e8m0_k32",
     "e4m3_k32": "e4m3_k32",
     "iq2_xs": "iq2_xs",
@@ -469,6 +530,9 @@ _W4A16_REGS_SM121 = {
     (256, 1, 32, 2, True): 118,
     (128, 1, 4, 8, True): 118,
     (128, 1, 8, 4, True): 120,
+    # K32 FC2 tile of intermediate sizes 32 mod 64 (2048/TP6 = 352): one warp
+    # row of four 64-column warps, the per-warp work of the N64/K128 tile.
+    (128, 1, 16, 2, True): 128,
     (256, 1, 8, 8, False): 158,
     # The wide-N single-route tile is already above the one-CTA/SM register
     # threshold in the narrower N=128 schedule. The architectural cap keeps
@@ -476,6 +540,10 @@ _W4A16_REGS_SM121 = {
     (256, 1, 16, 4, False): 255,
     (128, 1, 4, 8, False): 154,
     (128, 1, 8, 4, False): 143,
+    (128, 1, 16, 2, False): 160,
+    (128, 2, 16, 2, False): 220,
+    (128, 3, 16, 2, False): 255,
+    (128, 4, 16, 2, False): 255,
     (256, 2, 16, 4, False): 212,
     (128, 2, 4, 8, False): 215,
     (128, 2, 8, 4, False): 214,
@@ -510,6 +578,10 @@ _LARGE_BATCH_TILE_CONFIGS = (
     (64, 128, 128),
     (128, 64, 128),
 )
+# Packed NVFP4 shards whose K is 32 mod 64 (FC2 of 2048/TP6 = 352 channels)
+# have no dividing K64/K128 tile. They fall back to whole K32 stages; the
+# 128-thread tile pairs with the N64/K128 FC1 tile of the same shard.
+_K32_FALLBACK_TILE_CONFIGS = ((32, 256, 128),)
 
 
 def _covering_count(total: int, quantum: int) -> int:
@@ -620,44 +692,68 @@ def _reduction_shared_bytes(tile_n: int, tile_k: int, uses_m_block_8: bool) -> i
 class _CsfStage:
     """Shared-memory layout of one pipeline stage of compressed (CSF) scales.
 
-    A stage covers ``groups`` K16 groups of ``slabs`` 128-row slabs. Byte
-    offsets: row bases, 4-bit codes, the exception records of the ``atoms``
-    four-group atoms it touches, the record heads of the stage ``stages - 1``
-    later, and a window of ``cap + 4`` replacement words per slab.
+    A stage covers ``groups`` K16 groups of ``slabs`` storage slabs of
+    ``slab_rows`` rows. Byte offsets: the 4-bit codes (``slab_rows / 2``
+    bytes per k-group and slab), then either the exception records of the
+    ``atoms`` four-group atoms it touches, each with its first
+    ``inline_words`` replacement words, or, for storage without inline words
+    (``windowed``), a window of ``window_words`` replacement words per slab;
+    windowed stages read the records of the whole tile from a table staged
+    once per tile.
     """
 
+    slab_rows: int
     slabs: int
     groups: int
     atoms: int
-    cap: int
-    bases: int
+    record_bytes: int
+    inline_words: int
+    windowed: bool
+    window_words: int
     codes: int
     records: int
-    heads: int
-    words: int
     bytes: int
 
 
-def _csf_stage(tile_n: int, tile_k: int) -> _CsfStage:
-    slabs, groups = int(tile_n) // 128, int(tile_k) // 16
+def _csf_slab_rows(rows: int) -> int:
+    """Storage slab height of a projection with ``rows`` output rows."""
+    return 128 if int(rows) % 128 == 0 else 64
+
+
+def _csf_stage(
+    tile_n: int, tile_k: int, slab_rows: int, inline_words: int = 0
+) -> _CsfStage:
+    slab_rows = int(slab_rows)
+    slabs, groups = int(tile_n) // slab_rows, int(tile_k) // 16
     atoms = max(1, groups // 4)
-    cap = max(8, 4 * groups)
-    codes = 128 * slabs
-    records = codes + 64 * groups * slabs
-    heads = records + 32 * atoms * slabs
-    words = heads + 16 * atoms * slabs
-    total = words + 4 * (cap + 4) * slabs
+    rb = csf_record_bytes(slab_rows, inline_words)
+    windowed = int(inline_words) == 0
+    # A quarter of a stage's words (3-12% are replacement words in NVFP4
+    # checkpoints), plus the alignment of the window's first word.
+    window_words = (groups * slab_rows // 4) // 4 + 4
+    codes = 0
+    records = codes + slabs * groups * (slab_rows // 2)
+    total = records + (
+        slabs * (16 + window_words * 4) if windowed else slabs * atoms * rb
+    )
     return _CsfStage(
-        slabs, groups, atoms, cap, 0, codes, records, heads, words,
-        _covering_count(total, 16) * 16,
+        slab_rows, slabs, groups, atoms, rb, (rb - 32) // 4, windowed, window_words,
+        codes, records, _covering_count(total, 16) * 16,
     )
 
 
-def _csf_extra_shared_bytes(tile_n: int, tile_k: int, stages: int) -> int:
-    """Compressed-scale stages, the first stages' record heads and the storage address."""
-    csf = _csf_stage(tile_n, tile_k)
-    prologue = _covering_count((stages - 1) * 16 * csf.atoms * csf.slabs, 16) * 16
-    return stages * csf.bytes + prologue + 16
+def _csf_extra_shared_bytes(
+    tile_n: int, tile_k: int, stages: int, slab_rows: int, inline_words: int,
+    problem_k: int,
+) -> int:
+    """Compressed-scale stages, the tile's row bases and record table, and the storage address."""
+    csf = _csf_stage(tile_n, tile_k, slab_rows, inline_words)
+    table = (
+        csf.slabs * _covering_count(int(problem_k), 64) * csf.record_bytes
+        if csf.windowed
+        else 0
+    )
+    return stages * csf.bytes + _covering_count(tile_n, 16) * 16 + table + 16
 
 
 def _shared_memory_footprint(
@@ -670,6 +766,8 @@ def _shared_memory_footprint(
     weight_bits: int = 4,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    csf_slab_rows: int = 128,
+    problem_k: int = 0,
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -705,8 +803,11 @@ def _shared_memory_footprint(
         gemm_size,
         route_rows * 16 + _reduction_shared_bytes(cta_n, cta_k, uses_m_block_8),
     )
-    if scale_format == _CSF_SCALE_FORMAT:
-        gemm_size += _csf_extra_shared_bytes(cta_n, cta_k, stages)
+    if _is_csf_scale_format(scale_format):
+        gemm_size += _csf_extra_shared_bytes(
+            cta_n, cta_k, stages, csf_slab_rows,
+            _csf_format_inline_words(scale_format), problem_k,
+        )
     return gemm_size + lut_size
 
 
@@ -726,6 +827,7 @@ def _determine_blocks_per_sm(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     pipeline_stages: int | None = None,
+    problem_k: int = 0,
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -745,6 +847,8 @@ def _determine_blocks_per_sm(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        csf_slab_rows=_csf_slab_rows(problem_n),
+        problem_k=problem_k,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -800,6 +904,7 @@ def _candidate_tile_fits(
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
     allow_qualified_fc2_tile: bool = False,
+    allow_k32_tile: bool = False,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
 ) -> bool:
@@ -807,8 +912,11 @@ def _candidate_tile_fits(
         return False
     if weight_layout in BLOCK_CODECS and int(tile_k) > 128:
         return False
-    # Compressed scales are staged in whole 128-row slabs and half atoms.
-    if scale_format == _CSF_SCALE_FORMAT and (int(tile_n) % 128 or int(tile_k) % 32):
+    # Compressed scales are staged in whole storage slabs (64 rows for 64 mod
+    # 128 rows, else 128) and half atoms.
+    if _is_csf_scale_format(scale_format) and (
+        int(tile_n) % _csf_slab_rows(problem_n) or int(tile_k) % 32
+    ):
         return False
     scale_group_size = _scale_group_size(scale_format)
     exact_n = int(problem_n) % int(tile_n) == 0
@@ -836,10 +944,23 @@ def _candidate_tile_fits(
         and int(tile_n) == 512
         and int(cta_threads) == 256
     )
+    # Packed NVFP4 K that is 32 mod 64 has no dividing K64 tile; whole K32
+    # stages with two K16 steps per warp (N = 2 x cta_threads) cover it.
+    k32_tile = (
+        allow_k32_tile
+        and weight_layout == "packed"
+        and (
+            _normalize_scale_format(scale_format) == "e4m3_k16"
+            or _is_csf_scale_format(scale_format)
+        )
+        and int(tile_k) == 32
+        and int(problem_k) % 64 == 32
+        and int(tile_n) == 2 * int(cta_threads)
+    )
     if (
         int(tile_n) < 64
         or int(cta_threads) < 128
-        or (int(tile_k) < 64 and not wide_n_fc2_tile)
+        or (int(tile_k) < 64 and not (wide_n_fc2_tile or k32_tile))
     ):
         return False
     smem_bytes = _shared_memory_footprint(
@@ -851,6 +972,8 @@ def _candidate_tile_fits(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        csf_slab_rows=_csf_slab_rows(problem_n),
+        problem_k=problem_k,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -877,7 +1000,14 @@ def _select_tile_config(
     )
     best_occupancy = 0
     best_tile_config: tuple[int, int, int, int] | None = None
-    for tile_k, tile_n, cta_threads in configs:
+    candidates = tuple((config, False) for config in configs)
+    if (
+        weight_layout == "packed"
+        and not allow_logical_tail
+        and int(problem_k) % 64 == 32
+    ):
+        candidates += tuple((config, True) for config in _K32_FALLBACK_TILE_CONFIGS)
+    for (tile_k, tile_n, cta_threads), k32_fallback in candidates:
         if required_cta_threads is not None and int(cta_threads) != int(
             required_cta_threads
         ):
@@ -894,6 +1024,7 @@ def _select_tile_config(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_logical_tail,
+            allow_k32_tile=k32_fallback,
         ):
             continue
         occupancy_problem_n = (
@@ -915,6 +1046,7 @@ def _select_tile_config(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            problem_k=problem_k,
         )
         occupancy = blocks_per_sm_limit * (
             cta_threads if weight_layout in BLOCK_CODECS else 1
@@ -1399,7 +1531,10 @@ class W4A16GemmKernel:
         )
         self.b_bundle_rows = 2
         self.scale_format = scale_format
-        self.csf_scales = scale_format == _CSF_SCALE_FORMAT
+        self.csf_scales = _is_csf_scale_format(scale_format)
+        self.csf_inline_words = (
+            _csf_format_inline_words(scale_format) if self.csf_scales else 0
+        )
         self.native_nvfp4_scales = (
             weight_layout == "modelopt" and scale_format == "e4m3_k16"
         )
@@ -1515,6 +1650,7 @@ class W4A16GemmKernel:
                 max(4, self.trellis_bits) if self.weight_layout_trellis256 else 4
             ),
             pipeline_stages=self.stages,
+            problem_k=self.size_k,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -1607,45 +1743,89 @@ class W4A16GemmKernel:
         # Compressed scales stage after every other region: the partial
         # reduction never reaches them, and each tile restages its own.
         if self.csf_scales:
+            csf_slab_rows = _csf_slab_rows(self.size_n)
             if (
                 weight_layout != "packed"
-                or self.tile_n % 128
+                or self.tile_n % csf_slab_rows
                 or self.tile_k % 32
                 or self.size_n % self.tile_n
                 or self.size_k % self.tile_k
-                or self.size_k % 64
+                or self.size_k % 32
                 or self.has_logical_tail
                 or self.has_n_tile_tail
                 or self.has_k_tile_tail
                 or self.has_scale_k_tail
             ):
                 raise ValueError(
-                    "compressed W4A16 scales need packed weights, 128-row N "
-                    "tiles and whole K32 stages"
+                    "compressed W4A16 scales need packed weights, N tiles of "
+                    "whole storage slabs and whole K32 stages"
                 )
-            # Storage geometry of b12x/_lib/quant/nvfp4_csf_packed.py: one
-            # block per expert (slab fixed streams, then atom records); the
-            # records address replacement words from the storage start.
-            if self.b_sh_wr_iters < 2:
+            # Each lane rebuilds one scale word per stage: two K16 steps of
+            # its warp's 64 columns.
+            if self.b_sh_wr_iters != 2:
                 raise ValueError("compressed W4A16 scales need two K16 steps per stage")
-            self.csf = _csf_stage(self.tile_n, self.tile_k)
-            self.csf_slabs = self.size_n // 128
-            self.csf_atoms_per_slab = self.size_k // 64
-            self.csf_slab_bytes = 128 + 64 * (self.size_k // 16)
+            # Storage geometry of b12x/_lib/quant/nvfp4_csf_packed.py: one
+            # block per expert (slab fixed streams, then atom records with
+            # their first replacement words inline); records address the
+            # remaining replacement words from the storage start.
+            self.csf = _csf_stage(
+                self.tile_n, self.tile_k, csf_slab_rows, self.csf_inline_words
+            )
+            self.csf_slabs = self.size_n // csf_slab_rows
+            self.csf_atoms_per_slab = _covering_count(self.size_k, 64)
+            self.csf_slab_bytes = csf_slab_rows + (csf_slab_rows // 2) * (
+                self.size_k // 16
+            )
             self.csf_records_in_block = self.csf_slabs * self.csf_slab_bytes
             self.csf_block_bytes = self.csf_records_in_block + (
-                self.csf_slabs * self.csf_atoms_per_slab * 32
+                self.csf_slabs * self.csf_atoms_per_slab * self.csf.record_bytes
             )
             self.sh_csf_off = self.shared_int4
-            self.sh_csf_prologue_off = self.sh_csf_off + self.stages * (
+            # The tile's row bases, one byte per output row in tile order.
+            self.sh_csf_bases_off = self.sh_csf_off + self.stages * (
                 self.csf.bytes // 16
             )
-            # The storage address, for replacement words past a stage's window.
-            self.sh_csf_address_off = self.sh_csf_prologue_off + _covering_count(
-                (self.stages - 1) * 16 * self.csf.atoms * self.csf.slabs, 16
+            # Windowed stages: the records of the tile's slabs over the whole
+            # K range, indexed by absolute atom.
+            self.sh_csf_table_off = self.sh_csf_bases_off + _covering_count(
+                self.tile_n, 16
             )
+            table_bytes = (
+                self.csf.slabs * self.csf_atoms_per_slab * self.csf.record_bytes
+                if self.csf.windowed
+                else 0
+            )
+            # The storage address, for replacement words past a record or window.
+            self.sh_csf_address_off = self.sh_csf_table_off + table_bytes // 16
             self.shared_int4 = self.sh_csf_address_off + 1
         self.shared_words = self.shared_int4 * 4
+        if self.csf_scales:
+            # The persistent grid, and with it the split-K schedule and the
+            # output bits, follows blocks_per_sm: compressed scales keep the
+            # residency native scales plan whenever their real footprint
+            # admits it (the planner's estimate pads the shared footprint).
+            native_blocks = _determine_blocks_per_sm(
+                problem_m=self.size_m,
+                problem_n=self.covered_size_n,
+                top_k=self.top_k,
+                cta_threads=self.cta_threads,
+                cta_m_blocks=self.cta_m_blocks,
+                tile_n=self.tile_n,
+                tile_k=self.tile_k,
+                uses_m_block_8=self.uses_m_block_8,
+                sms=self.sms,
+                max_shared_mem=max_shared_mem,
+                scale_format="e4m3_k16",
+                weight_layout=weight_layout,
+                pipeline_stages=self.stages,
+                problem_k=self.size_k,
+            )
+            if (
+                native_blocks > self.blocks_per_sm
+                and native_blocks * _resident_cta_shared_bytes(self.shared_words * 4)
+                <= _device_shared_mem_per_sm()
+            ):
+                self.blocks_per_sm = native_blocks
         if self.shared_words * 4 > int(max_shared_mem):
             raise ValueError(
                 "W4A16 shared-memory footprint exceeds device opt-in limit: "
@@ -1709,6 +1889,15 @@ class W4A16GemmKernel:
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
         row = i // Int32(self.a_gl_rd_delta_o)
+        if cutlass.const_expr(self.a_gl_rd_delta_o < 8):
+            # K32 rows hold four 16-byte vectors: an XOR with row & 7 would
+            # leave the row (colliding rows 7 and 8 and overrunning the
+            # stage). Pairs of rows share one 128-byte line, so XOR the
+            # vector with the pair index to keep ldmatrix conflict free.
+            return Int32(self.a_gl_rd_delta_o) * row + (
+                (i - row * Int32(self.a_gl_rd_delta_o))
+                ^ ((row >> Int32(1)) & Int32(self.a_gl_rd_delta_o - 1))
+            )
         return Int32(self.a_gl_rd_delta_o) * row + (
             (i - row * Int32(self.a_gl_rd_delta_o)) ^ (row & Int32(7))
         )
@@ -2667,6 +2856,14 @@ class W4A16GemmKernel:
         active_size_m: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.csf_scales):
+            # The tile's row bases (and windowed record table) load while the
+            # route block is read.
+            self._stage_csf_tile(
+                scales_i32_flat, smem_base, tid, expert_idx, output_n_tile,
+                reduce_k_tile, reduce_tile_count,
+            )
+            cute.arch.cp_async_commit_group()
         (
             global_scale_f32,
             block_valid_rows,
@@ -2835,6 +3032,14 @@ class W4A16GemmKernel:
         active_size_m: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.csf_scales):
+            # The tile's row bases (and windowed record table) load while the
+            # route block is read.
+            self._stage_csf_tile(
+                scales_i32_flat, smem_base, tid, expert_idx, output_n_tile,
+                reduce_k_tile, reduce_tile_count,
+            )
+            cute.arch.cp_async_commit_group()
         (
             global_scale_f32,
             block_valid_rows,
@@ -3094,6 +3299,18 @@ class W4A16GemmKernel:
                             expert_idx,
                             dynamic_pair_override,
                         )
+                        if cutlass.const_expr(
+                            self.csf_scales and kk == self.b_sh_wr_iters - 2
+                        ):
+                            # The lookahead barrier landed the next stage:
+                            # issue its scale-word reads now, so this stage's
+                            # MMAs hide them (the word is stored after them).
+                            csf_word = self._csf_word_reads(
+                                smem_base,
+                                tid,
+                                Int32((pipe + 1) % self.stages),
+                                reduce_k_tile + tile_idx + Int32(1),
+                            )
 
                         if cutlass.const_expr(self.trellis_pair_dynamic):
                             if cutlass.const_expr(
@@ -3157,10 +3374,16 @@ class W4A16GemmKernel:
                             )
 
                         if cutlass.const_expr(
+                            self.csf_scales and kk == self.b_sh_wr_iters - 2
+                        ):
+                            csf_word = self._csf_word_pick(csf_word)
+                        if cutlass.const_expr(
                             self.csf_scales and kk + 1 == self.b_sh_wr_iters
                         ):
-                            # Rebuild the next stage's scale words once this
-                            # step's MMAs are issued, so they hide its latency.
+                            # Store the next stage's scale words once this
+                            # step's MMAs are issued, then load its fragments.
+                            if tile_idx + Int32(1) < k_tiles:
+                                self._csf_word_store(smem_base, tid, csf_word)
                             self._load_next_fragment_bundle(
                                 b_scale_next,
                                 a_regs_next,
@@ -4193,13 +4416,6 @@ class W4A16GemmKernel:
         else:
             next_tile = tile_idx + Int32(1)
             if next_tile < k_tiles:
-                if cutlass.const_expr(self.csf_scales):
-                    self._expand_csf_warp(
-                        smem_base,
-                        tid,
-                        Int32((pipe + 1) % self.stages),
-                        reduce_k_tile + next_tile,
-                    )
                 self._load_b_scale_register_bundle(
                     b_scale_next,
                     smem_base,
@@ -5009,7 +5225,6 @@ class W4A16GemmKernel:
         output_n_tile: Int32,
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
-        csf_heads: Int32,
     ):
         for i in cutlass.range_constexpr(self.a_sh_wr_iters):
             row = a_rows_per_iter * Int32(i) + a_gl_rd_row
@@ -5397,7 +5612,7 @@ class W4A16GemmKernel:
         if cutlass.const_expr(self.csf_scales):
             self._stage_csf_scales(
                 scales_i32_flat, smem_base, tid, pipe, tile_idx, expert_idx,
-                output_n_tile, csf_heads,
+                output_n_tile,
             )
         elif cutlass.const_expr(self.native_nvfp4_scales):
             self._stage_modelopt_scales(
@@ -5450,28 +5665,141 @@ class W4A16GemmKernel:
         )
 
     @cute.jit
-    def _csf_record(self, block: Int64, slab: Int32, atom: Int32) -> Int64:
+    def _stage_csf_tile(
+        self,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        reduce_k_tile: Int32,
+        k_tiles: Int32,
+    ):
+        """Issue the tile's row bases (and, windowed, the records of its K range).
+
+        Joins the current commit group; also stores the storage address.
+        """
+        csf = self.csf
+        block = self._csf_expert_block(scales_i32_flat, expert_idx)
+        slab0 = output_n_tile * Int32(csf.slabs)
+        if tid == Int32(0):
+            st_shared_u64(
+                smem_base + Int32(self.sh_csf_address_off * 16),
+                get_ptr_as_int64(scales_i32_flat, Int64(0)).to(Uint64),
+            )
+        chunks_per_slab = csf.slab_rows // 16
+        for i in cutlass.range_constexpr(
+            _covering_count(csf.slabs * chunks_per_slab, self.cta_threads)
+        ):
+            c = tid + Int32(i * self.cta_threads)
+            if c < Int32(csf.slabs * chunks_per_slab):
+                slab = c // Int32(chunks_per_slab)
+                part = c % Int32(chunks_per_slab)
+                cp_async4_shared_global(
+                    smem_base + Int32(self.sh_csf_bases_off * 16) + c * Int32(16),
+                    block
+                    + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
+                    + Int64(part * Int32(16)),
+                )
+        if cutlass.const_expr(csf.windowed):
+            parts = csf.record_bytes // 16
+            per_slab = self.csf_atoms_per_slab * parts
+            atom_first = (reduce_k_tile * Int32(csf.groups)) // Int32(4)
+            atom_end = (
+                (reduce_k_tile + k_tiles) * Int32(csf.groups) + Int32(3)
+            ) // Int32(4)
+            for i in cutlass.range_constexpr(
+                _covering_count(csf.slabs * per_slab, self.cta_threads)
+            ):
+                c = tid + Int32(i * self.cta_threads)
+                atom = (c % Int32(per_slab)) // Int32(parts)
+                if (
+                    c < Int32(csf.slabs * per_slab)
+                    and atom >= atom_first
+                    and atom < atom_end
+                ):
+                    cp_async4_shared_global(
+                        smem_base + Int32(self.sh_csf_table_off * 16) + c * Int32(16),
+                        block
+                        + Int64(self.csf_records_in_block)
+                        + Int64(slab0 * Int32(self.csf_atoms_per_slab)) * Int64(
+                            csf.record_bytes
+                        )
+                        + Int64(c) * Int64(16),
+                    )
+
+    @cute.jit
+    def _csf_table_record(self, smem_base: Int32, slab: Int32, atom: Int32) -> Int32:
+        """Shared address of a staged record of the tile's record table."""
         return (
-            block
-            + Int64(self.csf_records_in_block)
-            + (Int64(slab) * Int64(self.csf_atoms_per_slab) + Int64(atom)) * Int64(32)
+            smem_base
+            + Int32(self.sh_csf_table_off * 16)
+            + (slab * Int32(self.csf_atoms_per_slab) + atom) * Int32(self.csf.record_bytes)
         )
 
     @cute.jit
-    def _csf_bounds(self, heads: Int32, slab: Int32, sub: Int32):
-        """Replacement-word range of one slab of a stage, from the stage's record heads.
+    def _csf_window_addr(self, stage: Int32, slab: Int32) -> Int32:
+        """A slab's window of a stage: its first word index, then the words."""
+        return stage + Int32(self.csf.records) + slab * Int32(16 + 4 * self.csf.window_words)
 
-        A K32 stage covers half an atom: its k-groups start at ``sub`` (0 or 2).
+    @cute.jit
+    def _stage_csf_window(
+        self,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: Int32,
+        tile_idx: Int32,
+        first_thread: cutlass.Constexpr[int],
+    ):
+        """Issue the replacement-word window of one stage from the tile's record table.
+
+        The window starts at the stage's first replacement word, aligned down
+        to four words, and holds at most ``window_words``; its first word index
+        is stored with it. Words past it are read from global memory.
         """
-        first = heads + slab * Int32(self.csf.atoms * 16)
-        start = ld_shared_u32(first)
-        prefixes = ld_shared_u32(first + Int32(4))
-        begin = start + ((prefixes >> (sub.to(Uint32) * Uint32(8))) & Uint32(255))
-        end = ld_shared_u32(first + Int32((self.csf.atoms - 1) * 16 + 8))
-        if cutlass.const_expr(self.csf.groups < 4):
-            if sub == Int32(0):
-                end = start + ((prefixes >> Uint32(16)) & Uint32(255))
-        return begin, end
+        csf = self.csf
+        storage = get_ptr_as_int64(scales_i32_flat, Int64(0))
+        stage = self._csf_stage_addr(smem_base, pipe)
+        parts = csf.window_words // 4
+        group0 = tile_idx * Int32(csf.groups)
+        last = group0 + Int32(csf.groups - 1)
+        for i in cutlass.range_constexpr(
+            _covering_count(first_thread + csf.slabs * parts, self.cta_threads)
+        ):
+            c = tid + Int32(i * self.cta_threads) - Int32(first_thread)
+            if c >= Int32(0) and c < Int32(csf.slabs * parts):
+                slab = c // Int32(parts)
+                part = c % Int32(parts)
+                first = self._csf_table_record(smem_base, slab, group0 // Int32(4))
+                begin = ld_shared_u32(first) + (
+                    (
+                        ld_shared_u32(first + Int32(4))
+                        >> ((group0 % Int32(4)).to(Uint32) * Uint32(8))
+                    )
+                    & Uint32(255)
+                )
+                closing = self._csf_table_record(smem_base, slab, last // Int32(4))
+                end = ld_shared_u32(closing) + ld_shared_u32(closing + Int32(8))
+                if last % Int32(4) != Int32(3):
+                    end = ld_shared_u32(closing) + (
+                        (
+                            ld_shared_u32(closing + Int32(4))
+                            >> (((last % Int32(4)) + Int32(1)).to(Uint32) * Uint32(8))
+                        )
+                        & Uint32(255)
+                    )
+                aligned = begin & Uint32(0xFFFFFFFC)
+                window = self._csf_window_addr(stage, slab)
+                if part == Int32(0):
+                    st_shared_u32(window, aligned)
+                if (part * Int32(4)).to(Uint32) < end - aligned:
+                    cp_async4_shared_global(
+                        window + Int32(16) + part * Int32(16),
+                        storage
+                        + aligned.to(Int64) * Int64(4)
+                        + Int64(part) * Int64(16),
+                    )
 
     @cute.jit
     def _stage_csf_scales(
@@ -5483,229 +5811,211 @@ class W4A16GemmKernel:
         tile_idx: Int32,
         expert_idx: Int32,
         output_n_tile: Int32,
-        heads: Int32,
     ):
         """Issue one stage of compressed scales into the current commit group.
 
-        Copies the row bases and codes of the stage's k-groups, its exception
-        records, the record heads of the stage ``stages - 1`` later (whose
-        replacement words are issued from them), and this stage's replacement
-        words, whose bounds come from ``heads``.
+        Copies the codes of the stage's k-groups and either the exception
+        records of the atoms they touch, which carry their first replacement
+        words, or (windowed storage) the stage's replacement-word window,
+        located through the tile's staged record table.
         """
         csf = self.csf
         block = self._csf_expert_block(scales_i32_flat, expert_idx)
-        storage = get_ptr_as_int64(scales_i32_flat, Int64(0))
         stage = self._csf_stage_addr(smem_base, pipe)
         group0 = tile_idx * Int32(csf.groups)
         atom0 = group0 // Int32(4)
-        sub = group0 % Int32(4)
-        ahead = tile_idx + Int32(self.stages - 1)
-        atom_ahead = (ahead * Int32(csf.groups)) // Int32(4)
         slab0 = output_n_tile * Int32(csf.slabs)
-        window = (csf.cap + 4) // 4
-        end_bases = 8 * csf.slabs
-        end_codes = end_bases + 4 * csf.groups * csf.slabs
-        end_records = end_codes + 2 * csf.atoms * csf.slabs
-        end_heads = end_records + csf.atoms * csf.slabs
-        total = end_heads + window * csf.slabs
+        # A slab's codes of consecutive k-groups are contiguous.
+        code_parts = csf.groups * csf.slab_rows // 32
+        record_parts = 0 if csf.windowed else csf.atoms * csf.record_bytes // 16
+        code_chunks = csf.slabs * code_parts
+        total = code_chunks + csf.slabs * record_parts
         for i in cutlass.range_constexpr(_covering_count(total, self.cta_threads)):
             chunk = tid + Int32(i * self.cta_threads)
-            if chunk < Int32(end_bases):
-                slab = chunk // Int32(8)
-                part = chunk % Int32(8)
+            # Both regions are contiguous in shared memory.
+            destination = stage + chunk * Int32(16)
+            if chunk < Int32(code_chunks):
+                slab = chunk // Int32(code_parts)
+                part = chunk % Int32(code_parts)
                 cp_async4_shared_global(
-                    stage + Int32(csf.bases) + slab * Int32(128) + part * Int32(16),
+                    destination,
                     block
                     + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
-                    + Int64(part) * Int64(16),
+                    + Int64(
+                        Int32(csf.slab_rows)
+                        + group0 * Int32(csf.slab_rows // 2)
+                        + part * Int32(16)
+                    ),
                 )
-            elif chunk < Int32(end_codes):
-                c = chunk - Int32(end_bases)
-                slab = c // Int32(4 * csf.groups)
-                part = c % Int32(4 * csf.groups)
-                cp_async4_shared_global(
-                    stage
-                    + Int32(csf.codes)
-                    + slab * Int32(64 * csf.groups)
-                    + part * Int32(16),
-                    block
-                    + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
-                    + Int64(128)
-                    + Int64(group0) * Int64(64)
-                    + Int64(part) * Int64(16),
-                )
-            elif chunk < Int32(end_records):
-                c = chunk - Int32(end_codes)
-                slab = c // Int32(2 * csf.atoms)
-                part = c % Int32(2 * csf.atoms)
-                cp_async4_shared_global(
-                    stage
-                    + Int32(csf.records)
-                    + (slab * Int32(csf.atoms) + part // Int32(2)) * Int32(32)
-                    + (part % Int32(2)) * Int32(16),
-                    self._csf_record(block, slab0 + slab, atom0 + part // Int32(2))
-                    + Int64(part % Int32(2)) * Int64(16),
-                )
-            elif chunk < Int32(end_heads):
-                c = chunk - Int32(end_records)
-                slab = c // Int32(csf.atoms)
-                part = c % Int32(csf.atoms)
-                if ahead < Int32(self.k_tiles):
-                    cp_async4_shared_global(
-                        stage
-                        + Int32(csf.heads)
-                        + (slab * Int32(csf.atoms) + part) * Int32(16),
-                        self._csf_record(block, slab0 + slab, atom_ahead + part),
-                    )
             elif chunk < Int32(total):
-                c = chunk - Int32(end_heads)
-                slab = c // Int32(window)
-                part = c % Int32(window)
-                begin, end = self._csf_bounds(heads, slab, sub)
-                aligned = begin & Uint32(0xFFFFFFFC)
-                if (part * Int32(4)).to(Uint32) < end - aligned:
-                    cp_async4_shared_global(
-                        stage
-                        + Int32(csf.words)
-                        + slab * Int32(4 * (csf.cap + 4))
-                        + part * Int32(16),
-                        storage
-                        + aligned.to(Int64) * Int64(4)
-                        + Int64(part) * Int64(16),
+                c = chunk - Int32(code_chunks)
+                slab = c // Int32(record_parts)
+                part = c % Int32(record_parts)
+                cp_async4_shared_global(
+                    destination,
+                    block
+                    + Int64(self.csf_records_in_block)
+                    + (
+                        Int64(slab0 + slab) * Int64(self.csf_atoms_per_slab)
+                        + Int64(atom0)
                     )
-
-    @cute.jit
-    def _stage_csf_prologue(
-        self,
-        scales_i32_flat: cute.Tensor,
-        smem_base: Int32,
-        tid: Int32,
-        first_k_tile: Int32,
-        expert_idx: Int32,
-        output_n_tile: Int32,
-    ):
-        """Copy the storage address and the record heads of the stages issued at tile start."""
-        csf = self.csf
-        block = self._csf_expert_block(scales_i32_flat, expert_idx)
-        storage = get_ptr_as_int64(scales_i32_flat, Int64(0))
-        slab0 = output_n_tile * Int32(csf.slabs)
-        heads_per_stage = csf.atoms * csf.slabs
-        total = (self.stages - 1) * heads_per_stage
-        if tid == Int32(0):
-            st_shared_u64(
-                smem_base + Int32(self.sh_csf_address_off * 16), storage.to(Uint64)
+                    * Int64(csf.record_bytes)
+                    + Int64(part) * Int64(16),
+                )
+        if cutlass.const_expr(csf.windowed):
+            self._stage_csf_window(
+                scales_i32_flat, smem_base, tid, pipe, tile_idx,
+                min(code_chunks, self.cta_threads - csf.slabs * (csf.window_words // 4)),
             )
-        for i in cutlass.range_constexpr(_covering_count(total, self.cta_threads)):
-            c = tid + Int32(i * self.cta_threads)
-            if c < Int32(total):
-                stage = c // Int32(heads_per_stage)
-                rest = c % Int32(heads_per_stage)
-                slab = rest // Int32(csf.atoms)
-                part = rest % Int32(csf.atoms)
-                k_tile = first_k_tile + stage
-                if k_tile < Int32(self.k_tiles):
-                    atom = (k_tile * Int32(csf.groups)) // Int32(4) + part
-                    cp_async4_shared_global(
-                        smem_base
-                        + Int32(self.sh_csf_prologue_off * 16)
-                        + c * Int32(16),
-                        self._csf_record(block, slab0 + slab, atom),
-                    )
 
     @cute.jit
-    def _csf_scale_word(
-        self, stage: Int32, slab: Int32, group: Int32, lane: Int32, sub: Int32,
-        smem_base: Int32,
-    ) -> Uint32:
-        """One packed scale word (rows 4 lane to 4 lane + 3 of k-group ``group``) of a staged stage.
+    def _csf_lane_word(self, tid: Int32):
+        """The scale word a lane rebuilds: (k-group in the stage, word in the tile).
+
+        A warp reads two k-groups of its 64 output columns, one four-byte word
+        per lane. Warps own disjoint words.
+        """
+        warp = tid // Int32(32)
+        lane = tid % Int32(32)
+        group = Int32(2) * (warp // Int32(self.tb_n_warps)) + lane // Int32(16)
+        column = (warp % Int32(self.tb_n_warps)) * Int32(16) + lane % Int32(16)
+        return group, column
+
+    @cute.jit
+    def _csf_word_reads(self, smem_base: Int32, tid: Int32, pipe: Int32, tile_idx: Int32):
+        """Issue the staged reads of this lane's scale word of k-tile ``tile_idx``.
 
         The word is its rows' biased bases plus four 4-bit codes, already in
-        W4A16's packed scale encoding, unless the word's mask bit selects a
-        complete replacement word: from the staged window, or from global memory
-        past it.
+        W4A16's packed scale encoding, unless its mask bit selects a complete
+        replacement word: from the atom's record (inline words) or from the
+        stage's window (windowed storage). Reads of a stage past the tile's
+        last return stale bytes; only stores and global reads are guarded.
         """
         csf = self.csf
-        codes = ld_shared_u16_zx(
+        group, column = self._csf_lane_word(tid)
+        slab = column // Int32(csf.slab_rows // 4)
+        word = column % Int32(csf.slab_rows // 4)
+        stage = self._csf_stage_addr(smem_base, pipe)
+        # Stages reuse their shared addresses: the load must not be hoisted.
+        codes = ld_shared_u16_zx_ordered(
             stage
             + Int32(csf.codes)
-            + slab * Int32(64 * csf.groups)
-            + group * Int32(64)
-            + lane * Int32(2)
+            + slab * Int32(csf.groups * csf.slab_rows // 2)
+            + group * Int32(csf.slab_rows // 2)
+            + word * Int32(2)
         )
-        codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
-        value = codes + ld_shared_u32(
-            stage + Int32(csf.bases) + slab * Int32(128) + lane * Int32(4)
+        base = ld_shared_u32(
+            smem_base + Int32(self.sh_csf_bases_off * 16) + column * Int32(4)
         )
-        position = sub + group
-        record = (
-            stage
-            + Int32(csf.records)
-            + (slab * Int32(csf.atoms) + position // Int32(4)) * Int32(32)
-        )
+        position = (tile_idx * Int32(csf.groups)) % Int32(4) + group
+        start = Uint32(0)
+        aligned = Uint32(0)
+        if cutlass.const_expr(csf.windowed):
+            record = self._csf_table_record(
+                smem_base,
+                slab,
+                (tile_idx * Int32(csf.groups)) // Int32(4) + position // Int32(4),
+            )
+            start = ld_shared_u32(record)
+            aligned = ld_shared_u32(self._csf_window_addr(stage, slab))
+        else:
+            record = (
+                stage
+                + Int32(csf.records)
+                + (slab * Int32(csf.atoms) + position // Int32(4))
+                * Int32(csf.record_bytes)
+            )
         mask = ld_shared_u32(record + Int32(16) + (position % Int32(4)) * Int32(4))
-        bit = Uint32(1) << lane.to(Uint32)
-        if (mask & bit) != Uint32(0):
-            prefixes = ld_shared_u32(record + Int32(4))
-            index = (
-                ld_shared_u32(record)
-                + (
-                    (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8)))
-                    & Uint32(255)
-                )
-                + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
+        prefixes = ld_shared_u32(record + Int32(4))
+        return (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            stage, slab, start, aligned, Uint32(0), Uint32(0),
+        )
+
+    @cute.jit
+    def _csf_word_pick(self, state):
+        """Locate the word's replacement and issue its staged read."""
+        csf = self.csf
+        (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            stage, slab, start, aligned, _, _,
+        ) = state
+        bit = Uint32(1) << word.to(Uint32)
+        index = (
+            (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8))) & Uint32(255)
+        ) + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
+        if cutlass.const_expr(csf.windowed):
+            # Storage word index; the window starts at ``aligned``.
+            index = start + index
+            staged = index - aligned
+            if staged > Uint32(csf.window_words - 1):
+                staged = Uint32(csf.window_words - 1)
+            replacement = ld_shared_u32(
+                self._csf_window_addr(stage, slab) + Int32(16) + staged.to(Int32) * Int32(4)
             )
-            first = stage + Int32(csf.records) + slab * Int32(csf.atoms * 32)
-            begin = ld_shared_u32(first) + (
-                (ld_shared_u32(first + Int32(4)) >> (sub.to(Uint32) * Uint32(8)))
-                & Uint32(255)
-            )
-            offset = index - (begin & Uint32(0xFFFFFFFC))
-            if offset < Uint32(csf.cap + 4):
-                value = ld_shared_u32(
-                    stage
-                    + Int32(csf.words)
-                    + slab * Int32(4 * (csf.cap + 4))
-                    + offset.to(Int32) * Int32(4)
+        else:
+            staged = index
+            if index > Uint32(csf.inline_words - 1):
+                staged = Uint32(csf.inline_words - 1)
+            replacement = ld_shared_u32(record + Int32(32) + staged.to(Int32) * Int32(4))
+        return (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            stage, slab, start, aligned, index, replacement,
+        )
+
+    @cute.jit
+    def _csf_word_store(self, smem_base: Int32, tid: Int32, state):
+        """Select this lane's scale word and store it where the register loads read it.
+
+        Replacement words past the record's inline words, or past the stage's
+        window, read global memory. A warp barrier orders the stores before
+        the warp's register loads.
+        """
+        csf = self.csf
+        (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            stage, slab, start, aligned, index, replacement,
+        ) = state
+        codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
+        value = codes + base
+        flagged = (mask & (Uint32(1) << word.to(Uint32))) != Uint32(0)
+        if flagged:
+            value = replacement
+        if cutlass.const_expr(csf.windowed):
+            if flagged and index - aligned >= Uint32(csf.window_words):
+                slot = smem_base + Int32(self.sh_csf_address_off * 16)
+                address = ld_shared_u32(slot).to(Uint64) | (
+                    ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
                 )
-            else:
+                value = ld_global_nc_u32(address.to(Int64) + index.to(Int64) * Int64(4))
+        else:
+            if flagged and index >= Uint32(csf.inline_words):
                 slot = smem_base + Int32(self.sh_csf_address_off * 16)
                 address = ld_shared_u32(slot).to(Uint64) | (
                     ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
                 )
                 value = ld_global_nc_u32(
-                    address.to(Int64) + index.to(Int64) * Int64(4)
+                    address.to(Int64)
+                    + (ld_shared_u32(record).to(Int64) + index.to(Int64)) * Int64(4)
                 )
-        return value
+        st_shared_u32(
+            smem_base
+            + Int32(self.sh_s_off * 16)
+            + pipe * Int32(self.s_sh_stage * 16)
+            + group * Int32(self.tile_n)
+            + column * Int32(4),
+            value,
+        )
+        cute.arch.sync_warp()
 
     @cute.jit
     def _expand_csf_warp(self, smem_base: Int32, tid: Int32, pipe: Int32, tile_idx: Int32):
-        """Rebuild the packed scale words this warp reads from one staged k-tile.
-
-        A warp reads ``b_sh_wr_iters`` k-groups of its 64 output columns, one
-        four-byte word per lane for the usual two groups. Warps own disjoint
-        words, so a warp barrier orders the rebuild before its register loads.
-        """
-        warp = tid // Int32(32)
-        lane = tid % Int32(32)
-        warp_row = warp // Int32(self.tb_n_warps)
-        warp_col = warp % Int32(self.tb_n_warps)
-        stage = self._csf_stage_addr(smem_base, pipe)
-        slot = smem_base + Int32(self.sh_s_off * 16) + pipe * Int32(self.s_sh_stage * 16)
-        sub = (tile_idx * Int32(self.csf.groups)) % Int32(4)
-        words = 16 * self.b_sh_wr_iters
-        for i in cutlass.range_constexpr(_covering_count(words, 32)):
-            word = lane + Int32(32 * i)
-            if word < Int32(words):
-                group = Int32(self.b_sh_wr_iters) * warp_row + word // Int32(16)
-                column = warp_col * Int32(16) + word % Int32(16)
-                st_shared_u32(
-                    slot + group * Int32(self.tile_n) + column * Int32(4),
-                    self._csf_scale_word(
-                        stage, column // Int32(32), group, column % Int32(32), sub,
-                        smem_base,
-                    ),
-                )
-        cute.arch.sync_warp()
+        """Rebuild the packed scale words this warp reads from one staged k-tile."""
+        self._csf_word_store(
+            smem_base,
+            tid,
+            self._csf_word_pick(self._csf_word_reads(smem_base, tid, pipe, tile_idx)),
+        )
 
     @cute.jit
     def _prefetch_pipeline_step(
@@ -5787,22 +6097,12 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
-        if cutlass.const_expr(self.csf_scales):
-            # The first stages' replacement words need their record heads first.
-            self._stage_csf_prologue(
-                scales_i32_flat, smem_base, tid, reduce_k_tile, expert_idx,
-                output_n_tile,
-            )
-            cute.arch.cp_async_commit_group()
+        if cutlass.const_expr(self.csf_scales and self.csf.windowed):
+            # The tile's record table (staged before the route-block read)
+            # locates the replacement-word windows of the stages issued here.
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
         for pipe in cutlass.range_constexpr(self.stages - 1):
-            csf_heads = Int32(0)
-            if cutlass.const_expr(self.csf_scales):
-                csf_heads = smem_base + Int32(
-                    self.sh_csf_prologue_off * 16
-                    + pipe * 16 * self.csf.atoms * self.csf.slabs
-                )
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
                     a_bf16_flat,
@@ -5826,7 +6126,6 @@ class W4A16GemmKernel:
                     output_n_tile,
                     expert_idx,
                     dynamic_pair_override,
-                    csf_heads,
                 )
             else:
                 cute.arch.cp_async_commit_group()
@@ -5864,10 +6163,6 @@ class W4A16GemmKernel:
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
         fetch_tile = tile_idx + Int32(self.stages - 1)
-        # The stage consumed now staged the record heads of the stage fetched now.
-        csf_heads = Int32(0)
-        if cutlass.const_expr(self.csf_scales):
-            csf_heads = self._csf_stage_addr(smem_base, pipe) + Int32(self.csf.heads)
         if fetch_tile < k_tiles:
             self._stage_k_tile_async(
                 a_bf16_flat,
@@ -5891,7 +6186,6 @@ class W4A16GemmKernel:
                 output_n_tile,
                 expert_idx,
                 dynamic_pair_override,
-                csf_heads,
             )
         else:
             cute.arch.cp_async_commit_group()
@@ -7210,6 +7504,25 @@ class W4A16FusedMoeKernel:
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        # The cooperative launch must admit blocks_per_sm CTAs on every SM.
+        if self.fc1.weight_layout_block:
+            self.smem_carveout = 100
+        elif self.blocks_per_sm > 1:
+            shared_mem_per_sm = _device_shared_mem_per_sm()
+            if self.blocks_per_sm * (
+                self.shared_words * 4 + _CTA_RESERVED_SHARED_MEM
+            ) > shared_mem_per_sm:
+                raise ValueError(
+                    "fused W4A16 plan does not fit its residency: "
+                    f"{self.blocks_per_sm} CTAs of {self.shared_words * 4} shared bytes"
+                )
+            self.smem_carveout = _cooperative_smem_carveout(
+                blocks_per_sm=self.blocks_per_sm,
+                shared_bytes=self.shared_words * 4,
+                shared_mem_per_sm=shared_mem_per_sm,
+            )
+        else:
+            self.smem_carveout = None
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -7581,8 +7894,9 @@ class W4A16FusedMoeKernel:
             # Occupancy uses the full SMEM budget. CUTLASS's automatic carveout
             # omits the per-CTA reservation: two 32 KiB Q8_0 CTAs request a
             # 64 KiB carveout but cannot both reside there, rejecting the
-            # cooperative launch. Match the budget used by the launch planner.
-            preferred_smem_carveout=100 if self.fc1.weight_layout_block else None,
+            # cooperative launch. Block codecs take the whole budget; other
+            # layouts the smallest carveout that admits their planned CTAs.
+            preferred_smem_carveout=self.smem_carveout,
             stream=stream,
         )
 
@@ -10837,6 +11151,7 @@ def compile_w4a16_fused_moe(
                 weight_bits=weight_bits,
                 allow_logical_tail=allow_native_logical_tail,
                 allow_qualified_fc2_tile=name == "fc2",
+                allow_k32_tile=name == "fc2",
                 uses_m_block_8=moe_block_size == 8,
                 pipeline_stages=pipeline_stages,
             ):
