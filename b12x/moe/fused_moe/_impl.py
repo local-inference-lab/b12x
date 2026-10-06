@@ -13208,7 +13208,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         # expert's scales, expanded once from the inline storage.
         from b12x._lib.quant.mxfp4_csf_inline import expand_mxfp4_csf_inline
 
-        for plane, scales in zip(csf_inline, (w1_blockscale, w2_blockscale)):
+        for plane, scales in zip(csf_inline, (w1_blockscale, w2_blockscale), strict=True):
             expand_mxfp4_csf_inline(
                 plane, scales.view(torch.uint8).view(plane.num_experts, -1)
             )
