@@ -10,11 +10,16 @@ from b12x._lib.quant.nvfp4_csf import (
     repack_nvfp4_csf_batch,
 )
 from b12x._lib.quant.nvfp4_csf_packed import (
+    HEADER_BYTES,
+    RECORD_HEADER_BYTES,
+    TAIL_BYTES,
     PackedCsfPlane,
     build_packed_csf_scales,
+    configured_inline_words,
     expand_packed_csf_scales,
     inline_words,
     packed_slab_position,
+    record_bytes,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import _process_nvfp4_packed_scales
 from ..conftest import require_b12x
@@ -75,9 +80,10 @@ def test_packed_slab_positions_invert_the_plane_permutation():
     assert np.array_equal(perm[positions], np.arange(128))
 
 
+@pytest.mark.parametrize("inline", [0, 32])
 @pytest.mark.parametrize("table", ["w4a16", "permutation"])
 @pytest.mark.parametrize("rows,columns,rotation", [(256, 64, 128), (512, 16, 0), (128, 256, 0)])
-def test_index_matches_the_expansion_pass(rows, columns, rotation, table):
+def test_index_matches_the_expansion_pass(rows, columns, rotation, table, inline):
     device = require_b12x()
     experts = 5
     lut = _value_table(table, device)
@@ -99,7 +105,7 @@ def test_index_matches_the_expansion_pass(rows, columns, rotation, table):
     torch.cuda.synchronize()
     stored = []
     for batch, expected in ((first, out13), (second, out2)):
-        scales = build_packed_csf_scales(batch)
+        scales = build_packed_csf_scales(batch, inline=inline)
         stored.append(scales)
         assert torch.equal(expand_packed_csf_scales(scales), expected)
         assert scales.max_atom_words <= 128
@@ -128,8 +134,9 @@ def _w4a16_scale_bytes(logical, lut, rotation):
     return torch.from_numpy(out)
 
 
+@pytest.mark.parametrize("inline", [0, 32])
 @pytest.mark.parametrize("rows,columns,rotation", [(192, 22, 96), (704, 6, 352), (128, 10, 0)])
-def test_index_of_planes_off_the_native_grid(rows, columns, rotation):
+def test_index_of_planes_off_the_native_grid(rows, columns, rotation, inline):
     """2048/TP6 = 352 channels: 704 gate/up rows (64-row slabs), 22 down k-groups."""
     device = require_b12x()
     experts = 3
@@ -141,7 +148,7 @@ def test_index_of_planes_off_the_native_grid(rows, columns, rotation):
         rows, columns,
     )
     batch = repack_nvfp4_csf_batch(native, row_rotation=rotation, value_lut=lut)
-    scales = build_packed_csf_scales(batch)
+    scales = build_packed_csf_scales(batch, inline=inline)
     assert (scales.rows, scales.columns) == (rows, columns)
     assert scales.slab_rows == (128 if rows % 128 == 0 else 64)
     expected = _w4a16_scale_bytes(logical, lut, rotation).to(device)
@@ -153,7 +160,8 @@ def test_index_of_planes_off_the_native_grid(rows, columns, rotation):
             _native_batch(_logical_scales(experts, 256, 32, 2), device),
             row_rotation=0,
             value_lut=lut,
-        )
+        ),
+        inline=inline,
     )
     views = (out.view(torch.float8_e4m3fn), other.view(torch.float8_e4m3fn))
     expander = Nvfp4CsfDecoder.prepare(PackedCsfPlane.of(scales), PackedCsfPlane.of(second), *views)
@@ -163,15 +171,62 @@ def test_index_of_planes_off_the_native_grid(rows, columns, rotation):
     assert torch.equal(other[[0, 2]], expand_packed_csf_scales(second)[[0, 2]])
 
 
-def test_records_spill_past_their_inline_words():
+@pytest.mark.parametrize("inline", [4, 32])
+def test_records_spill_past_their_inline_words(inline):
     """Atoms with more replacement words than a record holds read the rest from storage."""
     device = require_b12x()
     experts, rows, columns = 2, 128, 8
     lut = _value_table("w4a16", device)
     logical = _logical_scales(experts, rows, columns, 9, outliers=0.5)
     batch = repack_nvfp4_csf_batch(_native_batch(logical, device), row_rotation=0, value_lut=lut)
-    scales = build_packed_csf_scales(batch)
-    assert scales.max_atom_words > inline_words(scales.slab_rows)
+    scales = build_packed_csf_scales(batch, inline=inline)
+    assert scales.max_atom_words > inline_words(scales.slab_rows, inline)
     assert torch.equal(
         expand_packed_csf_scales(scales), _w4a16_scale_bytes(logical, lut, 0).to(device)
     )
+
+
+def test_inline_words_parameter(monkeypatch):
+    """B12X_NVFP4_CSF_INLINE_WORDS: 0 (default) keeps 32-byte records, header only."""
+    monkeypatch.delenv("B12X_NVFP4_CSF_INLINE_WORDS", raising=False)
+    assert configured_inline_words() == 0
+    for value, words in (("0", 0), ("32", 32), ("8", 8), ("64", 64)):
+        monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", value)
+        assert configured_inline_words() == words
+    for value in ("3", "-4", "68", "many"):
+        monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", value)
+        with pytest.raises(ValueError, match="multiple of 4"):
+            configured_inline_words()
+    # 64-row records hold five eighths of the 128-row count, in whole 16 bytes.
+    assert [record_bytes(128, w) for w in (0, 4, 8, 32)] == [32, 48, 64, 160]
+    assert [record_bytes(64, w) for w in (0, 4, 8, 32)] == [32, 48, 64, 112]
+
+
+@pytest.mark.parametrize("rows,columns", [(256, 64), (704, 22)])
+def test_storage_without_inline_words_matches_uninlined_storage_size(rows, columns, monkeypatch):
+    """The default keeps the memory of 32-byte records plus every replacement word once."""
+    device = require_b12x()
+    experts = 3
+    lut = _value_table("w4a16", device)
+    batch = repack_nvfp4_csf_batch(
+        _native_batch(_logical_scales(experts, rows, columns, 11), device),
+        row_rotation=0,
+        value_lut=lut,
+    )
+    monkeypatch.delenv("B12X_NVFP4_CSF_INLINE_WORDS", raising=False)
+    plain = build_packed_csf_scales(batch)
+    assert plain.inline_words == 0 and plain.record_bytes == RECORD_HEADER_BYTES
+    slabs, atoms = plain.slabs, plain.atoms
+    records = plain.storage[HEADER_BYTES : plain.words_offset].view(experts, -1)
+    records = records[:, slabs * plain.slab_bytes :].contiguous().view(torch.int32)
+    words = int(records.reshape(-1, RECORD_HEADER_BYTES // 4)[:, 2].sum())
+    assert words > 0
+    assert plain.storage.numel() == (
+        HEADER_BYTES
+        + experts * slabs * (plain.slab_bytes + atoms * RECORD_HEADER_BYTES)
+        + 4 * words
+        + TAIL_BYTES
+    )
+    inlined = build_packed_csf_scales(batch, inline=32)
+    assert torch.equal(expand_packed_csf_scales(inlined), expand_packed_csf_scales(plain))
+    assert inlined.storage.numel() > plain.storage.numel()

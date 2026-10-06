@@ -518,9 +518,14 @@ def prepare_weights(
                 from b12x._lib.quant.nvfp4_csf_packed import (
                     PackedCsfPlane,
                     build_packed_csf_scales,
+                    configured_inline_words,
                 )
 
-                stored = tuple(build_packed_csf_scales(plane) for plane in planes)
+                inline_words = configured_inline_words()
+                stored = tuple(
+                    build_packed_csf_scales(plane, inline=inline_words)
+                    for plane in planes
+                )
                 expander = Nvfp4CsfDecoder.prepare(
                     *(PackedCsfPlane.of(scales) for scales in stored), *outputs
                 )
@@ -529,10 +534,19 @@ def prepare_weights(
                     packed,
                     w13_scale=stored[0].storage,
                     w2_scale=stored[1].storage,
-                    scale_format="e4m3_k16_csf",
+                    scale_format=(
+                        "e4m3_k16_csf"
+                        if inline_words == 0
+                        else f"e4m3_k16_csf_i{inline_words}"
+                    ),
                 )
                 plan = replace(
-                    plan, _impl=replace(plan._impl, w4a16_compressed_scales=True)
+                    plan,
+                    _impl=replace(
+                        plan._impl,
+                        w4a16_compressed_scales=True,
+                        w4a16_csf_inline_words=inline_words,
+                    ),
                 )
                 return PreparedExperts(
                     plan=plan,
