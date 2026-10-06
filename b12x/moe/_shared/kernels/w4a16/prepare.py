@@ -1420,6 +1420,9 @@ def prepare_w4a16_x4t_weights(
     packed_w2_scale = scale_scratch(
         "w2_scale_scratch", w2_scale_scratch, (intermediate_size // 32, hidden_size)
     )
+    lo13, lo2 = packed_w13_scale.data_ptr(), packed_w2_scale.data_ptr()
+    if lo13 < lo2 + packed_w2_scale.numel() and lo2 < lo13 + packed_w13_scale.numel():
+        raise ValueError("X4T scale pair destinations must not overlap")
     w13_row_rotation = intermediate_size if w13_layout == "w13" else 0
     packed_programs = None
     if ds41 or (
@@ -1446,6 +1449,16 @@ def prepare_w4a16_x4t_weights(
                 (False, True, False), (False, False, True),
             )
         )
+    elif (
+        weight_layout != "packed"
+        or not kimi
+        or intermediate_size != 256
+        or w13_x4t.exception_task_rows != 128
+        or w2_x4t.exception_task_rows != 896
+        or w13_x4t.exception_row_rotation != w13_row_rotation
+        or w2_x4t.exception_row_rotation != 0
+    ):
+        raise ValueError("X4T requires paired 64-row tasks or packed Kimi TP12 tasks")
     if weight_layout == "modelopt":
         return W4A16ModelOptWeights(
             w13=w13_fp4, w2=w2_fp4,
