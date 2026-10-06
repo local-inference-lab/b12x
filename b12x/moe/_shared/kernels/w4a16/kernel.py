@@ -5604,7 +5604,9 @@ class W4A16GemmKernel:
         The word is its rows' biased bases plus four 4-bit codes, already in
         W4A16's packed scale encoding, unless its mask bit selects a complete
         replacement word: from the staged record, or from global memory past
-        the record's inline words.
+        the record's inline words. Every staged read issues up front and the
+        record's word is selected without a branch; only words past the
+        record's inline words branch to global memory.
         """
         csf = self.csf
         # Stages reuse their shared addresses: the load must not be hoisted.
@@ -5615,8 +5617,6 @@ class W4A16GemmKernel:
             + group * Int32(csf.tile_rows // 2)
             + word * Int32(2)
         )
-        codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
-        value = codes + base
         position = sub + group
         record = (
             stage
@@ -5625,24 +5625,29 @@ class W4A16GemmKernel:
             * Int32(csf.record_bytes)
         )
         mask = ld_shared_u32(record + Int32(16) + (position % Int32(4)) * Int32(4))
+        prefixes = ld_shared_u32(record + Int32(4))
         bit = Uint32(1) << bit_index.to(Uint32)
-        if (mask & bit) != Uint32(0):
-            prefixes = ld_shared_u32(record + Int32(4))
-            index = (
-                (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8)))
-                & Uint32(255)
-            ) + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
-            if index < Uint32(csf.inline_words):
-                value = ld_shared_u32(record + Int32(32) + index.to(Int32) * Int32(4))
-            else:
-                slot = smem_base + Int32(self.sh_csf_address_off * 16)
-                address = ld_shared_u32(slot).to(Uint64) | (
-                    ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
-                )
-                value = ld_global_nc_u32(
-                    address.to(Int64)
-                    + (ld_shared_u32(record).to(Int64) + index.to(Int64)) * Int64(4)
-                )
+        index = (
+            (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8))) & Uint32(255)
+        ) + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
+        staged = index
+        if index > Uint32(csf.inline_words - 1):
+            staged = Uint32(csf.inline_words - 1)
+        replacement = ld_shared_u32(record + Int32(32) + staged.to(Int32) * Int32(4))
+        codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
+        value = codes + base
+        flagged = (mask & bit) != Uint32(0)
+        if flagged:
+            value = replacement
+        if flagged and index >= Uint32(csf.inline_words):
+            slot = smem_base + Int32(self.sh_csf_address_off * 16)
+            address = ld_shared_u32(slot).to(Uint64) | (
+                ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
+            )
+            value = ld_global_nc_u32(
+                address.to(Int64)
+                + (ld_shared_u32(record).to(Int64) + index.to(Int64)) * Int64(4)
+            )
         return value
 
     @cute.jit
