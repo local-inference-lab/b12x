@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-483",
+  "category": "performance",
+  "summary": "GLM-5.3 (744B) long-context decode up to 12% faster: the DSA indexer picks its merge from the live context length again",
+  "models": ["GLM-5.3"],
+  "compatibility": "No user action required. Cached indexer tuning selections are re-planned once.",
+  "details": [
+    "Startup tuning measured the fused-indexer merge at one short length and pinned the serial merge, which is about 3x slower per indexer launch at 128K tokens in the served model.",
+    "The tuning space now keeps the automatic per-launch choice (serial below the threshold, cooperative above it); fixed merges remain overrides.",
+    "GLM-5.3-NVFP4 TP8 MTP-3 on 8x RTX PRO 6000: C1 70.1 -> 78.3 steps/s at 128K, 74.9 -> 81.9 at 64K, 78.6 -> 83.0 at 32K; C2 111.9 -> 117.6 at 128K; short context unchanged."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [483],
+  "requires": []
+}
