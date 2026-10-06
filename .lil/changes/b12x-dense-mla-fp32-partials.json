@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-dense-mla-fp32-partials",
+  "category": "feature",
+  "summary": "Allow dense MLA split partials to remain FP32 until the output merge",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Set Caps.partial_dtype=torch.float32; torch.bfloat16 remains the default.",
+  "details": [
+    "FP32 doubles partial-output scratch without changing KV dtype, output dtype or split-selection policy."
+  ],
+  "pull_requests": [],
+  "requires": [],
+  "authors": [
+    "voipmonitor"
+  ]
+}

@@ -1,0 +1,135 @@
+{
+ "label": "nccl",
+ "command": "/private/tmp/claude-501/-Users-defilan-stuffy-code-ai-llmkube/c8d30f6c-615f-4609-be59-629b600c652a/scratchpad/decode_ab.py http://localhost:18120 nccl /private/tmp/claude-501/-Users-defilan-stuffy-code-ai-llmkube/c8d30f6c-615f-4609-be59-629b600c652a/scratchpad/ab-out/nccl-decode.json",
+ "endpoint": "http://localhost:18120",
+ "prompt": "Write a Go package that implements an LRU cache with generics, a mutex for concurrent use, and a table-driven test file. Explain each design decision briefly.",
+ "max_tokens": 512,
+ "runs": 5,
+ "started": "2026-10-01T18:31:42Z",
+ "models": {
+  "object": "list",
+  "data": [
+   {
+    "id": "DeepSeek-V4.1-Flash",
+    "object": "model",
+    "created": 1790879502,
+    "owned_by": "vllm",
+    "root": "/models/73da83042eadd0f7",
+    "parent": null,
+    "max_model_len": 8192,
+    "permission": [
+     {
+      "id": "modelperm-a3b9c8166ea298f7",
+      "object": "model_permission",
+      "created": 1790879502,
+      "allow_create_engine": false,
+      "allow_sampling": true,
+      "allow_logprobs": true,
+      "allow_search_indices": false,
+      "allow_view": true,
+      "allow_fine_tuning": false,
+      "organization": "*",
+      "group": null,
+      "is_blocking": false
+     }
+    ]
+   }
+  ]
+ },
+ "cells": [
+  {
+   "concurrency": 1,
+   "samples": [
+    {
+     "ttft_s": 0.2201,
+     "completion_tokens": 512,
+     "decode_tok_s": 33.866
+    },
+    {
+     "ttft_s": 0.2243,
+     "completion_tokens": 512,
+     "decode_tok_s": 33.897
+    },
+    {
+     "ttft_s": 0.2259,
+     "completion_tokens": 512,
+     "decode_tok_s": 33.929
+    },
+    {
+     "ttft_s": 0.2302,
+     "completion_tokens": 512,
+     "decode_tok_s": 34.037
+    },
+    {
+     "ttft_s": 0.2343,
+     "completion_tokens": 512,
+     "decode_tok_s": 33.914
+    }
+   ],
+   "median_decode_tok_s_per_stream": 33.914,
+   "min": 33.866,
+   "max": 34.037,
+   "median_ttft_s": 0.2259
+  },
+  {
+   "concurrency": 2,
+   "samples": [
+    {
+     "ttft_s": 0.4657,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.647
+    },
+    {
+     "ttft_s": 0.2256,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.484
+    },
+    {
+     "ttft_s": 0.4389,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.6
+    },
+    {
+     "ttft_s": 0.2267,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.331
+    },
+    {
+     "ttft_s": 0.4774,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.84
+    },
+    {
+     "ttft_s": 0.2325,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.562
+    },
+    {
+     "ttft_s": 0.4766,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.764
+    },
+    {
+     "ttft_s": 0.2316,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.483
+    },
+    {
+     "ttft_s": 0.44,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.677
+    },
+    {
+     "ttft_s": 0.2261,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.403
+    }
+   ],
+   "median_decode_tok_s_per_stream": 27.581000000000003,
+   "min": 27.331,
+   "max": 27.84,
+   "median_ttft_s": 0.3357
+  }
+ ],
+ "finished": "2026-10-01T18:35:07Z"
+}

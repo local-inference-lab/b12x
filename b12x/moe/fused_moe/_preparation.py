@@ -95,14 +95,21 @@ def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
     from b12x.moe._shared.kernels.w4a16.host import (
-        prefill_fused_sum_enabled,
+        prefill_fused_sum_enabled, trellis_decode_table,
     )
+
+    from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_small_m_occupancy
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "trellis_decode_table": trellis_decode_table(),
+        "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
+        "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
+            "B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1"
+        ) == "1",
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -146,6 +153,16 @@ def _query(
         elif experts.plan.activation.mode is not ActivationMode.AUTO:
             quant_mode = _packed_recipe(experts.plan.source, experts.plan.activation.mode)
             quant_modes = (quant_mode,)
+    deterministic_output = routing.deterministic_output
+    if deterministic_output is None:
+        from ._impl import _dynamic_deterministic_output_enabled
+
+        # Candidate eligibility and the compiled kernel must see the same
+        # reduction contract, including environment-selected determinism.
+        deterministic_output = any(
+            _dynamic_deterministic_output_enabled(quant_mode=mode, device=experts.device)
+            for mode in quant_modes
+        )
     return MoeDecodeQuery(
         quant_mode=quant_mode,
         quant_modes=quant_modes,
@@ -162,7 +179,7 @@ def _query(
         route_logits_dtype=None if routing.logits_dtype is None else str(routing.logits_dtype).removeprefix("torch."),
         apply_router_weight_on_input=bool(routing.apply_router_weight_on_input),
         collect_activation_amax=bool(routing.collect_activation_amax),
-        deterministic_output=routing.deterministic_output,
+        deterministic_output=deterministic_output,
         swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
         swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
         swiglu_beta=_codec_scalar(experts.plan.activation.swiglu_beta),
@@ -272,6 +289,9 @@ def _lower_caps(
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
+        trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
+        w4a16_small_m_occupancy=int(query.controls.get("w4a16_small_m_occupancy", 1)),
+        w4a16_skip_empty_m_blocks=bool(query.controls.get("w4a16_skip_empty_m_blocks", True)),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -411,6 +431,8 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             scale_format=scale_format, w13_layout=w13_layout,
             force_tile_config=caps.decode_config.w4a16_tile_config,
             pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
+            skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
+            small_m_occupancy=caps.w4a16_small_m_occupancy,
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,
@@ -713,6 +735,7 @@ class _FusedMoePrograms:
     fused_launches: tuple
     topk_sum_launches: tuple
     mixed_trellis_launches: tuple
+    route_pack_launches: object | None
     w4a16: _W4A16PrimaryLaunches | None
     compact: object | None
     launchers: tuple
@@ -815,7 +838,8 @@ def compile_fused_moe(
     return attach_programs(
         _FusedMoePrograms(
             scratch._prewarmed_fused_launches, scratch._prewarmed_topk_sum_launches,
-            scratch._mixed_trellis_launches, w4a16, compact, launchers,
+            scratch._mixed_trellis_launches, scratch._prewarmed_route_pack_launches,
+            w4a16, compact, launchers,
         ),
         *launchers, compact,
     )
@@ -1011,6 +1035,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                 _prewarmed_fused_launches=programs.fused_launches,
                 _prewarmed_topk_sum_launches=programs.topk_sum_launches,
                 _mixed_trellis_launches=programs.mixed_trellis_launches,
+                _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
             launchers = list(programs.launchers)
             if x4t_payload:

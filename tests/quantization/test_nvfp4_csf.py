@@ -7,12 +7,40 @@ import pytest
 import torch
 
 from b12x._lib.quant.nvfp4_csf import (
+    Nvfp4CsfDecoder,
     compile_nvfp4_csf_pair,
     decode_nvfp4_csf_pair,
     make_nvfp4_csf_batch,
 )
 from b12x._lib.runtime_control import kernel_resolution_guard
 from ..conftest import require_b12x
+
+
+@pytest.mark.parametrize("partial_overlap", [False, True])
+def test_pair_rejects_overlapping_output_storage(partial_overlap):
+    batch, reference = _fixture(128, 16, 0, require_b12x())
+    storage = torch.empty(reference.numel() + 16, dtype=torch.uint8, device=reference.device)
+    first = storage[:reference.numel()].reshape_as(reference).view(torch.float8_e4m3fn)
+    offset = 16 if partial_overlap else 0
+    second = storage[offset:offset + reference.numel()].reshape_as(first)
+    with pytest.raises(ValueError, match="must not overlap"):
+        Nvfp4CsfDecoder.prepare(batch, batch, first, second.view(torch.float8_e4m3fn))
+    ids = torch.zeros(1, dtype=torch.int32, device=reference.device)
+    with pytest.raises(ValueError, match="must not overlap"):
+        decode_nvfp4_csf_pair(batch, batch, ids, first, second)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
+def test_pair_rejects_projections_on_different_devices():
+    first, ref13 = _fixture(128, 16, 0, "cuda:0")
+    second, ref2 = _fixture(128, 16, 0, "cuda:1")
+    outputs = (torch.empty_like(ref13).view(torch.float8_e4m3fn),
+               torch.empty_like(ref2).view(torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="one CUDA device"):
+        Nvfp4CsfDecoder.prepare(first, second, *outputs)
+    ids = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+    with pytest.raises(ValueError, match="one CUDA device"):
+        decode_nvfp4_csf_pair(first, second, ids, *outputs)
 
 
 def _fixture(rows, columns, codec, device):
