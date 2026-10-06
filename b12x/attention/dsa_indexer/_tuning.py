@@ -154,10 +154,9 @@ def _parameters(query, _device):
         query.cache_format == "mxfp4" and query.mode == "prefill"
         and query.num_q_heads == 32 and query.max_q_rows >= 64
     )
-    # "auto" picks the merge per launch from the live length: serial below the
-    # threshold, cooperative above it. Startup trials run one short length, so
-    # tuning a fixed merge picked serial, which made GLM-5.3 128K-token decode
-    # indexer launches 3x slower. Fixed merges remain valid overrides.
+    # "auto" selects the merge from each launch's live length. A fixed merge
+    # tuned at one trial length cannot represent all serving lengths.
+    # Fixed merges remain available as explicit overrides.
     return ParameterSpace.create(
         TUNING.knobs,
         values={
