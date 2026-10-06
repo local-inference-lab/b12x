@@ -268,6 +268,7 @@ class TuningRequirement:
     latency_us: float | None
     candidate_index: int | None
     rejected_count: int = 0
+    cute_programs: tuple[str, ...] = ()
 
     def __post_init__(self):
         ranks = tuple(self.ranks)
@@ -280,6 +281,14 @@ class TuningRequirement:
         if type(self.rejected_count) is not int or self.rejected_count < 0:
             raise ValueError("rejected candidate count must be a nonnegative integer")
         empty = self.assignment is None
+        programs = tuple(self.cute_programs)
+        if (empty and programs) or any(
+            not isinstance(key, str) or len(key) != 64
+            or any(char not in "0123456789abcdef" for char in key)
+            for key in programs
+        ):
+            raise ValueError("winner programs must be CuTe cache keys")
+        object.__setattr__(self, "cute_programs", tuple(sorted(set(programs))))
         if empty != (self.latency_us is None) or empty != (self.candidate_index is None):
             raise ValueError("a tuning contribution must be either complete or empty")
         if not empty:

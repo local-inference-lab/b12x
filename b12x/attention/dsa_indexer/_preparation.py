@@ -31,7 +31,7 @@ class _Mxfp4Programs:
 
     @property
     def __b12x_dependencies__(self):
-        return tuple(value[0] for value in self.launchers.values())
+        return tuple(self.launchers.values())
 
     @property
     def __b12x_programs__(self):

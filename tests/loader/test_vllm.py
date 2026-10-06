@@ -18,6 +18,30 @@ from b12x.loader._checkpoint import DirectWeightSession
 from b12x.loader._progress import CheckpointDisplay
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_optional_fp6_registration_requires_host_hooks_only_when_enabled(monkeypatch, enabled):
+    from b12x.integration.vllm import plugin
+    from vllm.utils import b12x as host
+
+    monkeypatch.delattr(host, "set_b12x_preparation_provider", raising=False)
+    monkeypatch.setattr(plugin, "_registered", False)
+    monkeypatch.setattr(plugin, "is_b12x_fp6_enabled", lambda: enabled)
+    if enabled:
+        with pytest.raises(RuntimeError, match="requires vLLM preparation hooks"):
+            plugin.register_b12x_fp6()
+    else:
+        plugin.register_b12x_fp6()
+        assert not plugin._registered
+
+
+def test_direct_loader_reports_missing_host_hooks_when_selected(monkeypatch):
+    from vllm.model_executor.model_loader import weight_utils
+
+    monkeypatch.delattr(weight_utils, "file_source_tensor", raising=False)
+    with pytest.raises(RuntimeError, match="requires vLLM file-source hooks.*file_source_tensor"):
+        B12xModelLoader(LoadConfig(load_format="b12x"))
+
+
 @pytest.mark.parametrize("show_progress", [True, False])
 @pytest.mark.parametrize("read_mode", ["auto", "bounce"])
 def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(

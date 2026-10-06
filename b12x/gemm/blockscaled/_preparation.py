@@ -448,7 +448,7 @@ def _fixed_lowering(query, device):
     use_block = False
     if recipe == "tensor_fp8":
         use_block = _use_block_fp8_recipe(
-            live_m=query.max_rows, expected_m=query.expected_m,
+            live_m=query.max_rows, expected_m=query.expected_m or query.max_rows,
             out_features=query.out_features, padded_in_features=query.padded_in_features,
             sm_count=device.identity.sm_count,
         )
@@ -471,8 +471,9 @@ def compile_fixed(query_payload, lowering_payload, ordinal, sm_count):
         programs = dict(dense._compile_dense_lowering(lowering_payload, ordinal))
         if query.call_kind == "packed" and query.recipe == "mxfp8" and query.input_dtype == "float16":
             from b12x._lib.quant import mxfp8_rows
-            subgroup = 8 if query.expected_m <= 8 else mxfp8_rows._WARP_SUBGROUP_WIDTH
-            threads = 128 if query.expected_m <= 8 else mxfp8_rows._THREADS
+            rows = query.expected_m or query.max_rows
+            subgroup = 8 if rows <= 8 else mxfp8_rows._WARP_SUBGROUP_WIDTH
+            threads = 128 if rows <= 8 else mxfp8_rows._THREADS
             programs["quantize"] = mxfp8_rows._get_compiled_mxfp8_rows_quant(
                 query.padded_in_features, torch.float16, subgroup, threads, "linear",
                 device_ordinal=ordinal, sm_count=sm_count,
@@ -586,7 +587,7 @@ class _FixedExecutionState:
         with torch.cuda.device(self.device), _stream_context(stream, self.device):
             source = _pad_k(source_values, k)
             return self.dense.run(
-                (source.view(m, k, 1), self.unit_scale),
+                (source.view(m, k, 1), self.unit_scale[:m] if self.use_block else self.unit_scale[:, :, :((m + 127) // 128)]),
                 (weight_values.view(q.out_features, k, 1), weight_block_scale if self.use_block else weight_scale_mma),
                 alpha=output_scale, stream=stream,
             )[:, :, 0]
@@ -653,6 +654,29 @@ def plan(query, *, invocation=FrozenMapping(), override=None):
         from b12x.gemm._preparation import plan as dense_plan
         return dense_plan(query, invocation=invocation, override=override)
     raise TypeError("unsupported blockscaled declaration query")
+
+
+_HEURISTIC_PLANS = {}
+
+
+def heuristic_plan(query, device):
+    """Retain a default plan for a power-of-two row capacity on one device."""
+    from dataclasses import replace
+
+    if query.expected_m is not None and (
+        type(query.expected_m) is not int or query.expected_m <= 0
+    ):
+        raise ValueError("expected_m must be positive or None")
+    field = "num_tokens" if isinstance(query, BlockscaledQuery) else "max_rows"
+    rows = max(1, getattr(query, field), query.expected_m or 1)
+    capacity = 1 << (rows - 1).bit_length()
+    query = replace(query, **{field: capacity, "expected_m": None})
+    key = (torch.device(device), query)
+    declaration = _HEURISTIC_PLANS.get(key)
+    if declaration is None:
+        declaration = replace(plan(query), _device=key[0])
+        _HEURISTIC_PLANS[key] = declaration
+    return declaration
 
 
 @dataclass(frozen=True)

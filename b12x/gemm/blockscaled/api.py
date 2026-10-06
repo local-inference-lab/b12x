@@ -42,7 +42,7 @@ def mm_mxfp4(
     rhs_values: torch.Tensor,
     rhs_scale_storage: torch.Tensor,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> torch.Tensor:
@@ -66,7 +66,7 @@ def mm_nvfp4(
     rhs_scale_storage: torch.Tensor,
     alpha: torch.Tensor,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> torch.Tensor:
@@ -90,7 +90,7 @@ def mm_block_fp8(
     rhs_values: torch.Tensor,
     rhs_scale: torch.Tensor,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> torch.Tensor:

@@ -22,7 +22,11 @@ and FP16 scales, and uses the same engines without a codebook.
 
 ``plan(query)`` declares an invocation without compiling or allocating.
 ``PreparationSession`` selects and primes its prepared ``Plan`` before
-``mm`` or the explicit ``w4a16``/``w8a16`` entry points may execute. A16 uses
+execution with an explicit plan. ``mm`` also accepts NVFP4, MXFP8, tensor-FP8,
+and serialized operands without a plan: first use prepares the heuristic
+configuration without autotuning and retains a power-of-two row capacity.
+Warm each required capacity before graph capture or frozen kernel resolution.
+The explicit ``w4a16``/``w8a16`` entry points require a plan. A16 uses
 BF16 activations and inline weight dequantization; it performs no activation
 scaling. ``plan_regimes`` combines exact static-shape variants with one bounded
 dynamic-row execution while keeping runtime dispatch behind the custom-op boundary.
@@ -37,7 +41,8 @@ fit BF16. Quantized activation execution requires K divisible by 128 and N by 8.
 Caller-owned output/workspace buffers are described by the query and reserved
 before durable binding. Concurrent owners use disjoint buffers. Functional
 forms retain their output allocation contract, while graph replay uses fixed
-captured addresses. No standalone warmup or implicit execution path exists.
+captured addresses. Concurrent executions sharing a heuristic plan must be
+serialized; independent owners should prepare separate plans.
 """
 
 from __future__ import annotations

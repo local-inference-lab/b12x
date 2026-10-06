@@ -46,7 +46,7 @@ def cache_device(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda ordinal: _TEST_GPUS[ordinal]
     )
-    monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: ("device_uuid", f"gpu-{ordinal}"))
+    monkeypatch.setattr(compiler, "_device_arch_key", lambda ordinal: ("cuda", (12, 0), 170))
     monkeypatch.delenv("B12X_TUNING_CACHE_VERSION", raising=False)
 
 
@@ -104,7 +104,8 @@ def test_stream_gated_measurement_keeps_prior_choices_in_a_separate_cache(cache_
 def test_cached_choices_survive_uuid_and_ordinal_changes(cache_device, tmp_path, monkeypatch):
     original = SelectionCache(tmp_path, cache_identity({"model": "a"}, 0))
     _save_choice(original)
-    monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: ("device_uuid", "replacement-gpu"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda ordinal: SimpleNamespace(
+        **vars(_TEST_GPUS[ordinal]), uuid="replacement-gpu"))
     moved = SelectionCache(tmp_path, cache_identity({"model": "a"}, 1))
     assert moved.path == original.path
     assert moved.get("shape") == original.get("shape")

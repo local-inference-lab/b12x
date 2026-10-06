@@ -6,7 +6,10 @@ from b12x.preparation import Plan
 
 from . import META
 from ._forward import clear_paged_caches as clear_caches
-from ._preparation import bind, invocation_from_descriptors, invocation_from_tensors, memory_requirements, plan, run
+from ._preparation import bind as _bind, plan as _plan, run as _run
+from ._preparation import invocation_from_descriptors, invocation_from_tensors, memory_requirements
+from ._forward import _compile_paged_attention, paged_attention_forward
+from ._scratch import B12XPagedAttentionScratchPlan, plan_paged_attention_scratch
 from ._scratch import (
     B12XPagedAttentionBinding as Binding,
     B12XPagedAttentionScratchCaps as Caps,
@@ -27,6 +30,37 @@ from .planner import (
 from .workspace import PagedAttentionWorkspace as Workspace
 
 
+def plan(caps, *, invocation=None, override=None):
+    """Declare session preparation, or size heuristic scratch without metadata."""
+    if invocation is not None:
+        return _plan(caps, invocation=invocation, override=override)
+    if override is not None:
+        from dataclasses import replace
+        caps = replace(caps, config=override)
+    return plan_paged_attention_scratch(caps)
+
+
+def bind(plan, **kwargs):
+    if isinstance(plan, B12XPagedAttentionScratchPlan):
+        return plan.bind(**kwargs)
+    return _bind(plan, **kwargs)
+
+
+def compile(*, binding):
+    """Prime a heuristic binding before serving or CUDA graph capture."""
+    if binding.plan is not None:
+        from b12x.preparation import require_prepared
+        require_prepared(binding.plan, "attention.gqa")
+        return
+    _compile_paged_attention(binding=binding)
+
+
+def run(*, binding, plan=None):
+    if binding.plan is None and plan is None:
+        return paged_attention_forward(binding=binding)
+    return _run(binding=binding, plan=plan)
+
+
 def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
@@ -36,5 +70,5 @@ __all__ = [
     "GqaConfig", "GqaQuery", "ExtendGraphCapacity", "VerifyGraphCapacity",
     "DecodeGraphScratchEnvelope", "decode_graph_capacity", "extend_graph_capacity",
     "verify_graph_capacity", "decode_graph_scratch_envelope", "plan", "bind",
-    "run", "invocation_from_descriptors", "invocation_from_tensors", "memory_requirements", "infer_mode", "is_supported", "clear_caches",
+    "compile", "run", "invocation_from_descriptors", "invocation_from_tensors", "memory_requirements", "infer_mode", "is_supported", "clear_caches",
 ]

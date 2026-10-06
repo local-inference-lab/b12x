@@ -177,7 +177,9 @@ def _initialize_worker(
     torch.set_num_threads(1)
     if torch.cuda.is_initialized():
         raise RuntimeError("compiler worker inherited an initialized CUDA runtime")
-    compiler._configure_offline_compile_target(device_ordinal, device_uuid)
+    compiler._configure_offline_compile_target(
+        device_ordinal, compute_capability, sm_count,
+    )
 
     def target_ordinal(device=None):
         if device is None:

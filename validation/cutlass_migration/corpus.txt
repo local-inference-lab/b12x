@@ -1,0 +1,12 @@
+tests/_lib/test_cutlass_runtime_patches.py
+tests/gemm/test_blockscaled.py
+tests/gemm/test_tensor_fp8_linear.py
+tests/moe/test_fused_moe.py
+tests/attention/test_attention_paged_page128_high_pid.py
+tests/gemm/test_cute_migration_gemm_corpus.py
+tests/moe/test_w4a8_migration_corpus.py
+tests/attention/test_cute_migration_paged_corpus.py::test_paged_fp8_prefill_size_graph_oracle
+tests/attention/test_cute_migration_paged_corpus.py::test_paged_verify_split_merge_graph_oracle
+tests/attention/test_cute_migration_paged_corpus.py::test_paged_decode_direct_graph_oracle
+tests/attention/test_attention_contiguous_torch_ref.py
+tests/preparation/test_startup_capture.py::test_graph_replay_survives_compiler_cache_eviction

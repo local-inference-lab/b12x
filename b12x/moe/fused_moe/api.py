@@ -10,7 +10,9 @@ import torch
 from ..._lib.gating import default_is_supported
 from ...preparation.types import FrozenMapping, Plan, require_prepared
 from . import META
+from ._compat import Caps
 from ._impl import (
+    TPMoEScratchPlan,
     TPMoEFP4Binding as Binding,
     TPMoERouteBinding as RouteBinding,
     TPMoESparseFP4Binding as SparseBinding,
@@ -18,6 +20,7 @@ from ._impl import (
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
     clear_tp_moe_caches as clear_caches,
+    plan_tp_moe_scratch as plan,
 )
 from .config import TrellisConfig
 from ._tuning import MoeDecodeConfig, MoeDecodeQuery
@@ -53,9 +56,35 @@ from .weights import (
     WeightPacking,
 )
 
+def plan_weights(**kwargs):
+    """Plan typed checkpoint sources or the tensor-based quantization contract."""
+    if "quant_modes" in kwargs:
+        if "source" in kwargs or "geometry" in kwargs:
+            raise TypeError("quant_modes cannot be combined with source or geometry")
+        from ._impl import plan_b12x_fp4_moe_weights
+        return plan_b12x_fp4_moe_weights(**kwargs)
+    return _canonical_plan_weights(**kwargs)
 
 
-def plan_weights(
+def prepare_weights(**kwargs):
+    """Prepare typed sources or tensor arguments using their weight plan."""
+    if isinstance(kwargs.get("plan"), WeightPlan):
+        return _canonical_prepare_weights(**kwargs)
+    from ._impl import prepare_b12x_fp4_moe_weights
+    return prepare_b12x_fp4_moe_weights(**kwargs)
+
+
+def plan_execution(**kwargs):
+    """Declare session preparation or size a heuristic tensor-based invocation."""
+    if "weight_plan" in kwargs:
+        if "experts" in kwargs or "capacity" in kwargs:
+            raise TypeError("weight_plan cannot be combined with experts or capacity")
+        from ._compat import plan_execution as legacy_plan_execution
+        return legacy_plan_execution(**kwargs)
+    return _canonical_plan_execution(**kwargs)
+
+
+def _canonical_plan_weights(
     *,
     source: WeightSource,
     activation: ActivationSpec,
@@ -71,7 +100,7 @@ def plan_weights(
     )
 
 
-def prepare_weights(
+def _canonical_prepare_weights(
     *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
@@ -80,7 +109,7 @@ def prepare_weights(
     return _prepare_weights(plan=plan, weights=weights, device=device, staging=staging)
 
 
-def plan_execution(
+def _canonical_plan_execution(
     *,
     experts: PreparedExperts,
     capacity: ExecutionCapacity,
@@ -119,15 +148,18 @@ def plan_fc2(
 
 
 def bind(plan: Plan, **kwargs: Any) -> Binding:
-    """Bind live tensors within a session-prepared token capacity."""
+    """Bind live tensors within a prepared or heuristic scratch capacity."""
+    if isinstance(plan, TPMoEScratchPlan):
+        return plan.bind(**kwargs)
     state = require_prepared(plan, "moe.decode")
     return replace(state.bind(**kwargs), plan=plan)
 
 
 def run(*, binding: Binding):
-    """Run only a binding created from a prepared plan."""
+    """Run a binding through its prepared or heuristic native launch path."""
     plan = binding.plan
-    require_prepared(plan, "moe.decode", binding.a.device)
+    if plan is not None:
+        require_prepared(plan, "moe.decode", binding.a.device)
     return _run(binding=binding)
 
 def _state_for(plan: Plan, hidden_states: torch.Tensor):
@@ -194,6 +226,8 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "Caps",
+    "plan",
     "TrellisExtent",
     "TrellisSource",
     "TrellisStaging",

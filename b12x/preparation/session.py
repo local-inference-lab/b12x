@@ -231,14 +231,25 @@ def _plans_of(request):
     return (plan,)
 
 
+def _default_compile_workers(device):
+    identity = device.identity
+    spark = (
+        identity is not None
+        and identity.vendor == "nvidia"
+        and identity.product_name in {"gb10", "nvidia gb10"}
+    )
+    return int(os.environ.get("B12X_COMPILE_WORKERS", "4" if spark else "8"))
+
+
 class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
         compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
         race_batch=32, race_budget=None,
     ):
+        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         if compile_workers is None:
-            compile_workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
+            compile_workers = _default_compile_workers(self.device)
         for name, value in (
             ("compile_workers", compile_workers), ("rounds", rounds), ("samples", samples),
             ("race_batch", race_batch),
@@ -250,7 +261,6 @@ class PreparationSession:
             raise ValueError("race_budget must be a positive byte count or None")
         if type(autotune) is not bool or type(cache_only) is not bool:
             raise TypeError("autotune and cache_only must be boolean")
-        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         self.autotune, self.cache_only = autotune, cache_only
         self.compile_workers, self.rounds, self.samples = compile_workers, rounds, samples
         self.race_batch, self.race_budget = race_batch, race_budget
@@ -277,7 +287,7 @@ class PreparationSession:
         if self._job is not None or self._pool is not None:
             raise RuntimeError("compiler concurrency can only change between jobs")
         if workers is None:
-            workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
+            workers = _default_compile_workers(self.device)
         if type(workers) is not int or workers < 0:
             raise ValueError("compile_workers must be an integer of at least 0")
         self.compile_workers = workers
@@ -1378,6 +1388,11 @@ class PreparationJob:
                     obligation.key, self.session._tuning_ranks,
                     assignment, latency_us, candidate_index,
                     rejected_count=rejected_count,
+                    cute_programs=tuple(
+                        program.key for program in obligation.programs[
+                            request.plan.contract.config_payload(config)
+                        ] if program.dialect == "cute"
+                    ),
                 )
             selection = self._selection(obligation, config, "tuned", assignment)
             obligation.cache_pending = rejected_count == 0

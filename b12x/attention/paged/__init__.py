@@ -7,15 +7,20 @@ attention sinks, sliding window, and an MSA block-sparse variant driven by
 supply tensors, shape metadata, and capacity caps (``Budget``). Decode
 supports CUDA-graph replay with all metadata rebuilt on-device.
 
-Planned lifecycle: ``plan(Caps(...))`` declares a configuration without device
-work.  ``PreparationSession`` materializes it, then ``bind(plan, ...)``
+Planned lifecycle: ``plan(caps, invocation=metadata)`` declares a configuration
+without device work. ``PreparationSession`` materializes it, then ``bind(plan, ...)``
 maps caller-owned scratch and ``run(binding=..., plan=...)`` launches.
 Decode replay metadata is owned by the prepared plan.
+
+Without invocation metadata, ``plan(caps)`` returns a heuristic scratch plan
+with ``layout``, ``bind``, and replay-state preparation methods. Call
+``compile(binding=...)`` and warm execution before CUDA graph capture.
 
 Example:
     from b12x.attention import paged
 
-    declaration = paged.plan(paged.Caps(mode="decode", dtype=torch.bfloat16, ...))
+    caps = paged.Caps(mode="decode", dtype=torch.bfloat16, ...)
+    declaration = paged.plan(caps, invocation=paged.invocation_from_tensors(caps, ...))
     session.prepare((declaration.request(...),))
     binding = paged.bind(declaration, scratch=scratch, q=q, k_cache=k, v_cache=v,
                          output=out, page_table=pt, cache_seqlens=lens,
@@ -51,6 +56,7 @@ META = OpMeta(
         "decode_graph_scratch_envelope",
         "plan",
         "bind",
+        "compile",
         "invocation_from_descriptors",
         "invocation_from_tensors",
         "run",
@@ -92,6 +98,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Plan,
         Workspace,
         bind,
+        compile,
         clear_caches,
         decode_graph_capacity,
         extend_graph_capacity,

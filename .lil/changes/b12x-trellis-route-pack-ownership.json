@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-trellis-route-pack-ownership",
+  "category": "fix",
+  "summary": "Retain full-rotation Trellis route-pack programs in materialized MoE plans",
+  "models": ["Kimi-K3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Transfers compiled route-pack carriers from the preparation result to caller-owned scratch plans.",
+    "Tests carrier identity, numerical parity, poisoned scratch, and CUDA Graph replay at capacities 1, 8, and 129 with uneven expert extents."
+  ],
+  "pull_requests": [],
+  "authors": ["voipmonitor"],
+  "requires": []
+}

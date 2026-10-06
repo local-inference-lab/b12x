@@ -12,7 +12,7 @@ from b12x.preparation import (
     current_prepared_state, plan_from_handle, require_prepared,
 )
 from b12x.preparation._cache import SelectionCache
-from b12x.preparation.types import _CompositePlan
+from b12x.preparation.types import DeviceIdentity, _CompositePlan
 from b12x._lib.scratch import ScratchBufferSpec
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from .test_defaults import Config, Query, contract
@@ -34,6 +34,34 @@ def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
         assert engine.autotune
     with session(tmp_path, compile_workers=2) as engine:
         assert engine.compile_workers == 2
+
+
+@pytest.mark.parametrize("identity, workers", [
+    (DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"), 4),
+    (DeviceIdentity("nvidia", (12, 1), 48, "GB10"), 4),
+    (DeviceIdentity("nvidia", (12, 0), 170, "NVIDIA GeForce RTX 5090"), 8),
+    (None, 8),
+])
+def test_compiler_default_limits_spark_memory_across_stages(monkeypatch, identity, workers):
+    monkeypatch.delenv("B12X_COMPILE_WORKERS", raising=False)
+    with PreparationSession(device=DetectedDevice(None, identity)) as engine:
+        assert engine.compile_workers == workers
+        engine.configure_compile_workers(2)
+        engine.configure_compile_workers()
+        assert engine.compile_workers == workers
+
+
+def test_spark_compiler_budget_preserves_explicit_overrides(monkeypatch):
+    monkeypatch.setenv("B12X_COMPILE_WORKERS", "6")
+    device = DetectedDevice(None, DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"))
+    with PreparationSession(device=device, compile_workers=1) as engine:
+        assert engine.compile_workers == 1
+        engine.configure_compile_workers()
+        assert engine.compile_workers == 6
+        engine.configure_compile_workers(0)
+        assert engine.compile_workers == 0
+    with PreparationSession(device=device) as engine:
+        assert engine.compile_workers == 6
 
 
 def declaration(*, tuning=None, pin=None, shared=False):

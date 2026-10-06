@@ -318,8 +318,9 @@ def test_mm_mxfp8_grouped_batches_use_their_own_scales() -> None:
         expected_m=2048, sfb_k_replicated=True, _tile_k_override=64,
     ) as plan:
         out = blockscaled.mm(lhs, rhs, plan=plan)
-    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.bfloat16)
-    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.bfloat16)
+    # Accumulate in FP64 so FP32 rounding cannot cross a BF16 midpoint.
+    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.float64)
+    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.float64)
     ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
 
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -521,3 +522,68 @@ def test_nvfp4_a16_preserves_logical_k_inside_padded_weight() -> None:
         output.float().flatten(), expected.flatten(), dim=0
     )
     assert cosine.item() >= 0.999
+
+
+@pytest.mark.parametrize("recipe", [
+    "mxfp8", "mxfp8_fp16", "mxfp8_prequantized", "tensor_fp8", "block_fp8", "mxfp4", "nvfp4",
+])
+def test_implicit_plan_reuses_capacity_under_compile_and_graph(recipe):
+    """Calls without a plan reuse heuristic programs across row counts and replay."""
+    require_b12x()
+    n, k = 128, 256
+    if recipe in ("mxfp4", "nvfp4"):
+        a = torch.randint(0, 256, (4, k // 2), device="cuda", dtype=torch.uint8)
+        b = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
+        lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+        def unpack(value):
+            return lut[torch.stack((value & 15, value >> 4), -1).long()].flatten(1)
+        reference = unpack(a) @ unpack(b).T
+        group = 32 if recipe == "mxfp4" else 16
+        dtype = torch.uint8 if recipe == "mxfp4" else torch.float8_e4m3fn
+        scale = 127 if recipe == "mxfp4" else 1
+        sa = swizzle_block_scale(torch.full((4, k // group), scale, device="cuda").to(dtype))
+        sb = swizzle_block_scale(torch.full((n, k // group), scale, device="cuda").to(dtype))
+        alpha = torch.ones(1, device="cuda")
+        def call(x):
+            if recipe == "mxfp4":
+                return blockscaled.mm_mxfp4(x, sa, b, sb)
+            return blockscaled.mm_nvfp4(x, sa, b, sb, alpha)
+    else:
+        a = torch.randn((4, k), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        if recipe.startswith("mxfp8"):
+            weight = blockscaled.pack_weight(b, torch.full((n, k // 32), 127, device="cuda", dtype=torch.uint8))
+            if recipe == "mxfp8_fp16":
+                a = torch.randint(-4, 5, (4, k), device="cuda").to(torch.float16)
+            elif recipe == "mxfp8_prequantized":
+                a = a.to(torch.float8_e4m3fn)
+        else:
+            a = a.to(torch.float8_e4m3fn)
+            weight = blockscaled.pack_weight(b, torch.ones(1, device="cuda"))
+        reference = a.float() @ b.float().T
+        if recipe == "block_fp8":
+            sa = torch.ones((4, k // 128), device="cuda")
+            sb = torch.ones((n // 128, k // 128), device="cuda")
+            def call(x):
+                return blockscaled.mm_block_fp8(x, sa[:x.shape[0]], b, sb)
+        else:
+            def call(x):
+                if recipe == "mxfp8_prequantized":
+                    scales = torch.full((x.shape[0], k // 32), 127, device=x.device, dtype=torch.uint8)
+                    return blockscaled.mm((x, scales), weight)
+                return blockscaled.mm(x, weight, expected_m=x.shape[0])
+
+    actual = call(a[:3])
+    torch.testing.assert_close(actual.float(), reference[:3].to(actual.dtype).float(), atol=.125, rtol=.02)
+    launch = torch.compile(call, fullgraph=True)
+    compiled = launch(a)
+    with kernel_resolution_guard("legacy capacity replay"):
+        for rows in (3, 4):
+            actual = call(a[:rows])
+            torch.testing.assert_close(actual.float(), reference[:rows].to(actual.dtype).float(), atol=.125, rtol=.02)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = launch(a)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, compiled, atol=0, rtol=0)

@@ -266,6 +266,35 @@ def test_mhc_program_bundle_reuse_obeys_deferred_and_resident_reclamation(monkey
         assert len(built) == 2
 
 
+def test_mxfp4_cache_releases_losing_programs_and_keeps_selected_program(monkeypatch):
+    from b12x.attention.dsa_indexer import mxfp4
+
+    winner = ProgramKey("cute", "3" * 64, "attention.indexer.mxfp4")
+    loser = ProgramKey("cute", "4" * 64, "attention.indexer.mxfp4")
+    keys = iter((winner, loser))
+    monkeypatch.setattr(mxfp4, "b12x_compile", lambda *_a, **_k:
+                        compile_plan.CompiledCuTeProgram(lambda: None, next(keys)))
+    monkeypatch.setattr(mxfp4, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(mxfp4, "make_ptr", lambda *_a, **_k: None)
+    monkeypatch.setattr(program_cache, "_CACHES", {mxfp4._compile})
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    mxfp4._compile.cache_clear()
+    try:
+        selected = mxfp4._compile("quantize", (False, 64), 0)
+        assert compile_plan.program_keys(selected) == (winner,)
+        compile_plan.load_programs(selected)
+        selected_ref = weakref.ref(selected.raw)
+        del selected
+        losing_ref = weakref.ref(mxfp4._compile("quantize", (True, 64), 0).raw)
+        assert program_cache.evict_unretained({winner}) == 1
+        assert losing_ref() is None
+        assert mxfp4._compile("quantize", (False, 64), 0).raw is selected_ref()
+        assert program_cache.evict_unretained(set()) == 1
+        assert selected_ref() is None
+    finally:
+        mxfp4._compile.cache_clear()
+
+
 def test_mhc_program_bundle_hit_still_validates_codegen_snapshot(monkeypatch):
     import pytest
     from b12x.norm.mhc import _preparation as mhc

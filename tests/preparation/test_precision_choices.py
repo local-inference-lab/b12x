@@ -83,6 +83,22 @@ def test_dense_nvfp4_without_activation_scale_excludes_a4():
     assert {config.mode for _, config in TUNING.eligible_plan(query, DEVICE).candidates} == {"a16"}
 
 
+@pytest.mark.parametrize("recipe", ("nvfp4", "iq2_xs", "iq2_xxs", "q8_0"))
+@pytest.mark.parametrize("sm_count", (48, 188))
+@pytest.mark.parametrize("rows,k,n", ((1, 512, 768), (2, 2048, 640), (16, 3072, 1536), (256, 2048, 768)))
+def test_dense_heuristic_respects_zero_split_workspace(recipe, sm_count, rows, k, n):
+    from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING
+
+    query = BlockscaledQuery(
+        recipe=recipe, num_tokens=rows, in_features=k, padded_in_features=k,
+        out_features=n, activation_mode="a16", workspace_form="provided",
+        workspace_nbytes=0,
+    )
+    device = DeviceIdentity("nvidia", (12, 0), sm_count, "test device")
+    selected = TUNING.configure(query, device=device, search=False).default
+    assert selected.split_k == 1
+
+
 @pytest.mark.parametrize("k,n", ((4096, 18560), (8192, 4096)))
 @pytest.mark.parametrize("rows", (1, 2, 4, 8, 16, 256))
 def test_super3_mamba_tuning_can_select_wide_k_without_changing_precision(k, n, rows):

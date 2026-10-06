@@ -96,6 +96,19 @@ def register_b12x_fp6() -> None:
     if _registered:
         return
 
+    from vllm.utils import b12x as vllm_b12x
+    preparation_hooks = (
+        "set_b12x_preparation_provider", "B12xPreparationUnit", "b12x_layer",
+        "b12x_layer_prefix", "register_b12x_layer",
+    )
+    missing = [name for name in preparation_hooks if not hasattr(vllm_b12x, name)]
+    if missing:
+        message = "b12x FP6 plugin requires vLLM preparation hooks: " + ", ".join(missing)
+        if is_b12x_fp6_enabled():
+            raise RuntimeError(message)
+        logger.warning("%s; FP6 quantization is not registered", message)
+        return
+
     try:
         from vllm.logger import init_logger
 

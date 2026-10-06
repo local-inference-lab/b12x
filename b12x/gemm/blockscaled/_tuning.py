@@ -100,10 +100,61 @@ def _default_config(query, device):
     if query.activation_mode == "quantized":
         return BlockscaledConfig(mode="quantized")
     if _automatic_a16(query, device):
-        return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
+        return _a16_default_config(query, device)
     if query.activation_mode == "a16" or query.recipe in BLOCK_CODECS:
-        return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
+        return _a16_default_config(query, device)
     return BlockscaledConfig(mode="quantized")
+
+
+def _a16_default_config(query, device):
+    if query.recipe == "mxfp8" or device is None:
+        if _automatic_a16(query, device):
+            return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
+        return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
+    m, n, k = query.num_tokens, query.out_features, query.in_features
+    sms = device.sm_count
+    iq2 = query.recipe in ("iq2_xs", "iq2_xxs")
+    if query.recipe in BLOCK_CODECS and m <= 8:
+        # SIMT avoids tile staging for N8 packing and low-reuse GEMVs.
+        if n % 128 or (m <= 2 and ((iq2 and n >= k) or k <= 1024)):
+            rows = max(1, m // 4) if n % 128 else 1 << (m - 1).bit_length()
+            return BlockscaledConfig(
+                mode="a16", tile_m=rows, tile_n=4, tile_k=256, split_k=1,
+            )
+        if n >= 128 * sms:
+            return BlockscaledConfig(
+                mode="a16", tile_m=8, tile_n=64, tile_k=256, split_k=1,
+            )
+    tile_m = 16 if iq2 else max(16, min(64, 1 << (m.bit_length() - 1)))
+    if query.recipe == "nvfp4" and m > 16 and (n + 127) // 128 >= sms / 2:
+        tile_m = 32
+    rows = (m + tile_m - 1) // tile_m
+    wide = rows * ((n + 127) // 128) >= sms / 2
+    tile_n = 128 if (
+        query.recipe == "nvfp4"
+        or (m > 16 and (iq2 or n % 128 or wide))
+        or (query.recipe == "q8_0" and n >= k)
+    ) else 64
+    tile_k = (128 if m <= 16 else 256) if iq2 else 64
+    grid = rows * ((n + tile_n - 1) // tile_n)
+    splits = [1]
+    if grid < sms:
+        for split in (2, 4, 8):
+            workspace = split * m * n * 4
+            if k // split >= 512 and (
+                query.workspace_nbytes is None or workspace <= query.workspace_nbytes
+            ):
+                splits.append(split)
+    # Extra partitions must offset their partial-output and reduction overhead.
+    reduction_penalty = 0.005 if iq2 else 0.025
+    split_k = min(splits, key=lambda split: (
+        ((grid * split + sms - 1) // sms) / split + reduction_penalty * (split - 1)
+    ))
+    if query.recipe == "nvfp4" and m <= 16 and split_k == 1:
+        tile_k = 128
+    return BlockscaledConfig(
+        mode="a16", tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, split_k=split_k,
+    )
 
 
 def functional_mxfp8_quantization(query, config):
@@ -223,7 +274,7 @@ TUNING = TuningContract(
 
 @dataclass(frozen=True, kw_only=True)
 class FixedBlockscaledQuery:
-    """Fixed kernel recipe; serialized block-FP8 accepts dynamic M with expected_m=None."""
+    """Fixed kernel recipe with bounded dynamic M when expected_m is None."""
 
     recipe: str
     call_kind: str
@@ -260,8 +311,6 @@ def _validate_fixed_query(query, device):
             or query.output_dtype not in ("bfloat16", "float16")
             or query.alpha_mode not in ("unit", "tensor")):
         raise ValueError("invalid fixed blockscaled metadata")
-    if query.expected_m is None and (query.call_kind, query.recipe) != ("serialized", "block_fp8"):
-        raise ValueError("dynamic fixed blockscaled rows require serialized block-FP8")
     if query.call_kind == "serialized":
         if (query.recipe not in ("nvfp4", "mxfp4", "block_fp8")
                 or query.in_features != query.padded_in_features
@@ -296,5 +345,5 @@ def _validate_fixed_query(query, device):
 
 FIXED_TUNING = replace(
     make_fixed_contract(component_id="gemm.blockscaled.fixed", query_type=FixedBlockscaledQuery, backend="cutedsl"),
-    query_schema_version=3, validate_query=_validate_fixed_query,
+    query_schema_version=4, validate_query=_validate_fixed_query,
 )

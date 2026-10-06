@@ -9,7 +9,6 @@ or the streaming top-k's unrelated candidate folds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -20,6 +19,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from ..._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from ..._lib.program_cache import program_cache
 from ..._lib.intrinsics import (
     cvt_fp32x2_to_e2m1x2,
     f16x2_to_f32x2,
@@ -957,7 +957,22 @@ class _SortPositions:
                     out_lengths[row] = count
 
 
-@cache
+@dataclass(frozen=True)
+class _CompiledLauncher:
+    raw: object
+    dtypes: tuple
+
+    @property
+    def __b12x_dependencies__(self):
+        return (self.raw,)
+
+    @property
+    def __b12x_programs__(self):
+        from b12x._lib.compile_plan import program_keys
+        return program_keys(self.raw)
+
+
+@program_cache
 def _compile(kind: str, recipe: tuple, device_index: int):
     # Pointer-only launch ABIs: all live row/page/width/stride quantities are
     # runtime scalars and do not contribute to compile identity.
@@ -1002,16 +1017,17 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 9, key),
     )
-    return raw, dtypes
+    return _CompiledLauncher(raw, dtypes)
 
 
 def _launch(kind, recipe, tensors, scalars, *, launcher=None):
     if tensors[0].device.type != "cuda":
         raise ValueError("native MXFP4 indexer requires CUDA tensors")
     with torch.cuda.device(tensors[0].device):
-        raw, dtypes = _compile(kind, recipe, tensors[0].device.index) if launcher is None else launcher
-        raw(
-            *(_ptr(t, dtype) for t, dtype in zip(tensors, dtypes, strict=True)),
+        if launcher is None:
+            launcher = _compile(kind, recipe, tensors[0].device.index)
+        launcher.raw(
+            *(_ptr(t, dtype) for t, dtype in zip(tensors, launcher.dtypes, strict=True)),
             *scalars,
             current_cuda_stream(),
         )
@@ -1380,7 +1396,7 @@ class MXFP4PreparedState:
 
     @property
     def __b12x_dependencies__(self):
-        return tuple(launcher[0] for launcher in self._launchers.values())
+        return tuple(self._launchers.values())
 
     def bind(self, *, scratch, q_mxfp4, q_scales, query_weights, index_k_cache,
              page_table, cache_lengths, active_width, output_indices,

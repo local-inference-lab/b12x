@@ -80,16 +80,26 @@ pins, fixed choices and partial races are never saved as measured winners.
 Malformed matching cache data fails closed. Compiler artifact availability is
 checked independently of selection-cache presence.
 
+vLLM divides each tuning race's candidates across TP ranks. At winner
+consolidation, it fetches missing CuTe objects and manifests from the rank
+that proposed the winning configuration before installing it locally.
+Transfers use 1 MiB CPU chunks on the preparation control channel, validate
+the object digest, and publish under the local compiler lock. A stalled peer
+falls back to local compilation and is not retried during that stage. Transfer
+threads and temporary store entries are released before preparation completes.
+Triton programs and fixed/default-only preparation retain local compilation.
+
 `B12X_COMPILE_WORKERS` limits compiler processes per preparation session
-(default: 8). An explicit `compile_workers` argument takes precedence. Lower
-this on unified-memory systems where compiler processes share RAM with model
-weights and KV caches. This changes compilation concurrency, not autotuning.
+(default: 4 on NVIDIA GB10/Spark, 8 elsewhere). An explicit `compile_workers`
+argument takes precedence. Lower this on unified-memory systems where compiler
+processes share RAM with model weights and KV caches. This changes compilation
+concurrency, not autotuning.
 `session.configure_compile_workers()` can change the budget between jobs
 without releasing prepared plans. vLLM's `B12X_WEIGHTS_COMPILE_WORKERS` and
 `B12X_STATE_COMPILE_WORKERS` override the common budget for their respective
 preparation stages. State tuning uses disposable pools with the final KV layout
 before allocating serving KV. `B12X_BIND_COMPILE_WORKERS` controls final binding
-and priming. The Spark TP2 launchers default to 16, 16, and 4 respectively.
+and priming. The Spark launchers default to 4 workers for every stage.
 
 `autotune=False` uses a serial warmup through the same session's materialize,
 prime and resource-ownership hooks. It skips selection-cache lookup, candidate
@@ -116,10 +126,15 @@ every rank. Increment it before launch to discard prior tuning decisions:
 export B12X_TUNING_CACHE_VERSION=2
 ```
 
-Decision identity includes that version, the model namespace and reported
-CUDA device name. GPUs with the same name share choices regardless of UUID or
-visible ordinal. Source edits and compiler/toolchain changes do not invalidate
-decisions automatically. CuTe and Triton artifacts retain their source-based
+Decision identity includes that version, the model namespace, CUDA compute
+capability and SM count. Matching silicon shares choices regardless of UUID,
+product label, reported memory or visible ordinal. Source edits and
+compiler/toolchain changes do not invalidate decisions automatically.
+CuTe artifacts also use compute capability and SM count instead of physical
+UUID, with separate in-memory entries for loaded programs on each CUDA device.
+The portable CuTe formats are v7 for explicit specs and v4 for structural keys;
+old UUID-keyed artifacts remain intact but are not reused under the new keys.
+CuTe and Triton artifacts retain their source-based
 keys; the tuning-cache version is excluded from the compiler environment key.
 A cached decision still validates its assignment and configuration, then
 compiles any missing artifacts for that selected configuration. Increment the
