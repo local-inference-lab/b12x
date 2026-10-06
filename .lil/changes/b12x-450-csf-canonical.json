@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-450-csf-canonical",
+  "category": "feature",
+  "summary": "Load canonical MXFP4-CSF and NVFP4-CSF checkpoints, including Qwen3.8-Flash-Next",
+  "models": [
+    "Kimi-K3",
+    "DeepSeek-V4.1-Flash",
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "Requires CSF schema, tensor suffixes, and loader names. Predecessor X4T/LSC schemas require migration. Original FP4 values and calibration are preserved.",
+  "details": [
+    "TP-independent checkpoint slices preserve native expert arithmetic.",
+    "NVFP4-CSF stores resident offsets in native scale order and initializes micro-kernel barriers during scale expansion."
+  ],
+  "pull_requests": [
+    450
+  ],
+  "requires": []
+}

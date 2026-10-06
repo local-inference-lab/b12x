@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-450-moe-routing",
+  "category": "fix",
+  "summary": "Preserve route broadcasts and shared-input token addressing in dynamic MoE",
+  "models": ["all"],
+  "compatibility": "Applies to native and compressed weights. Deterministic W4A8 M32 execution now reads the correct token activation for each routed pair.",
+  "details": [
+    "A CTA barrier prevents reuse of the shared work-claim slot before every warp has retained its value.",
+    "Shared W4A8 payload and scale gathers convert deterministic routed-pair indices back to token indices before computing Int64 global offsets.",
+    "Preparation retains the separate deterministic top-k reduction as well as every selected scale decoder before frozen graph replay."
+  ],
+  "pull_requests": [450],
+  "requires": []
+}

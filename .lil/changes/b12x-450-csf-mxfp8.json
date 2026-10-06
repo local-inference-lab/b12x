@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-450-csf-mxfp8",
+  "category": "fix",
+  "summary": "Prepare MXFP4-CSF scales for native MXFP8 expert activations",
+  "models": ["DeepSeek-V4.1-Flash", "GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "Canonical checkpoint bytes are unchanged. Pair with the vLLM DS4.1 activation-policy update. Kimi retains BF16 expert activations.",
+  "details": [
+    "MXFP4-CSF supports the native W4A8 prepared scale layout, including compact N64 tails, native E8M0 clamping and caller-owned shared scratch.",
+    "Compressed-scale expansion skips absent experts using a bounded presence mask instead of repeatedly scanning route prefixes or assuming every expert is active.",
+    "The DS4.1 TP4 batch execution-rate regression is reduced to approximately 1.4 percent or less at concurrency 8 through 32 in the measured configuration. NVFP4 serving retains a material regression; its complete repair is not claimed."
+  ],
+  "pull_requests": [450],
+  "requires": ["b12x-450-csf-preparation"]
+}
