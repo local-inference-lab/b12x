@@ -2,17 +2,18 @@
   "schema": "local-inference-release-change/v1",
   "id": "b12x-487",
   "category": "performance",
-  "summary": "W4A16 MoE decode on NVFP4-CSF checkpoints now runs as fast as plain NVFP4, and GLM-5.3 runs W4A16 at TP6 (352 expert channels per rank)",
+  "summary": "W4A16 MoE decode on NVFP4-CSF checkpoints runs close to plain NVFP4, and GLM-5.3 runs W4A16 at TP6 (352 expert channels per rank)",
   "models": [
     "GLM-5.3",
     "GLM-5.3-Flash"
   ],
-  "compatibility": "No user action required. CSF scale memory is unchanged by default; B12X_NVFP4_CSF_INLINE_WORDS=32 (the GLM-5.3 profile) spends about 25% of the native scale bytes more on records with inline replacement words.",
+  "compatibility": "No user action required. CSF scale memory is unchanged by default. B12X_NVFP4_CSF_INLINE_WORDS=32 keeps the first replacement words inline in the compressed records for a faster single-request decode, at about 25% of the native scale bytes more (about 1.1 GiB per GPU on GLM-5.3 TP8).",
   "details": [
     "Stage-readable NVFP4-CSF scale storage no longer needs a per-tile prologue wait or reads that depend on the previous stage: each tile stages its exception records while its route block is read, every stage copies its codes and replacement-word window together, and the scale-word rebuild overlaps the stage's MMAs; outputs stay bit-identical to native NVFP4 scales.",
-    "B12X_NVFP4_CSF_INLINE_WORDS (read when the CSF experts are prepared) puts that many replacement words inline in each 128-row record (64-row records: five eighths of it); the default 0 keeps 32-byte records, the memory of the previous storage.",
-    "Fused MoE, CSF vs native at 4/8/16/32/64 tokens. GLM-5.3 TP8 (256 channels per rank, B12X_W4A16_SMALL_M_OCCUPANCY=2): +12.4/+3.1/+2.7/+1.7/+1.3% before, +1.0/-1.1/+0.4/-1.2/-2.8% now (+1.1/-0.3/0.0/-1.3/-2.6% with 32 inline words). GLM-5.3-Flash TP2: +6.5/+2.8/+1.5/+0.4/-0.4% before, -0.4/-1.6/-1.6/-2.3/-2.4% now; TP4: +6.2/+5.7/+3.7/+2.6/+2.0% before, +1.3/-0.4/-0.9/-1.7/-1.9% now.",
-    "Served GLM-5.3 TP8 MTP3 with 32 inline words: the FP4-CSF checkpoint decodes within 1.5% of the original (C1 83.9 vs 85.0, C2 137.3 vs 138.7, C4 194.9 vs 196.8 steps/s).",
+    "B12X_NVFP4_CSF_INLINE_WORDS (read when the CSF experts are prepared) puts that many replacement words inline in each 128-row record (64-row records: five eighths of it); the default 0 keeps 32-byte records, the memory of the previous storage. Only 0 and 32 are measured; 4 to 16 are slower than both.",
+    "Fused W4A16 launches request a shared-memory carveout that admits their planned CTAs per SM, and plans whose CTAs cannot fit fail at planning time instead of at the cooperative launch.",
+    "Fused MoE, CSF vs native at 4/8/16/32/64 tokens. GLM-5.3 TP8 (256 channels per rank, B12X_W4A16_SMALL_M_OCCUPANCY=2): +12.4/+3.1/+2.7/+1.7/+1.3% before, +0.9/-1.1/+0.4/-1.2/-2.8% now (+1.2/-0.3/+0.1/-1.3/-2.7% with 32 inline words). GLM-5.3-Flash TP2: +6.5/+2.8/+1.5/+0.4/-0.4% before, -0.4/-1.6/-1.6/-2.3/-2.4% now; TP4: +6.2/+5.7/+3.7/+2.6/+2.0% before, +1.3/-0.4/-0.9/-1.7/-1.9% now.",
+    "Served GLM-5.3 TP8 MTP3, FP4-CSF vs the original NVFP4 checkpoint (MTP-normalized steps/s): C1 83.3 vs 85.0, C2 138.4 vs 138.7, C4 196.2 vs 196.8, with 535,808 against 489,920 KV tokens; with 32 inline words C1 83.9 at 508,608 KV tokens. GLM-5.3-Flash TP2 serves unchanged (C1 85.1, C4 191.5 steps/s; same KV cache).",
     "Packed NVFP4 W4A16 (native and CSF scales) supports expert shards whose channel count is 32 mod 64, such as GLM-5.3 TP6 (2048 padded to 2112, 352 channels per rank): N64 gate/up tiles and K32 down tiles, for decode and prefill.",
     "Fixes a K32 activation-tile swizzle that left its 64-byte rows and corrupted large-batch outputs of K32 W4A16 tiles."
   ],
