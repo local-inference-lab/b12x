@@ -164,3 +164,29 @@ def test_rails_out_of_range_rejected():
         plan_routes(RING, 0, 0)
     with pytest.raises(ValueError):
         plan_routes(RING, 0, 3)
+
+
+@pytest.mark.parametrize("gid,netmask,expected", [
+    ("0000:0000:0000:0000:0000:ffff:0a0a:0001", "255.255.255.252", "10.10.0.1/30"),
+    ("0000:0000:0000:0000:0000:ffff:0a0a:0001", None, None),
+    ("fe80:0000:0000:0000:0000:0000:0000:0001", "255.255.255.252", None),
+    ("invalid", "255.255.255.252", None),
+])
+def test_local_endpoints_uses_gid_netdev_prefix(tmp_path, monkeypatch, gid, netmask, expected):
+    from b12x.comm.roce import _routes
+
+    port = tmp_path / "rdma0" / "ports" / "1"
+    (port / "gids").mkdir(parents=True)
+    (port / "gid_attrs" / "ndevs").mkdir(parents=True)
+    (port / "gids" / "3").write_text(gid)
+    (port / "gid_attrs" / "ndevs" / "3").write_text("eth7")
+    seen = []
+
+    def mask(name):
+        seen.append(name)
+        return netmask
+
+    monkeypatch.setattr(_routes, "_netmask", mask)
+    actual = _routes.local_endpoints(("rdma0", "missing"), 3, root=tmp_path)
+    assert actual == (ep("rdma0", expected), ep("missing"))
+    assert seen == (["eth7"] if "ffff" in gid else [])

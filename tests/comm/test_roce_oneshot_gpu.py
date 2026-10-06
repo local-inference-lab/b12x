@@ -29,15 +29,23 @@ pytestmark = pytest.mark.skipif(
 
 
 class _PreparedRuntime:
-    def __init__(self, runtime, plan):
+    def __init__(self, runtime, plan, session=None):
         self._runtime = runtime
         self._plan = plan
+        self._session = session
 
     def all_reduce(self, inp, **kwargs):
         return self._runtime.all_reduce(inp, plan=self._plan, **kwargs)
 
     def all_gather(self, inp, **kwargs):
         return self._runtime.all_gather(inp, plan=self._plan, **kwargs)
+
+    def close(self):
+        try:
+            if self._session is not None:
+                self._session.close()
+        finally:
+            self._runtime.close()
 
     def __getattr__(self, name):
         return getattr(self._runtime, name)
@@ -465,8 +473,36 @@ def _fresh_runtime(spin_limit: int):
             del os.environ["B12X_ROCE_SPIN_LIMIT"]
         else:
             os.environ["B12X_ROCE_SPIN_LIMIT"] = previous
-    rt.prepare((torch.bfloat16,))
-    return rt
+    from b12x.comm.roce import _preparation
+
+    query = roce.query_from_runtime(
+        rt, surface="AllReduce.all_reduce", call={"dtypes": ("bfloat16",)},
+        topology="roce_rdma", peer_hosts=tuple(f"rank-{r}" for r in range(rt.world_size)),
+    )
+    declaration = roce.plan(query, runtime=rt)
+    seed = torch.zeros(8, dtype=torch.bfloat16, device=rt.device)
+    def prepare(state):
+        call = _preparation.prepared_call(state, inp=seed)
+
+        def run():
+            dist.barrier()
+            call.run()
+            torch.cuda.synchronize(rt.device)
+            dist.barrier()
+
+        return PreparedCall(run=run, output=call.output)
+
+    request = declaration.request(name="roce_fault_injection", prepare_call=prepare)
+    session = PreparationSession(device=rt.device, autotune=False, compile_workers=2)
+    try:
+        session.prepare((request,))
+    except BaseException:
+        try:
+            session.close()
+        finally:
+            rt.close()
+        raise
+    return _PreparedRuntime(rt, declaration, session)
 
 
 def test_fail_stop_on_timeout_eager(runtime):
