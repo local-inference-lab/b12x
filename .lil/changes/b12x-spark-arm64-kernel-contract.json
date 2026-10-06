@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-spark-arm64-kernel-contract",
+  "category": "fix",
+  "summary": "Match the ARM64 wheel contract to CUTLASS DSL 4.7.1 and SM121",
+  "models": [
+    "Models served on NVIDIA DGX Spark"
+  ],
+  "compatibility": "The ARM64 target remains research-only until its wheel is built and qualified on SM121.",
+  "details": [
+    "The runtime lock matches the B12X package dependency and the vLLM ARM64 architecture target."
+  ],
+  "pull_requests": [
+    488
+  ],
+  "requires": [
+    "b12x-spark-arm64-wheel"
+  ]
+}
