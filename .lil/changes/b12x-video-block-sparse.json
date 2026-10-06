@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-video-block-sparse",
+  "category": "feature",
+  "summary": "Block-list (video) sparse attention in attention.varlen: a data-dependent CSR list of K blocks per q tile, for MiniMax-H3 / FastH3-style learned block selection on SM120/SM121",
+  "models": [
+    "MiniMax-H3"
+  ],
+  "compatibility": "Opt-in. block_sparse defaults to False and the dense path is unchanged (verified bit-identical). New optional keyword arguments on varlen.plan (block_sparse, num_q_tiles, total_blocks_cap) and varlen.bind (block_indices, block_offsets).",
+  "details": [
+    "The sparse walk runs in both the producer (load) and consumer (mma) sides of the warp-specialized contiguous kernel, behind Constexpr[bool] is_block_sparse; the dense/causal/window body is preserved verbatim as the else branch.",
+    "The list is authoritative: causal and window constraints are not re-applied, and dense regions (H3 text/audio) are expressed as contiguous runs in the list.",
+    "CSR block dimensions are fixed at declaration from the explicit tile override or the default configuration; tuning preserves them.",
+    "Correctness gates: a full list reproduces dense exactly; a sparse list matches the fp32 oracle under the same mask; an empty list attends nothing (proving the walk is live, not silently dense); partial final blocks are handled; bind allocates no device memory; the path is CUDA-graph capturable and replays exactly."
+  ],
+  "pull_requests": [],
+  "requires": []
+}
