@@ -285,7 +285,12 @@ class PreparationSession:
         compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
         race_batch=32, race_budget=None, collective_barrier=None,
     ):
-        """Initialize planning resources and an optional collective entry barrier."""
+        """Initialize planning resources and an optional collective entry barrier.
+
+        ``collective_barrier(key, ranks)`` runs in a daemon thread and must be
+        safe to call there. A timeout does not cancel that callback; another
+        preparation job cannot begin until the callback exits.
+        """
         self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         if compile_workers is None:
             compile_workers = _default_compile_workers(self.device)
@@ -692,7 +697,6 @@ class PreparationJob:
         self._last_advance_end = None
         self._phase = "planning"
         self._active_request = None
-        self._barrier_marker = None
         self._total_requests = len(requests)
         self._completed_requests = 0
         self._selection_counts = {}
