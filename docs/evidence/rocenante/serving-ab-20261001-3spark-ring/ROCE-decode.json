@@ -1,0 +1,135 @@
+{
+ "label": "roce",
+ "command": "/private/tmp/claude-501/-Users-defilan-stuffy-code-ai-llmkube/c8d30f6c-615f-4609-be59-629b600c652a/scratchpad/decode_ab.py http://localhost:18120 roce /private/tmp/claude-501/-Users-defilan-stuffy-code-ai-llmkube/c8d30f6c-615f-4609-be59-629b600c652a/scratchpad/ab-out/roce-decode.json",
+ "endpoint": "http://localhost:18120",
+ "prompt": "Write a Go package that implements an LRU cache with generics, a mutex for concurrent use, and a table-driven test file. Explain each design decision briefly.",
+ "max_tokens": 512,
+ "runs": 5,
+ "started": "2026-10-01T18:26:07Z",
+ "models": {
+  "object": "list",
+  "data": [
+   {
+    "id": "DeepSeek-V4.1-Flash",
+    "object": "model",
+    "created": 1790879167,
+    "owned_by": "vllm",
+    "root": "/models/73da83042eadd0f7",
+    "parent": null,
+    "max_model_len": 8192,
+    "permission": [
+     {
+      "id": "modelperm-9ce20d55bf4cabc5",
+      "object": "model_permission",
+      "created": 1790879167,
+      "allow_create_engine": false,
+      "allow_sampling": true,
+      "allow_logprobs": true,
+      "allow_search_indices": false,
+      "allow_view": true,
+      "allow_fine_tuning": false,
+      "organization": "*",
+      "group": null,
+      "is_blocking": false
+     }
+    ]
+   }
+  ]
+ },
+ "cells": [
+  {
+   "concurrency": 1,
+   "samples": [
+    {
+     "ttft_s": 0.2222,
+     "completion_tokens": 512,
+     "decode_tok_s": 33.684
+    },
+    {
+     "ttft_s": 0.2257,
+     "completion_tokens": 512,
+     "decode_tok_s": 34.544
+    },
+    {
+     "ttft_s": 0.2557,
+     "completion_tokens": 512,
+     "decode_tok_s": 33.384
+    },
+    {
+     "ttft_s": 0.2236,
+     "completion_tokens": 512,
+     "decode_tok_s": 34.359
+    },
+    {
+     "ttft_s": 0.2224,
+     "completion_tokens": 512,
+     "decode_tok_s": 32.552
+    }
+   ],
+   "median_decode_tok_s_per_stream": 33.684,
+   "min": 32.552,
+   "max": 34.544,
+   "median_ttft_s": 0.2236
+  },
+  {
+   "concurrency": 2,
+   "samples": [
+    {
+     "ttft_s": 0.5006,
+     "completion_tokens": 512,
+     "decode_tok_s": 26.989
+    },
+    {
+     "ttft_s": 0.2577,
+     "completion_tokens": 512,
+     "decode_tok_s": 26.749
+    },
+    {
+     "ttft_s": 0.4685,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.018
+    },
+    {
+     "ttft_s": 0.2291,
+     "completion_tokens": 512,
+     "decode_tok_s": 26.762
+    },
+    {
+     "ttft_s": 0.5456,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.864
+    },
+    {
+     "ttft_s": 0.256,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.472
+    },
+    {
+     "ttft_s": 0.4759,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.63
+    },
+    {
+     "ttft_s": 0.23,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.347
+    },
+    {
+     "ttft_s": 0.526,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.714
+    },
+    {
+     "ttft_s": 0.2381,
+     "completion_tokens": 512,
+     "decode_tok_s": 27.367
+    }
+   ],
+   "median_decode_tok_s_per_stream": 27.357,
+   "min": 26.749,
+   "max": 27.864,
+   "median_ttft_s": 0.3631
+  }
+ ],
+ "finished": "2026-10-01T18:29:34Z"
+}
