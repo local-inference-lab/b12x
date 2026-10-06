@@ -99,6 +99,7 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
+from b12x._lib.quant.nvfp4_csf_packed import record_bytes as csf_record_bytes
 from b12x._lib.quant.lut_e4m3 import (
     lut_e4m3_direct_table,
     lut_e4m3_value_table,
@@ -594,15 +595,13 @@ class _CsfStage:
     """Shared-memory layout of one pipeline stage of compressed (CSF) scales.
 
     A stage covers ``groups`` K16 groups of ``slabs`` storage slabs of
-    ``tile_rows`` rows each (a whole ``slab_rows``-row storage slab, or one
-    half of a 128-row slab for a 64-row tile). Byte offsets: the 4-bit codes
-    (``tile_rows / 2`` bytes per k-group and slab), then the exception records
-    of the ``atoms`` four-group atoms it touches, each with its first
-    ``inline_words`` replacement words.
+    ``slab_rows`` rows. Byte offsets: the 4-bit codes (``slab_rows / 2``
+    bytes per k-group and slab), then the exception records of the ``atoms``
+    four-group atoms it touches, each with its first ``inline_words``
+    replacement words.
     """
 
     slab_rows: int
-    tile_rows: int
     slabs: int
     groups: int
     atoms: int
@@ -618,28 +617,23 @@ def _csf_slab_rows(rows: int) -> int:
     return 128 if int(rows) % 128 == 0 else 64
 
 
-def _csf_stage(tile_n: int, tile_k: int, slab_rows: int = 128) -> _CsfStage:
-    from b12x._lib.quant.nvfp4_csf_packed import record_bytes
-
-    tile_rows = min(int(slab_rows), int(tile_n))
-    slabs, groups = int(tile_n) // tile_rows, int(tile_k) // 16
+def _csf_stage(tile_n: int, tile_k: int, slab_rows: int) -> _CsfStage:
+    slab_rows = int(slab_rows)
+    slabs, groups = int(tile_n) // slab_rows, int(tile_k) // 16
     atoms = max(1, groups // 4)
-    rb = record_bytes(slab_rows)
+    rb = csf_record_bytes(slab_rows)
     codes = 0
-    records = codes + slabs * groups * (tile_rows // 2)
+    records = codes + slabs * groups * (slab_rows // 2)
     total = records + slabs * atoms * rb
     return _CsfStage(
-        int(slab_rows), tile_rows, slabs, groups, atoms, rb, (rb - 32) // 4,
+        slab_rows, slabs, groups, atoms, rb, (rb - 32) // 4,
         codes, records, _covering_count(total, 16) * 16,
     )
 
 
-def _csf_extra_shared_bytes(tile_n: int, tile_k: int, stages: int) -> int:
-    """Compressed-scale stages, the tile's row bases and the storage address.
-
-    Sized for 128-row storage slabs, whose records are the larger ones.
-    """
-    csf = _csf_stage(tile_n, tile_k, 128)
+def _csf_extra_shared_bytes(tile_n: int, tile_k: int, stages: int, slab_rows: int) -> int:
+    """Compressed-scale stages, the tile's row bases and the storage address."""
+    csf = _csf_stage(tile_n, tile_k, slab_rows)
     return stages * csf.bytes + _covering_count(tile_n, 16) * 16 + 16
 
 
@@ -654,6 +648,7 @@ def _shared_memory_footprint(
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
     small_m_occupancy: int | None = None,
+    csf_slab_rows: int = 128,
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -691,7 +686,7 @@ def _shared_memory_footprint(
         route_rows * 16 + _reduction_shared_bytes(cta_n, cta_k, uses_m_block_8),
     )
     if scale_format == _CSF_SCALE_FORMAT:
-        gemm_size += _csf_extra_shared_bytes(cta_n, cta_k, stages)
+        gemm_size += _csf_extra_shared_bytes(cta_n, cta_k, stages, csf_slab_rows)
     return gemm_size + lut_size
 
 
@@ -732,6 +727,7 @@ def _determine_blocks_per_sm(
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
         small_m_occupancy=small_m_occupancy,
+        csf_slab_rows=_csf_slab_rows(problem_n),
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -797,8 +793,11 @@ def _candidate_tile_fits(
         return False
     if weight_layout in BLOCK_CODECS and int(tile_k) > 128:
         return False
-    # Compressed scales are staged in 64-row (half) slabs and half atoms.
-    if scale_format == _CSF_SCALE_FORMAT and (int(tile_n) % 64 or int(tile_k) % 32):
+    # Compressed scales are staged in whole storage slabs (64 rows for 64 mod
+    # 128 rows, else 128) and half atoms.
+    if scale_format == _CSF_SCALE_FORMAT and (
+        int(tile_n) % _csf_slab_rows(problem_n) or int(tile_k) % 32
+    ):
         return False
     scale_group_size = _scale_group_size(scale_format)
     exact_n = int(problem_n) % int(tile_n) == 0
@@ -852,6 +851,7 @@ def _candidate_tile_fits(
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
         small_m_occupancy=small_m_occupancy,
+        csf_slab_rows=_csf_slab_rows(problem_n),
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -1626,7 +1626,7 @@ class W4A16GemmKernel:
             csf_slab_rows = _csf_slab_rows(self.size_n)
             if (
                 weight_layout != "packed"
-                or self.tile_n % 64
+                or self.tile_n % csf_slab_rows
                 or self.tile_k % 32
                 or self.size_n % self.tile_n
                 or self.size_k % self.tile_k
@@ -1637,8 +1637,8 @@ class W4A16GemmKernel:
                 or self.has_scale_k_tail
             ):
                 raise ValueError(
-                    "compressed W4A16 scales need packed weights, 64-row N "
-                    "tiles and whole K32 stages"
+                    "compressed W4A16 scales need packed weights, N tiles of "
+                    "whole storage slabs and whole K32 stages"
                 )
             # Each lane rebuilds one scale word per stage: two K16 steps of
             # its warp's 64 columns.
@@ -5481,20 +5481,6 @@ class W4A16GemmKernel:
         )
 
     @cute.jit
-    def _csf_tile_slab(self, output_n_tile: Int32):
-        """First storage slab of an N tile, and the byte offset of its rows in the slab.
-
-        A 64-row tile of 128-row storage reads one half of a slab.
-        """
-        csf = self.csf
-        slab0 = output_n_tile * Int32(csf.slabs)
-        half = Int32(0)
-        if cutlass.const_expr(csf.tile_rows < csf.slab_rows):
-            slab0 = output_n_tile // Int32(2)
-            half = output_n_tile % Int32(2)
-        return slab0, half
-
-    @cute.jit
     def _stage_csf_tile(
         self,
         scales_i32_flat: cute.Tensor,
@@ -5506,18 +5492,13 @@ class W4A16GemmKernel:
         """Issue the tile's row bases into the current commit group and store the storage address."""
         csf = self.csf
         block = self._csf_expert_block(scales_i32_flat, expert_idx)
-        slab0, half = self._csf_tile_slab(output_n_tile)
+        slab0 = output_n_tile * Int32(csf.slabs)
         if tid == Int32(0):
             st_shared_u64(
                 smem_base + Int32(self.sh_csf_address_off * 16),
                 get_ptr_as_int64(scales_i32_flat, Int64(0)).to(Uint64),
             )
-            # Mask bit of the tile's first word in its (half) slab.
-            st_shared_u32(
-                smem_base + Int32(self.sh_csf_address_off * 16 + 8),
-                (half * Int32(csf.tile_rows // 4)).to(Uint32),
-            )
-        chunks_per_slab = csf.tile_rows // 16
+        chunks_per_slab = csf.slab_rows // 16
         for i in cutlass.range_constexpr(
             _covering_count(csf.slabs * chunks_per_slab, self.cta_threads)
         ):
@@ -5529,7 +5510,7 @@ class W4A16GemmKernel:
                     smem_base + Int32(self.sh_csf_bases_off * 16) + c * Int32(16),
                     block
                     + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
-                    + Int64(half * Int32(csf.tile_rows) + part * Int32(16)),
+                    + Int64(part * Int32(16)),
                 )
 
     @cute.jit
@@ -5554,28 +5535,27 @@ class W4A16GemmKernel:
         stage = self._csf_stage_addr(smem_base, pipe)
         group0 = tile_idx * Int32(csf.groups)
         atom0 = group0 // Int32(4)
-        slab0, half = self._csf_tile_slab(output_n_tile)
-        code_parts = csf.tile_rows // 32
-        code_chunks = csf.slabs * csf.groups * code_parts
+        slab0 = output_n_tile * Int32(csf.slabs)
+        # A slab's codes of consecutive k-groups are contiguous.
+        code_parts = csf.groups * csf.slab_rows // 32
         record_parts = csf.atoms * csf.record_bytes // 16
+        code_chunks = csf.slabs * code_parts
         total = code_chunks + csf.slabs * record_parts
         for i in cutlass.range_constexpr(_covering_count(total, self.cta_threads)):
             chunk = tid + Int32(i * self.cta_threads)
             # Both regions are contiguous in shared memory.
             destination = stage + chunk * Int32(16)
             if chunk < Int32(code_chunks):
-                slab = chunk // Int32(csf.groups * code_parts)
-                rest = chunk % Int32(csf.groups * code_parts)
+                slab = chunk // Int32(code_parts)
+                part = chunk % Int32(code_parts)
                 cp_async4_shared_global(
                     destination,
                     block
                     + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
                     + Int64(
                         Int32(csf.slab_rows)
-                        + (group0 + rest // Int32(code_parts))
-                        * Int32(csf.slab_rows // 2)
-                        + half * Int32(csf.tile_rows // 2)
-                        + (rest % Int32(code_parts)) * Int32(16)
+                        + group0 * Int32(csf.slab_rows // 2)
+                        + part * Int32(16)
                     ),
                 )
             elif chunk < Int32(total):
@@ -5596,8 +5576,8 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _csf_scale_word(
-        self, stage: Int32, slab: Int32, group: Int32, word: Int32, bit_index: Int32,
-        sub: Int32, base: Uint32, smem_base: Int32,
+        self, stage: Int32, slab: Int32, group: Int32, word: Int32, sub: Int32,
+        base: Uint32, smem_base: Int32,
     ) -> Uint32:
         """One packed scale word (four rows of k-group ``group``) of a staged stage.
 
@@ -5613,8 +5593,8 @@ class W4A16GemmKernel:
         codes = ld_shared_u16_zx_ordered(
             stage
             + Int32(csf.codes)
-            + slab * Int32(csf.groups * csf.tile_rows // 2)
-            + group * Int32(csf.tile_rows // 2)
+            + slab * Int32(csf.groups * csf.slab_rows // 2)
+            + group * Int32(csf.slab_rows // 2)
             + word * Int32(2)
         )
         position = sub + group
@@ -5626,7 +5606,7 @@ class W4A16GemmKernel:
         )
         mask = ld_shared_u32(record + Int32(16) + (position % Int32(4)) * Int32(4))
         prefixes = ld_shared_u32(record + Int32(4))
-        bit = Uint32(1) << bit_index.to(Uint32)
+        bit = Uint32(1) << word.to(Uint32)
         index = (
             (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8))) & Uint32(255)
         ) + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
@@ -5668,22 +5648,20 @@ class W4A16GemmKernel:
         sub = (tile_idx * Int32(csf.groups)) % Int32(4)
         group = Int32(2) * warp_row + lane // Int32(16)
         column = warp_col * Int32(16) + lane % Int32(16)
-        words_per_slab = csf.tile_rows // 4
-        slab = column // Int32(words_per_slab)
-        word = column % Int32(words_per_slab)
-        bit_index = word
-        if cutlass.const_expr(csf.tile_rows < csf.slab_rows):
-            bit_index = word + (
-                ld_shared_u32(smem_base + Int32(self.sh_csf_address_off * 16 + 8))
-                .to(Int32)
-            )
+        words_per_slab = csf.slab_rows // 4
         base = ld_shared_u32(
             smem_base + Int32(self.sh_csf_bases_off * 16) + column * Int32(4)
         )
         st_shared_u32(
             slot + group * Int32(self.tile_n) + column * Int32(4),
             self._csf_scale_word(
-                stage, slab, group, word, bit_index, sub, base, smem_base,
+                stage,
+                column // Int32(words_per_slab),
+                group,
+                column % Int32(words_per_slab),
+                sub,
+                base,
+                smem_base,
             ),
         )
         cute.arch.sync_warp()
