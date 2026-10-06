@@ -15,7 +15,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import OptLevel
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
+from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, Uint64, dsl_user_op
 
 from b12x._lib.compiler import (
     KernelCompileSpec,
@@ -49,6 +49,7 @@ from b12x._lib.intrinsics import (
     ld_global_v4_f32,
     ld_shared_f32,
     ld_shared_i32_relaxed,
+    ld_shared_u16_zx,
     ld_shared_u32,
     ld_shared_v2_u32,
     ld_shared_v4_f32,
@@ -72,6 +73,7 @@ from b12x._lib.intrinsics import (
     packed_decode_lut_fp16_to_bfloat2x4,
     packed_decode_lut_fp16_to_half2x4,
     packed_decode_lut_e4m3_to_e4m3x8,
+    packed_decode_lut_e4m3_direct_to_e4m3x8,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
@@ -88,6 +90,7 @@ from b12x._lib.intrinsics import (
     st_shared_f32,
     st_shared_i32,
     st_shared_u32,
+    st_shared_u64,
     st_shared_v4_f32,
     st_shared_v4_u32,
     threadfence,
@@ -95,7 +98,10 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
-from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table
+from b12x._lib.quant.lut_e4m3 import (
+    lut_e4m3_direct_table,
+    lut_e4m3_value_table,
+)
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
 )
@@ -146,6 +152,28 @@ _PACK_FACTOR = 8
 _STAGES = 4
 
 
+def _w4a16_small_m_occupancy() -> int:
+    """Resolve the packed NVFP4 small-M schedule: one CTA/four stages or two/three."""
+    value = os.environ.get("B12X_W4A16_SMALL_M_OCCUPANCY", "1")
+    if value not in ("1", "2"):
+        raise ValueError("B12X_W4A16_SMALL_M_OCCUPANCY must be 1 or 2")
+    return int(value)
+
+
+def _w4a16_small_m_double_occupancy(
+    *, weight_layout: str, scale_format: str, uses_m_block_8: bool,
+    small_m_occupancy: int | None = None,
+) -> bool:
+    """Whether a small-M plan runs two CTAs per SM with three stages: opted in,
+    and packed NVFP4 weights with E4M3 scales, the measured geometry."""
+    return (
+        uses_m_block_8
+        and weight_layout == "packed"
+        and scale_format == "e4m3_k16"
+        and (_w4a16_small_m_occupancy() if small_m_occupancy is None else small_m_occupancy) == 2
+    )
+
+
 def _w4a16_small_m_splitk_enabled() -> bool:
     """Experimental small-M split-K schedule toggle.  NOT yet correct.
 
@@ -193,8 +221,14 @@ _TRELLIS256_BITS = (2, 3, 4, 5, 6)
 _TRELLIS256_CODEBOOKS = {MCG, LUT_E4M3, LUT_FP16}
 _LUT_E4M3_VALUE_TABLE_ENTRIES = 1 << 12
 _LUT_E4M3_SMEM_REGION_BYTES = _LUT_E4M3_VALUE_TABLE_ENTRIES
+# E4M3 K16 scales kept as stage-readable lossless CSF storage
+# (b12x/_lib/quant/nvfp4_csf_packed.py); each pipeline stage is rebuilt in
+# shared memory from compressed bytes instead of a pre-expanded scale copy.
+_CSF_SCALE_FORMAT = "e4m3_k16_csf"
+_CSF_HEADER_BYTES = 1024
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
+    _CSF_SCALE_FORMAT: _CSF_SCALE_FORMAT,
     "e8m0_k32": "e8m0_k32",
     "e4m3_k32": "e4m3_k32",
     "iq2_xs": "iq2_xs",
@@ -298,10 +332,12 @@ def _gather_native_scale_bytes(a: Uint32, b: Uint32, c: Uint32, d: Uint32, byte:
 
 
 def _trellis256_execution_lut(
-    device: torch.device | str, codebook: str
+    device: torch.device | str, codebook: str, *, direct_lut: bool = False
 ) -> torch.Tensor:
     if codebook == LUT_FP16:
         return lut_fp16_segment_table(device)
+    if direct_lut:
+        return lut_e4m3_direct_table(device)
     return lut_e4m3_value_table(device)
 
 # TC-decode runs on the packed W4A16 object and folds the top-k sum into the FC2
@@ -503,7 +539,8 @@ def _iq2_xs_stage_bytes(tile_k: int, tile_n: int, codec: str = "iq2_xs") -> int:
 
 def _w4a16_pipeline_stages(
     *, weight_layout: str, tile_n: int, tile_k: int, uses_m_block_8: bool,
-    pipeline_stages: int | None = None,
+    pipeline_stages: int | None = None, scale_format: str = "e4m3_k16",
+    small_m_occupancy: int | None = None,
 ) -> int:
     if pipeline_stages is not None:
         if type(pipeline_stages) is not int or pipeline_stages not in (2, 3, 4, 5):
@@ -512,6 +549,13 @@ def _w4a16_pipeline_stages(
     if weight_layout in BLOCK_CODECS and tile_n == 128 and tile_k == 128:
         return 2
     if weight_layout in BLOCK_CODECS and uses_m_block_8 and tile_n == 64 and tile_k == 128:
+        return 3
+    if _w4a16_small_m_double_occupancy(
+        weight_layout=weight_layout, scale_format=scale_format,
+        uses_m_block_8=uses_m_block_8,
+        small_m_occupancy=small_m_occupancy,
+    ):
+        # Three stages leave room for two resident CTAs per SM.
         return 3
     return _STAGES
 
@@ -532,6 +576,50 @@ def _reduction_shared_bytes(tile_n: int, tile_k: int, uses_m_block_8: bool) -> i
     return (int(tile_n) // 2) * vectors * 16
 
 
+@dataclass(frozen=True)
+class _CsfStage:
+    """Shared-memory layout of one pipeline stage of compressed (CSF) scales.
+
+    A stage covers ``groups`` K16 groups of ``slabs`` 128-row slabs. Byte
+    offsets: row bases, 4-bit codes, the exception records of the ``atoms``
+    four-group atoms it touches, the record heads of the stage ``stages - 1``
+    later, and a window of ``cap + 4`` replacement words per slab.
+    """
+
+    slabs: int
+    groups: int
+    atoms: int
+    cap: int
+    bases: int
+    codes: int
+    records: int
+    heads: int
+    words: int
+    bytes: int
+
+
+def _csf_stage(tile_n: int, tile_k: int) -> _CsfStage:
+    slabs, groups = int(tile_n) // 128, int(tile_k) // 16
+    atoms = max(1, groups // 4)
+    cap = max(8, 4 * groups)
+    codes = 128 * slabs
+    records = codes + 64 * groups * slabs
+    heads = records + 32 * atoms * slabs
+    words = heads + 16 * atoms * slabs
+    total = words + 4 * (cap + 4) * slabs
+    return _CsfStage(
+        slabs, groups, atoms, cap, 0, codes, records, heads, words,
+        _covering_count(total, 16) * 16,
+    )
+
+
+def _csf_extra_shared_bytes(tile_n: int, tile_k: int, stages: int) -> int:
+    """Compressed-scale stages, the first stages' record heads and the storage address."""
+    csf = _csf_stage(tile_n, tile_k)
+    prologue = _covering_count((stages - 1) * 16 * csf.atoms * csf.slabs, 16) * 16
+    return stages * csf.bytes + prologue + 16
+
+
 def _shared_memory_footprint(
     *,
     cta_m_blocks: int,
@@ -542,6 +630,7 @@ def _shared_memory_footprint(
     weight_bits: int = 4,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -549,7 +638,8 @@ def _shared_memory_footprint(
     stages = _w4a16_pipeline_stages(
         weight_layout=weight_layout, tile_n=cta_n, tile_k=cta_k,
         uses_m_block_8=uses_m_block_8,
-        pipeline_stages=pipeline_stages,
+        pipeline_stages=pipeline_stages, scale_format=scale_format,
+        small_m_occupancy=small_m_occupancy,
     )
     activation_rows = 8 if uses_m_block_8 and stages == 3 else cta_m
     sh_block_meta_size = activation_rows * 16
@@ -577,6 +667,8 @@ def _shared_memory_footprint(
         gemm_size,
         route_rows * 16 + _reduction_shared_bytes(cta_n, cta_k, uses_m_block_8),
     )
+    if scale_format == _CSF_SCALE_FORMAT:
+        gemm_size += _csf_extra_shared_bytes(cta_n, cta_k, stages)
     return gemm_size + lut_size
 
 
@@ -596,6 +688,7 @@ def _determine_blocks_per_sm(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -615,6 +708,7 @@ def _determine_blocks_per_sm(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        small_m_occupancy=small_m_occupancy,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -629,8 +723,17 @@ def _determine_blocks_per_sm(
         # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
         # barrier participant count while still covering the machine for the
         # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
-        # is numerically identical.
-        blocks_per_sm_limit = 1
+        # is numerically identical. Narrow NVFP4 experts may opt into two
+        # CTAs per SM (see _w4a16_small_m_occupancy).
+        blocks_per_sm_limit = (
+            min(blocks_per_sm_limit, 2)
+            if _w4a16_small_m_double_occupancy(
+                weight_layout=weight_layout, scale_format=scale_format,
+                uses_m_block_8=uses_m_block_8,
+                small_m_occupancy=small_m_occupancy,
+            )
+            else 1
+        )
     elif uses_m_block_8:
         block_limit = 4 if tile_n == 64 and tile_k == 128 else 2
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, block_limit), 1)
@@ -664,10 +767,14 @@ def _candidate_tile_fits(
     allow_qualified_fc2_tile: bool = False,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
     if weight_layout in BLOCK_CODECS and int(tile_k) > 128:
+        return False
+    # Compressed scales are staged in whole 128-row slabs and half atoms.
+    if scale_format == _CSF_SCALE_FORMAT and (int(tile_n) % 128 or int(tile_k) % 32):
         return False
     scale_group_size = _scale_group_size(scale_format)
     exact_n = int(problem_n) % int(tile_n) == 0
@@ -710,6 +817,7 @@ def _candidate_tile_fits(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        small_m_occupancy=small_m_occupancy,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -728,6 +836,7 @@ def _select_tile_config(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
+    small_m_occupancy: int | None = None,
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
@@ -753,6 +862,7 @@ def _select_tile_config(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         ):
             continue
         occupancy_problem_n = (
@@ -774,6 +884,7 @@ def _select_tile_config(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         )
         occupancy = blocks_per_sm_limit * (
             cta_threads if weight_layout in BLOCK_CODECS else 1
@@ -884,6 +995,7 @@ class W4A16FusedMoeCompileResult:
     shared_memory_bytes: int = -1
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
+    trellis_direct_lut: bool = False
 
 
 @dataclass(frozen=True)
@@ -1036,6 +1148,8 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
+        small_m_occupancy: int | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1220,6 +1334,13 @@ class W4A16GemmKernel:
             static_pair_rates.get(trellis_pair_kind, (3, 3))
         )
         self.lut_e4m3_smem = False
+        self.trellis_direct_lut = False
+        # Large-M route blocks only issue the MMAs of 16-row blocks that hold
+        # live routes; padded rows of a partial block are never read back.
+        self.skip_empty_m_blocks = (
+            os.environ.get("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1") == "1"
+            if skip_empty_m_blocks is None else skip_empty_m_blocks
+        )
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1250,6 +1371,7 @@ class W4A16GemmKernel:
         )
         self.b_bundle_rows = 2
         self.scale_format = scale_format
+        self.csf_scales = scale_format == _CSF_SCALE_FORMAT
         self.native_nvfp4_scales = (
             weight_layout == "modelopt" and scale_format == "e4m3_k16"
         )
@@ -1335,7 +1457,8 @@ class W4A16GemmKernel:
         self.stages = _w4a16_pipeline_stages(
             weight_layout=weight_layout, tile_n=self.tile_n, tile_k=self.tile_k,
             uses_m_block_8=self.uses_m_block_8,
-            pipeline_stages=pipeline_stages,
+            pipeline_stages=pipeline_stages, scale_format=scale_format,
+            small_m_occupancy=small_m_occupancy,
         )
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
@@ -1347,6 +1470,7 @@ class W4A16GemmKernel:
         else:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        self.max_shared_mem = max_shared_mem
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
@@ -1364,6 +1488,7 @@ class W4A16GemmKernel:
                 max(4, self.trellis_bits) if self.weight_layout_trellis256 else 4
             ),
             pipeline_stages=self.stages,
+            small_m_occupancy=small_m_occupancy,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -1453,6 +1578,47 @@ class W4A16GemmKernel:
                 self.tile_n, self.tile_k, self.uses_m_block_8
             ) // 16,
         )
+        # Compressed scales stage after every other region: the partial
+        # reduction never reaches them, and each tile restages its own.
+        if self.csf_scales:
+            if (
+                weight_layout != "packed"
+                or self.tile_n % 128
+                or self.tile_k % 32
+                or self.size_n % self.tile_n
+                or self.size_k % self.tile_k
+                or self.size_k % 64
+                or self.has_logical_tail
+                or self.has_n_tile_tail
+                or self.has_k_tile_tail
+                or self.has_scale_k_tail
+            ):
+                raise ValueError(
+                    "compressed W4A16 scales need packed weights, 128-row N "
+                    "tiles and whole K32 stages"
+                )
+            # Storage geometry of b12x/_lib/quant/nvfp4_csf_packed.py: one
+            # block per expert (slab fixed streams, then atom records); the
+            # records address replacement words from the storage start.
+            if self.b_sh_wr_iters < 2:
+                raise ValueError("compressed W4A16 scales need two K16 steps per stage")
+            self.csf = _csf_stage(self.tile_n, self.tile_k)
+            self.csf_slabs = self.size_n // 128
+            self.csf_atoms_per_slab = self.size_k // 64
+            self.csf_slab_bytes = 128 + 64 * (self.size_k // 16)
+            self.csf_records_in_block = self.csf_slabs * self.csf_slab_bytes
+            self.csf_block_bytes = self.csf_records_in_block + (
+                self.csf_slabs * self.csf_atoms_per_slab * 32
+            )
+            self.sh_csf_off = self.shared_int4
+            self.sh_csf_prologue_off = self.sh_csf_off + self.stages * (
+                self.csf.bytes // 16
+            )
+            # The storage address, for replacement words past a stage's window.
+            self.sh_csf_address_off = self.sh_csf_prologue_off + _covering_count(
+                (self.stages - 1) * 16 * self.csf.atoms * self.csf.slabs, 16
+            )
+            self.shared_int4 = self.sh_csf_address_off + 1
         self.shared_words = self.shared_int4 * 4
         if self.shared_words * 4 > int(max_shared_mem):
             raise ValueError(
@@ -1509,7 +1675,9 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles,
             self.schedule_route_block_factor,
             self.lut_e4m3_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
+            self.skip_empty_m_blocks,
         )
 
     @cute.jit
@@ -2844,6 +3012,7 @@ class W4A16GemmKernel:
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
+        live_m_blocks = (block_valid_rows + Int32(15)) // Int32(16)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
             for pipe in cutlass.range(
@@ -2853,7 +3022,7 @@ class W4A16GemmKernel:
                 if tile_idx < k_tiles:
                     for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
                         if cutlass.const_expr(
-                            not self.weight_layout_block
+                            not (self.weight_layout_block or self.csf_scales)
                             or kk + 1 < self.b_sh_wr_iters
                         ):
                             self._load_next_fragment_bundle(
@@ -2920,6 +3089,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     dynamic_pair_override,
+                                    live_m_blocks,
                                 )
                             else:
                                 self._dequant_and_accumulate_bundle(
@@ -2938,6 +3108,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     0,
+                                    live_m_blocks,
                                 )
                         else:
                             self._dequant_and_accumulate_bundle(
@@ -2956,8 +3127,30 @@ class W4A16GemmKernel:
                                 trellis_lut_addr,
                                 uses_m_block_8,
                                 -1,
+                                live_m_blocks,
                             )
 
+                        if cutlass.const_expr(
+                            self.csf_scales and kk + 1 == self.b_sh_wr_iters
+                        ):
+                            # Rebuild the next stage's scale words once this
+                            # step's MMAs are issued, so they hide its latency.
+                            self._load_next_fragment_bundle(
+                                b_scale_next,
+                                a_regs_next,
+                                smem_base,
+                                tid,
+                                b_sh_rd,
+                                s_sh_rd,
+                                a_sh_rd,
+                                pipe,
+                                kk,
+                                tile_idx,
+                                k_tiles,
+                                reduce_k_tile,
+                                dynamic_pair_override,
+                                uses_m_block_8,
+                            )
                         if cutlass.const_expr(
                             self.weight_layout_block
                             and kk + 1 == self.b_sh_wr_iters
@@ -3041,6 +3234,7 @@ class W4A16GemmKernel:
         trellis_lut_addr: Int64,
         uses_m_block_8: cutlass.Constexpr[bool],
         dynamic_pair_override: cutlass.Constexpr[int],
+        live_m_blocks: Int32,
     ):
         if cutlass.const_expr(
             uses_m_block_8
@@ -3164,6 +3358,16 @@ class W4A16GemmKernel:
                 self._scaled_dequant_b_fragment(b_frag, q, s)
             if cutlass.const_expr(uses_m_block_8):
                 self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            elif cutlass.const_expr(self.skip_empty_m_blocks and self.cta_m_blocks > 1):
+                self._mma_accumulate_large_m(acc0, a_regs_cur, 0, jj, b_frag)
+                if live_m_blocks > Int32(1):
+                    self._mma_accumulate_large_m(acc1, a_regs_cur, 1, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 2):
+                    if live_m_blocks > Int32(2):
+                        self._mma_accumulate_large_m(acc2, a_regs_cur, 2, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 3):
+                    if live_m_blocks > Int32(3):
+                        self._mma_accumulate_large_m(acc3, a_regs_cur, 3, jj, b_frag)
             else:
                 for mb in cutlass.range_constexpr(self.cta_m_blocks):
                     if cutlass.const_expr(mb == 0):
@@ -3963,6 +4167,13 @@ class W4A16GemmKernel:
         else:
             next_tile = tile_idx + Int32(1)
             if next_tile < k_tiles:
+                if cutlass.const_expr(self.csf_scales):
+                    self._expand_csf_warp(
+                        smem_base,
+                        tid,
+                        Int32((pipe + 1) % self.stages),
+                        reduce_k_tile + next_tile,
+                    )
                 self._load_b_scale_register_bundle(
                     b_scale_next,
                     smem_base,
@@ -4101,13 +4312,19 @@ class W4A16GemmKernel:
                     win_a, win_b, trellis_lut_addr, int(bits)
                 )
         else:
-            e_lo, e_hi = packed_decode_lut_e4m3_to_e4m3x8(
-                win_a,
-                win_b,
-                trellis_lut_addr,
-                int(bits),
-                value_table_in_shared=self.lut_e4m3_smem,
-            )
+            if cutlass.const_expr(self.trellis_direct_lut):
+                e_lo, e_hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
+                    win_a, win_b, trellis_lut_addr, int(bits),
+                    in_shared=self.lut_e4m3_smem,
+                )
+            else:
+                e_lo, e_hi = packed_decode_lut_e4m3_to_e4m3x8(
+                    win_a,
+                    win_b,
+                    trellis_lut_addr,
+                    int(bits),
+                    value_table_in_shared=self.lut_e4m3_smem,
+                )
             if cutlass.const_expr(self.is_fp16):
                 o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
                 o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
@@ -4766,6 +4983,7 @@ class W4A16GemmKernel:
         output_n_tile: Int32,
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
+        csf_heads: Int32,
     ):
         for i in cutlass.range_constexpr(self.a_sh_wr_iters):
             row = a_rows_per_iter * Int32(i) + a_gl_rd_row
@@ -5150,7 +5368,12 @@ class W4A16GemmKernel:
         # before touching scale SMEM.  Const-expr-elide the otherwise dead HBM
         # reads so every layer can share a four-byte aligned dummy scale tensor
         # instead of retaining 54 MiB of packed ones.
-        if cutlass.const_expr(self.native_nvfp4_scales):
+        if cutlass.const_expr(self.csf_scales):
+            self._stage_csf_scales(
+                scales_i32_flat, smem_base, tid, pipe, tile_idx, expert_idx,
+                output_n_tile, csf_heads,
+            )
+        elif cutlass.const_expr(self.native_nvfp4_scales):
             self._stage_modelopt_scales(
                 scales_i32_flat, smem_base, tid, pipe, expert_idx,
                 output_n_tile, tile_idx,
@@ -5186,6 +5409,277 @@ class W4A16GemmKernel:
                         get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
                     )
         cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def _csf_stage_addr(self, smem_base: Int32, pipe: Int32) -> Int32:
+        return smem_base + Int32(self.sh_csf_off * 16) + pipe * Int32(self.csf.bytes)
+
+    @cute.jit
+    def _csf_expert_block(self, scales_i32_flat: cute.Tensor, expert_idx: Int32) -> Int64:
+        """Global address of an expert's compressed-scale block."""
+        return (
+            get_ptr_as_int64(scales_i32_flat, Int64(0))
+            + Int64(_CSF_HEADER_BYTES)
+            + Int64(expert_idx) * Int64(self.csf_block_bytes)
+        )
+
+    @cute.jit
+    def _csf_record(self, block: Int64, slab: Int32, atom: Int32) -> Int64:
+        return (
+            block
+            + Int64(self.csf_records_in_block)
+            + (Int64(slab) * Int64(self.csf_atoms_per_slab) + Int64(atom)) * Int64(32)
+        )
+
+    @cute.jit
+    def _csf_bounds(self, heads: Int32, slab: Int32, sub: Int32):
+        """Replacement-word range of one slab of a stage, from the stage's record heads.
+
+        A K32 stage covers half an atom: its k-groups start at ``sub`` (0 or 2).
+        """
+        first = heads + slab * Int32(self.csf.atoms * 16)
+        start = ld_shared_u32(first)
+        prefixes = ld_shared_u32(first + Int32(4))
+        begin = start + ((prefixes >> (sub.to(Uint32) * Uint32(8))) & Uint32(255))
+        end = ld_shared_u32(first + Int32((self.csf.atoms - 1) * 16 + 8))
+        if cutlass.const_expr(self.csf.groups < 4):
+            if sub == Int32(0):
+                end = start + ((prefixes >> Uint32(16)) & Uint32(255))
+        return begin, end
+
+    @cute.jit
+    def _stage_csf_scales(
+        self,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: Int32,
+        tile_idx: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        heads: Int32,
+    ):
+        """Issue one stage of compressed scales into the current commit group.
+
+        Copies the row bases and codes of the stage's k-groups, its exception
+        records, the record heads of the stage ``stages - 1`` later (whose
+        replacement words are issued from them), and this stage's replacement
+        words, whose bounds come from ``heads``.
+        """
+        csf = self.csf
+        block = self._csf_expert_block(scales_i32_flat, expert_idx)
+        storage = get_ptr_as_int64(scales_i32_flat, Int64(0))
+        stage = self._csf_stage_addr(smem_base, pipe)
+        group0 = tile_idx * Int32(csf.groups)
+        atom0 = group0 // Int32(4)
+        sub = group0 % Int32(4)
+        ahead = tile_idx + Int32(self.stages - 1)
+        atom_ahead = (ahead * Int32(csf.groups)) // Int32(4)
+        slab0 = output_n_tile * Int32(csf.slabs)
+        window = (csf.cap + 4) // 4
+        end_bases = 8 * csf.slabs
+        end_codes = end_bases + 4 * csf.groups * csf.slabs
+        end_records = end_codes + 2 * csf.atoms * csf.slabs
+        end_heads = end_records + csf.atoms * csf.slabs
+        total = end_heads + window * csf.slabs
+        for i in cutlass.range_constexpr(_covering_count(total, self.cta_threads)):
+            chunk = tid + Int32(i * self.cta_threads)
+            if chunk < Int32(end_bases):
+                slab = chunk // Int32(8)
+                part = chunk % Int32(8)
+                cp_async4_shared_global(
+                    stage + Int32(csf.bases) + slab * Int32(128) + part * Int32(16),
+                    block
+                    + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
+                    + Int64(part) * Int64(16),
+                )
+            elif chunk < Int32(end_codes):
+                c = chunk - Int32(end_bases)
+                slab = c // Int32(4 * csf.groups)
+                part = c % Int32(4 * csf.groups)
+                cp_async4_shared_global(
+                    stage
+                    + Int32(csf.codes)
+                    + slab * Int32(64 * csf.groups)
+                    + part * Int32(16),
+                    block
+                    + Int64(slab0 + slab) * Int64(self.csf_slab_bytes)
+                    + Int64(128)
+                    + Int64(group0) * Int64(64)
+                    + Int64(part) * Int64(16),
+                )
+            elif chunk < Int32(end_records):
+                c = chunk - Int32(end_codes)
+                slab = c // Int32(2 * csf.atoms)
+                part = c % Int32(2 * csf.atoms)
+                cp_async4_shared_global(
+                    stage
+                    + Int32(csf.records)
+                    + (slab * Int32(csf.atoms) + part // Int32(2)) * Int32(32)
+                    + (part % Int32(2)) * Int32(16),
+                    self._csf_record(block, slab0 + slab, atom0 + part // Int32(2))
+                    + Int64(part % Int32(2)) * Int64(16),
+                )
+            elif chunk < Int32(end_heads):
+                c = chunk - Int32(end_records)
+                slab = c // Int32(csf.atoms)
+                part = c % Int32(csf.atoms)
+                if ahead < Int32(self.k_tiles):
+                    cp_async4_shared_global(
+                        stage
+                        + Int32(csf.heads)
+                        + (slab * Int32(csf.atoms) + part) * Int32(16),
+                        self._csf_record(block, slab0 + slab, atom_ahead + part),
+                    )
+            elif chunk < Int32(total):
+                c = chunk - Int32(end_heads)
+                slab = c // Int32(window)
+                part = c % Int32(window)
+                begin, end = self._csf_bounds(heads, slab, sub)
+                aligned = begin & Uint32(0xFFFFFFFC)
+                if (part * Int32(4)).to(Uint32) < end - aligned:
+                    cp_async4_shared_global(
+                        stage
+                        + Int32(csf.words)
+                        + slab * Int32(4 * (csf.cap + 4))
+                        + part * Int32(16),
+                        storage
+                        + aligned.to(Int64) * Int64(4)
+                        + Int64(part) * Int64(16),
+                    )
+
+    @cute.jit
+    def _stage_csf_prologue(
+        self,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        first_k_tile: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+    ):
+        """Copy the storage address and the record heads of the stages issued at tile start."""
+        csf = self.csf
+        block = self._csf_expert_block(scales_i32_flat, expert_idx)
+        storage = get_ptr_as_int64(scales_i32_flat, Int64(0))
+        slab0 = output_n_tile * Int32(csf.slabs)
+        heads_per_stage = csf.atoms * csf.slabs
+        total = (self.stages - 1) * heads_per_stage
+        if tid == Int32(0):
+            st_shared_u64(
+                smem_base + Int32(self.sh_csf_address_off * 16), storage.to(Uint64)
+            )
+        for i in cutlass.range_constexpr(_covering_count(total, self.cta_threads)):
+            c = tid + Int32(i * self.cta_threads)
+            if c < Int32(total):
+                stage = c // Int32(heads_per_stage)
+                rest = c % Int32(heads_per_stage)
+                slab = rest // Int32(csf.atoms)
+                part = rest % Int32(csf.atoms)
+                k_tile = first_k_tile + stage
+                if k_tile < Int32(self.k_tiles):
+                    atom = (k_tile * Int32(csf.groups)) // Int32(4) + part
+                    cp_async4_shared_global(
+                        smem_base
+                        + Int32(self.sh_csf_prologue_off * 16)
+                        + c * Int32(16),
+                        self._csf_record(block, slab0 + slab, atom),
+                    )
+
+    @cute.jit
+    def _csf_scale_word(
+        self, stage: Int32, slab: Int32, group: Int32, lane: Int32, sub: Int32,
+        smem_base: Int32,
+    ) -> Uint32:
+        """One packed scale word (rows 4 lane to 4 lane + 3 of k-group ``group``) of a staged stage.
+
+        The word is its rows' biased bases plus four 4-bit codes, already in
+        W4A16's packed scale encoding, unless the word's mask bit selects a
+        complete replacement word: from the staged window, or from global memory
+        past it.
+        """
+        csf = self.csf
+        codes = ld_shared_u16_zx(
+            stage
+            + Int32(csf.codes)
+            + slab * Int32(64 * csf.groups)
+            + group * Int32(64)
+            + lane * Int32(2)
+        )
+        codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
+        value = codes + ld_shared_u32(
+            stage + Int32(csf.bases) + slab * Int32(128) + lane * Int32(4)
+        )
+        position = sub + group
+        record = (
+            stage
+            + Int32(csf.records)
+            + (slab * Int32(csf.atoms) + position // Int32(4)) * Int32(32)
+        )
+        mask = ld_shared_u32(record + Int32(16) + (position % Int32(4)) * Int32(4))
+        bit = Uint32(1) << lane.to(Uint32)
+        if (mask & bit) != Uint32(0):
+            prefixes = ld_shared_u32(record + Int32(4))
+            index = (
+                ld_shared_u32(record)
+                + (
+                    (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8)))
+                    & Uint32(255)
+                )
+                + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
+            )
+            first = stage + Int32(csf.records) + slab * Int32(csf.atoms * 32)
+            begin = ld_shared_u32(first) + (
+                (ld_shared_u32(first + Int32(4)) >> (sub.to(Uint32) * Uint32(8)))
+                & Uint32(255)
+            )
+            offset = index - (begin & Uint32(0xFFFFFFFC))
+            if offset < Uint32(csf.cap + 4):
+                value = ld_shared_u32(
+                    stage
+                    + Int32(csf.words)
+                    + slab * Int32(4 * (csf.cap + 4))
+                    + offset.to(Int32) * Int32(4)
+                )
+            else:
+                slot = smem_base + Int32(self.sh_csf_address_off * 16)
+                address = ld_shared_u32(slot).to(Uint64) | (
+                    ld_shared_u32(slot + Int32(4)).to(Uint64) << Uint64(32)
+                )
+                value = ld_global_nc_u32(
+                    address.to(Int64) + index.to(Int64) * Int64(4)
+                )
+        return value
+
+    @cute.jit
+    def _expand_csf_warp(self, smem_base: Int32, tid: Int32, pipe: Int32, tile_idx: Int32):
+        """Rebuild the packed scale words this warp reads from one staged k-tile.
+
+        A warp reads ``b_sh_wr_iters`` k-groups of its 64 output columns, one
+        four-byte word per lane for the usual two groups. Warps own disjoint
+        words, so a warp barrier orders the rebuild before its register loads.
+        """
+        warp = tid // Int32(32)
+        lane = tid % Int32(32)
+        warp_row = warp // Int32(self.tb_n_warps)
+        warp_col = warp % Int32(self.tb_n_warps)
+        stage = self._csf_stage_addr(smem_base, pipe)
+        slot = smem_base + Int32(self.sh_s_off * 16) + pipe * Int32(self.s_sh_stage * 16)
+        sub = (tile_idx * Int32(self.csf.groups)) % Int32(4)
+        words = 16 * self.b_sh_wr_iters
+        for i in cutlass.range_constexpr(_covering_count(words, 32)):
+            word = lane + Int32(32 * i)
+            if word < Int32(words):
+                group = Int32(self.b_sh_wr_iters) * warp_row + word // Int32(16)
+                column = warp_col * Int32(16) + word % Int32(16)
+                st_shared_u32(
+                    slot + group * Int32(self.tile_n) + column * Int32(4),
+                    self._csf_scale_word(
+                        stage, column // Int32(32), group, column % Int32(32), sub,
+                        smem_base,
+                    ),
+                )
+        cute.arch.sync_warp()
 
     @cute.jit
     def _prefetch_pipeline_step(
@@ -5267,7 +5761,22 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.csf_scales):
+            # The first stages' replacement words need their record heads first.
+            self._stage_csf_prologue(
+                scales_i32_flat, smem_base, tid, reduce_k_tile, expert_idx,
+                output_n_tile,
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
         for pipe in cutlass.range_constexpr(self.stages - 1):
+            csf_heads = Int32(0)
+            if cutlass.const_expr(self.csf_scales):
+                csf_heads = smem_base + Int32(
+                    self.sh_csf_prologue_off * 16
+                    + pipe * 16 * self.csf.atoms * self.csf.slabs
+                )
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
                     a_bf16_flat,
@@ -5291,11 +5800,15 @@ class W4A16GemmKernel:
                     output_n_tile,
                     expert_idx,
                     dynamic_pair_override,
+                    csf_heads,
                 )
             else:
                 cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(self.stages - 2)
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.csf_scales):
+            if k_tiles > Int32(0):
+                self._expand_csf_warp(smem_base, tid, Int32(0), reduce_k_tile)
 
     @cute.jit
     def _prefetch_lookahead_tile(
@@ -5325,6 +5838,10 @@ class W4A16GemmKernel:
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
         fetch_tile = tile_idx + Int32(self.stages - 1)
+        # The stage consumed now staged the record heads of the stage fetched now.
+        csf_heads = Int32(0)
+        if cutlass.const_expr(self.csf_scales):
+            csf_heads = self._csf_stage_addr(smem_base, pipe) + Int32(self.csf.heads)
         if fetch_tile < k_tiles:
             self._stage_k_tile_async(
                 a_bf16_flat,
@@ -5348,6 +5865,7 @@ class W4A16GemmKernel:
                 output_n_tile,
                 expert_idx,
                 dynamic_pair_override,
+                csf_heads,
             )
         else:
             cute.arch.cp_async_commit_group()
@@ -6292,6 +6810,9 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
+        trellis_decode_table: str = "auto",
+        small_m_occupancy: int | None = None,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6550,6 +7071,8 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
+            small_m_occupancy=small_m_occupancy,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6588,6 +7111,8 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
+            small_m_occupancy=small_m_occupancy,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -6603,10 +7128,38 @@ class W4A16FusedMoeKernel:
             self.shared_words += self.iq2_lut_bytes // 4
             self.fc1.iq2_xs_smem_lut = True
             self.fc2.iq2_xs_smem_lut = True
-        self.lut_e4m3_smem = (
+        if trellis_decode_table not in {"auto", "compact", "full"}:
+            raise ValueError("trellis decode table must be auto, compact, or full")
+        compact_smem = (
+            self.trellis_codebook == LUT_E4M3
+            and _lut_e4m3_smem_enabled()
+        )
+        lut_offset = (self.shared_words * 4 + 15) // 16 * 16
+        # The cooperative grid must retain its occupancy contract. A direct
+        # table is eligible only when it fits without reducing resident CTAs.
+        direct_eligible = (
             self.weight_layout == "trellis_t256"
             and self.trellis_codebook == LUT_E4M3
-            and _lut_e4m3_smem_enabled()
+            and self.intermediate_hadamard
+            and self.trellis_bits == 2
+            and self.fc1_trellis_pair_kind is None
+            and self.fc2_trellis_pair_kind is None
+            and self.blocks_per_sm == 1
+            and lut_offset + 65536 <= self.fc1.max_shared_mem
+        )
+        if trellis_decode_table == "full" and not direct_eligible:
+            raise ValueError(
+                "full trellis decode table is incompatible with the planned kernel geometry"
+            )
+        self.trellis_direct_lut = direct_eligible and (
+            trellis_decode_table == "full"
+            or (trellis_decode_table == "auto" and compact_smem and size_m <= 16)
+        )
+        self.fc1.trellis_direct_lut = self.trellis_direct_lut
+        self.fc2.trellis_direct_lut = self.trellis_direct_lut
+        self.lut_e4m3_smem = compact_smem or self.trellis_direct_lut
+        self.trellis_lut_smem_bytes = (
+            65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
         self.lut_e4m3_smem_off = 0
         if self.lut_e4m3_smem:
@@ -6615,8 +7168,10 @@ class W4A16FusedMoeKernel:
             ) // 16 * 16
             self.shared_words = (
                 self.lut_e4m3_smem_off
-                + _LUT_E4M3_SMEM_REGION_BYTES
+                + self.trellis_lut_smem_bytes
             ) // 4
+            if self.shared_words * 4 > self.fc1.max_shared_mem:
+                raise ValueError(f"full trellis decode table requires {self.shared_words * 4} bytes")
             self.fc1.lut_e4m3_smem = True
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
@@ -6660,6 +7215,7 @@ class W4A16FusedMoeKernel:
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -7051,8 +7607,8 @@ class W4A16FusedMoeKernel:
         fc1_trellis_lut_addr = get_ptr_as_int64(fc1_trellis_lut_flat, Int32(0))
         fc2_trellis_lut_addr = get_ptr_as_int64(fc2_trellis_lut_flat, Int32(0))
 
-        # The emit hooks receive the staged value table's shared byte offset
-        # through the LUT ABI slot.
+        # The LUT ABI slot carries the shared byte offset for either the
+        # compact value table or the complete 2-bit direct table.
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
         if cutlass.const_expr(self.weight_layout in IQ2_CODECS):
@@ -7073,7 +7629,7 @@ class W4A16FusedMoeKernel:
             self._lut_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.lut_e4m3_smem_off),
-                _LUT_E4M3_SMEM_REGION_BYTES,
+                self.trellis_lut_smem_bytes,
                 tid,
             )
             cute.arch.sync_threads()
@@ -9780,13 +10336,18 @@ def compile_w4a16_fused_moe(
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     pipeline_stages: int | None = None,
+    skip_empty_m_blocks: bool | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     intermediate_hadamard: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
+    trellis_decode_table: str = "auto",
     _require_cached: bool = False,
+    small_m_occupancy: int | None = None,
 ) -> W4A16FusedMoeCompileResult:
+    if small_m_occupancy is None:
+        small_m_occupancy = _w4a16_small_m_occupancy()
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
     full_rotation = bool(full_rotation)
@@ -9918,6 +10479,7 @@ def compile_w4a16_fused_moe(
         weight_layout=weight_layout,
         weight_bits=weight_bits,
         allow_logical_tail=allow_native_logical_tail,
+        small_m_occupancy=small_m_occupancy,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
         problem_m=routed_rows,
@@ -9931,6 +10493,7 @@ def compile_w4a16_fused_moe(
         weight_layout=weight_layout,
         weight_bits=weight_bits,
         allow_logical_tail=allow_native_logical_tail,
+        small_m_occupancy=small_m_occupancy,
     )
     if fc1_cta_threads != fc2_cta_threads:
         common_cta_threads = min(fc1_cta_threads, fc2_cta_threads)
@@ -9947,6 +10510,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_native_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
             problem_m=routed_rows,
@@ -9961,6 +10525,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_native_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         )
         if fc1_cta_threads != fc2_cta_threads:
             raise ValueError(
@@ -10011,6 +10576,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
@@ -10046,6 +10612,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc2_tile_n = 256
             fc2_tile_k = wide_fc2_tile_k
@@ -10097,6 +10664,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_qualified_fc2_tile=True,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
@@ -10135,6 +10703,7 @@ def compile_w4a16_fused_moe(
                 allow_qualified_fc2_tile=name == "fc2",
                 uses_m_block_8=moe_block_size == 8,
                 pipeline_stages=pipeline_stages,
+                small_m_occupancy=small_m_occupancy,
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
@@ -10180,6 +10749,9 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         pipeline_stages=pipeline_stages,
+        skip_empty_m_blocks=skip_empty_m_blocks,
+        trellis_decode_table=trellis_decode_table,
+        small_m_occupancy=small_m_occupancy,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -10462,6 +11034,7 @@ def compile_w4a16_fused_moe(
         shared_memory_bytes=kernel.shared_words * 4,
         broadcast_suh=bool(broadcast_suh),
         small_m_direct_launches=tuple(small_m_direct_launches),
+        trellis_direct_lut=kernel.trellis_direct_lut,
     )
     attach_programs(result, compiled, *(launch.compiled for launch in small_m_direct_launches))
     _FUSED_CACHE[cache_key] = result
@@ -11169,7 +11742,7 @@ def _w4a16_fused_moe_launch_flat(
         fc2_trellis_lut_addr = iq2_lut.data_ptr()
     elif weight_layout == "trellis_t256" and trellis_codebook != "mcg":
         trellis_rank_lut = _trellis256_execution_lut(
-            a_input.device, trellis_codebook
+            a_input.device, trellis_codebook, direct_lut=fused.trellis_direct_lut
         )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
@@ -12629,10 +13202,10 @@ def run_w4a16_moe(
         raise ValueError("prepared X4T weights have incomplete scale metadata")
     use_x4t_scale_predecode = x4t_w13_scale is not None
     if use_x4t_scale_predecode and (
-        weight_layout != "packed" or scale_format != "e8m0_k32"
+        weight_layout not in ("packed", "modelopt") or scale_format != "e8m0_k32"
     ):
         raise ValueError(
-            "X4T scale predecode requires packed FP4 weights with E8M0 K/32 scales"
+            "X4T scale predecode requires native or packed FP4 with E8M0 K/32 scales"
         )
     w13_layout = getattr(
         prepared,
@@ -12688,6 +13261,8 @@ def run_w4a16_moe(
         raise ValueError("a_input, topk_weights, and topk_ids must be contiguous")
     _validate_expert_map(expert_map, device=a_input.device)
     _validate_expert_map(output_expert_map, device=a_input.device)
+    if getattr(prepared, "x4t_packed_pair_programs", None) is not None and expert_map is not None:
+        raise NotImplementedError("DS4.1 packed X4T supports local TP expert IDs without expert mapping")
     if output_expert_map is not None and not full_rotation:
         raise ValueError("output_expert_map is only valid with full_rotation")
 
@@ -12868,6 +13443,20 @@ def run_w4a16_moe(
         ):
             raise RuntimeError(
                 "W4A16 small-M direct path requires prepared micro scale metadata"
+            )
+        if use_x4t_scale_predecode:
+            # Native and packed GEMMs consume the same expanded scale grid.
+            # The early-return micro path must refresh it before every launch.
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
+
+            programs = prepared.x4t_packed_pair_programs
+            if programs is None or w13_layout != "w31":
+                raise ValueError("Native X4T requires prepared gate/up scale programs")
+            _launch_x4t_packed_scale_pair(
+                x4t_w13_scale, x4t_w2_scale, topk_ids.view(-1),
+                micro_w13_scale, micro_w2_scale,
+                program=programs[2 if topk_ids.dtype == torch.int64 else 0],
+                stream=stream,
             )
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
@@ -13108,19 +13697,47 @@ def run_w4a16_moe(
             packed_route_indices if use_direct_topk_routes else block_expert_ids
         )
         assert x4t_expert_ids is not None
-        decode_x4t_tp12_w4a16_scales(
-            x4t_w13_scale,
-            x4t_w2_scale,
-            x4t_expert_ids,
-            prepared.w13_scale,
-            prepared.w2_scale,
-            expert_map=expert_map if use_direct_topk_routes else None,
-            w13_row_rotation=int(
-                getattr(prepared, "x4t_w13_row_rotation", 0)
-            ),
-            expert_ids_unique=bool(use_direct_topk_routes and m == 1),
-            stream=stream,
-        )
+        programs = getattr(prepared, "x4t_packed_pair_programs", None)
+        if programs is not None:
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
+
+            counts = not use_direct_topk_routes
+            active = expert_counts if counts else x4t_expert_ids
+            sorted_ids = False
+            block_bound = min(block_expert_ids.numel(), topk_ids.numel())
+            if counts and (expert_counts is None or block_bound < int(prepared.num_experts)):
+                # A nonempty packed block contains at least one routed row.
+                # Its sorted expert list therefore needs no more entries than
+                # the routed-row count; the packer fills unused entries with -1.
+                # Bounding the grid avoids scheduling all experts for decode.
+                active = block_expert_ids[:block_bound]
+                counts = False
+                sorted_ids = True
+            if active is None:
+                raise ValueError("Packed X4T routing requires caller-owned expert counts")
+            if sorted_ids:
+                program_index = 3
+            elif counts:
+                program_index = 1
+            else:
+                program_index = 2 if active.dtype == torch.int64 else 0
+            _launch_x4t_packed_scale_pair(
+                x4t_w13_scale, x4t_w2_scale, active,
+                prepared.w13_scale, prepared.w2_scale,
+                program=programs[program_index], stream=stream,
+            )
+        else:
+            decode_x4t_tp12_w4a16_scales(
+                x4t_w13_scale,
+                x4t_w2_scale,
+                x4t_expert_ids,
+                prepared.w13_scale,
+                prepared.w2_scale,
+                expert_map=expert_map if use_direct_topk_routes else None,
+                w13_row_rotation=int(getattr(prepared, "x4t_w13_row_rotation", 0)),
+                expert_ids_unique=bool(use_direct_topk_routes and m == 1),
+                stream=stream,
+            )
 
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)

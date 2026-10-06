@@ -1,0 +1,70 @@
+{
+  "status": "qualified",
+  "scope": "Load-time tensor preparation and component execution; no full-model generation or performance rerun",
+  "reference_b12x_revision": "1b32d927bab8d354718bfb559fa925f23e6266d2",
+  "reference_vllm_revision": "096c7037ee3f526434ee4816fc555b5cd3767715",
+  "source_sha256": {
+    "b12x:b12x/moe/checkpoints/csf.py": "1769d1ad936f444c8d5119ee0634de0178ef3fe26519375025643a0e0db53c65",
+    "b12x:b12x/moe/checkpoints/mxfp4_csf.py": "a9e5cd9120f55fec47b690c9dd1ae8e9511a96fb878065b9ff8dd8b98ea55f6d",
+    "b12x:b12x/moe/checkpoints/nvfp4_csf.py": "1cd841d35435b67019cb16640790bd25728cd684fdc26a82a4cf246debeea854",
+    "vllm:vllm/model_executor/model_loader/csf_utils.py": "025a6e31a5fb8307cb1e8761cbd9c02763dd8d7390aa02c96315c9778337d8b9",
+    "vllm:vllm/model_executor/model_loader/mxfp4_csf_loader.py": "0cda8cf2d38c3f52121714a5d3eeccd4e576ae244526eab360bba24e82445747",
+    "vllm:vllm/model_executor/model_loader/nvfp4_csf_loader.py": "eb1690ca2e4d8125c3598369eefe144b8379b019518ae6af9539fe56f1c9f145",
+    "vllm:vllm/model_executor/layers/quantization/mxfp4_csf.py": "789320a4756a1bfd42d1614c3590063bd024994898d32e0000da4628e74a7200",
+    "vllm:vllm/model_executor/layers/quantization/nvfp4_csf.py": "841bbc44be2b113e64815314154e987d311df33a365f46fc66b6f3e2f084345a",
+    "vllm:vllm/models/deepseek_v4_1/mxfp4_csf.py": "3f3ba7615de8ef2447f94a6a223e42eddd85fc58ea98a2b05987b855a18c5700"
+  },
+  "modified_tracked_runtime_files": {
+    "b12x": [
+      "b12x/moe/checkpoints/mxfp4_csf.py",
+      "b12x/moe/checkpoints/nvfp4_csf.py"
+    ],
+    "vllm": [
+      "vllm/model_executor/layers/quantization/mxfp4_csf.py",
+      "vllm/model_executor/layers/quantization/nvfp4_csf.py",
+      "vllm/model_executor/model_loader/csf_utils.py",
+      "vllm/model_executor/model_loader/mxfp4_csf_loader.py",
+      "vllm/model_executor/model_loader/nvfp4_csf_loader.py",
+      "vllm/models/deepseek_v4_1/mxfp4_csf.py"
+    ]
+  },
+  "compute_kernels_changed": false,
+  "environment": {
+    "base_image": "local/fp4-csf:beta-ce707c68e4-00c6f79301",
+    "base_image_id": "sha256:18b00b38c792463e8a9ba886d68b9f58256544776856d67c5146d9b2c872cf3f",
+    "python_source": "review worktrees via PYTHONPATH=/work/b12x:/work/vllm; native extensions from the base image",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "gpu_uuid": "GPU-6171baff-cc22-608e-4029-507f67c392ff",
+    "physical_gpu_index": 10,
+    "power_limit_w": 600,
+    "cutlass_dsl": "4.7.1",
+    "clocks": "dynamic; no timing claim"
+  },
+  "tests": {
+    "b12x": {
+      "passed": 88,
+      "command": ".venv/bin/python -m pytest -q tests/quantization/test_nvfp4_csf.py tests/quantization/test_nvfp4_csf_checkpoint.py tests/moe/test_nvfp4_csf.py tests/quantization/test_mxfp4_csf_checkpoint.py tests/quantization/test_x4t_packed_scales.py"
+    },
+    "vllm": {
+      "passed": 30,
+      "command": ".venv/bin/python -m pytest -q tests/quantization/test_mxfp4_csf.py tests/quantization/test_nvfp4_csf.py",
+      "evidence": "pytest stdout captured by the execution tool: 30 passed, 14 warnings in 12.82s"
+    },
+    "vllm_lint": "all applicable staged-file pre-commit hooks pass; manual mypy-3.12 passes",
+    "b12x_lint": "ruff check and format pass for changed Python files"
+  },
+  "case_receipts": [
+    "ds-layer-parity.json",
+    "glm-layer-parity.json",
+    "qwen-layer-parity.json",
+    "kimi-tp16-layer-parity.json",
+    "kimi-tp12-layer-parity.json",
+    "portable-tool-qwen.json"
+  ],
+  "kimi_source_shard": {
+    "file": "model-00002-of-000096.safetensors",
+    "bytes": 16209974572,
+    "sha256": "02182faabfa61a4ef6c506d3d1f4c9c905b80fa9e759401dcb632e1d0af74c8e",
+    "role": "temporary read-only fixture copied from the published snapshot on frank2; hash matches its manifest"
+  }
+}
