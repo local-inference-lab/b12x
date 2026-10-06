@@ -479,9 +479,13 @@ def prepare_weights(
         if plan.activation.mode is ActivationMode.A16:
             representation = prepared._impl.representation
             packed = representation.value
-            outputs = (
-                source_scales[0].view_as(packed.w13_scale),
-                source_scales[1].view_as(packed.w2_scale),
+            # The native F8_128x4 grid pads rows to 128 and k-groups to four;
+            # W4A16's packed scales are unpadded, a prefix of that buffer.
+            outputs = tuple(
+                source.reshape(-1)[: target.numel()].view(target.shape)
+                for source, target in zip(
+                    source_scales, (packed.w13_scale, packed.w2_scale), strict=True
+                )
             )
             tables = []
             for factor in factors:
@@ -541,6 +545,11 @@ def prepare_weights(
                         nvfp4_csf=expander,
                         w4a16_expanded=expanded,
                     ),
+                )
+            if any(plane.logical_rows or plane.logical_columns for plane in planes):
+                raise ValueError(
+                    "NVFP4-CSF scale planes off the F8_128x4 grid need W4A16 "
+                    "stage-readable scales (B12X_W4A16_CSF_INLINE=1)"
                 )
             packed = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
             prepared = replace(
@@ -839,13 +848,14 @@ def _w4a8_csf_inline(plan: WeightPlan) -> bool:
 def _w4a16_stage_scales(geometry) -> bool:
     """Whether W4A16 keeps NVFP4-CSF scales as stage-readable storage.
 
-    Stages cover whole 128-row slabs of four-k-group atoms in both projections.
-    B12X_W4A16_CSF_INLINE=0 keeps the per-layer expansion pass.
+    Stages cover 64- or 128-row slabs of K32 k-group pairs in both
+    projections (2048/TP6 = 352 channels: 64-row gate/up slabs, K32 down
+    stages). B12X_W4A16_CSF_INLINE=0 keeps the per-layer expansion pass.
     """
     return (
         os.environ.get("B12X_W4A16_CSF_INLINE", "1") != "0"
         and geometry.hidden_size % 128 == 0
-        and geometry.intermediate_size % 64 == 0
+        and geometry.intermediate_size % 32 == 0
     )
 
 
