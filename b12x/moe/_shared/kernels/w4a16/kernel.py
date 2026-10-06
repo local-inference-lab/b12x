@@ -228,6 +228,37 @@ def _lut_e4m3_smem_enabled() -> bool:
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 256 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
+_DEFAULT_SHARED_MEM_PER_SM = 102_400
+# Shared memory the driver reserves per resident CTA.
+_CTA_RESERVED_SHARED_MEM = 1024
+
+
+def _resident_cta_shared_bytes(shared_bytes: int) -> int:
+    """Shared memory one resident CTA occupies: its 1 KiB-aligned allocation and the reservation."""
+    return _covering_count(int(shared_bytes), 1024) * 1024 + _CTA_RESERVED_SHARED_MEM
+
+
+def _device_shared_mem_per_sm() -> int:
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return int(getattr(props, "shared_memory_per_multiprocessor", _DEFAULT_SHARED_MEM_PER_SM))
+    return _DEFAULT_SHARED_MEM_PER_SM
+
+
+def _cooperative_smem_carveout(
+    *, blocks_per_sm: int, shared_bytes: int, shared_mem_per_sm: int
+) -> int:
+    """Preferred shared-memory carveout (percent) that admits ``blocks_per_sm`` CTAs.
+
+    CUTLASS derives the automatic carveout from the CTAs' dynamic shared
+    memory alone, without the per-CTA reservation: two CTAs of just under
+    32 KiB get a 64 KiB carveout they do not fit in, and the cooperative
+    launch is rejected (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE). Wherever
+    the automatic carveout admits the CTAs this selects the same carveout
+    size, since the driver rounds a preference up to a supported size.
+    """
+    needed = int(blocks_per_sm) * _resident_cta_shared_bytes(shared_bytes)
+    return min(100, _covering_count(100 * needed, int(shared_mem_per_sm)))
 _SCALAR_ACC_FRAGMENT_WIDTH = 1
 _WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256", "iq2_xs", "iq2_xxs", "q8_0"}
 _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
@@ -1768,6 +1799,33 @@ class W4A16GemmKernel:
             self.sh_csf_address_off = self.sh_csf_table_off + table_bytes // 16
             self.shared_int4 = self.sh_csf_address_off + 1
         self.shared_words = self.shared_int4 * 4
+        if self.csf_scales:
+            # The persistent grid, and with it the split-K schedule and the
+            # output bits, follows blocks_per_sm: compressed scales keep the
+            # residency native scales plan whenever their real footprint
+            # admits it (the planner's estimate pads the shared footprint).
+            native_blocks = _determine_blocks_per_sm(
+                problem_m=self.size_m,
+                problem_n=self.covered_size_n,
+                top_k=self.top_k,
+                cta_threads=self.cta_threads,
+                cta_m_blocks=self.cta_m_blocks,
+                tile_n=self.tile_n,
+                tile_k=self.tile_k,
+                uses_m_block_8=self.uses_m_block_8,
+                sms=self.sms,
+                max_shared_mem=max_shared_mem,
+                scale_format="e4m3_k16",
+                weight_layout=weight_layout,
+                pipeline_stages=self.stages,
+                problem_k=self.size_k,
+            )
+            if (
+                native_blocks > self.blocks_per_sm
+                and native_blocks * _resident_cta_shared_bytes(self.shared_words * 4)
+                <= _device_shared_mem_per_sm()
+            ):
+                self.blocks_per_sm = native_blocks
         if self.shared_words * 4 > int(max_shared_mem):
             raise ValueError(
                 "W4A16 shared-memory footprint exceeds device opt-in limit: "
@@ -7446,6 +7504,25 @@ class W4A16FusedMoeKernel:
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        # The cooperative launch must admit blocks_per_sm CTAs on every SM.
+        if self.fc1.weight_layout_block:
+            self.smem_carveout = 100
+        elif self.blocks_per_sm > 1:
+            shared_mem_per_sm = _device_shared_mem_per_sm()
+            if self.blocks_per_sm * (
+                self.shared_words * 4 + _CTA_RESERVED_SHARED_MEM
+            ) > shared_mem_per_sm:
+                raise ValueError(
+                    "fused W4A16 plan does not fit its residency: "
+                    f"{self.blocks_per_sm} CTAs of {self.shared_words * 4} shared bytes"
+                )
+            self.smem_carveout = _cooperative_smem_carveout(
+                blocks_per_sm=self.blocks_per_sm,
+                shared_bytes=self.shared_words * 4,
+                shared_mem_per_sm=shared_mem_per_sm,
+            )
+        else:
+            self.smem_carveout = None
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -7817,8 +7894,9 @@ class W4A16FusedMoeKernel:
             # Occupancy uses the full SMEM budget. CUTLASS's automatic carveout
             # omits the per-CTA reservation: two 32 KiB Q8_0 CTAs request a
             # 64 KiB carveout but cannot both reside there, rejecting the
-            # cooperative launch. Match the budget used by the launch planner.
-            preferred_smem_carveout=100 if self.fc1.weight_layout_block else None,
+            # cooperative launch. Block codecs take the whole budget; other
+            # layouts the smallest carveout that admits their planned CTAs.
+            preferred_smem_carveout=self.smem_carveout,
             stream=stream,
         )
 
