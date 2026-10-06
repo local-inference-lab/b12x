@@ -6,7 +6,8 @@ GLM-5.3-Flash TP2 geometry by default: 288 experts, hidden 4096, intermediate
 per-row range with a configurable share of out-of-window values, close to
 the QAD checkpoint (3.6% of four-byte words carry an exception there). The
 three arms share weights and routed inputs, are planned, prepared and graph
-captured outside timing, replay interleaved, and must produce identical output.
+captured outside timing and replayed in balanced order. Every arm must pass the
+W4A16 reference gate, with at most one differing element per 10,000 versus native scales.
 
 - native: uncompressed MMA-packed scales.
 - pass:   compressed scales expanded into scratch before every call
@@ -23,6 +24,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +37,8 @@ sys.path.insert(0, str(ROOT))
 from b12x._lib.quant.nvfp4_csf import make_nvfp4_csf_batch  # noqa: E402
 from b12x.moe import fused_moe as moe  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
+from b12x.preparation._measurement import _prepare_race, measure_race_steps  # noqa: E402
+from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16  # noqa: E402
 
 
 def logical_scales(rng, experts, rows, columns, outliers):
@@ -82,7 +86,6 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=15)
     parser.add_argument("--block-size-m", type=int, help="pin the route block size of every arm")
     parser.add_argument("--json", type=Path)
-    parser.add_argument("--no-check", action="store_true", help="diagnostic kernels: skip the output check")
     args = parser.parse_args()
     device = torch.device("cuda")
     rng = np.random.default_rng(53)
@@ -106,8 +109,9 @@ def main() -> None:
             input_scale=one, intermediate_scale=one, immutable_input_scales=True,
         )
 
+    native_scales = (swizzled(l13, device), swizzled(l2, device))
     arms = {"native": moe.prepare_weights(
-        plan=plan, weights=packed_weights(swizzled(l13, device), swizzled(l2, device))
+        plan=plan, weights=packed_weights(*(s.clone() for s in native_scales))
     )}
     batches = (compressed(l13, device), compressed(l2, device))
     for name, inline in (("pass", "0"), ("stage", "1")):
@@ -131,6 +135,10 @@ def main() -> None:
         x = (torch.randn(tokens, h, device=device) * 0.5).to(torch.bfloat16)
         ids = torch.stack([torch.randperm(e, device=device)[: args.topk] for _ in range(tokens)]).to(torch.int32)
         weights = torch.softmax(torch.randn(tokens, args.topk, device=device), dim=-1).float()
+        reference = moe_reference_w4a16(
+            x, w13, native_scales[0], one, w2, native_scales[1], one,
+            ids, weights, e, h, n, activation="silu",
+        )
         plans = {
             name: moe.plan_execution(
                 experts=experts,
@@ -163,38 +171,61 @@ def main() -> None:
             for name, binding in bindings.items():
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    for _ in range(args.replays):
-                        moe.run(binding=binding)
+                    moe.run(binding=binding)
                 graphs[name] = graph
             for graph in graphs.values():
                 graph.replay()
             torch.cuda.synchronize()
             # Large calls may reduce top-k routes in a nondeterministic order;
             # the GPU tests check exact equality under deterministic reduction.
+            oracle_metrics = {}
+            for name, output in outputs.items():
+                assert torch.isfinite(output).all() and torch.count_nonzero(output)
+                metrics = compare_to_reference(output, reference)
+                assert metrics.cos >= 0.9975, (name, metrics)
+                oracle_metrics[name] = vars(metrics)
             mismatches = {}
             for name in ("pass", "stage"):
                 mismatches[name] = int((outputs[name] != outputs["native"]).sum())
-                if mismatches[name] > outputs[name].numel() // 10000 and not args.no_check:
+                if mismatches[name] > outputs[name].numel() // 10000:
                     raise AssertionError(f"{name} differs at {mismatches[name]} elements")
-            samples = {name: [] for name in graphs}
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            for _ in range(args.rounds):
-                for name, graph in graphs.items():
-                    start.record()
+            for _ in range(150):
+                for graph in graphs.values():
                     graph.replay()
-                    end.record()
-                    end.synchronize()
-                    samples[name].append(start.elapsed_time(end) * 1000 / args.replays)
+            calls = tuple(PreparedCall(run=graph.replay, produce=lambda: None,
+                                       owners=(graph, bindings, owners)) for graph in graphs.values())
+            race = _prepare_race(calls, device_ordinal=torch.cuda.current_device(),
+                                 samples=args.replays, primed=True)
+            raw_rounds, seen = [], 0
+            try:
+                for _ in measure_race_steps(race, device_ordinal=torch.cuda.current_device(), rounds=args.rounds):
+                    if race.completed_rounds != seen:
+                        seen = race.completed_rounds
+                        raw_rounds.append(tuple(race.latest_round_us))
+                if race.completed_rounds != seen:
+                    raw_rounds.append(tuple(race.latest_round_us))
+            finally:
+                race.close()
+            samples = {name: [row[i] for row in raw_rounds] for i, name in enumerate(graphs)}
             for graph in graphs.values():
                 graph.reset()
         row = {"tokens": tokens, **{name: statistics.median(v) for name, v in samples.items()},
-               "mismatches": mismatches}
+               "mismatches": mismatches, "oracle_metrics": oracle_metrics, "samples_us": samples}
         results.append(row)
         print(f"T={tokens:5d}  native {row['native']:8.1f} us  pass {row['pass']:8.1f} us "
               f"({row['pass'] / row['native'] - 1:+6.1%})  stage {row['stage']:8.1f} us "
               f"({row['stage'] / row['native'] - 1:+6.1%})  differing outputs {mismatches}", flush=True)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    report = {
+        "args": vars(args) | {"json": str(args.json)}, "results": results,
+        "gpu": props.name, "uuid": str(props.uuid), "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "source": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "diff": subprocess.check_output(["git", "diff", "--binary"], text=True),
+        "method": "balanced cold-L2 frozen graph replay using preparation timing; lower microseconds is better",
+    }
     if args.json:
-        args.json.write_text(json.dumps({"args": vars(args) | {"json": str(args.json)}, "results": results}, indent=1))
+        args.json.write_text(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

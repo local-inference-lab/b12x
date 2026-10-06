@@ -341,6 +341,13 @@ class Mxfp4CsfDecoder:
 
         if first.num_experts != second.num_experts:
             raise ValueError("MXFP4-CSF projections must have equal expert counts")
+        if first.bases.device != second.bases.device:
+            raise ValueError("MXFP4-CSF projections must be on one CUDA device")
+        if (
+            out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
+            and out2.data_ptr() < out13.data_ptr() + out13.numel() * out13.element_size()
+        ):
+            raise ValueError("MXFP4-CSF output buffers must not overlap")
         for plane, output in ((first, out13), (second, out2)):
             if (
                 output.element_size() * output.numel()

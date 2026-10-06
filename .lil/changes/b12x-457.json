@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-457",
+  "category": "fix",
+  "summary": "RoCEnante collectives now connect on switchless DGX Spark rings instead of falling back to NCCL",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Each peer's two rails use the RoCE devices that share a subnet with it, so three Sparks cabled in a ring without a switch can use RoCEnante.",
+    "Switched fabrics keep the previous device pairing.",
+    "On a ring, list all four port functions in B12X_ROCE_HCA or NCCL_IB_HCA."
+  ],
+  "pull_requests": [
+    457
+  ],
+  "requires": []
+}

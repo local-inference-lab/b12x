@@ -454,12 +454,10 @@ class _Pair:
             from b12x._lib.quant.nvfp4_csf_inline import IndexedNvfp4Plane
 
             plane = IndexedNvfp4Plane
-        if first[3] == 2 or second[3] == 2:
-            # Stage-readable W4A16 storage (nvfp4_csf_packed.py).
-            from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
+        from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
 
-            plane = PackedStoragePlane
-        self.first, self.second = plane(first), plane(second)
+        self.first = (PackedStoragePlane if first[3] == 2 else plane)(first)
+        self.second = (PackedStoragePlane if second[3] == 2 else plane)(second)
 
     @cute.jit
     def __call__(
@@ -598,7 +596,7 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         0,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 6, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 7, key),
     )
 
 
@@ -628,6 +626,13 @@ def decode_nvfp4_csf_pair(
             or out.device != batch.fixed.device
         ):
             raise ValueError("NVFP4-CSF output must match the native scale geometry")
+    if first.fixed.device != second.fixed.device:
+        raise ValueError("NVFP4-CSF projections must be on one CUDA device")
+    if (
+        out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
+        and out2.data_ptr() < out13.data_ptr() + out13.numel() * out13.element_size()
+    ):
+        raise ValueError("NVFP4-CSF output buffers must not overlap")
     capacity = first.num_experts if mode == 3 else ids.numel()
     if mode == 2 and capacity != first.num_experts:
         raise ValueError("NVFP4-CSF count routing requires one count per expert")
@@ -735,6 +740,13 @@ class Nvfp4CsfDecoder:
                 )
         if first.num_experts != second.num_experts:
             raise ValueError("NVFP4-CSF projections must have equal expert counts")
+        if first.fixed.device != second.fixed.device:
+            raise ValueError("NVFP4-CSF projections must be on one CUDA device")
+        if (
+            out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
+            and out2.data_ptr() < out13.data_ptr() + out13.numel() * out13.element_size()
+        ):
+            raise ValueError("NVFP4-CSF output buffers must not overlap")
         programs = tuple(
             compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64)
             for ids64 in (False, True)

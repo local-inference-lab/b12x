@@ -73,6 +73,7 @@ from b12x._lib.intrinsics import (
     packed_decode_lut_fp16_to_bfloat2x4,
     packed_decode_lut_fp16_to_half2x4,
     packed_decode_lut_e4m3_to_e4m3x8,
+    packed_decode_lut_e4m3_direct_to_e4m3x8,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
@@ -97,7 +98,10 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
-from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table
+from b12x._lib.quant.lut_e4m3 import (
+    lut_e4m3_direct_table,
+    lut_e4m3_value_table,
+)
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
 )
@@ -146,6 +150,28 @@ from b12x.moe._shared.kernels.micro import (
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
 _PACK_FACTOR = 8
 _STAGES = 4
+
+
+def _w4a16_small_m_occupancy() -> int:
+    """Resolve the packed NVFP4 small-M schedule: one CTA/four stages or two/three."""
+    value = os.environ.get("B12X_W4A16_SMALL_M_OCCUPANCY", "1")
+    if value not in ("1", "2"):
+        raise ValueError("B12X_W4A16_SMALL_M_OCCUPANCY must be 1 or 2")
+    return int(value)
+
+
+def _w4a16_small_m_double_occupancy(
+    *, weight_layout: str, scale_format: str, uses_m_block_8: bool,
+    small_m_occupancy: int | None = None,
+) -> bool:
+    """Whether a small-M plan runs two CTAs per SM with three stages: opted in,
+    and packed NVFP4 weights with E4M3 scales, the measured geometry."""
+    return (
+        uses_m_block_8
+        and weight_layout == "packed"
+        and scale_format == "e4m3_k16"
+        and (_w4a16_small_m_occupancy() if small_m_occupancy is None else small_m_occupancy) == 2
+    )
 
 
 def _w4a16_small_m_splitk_enabled() -> bool:
@@ -306,10 +332,12 @@ def _gather_native_scale_bytes(a: Uint32, b: Uint32, c: Uint32, d: Uint32, byte:
 
 
 def _trellis256_execution_lut(
-    device: torch.device | str, codebook: str
+    device: torch.device | str, codebook: str, *, direct_lut: bool = False
 ) -> torch.Tensor:
     if codebook == LUT_FP16:
         return lut_fp16_segment_table(device)
+    if direct_lut:
+        return lut_e4m3_direct_table(device)
     return lut_e4m3_value_table(device)
 
 # TC-decode runs on the packed W4A16 object and folds the top-k sum into the FC2
@@ -511,7 +539,8 @@ def _iq2_xs_stage_bytes(tile_k: int, tile_n: int, codec: str = "iq2_xs") -> int:
 
 def _w4a16_pipeline_stages(
     *, weight_layout: str, tile_n: int, tile_k: int, uses_m_block_8: bool,
-    pipeline_stages: int | None = None,
+    pipeline_stages: int | None = None, scale_format: str = "e4m3_k16",
+    small_m_occupancy: int | None = None,
 ) -> int:
     if pipeline_stages is not None:
         if type(pipeline_stages) is not int or pipeline_stages not in (2, 3, 4, 5):
@@ -520,6 +549,13 @@ def _w4a16_pipeline_stages(
     if weight_layout in BLOCK_CODECS and tile_n == 128 and tile_k == 128:
         return 2
     if weight_layout in BLOCK_CODECS and uses_m_block_8 and tile_n == 64 and tile_k == 128:
+        return 3
+    if _w4a16_small_m_double_occupancy(
+        weight_layout=weight_layout, scale_format=scale_format,
+        uses_m_block_8=uses_m_block_8,
+        small_m_occupancy=small_m_occupancy,
+    ):
+        # Three stages leave room for two resident CTAs per SM.
         return 3
     return _STAGES
 
@@ -594,6 +630,7 @@ def _shared_memory_footprint(
     weight_bits: int = 4,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -601,7 +638,8 @@ def _shared_memory_footprint(
     stages = _w4a16_pipeline_stages(
         weight_layout=weight_layout, tile_n=cta_n, tile_k=cta_k,
         uses_m_block_8=uses_m_block_8,
-        pipeline_stages=pipeline_stages,
+        pipeline_stages=pipeline_stages, scale_format=scale_format,
+        small_m_occupancy=small_m_occupancy,
     )
     activation_rows = 8 if uses_m_block_8 and stages == 3 else cta_m
     sh_block_meta_size = activation_rows * 16
@@ -650,6 +688,7 @@ def _determine_blocks_per_sm(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -669,6 +708,7 @@ def _determine_blocks_per_sm(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        small_m_occupancy=small_m_occupancy,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -683,8 +723,17 @@ def _determine_blocks_per_sm(
         # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
         # barrier participant count while still covering the machine for the
         # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
-        # is numerically identical.
-        blocks_per_sm_limit = 1
+        # is numerically identical. Narrow NVFP4 experts may opt into two
+        # CTAs per SM (see _w4a16_small_m_occupancy).
+        blocks_per_sm_limit = (
+            min(blocks_per_sm_limit, 2)
+            if _w4a16_small_m_double_occupancy(
+                weight_layout=weight_layout, scale_format=scale_format,
+                uses_m_block_8=uses_m_block_8,
+                small_m_occupancy=small_m_occupancy,
+            )
+            else 1
+        )
     elif uses_m_block_8:
         block_limit = 4 if tile_n == 64 and tile_k == 128 else 2
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, block_limit), 1)
@@ -718,6 +767,7 @@ def _candidate_tile_fits(
     allow_qualified_fc2_tile: bool = False,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -767,6 +817,7 @@ def _candidate_tile_fits(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        small_m_occupancy=small_m_occupancy,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -785,6 +836,7 @@ def _select_tile_config(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
+    small_m_occupancy: int | None = None,
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
@@ -810,6 +862,7 @@ def _select_tile_config(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         ):
             continue
         occupancy_problem_n = (
@@ -831,6 +884,7 @@ def _select_tile_config(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         )
         occupancy = blocks_per_sm_limit * (
             cta_threads if weight_layout in BLOCK_CODECS else 1
@@ -941,6 +995,7 @@ class W4A16FusedMoeCompileResult:
     shared_memory_bytes: int = -1
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
+    trellis_direct_lut: bool = False
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1148,8 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
+        small_m_occupancy: int | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1277,6 +1334,13 @@ class W4A16GemmKernel:
             static_pair_rates.get(trellis_pair_kind, (3, 3))
         )
         self.lut_e4m3_smem = False
+        self.trellis_direct_lut = False
+        # Large-M route blocks only issue the MMAs of 16-row blocks that hold
+        # live routes; padded rows of a partial block are never read back.
+        self.skip_empty_m_blocks = (
+            os.environ.get("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1") == "1"
+            if skip_empty_m_blocks is None else skip_empty_m_blocks
+        )
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1393,7 +1457,8 @@ class W4A16GemmKernel:
         self.stages = _w4a16_pipeline_stages(
             weight_layout=weight_layout, tile_n=self.tile_n, tile_k=self.tile_k,
             uses_m_block_8=self.uses_m_block_8,
-            pipeline_stages=pipeline_stages,
+            pipeline_stages=pipeline_stages, scale_format=scale_format,
+            small_m_occupancy=small_m_occupancy,
         )
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
@@ -1405,6 +1470,7 @@ class W4A16GemmKernel:
         else:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        self.max_shared_mem = max_shared_mem
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
@@ -1422,6 +1488,7 @@ class W4A16GemmKernel:
                 max(4, self.trellis_bits) if self.weight_layout_trellis256 else 4
             ),
             pipeline_stages=self.stages,
+            small_m_occupancy=small_m_occupancy,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -1608,7 +1675,9 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles,
             self.schedule_route_block_factor,
             self.lut_e4m3_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
+            self.skip_empty_m_blocks,
         )
 
     @cute.jit
@@ -2943,6 +3012,7 @@ class W4A16GemmKernel:
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
+        live_m_blocks = (block_valid_rows + Int32(15)) // Int32(16)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
             for pipe in cutlass.range(
@@ -3019,6 +3089,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     dynamic_pair_override,
+                                    live_m_blocks,
                                 )
                             else:
                                 self._dequant_and_accumulate_bundle(
@@ -3037,6 +3108,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     0,
+                                    live_m_blocks,
                                 )
                         else:
                             self._dequant_and_accumulate_bundle(
@@ -3055,6 +3127,7 @@ class W4A16GemmKernel:
                                 trellis_lut_addr,
                                 uses_m_block_8,
                                 -1,
+                                live_m_blocks,
                             )
 
                         if cutlass.const_expr(
@@ -3161,6 +3234,7 @@ class W4A16GemmKernel:
         trellis_lut_addr: Int64,
         uses_m_block_8: cutlass.Constexpr[bool],
         dynamic_pair_override: cutlass.Constexpr[int],
+        live_m_blocks: Int32,
     ):
         if cutlass.const_expr(
             uses_m_block_8
@@ -3284,6 +3358,16 @@ class W4A16GemmKernel:
                 self._scaled_dequant_b_fragment(b_frag, q, s)
             if cutlass.const_expr(uses_m_block_8):
                 self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            elif cutlass.const_expr(self.skip_empty_m_blocks and self.cta_m_blocks > 1):
+                self._mma_accumulate_large_m(acc0, a_regs_cur, 0, jj, b_frag)
+                if live_m_blocks > Int32(1):
+                    self._mma_accumulate_large_m(acc1, a_regs_cur, 1, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 2):
+                    if live_m_blocks > Int32(2):
+                        self._mma_accumulate_large_m(acc2, a_regs_cur, 2, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 3):
+                    if live_m_blocks > Int32(3):
+                        self._mma_accumulate_large_m(acc3, a_regs_cur, 3, jj, b_frag)
             else:
                 for mb in cutlass.range_constexpr(self.cta_m_blocks):
                     if cutlass.const_expr(mb == 0):
@@ -4228,13 +4312,19 @@ class W4A16GemmKernel:
                     win_a, win_b, trellis_lut_addr, int(bits)
                 )
         else:
-            e_lo, e_hi = packed_decode_lut_e4m3_to_e4m3x8(
-                win_a,
-                win_b,
-                trellis_lut_addr,
-                int(bits),
-                value_table_in_shared=self.lut_e4m3_smem,
-            )
+            if cutlass.const_expr(self.trellis_direct_lut):
+                e_lo, e_hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
+                    win_a, win_b, trellis_lut_addr, int(bits),
+                    in_shared=self.lut_e4m3_smem,
+                )
+            else:
+                e_lo, e_hi = packed_decode_lut_e4m3_to_e4m3x8(
+                    win_a,
+                    win_b,
+                    trellis_lut_addr,
+                    int(bits),
+                    value_table_in_shared=self.lut_e4m3_smem,
+                )
             if cutlass.const_expr(self.is_fp16):
                 o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
                 o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
@@ -6720,6 +6810,9 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
+        trellis_decode_table: str = "auto",
+        small_m_occupancy: int | None = None,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6978,6 +7071,8 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
+            small_m_occupancy=small_m_occupancy,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -7016,6 +7111,8 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
+            small_m_occupancy=small_m_occupancy,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -7031,10 +7128,38 @@ class W4A16FusedMoeKernel:
             self.shared_words += self.iq2_lut_bytes // 4
             self.fc1.iq2_xs_smem_lut = True
             self.fc2.iq2_xs_smem_lut = True
-        self.lut_e4m3_smem = (
+        if trellis_decode_table not in {"auto", "compact", "full"}:
+            raise ValueError("trellis decode table must be auto, compact, or full")
+        compact_smem = (
+            self.trellis_codebook == LUT_E4M3
+            and _lut_e4m3_smem_enabled()
+        )
+        lut_offset = (self.shared_words * 4 + 15) // 16 * 16
+        # The cooperative grid must retain its occupancy contract. A direct
+        # table is eligible only when it fits without reducing resident CTAs.
+        direct_eligible = (
             self.weight_layout == "trellis_t256"
             and self.trellis_codebook == LUT_E4M3
-            and _lut_e4m3_smem_enabled()
+            and self.intermediate_hadamard
+            and self.trellis_bits == 2
+            and self.fc1_trellis_pair_kind is None
+            and self.fc2_trellis_pair_kind is None
+            and self.blocks_per_sm == 1
+            and lut_offset + 65536 <= self.fc1.max_shared_mem
+        )
+        if trellis_decode_table == "full" and not direct_eligible:
+            raise ValueError(
+                "full trellis decode table is incompatible with the planned kernel geometry"
+            )
+        self.trellis_direct_lut = direct_eligible and (
+            trellis_decode_table == "full"
+            or (trellis_decode_table == "auto" and compact_smem and size_m <= 16)
+        )
+        self.fc1.trellis_direct_lut = self.trellis_direct_lut
+        self.fc2.trellis_direct_lut = self.trellis_direct_lut
+        self.lut_e4m3_smem = compact_smem or self.trellis_direct_lut
+        self.trellis_lut_smem_bytes = (
+            65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
         self.lut_e4m3_smem_off = 0
         if self.lut_e4m3_smem:
@@ -7043,8 +7168,10 @@ class W4A16FusedMoeKernel:
             ) // 16 * 16
             self.shared_words = (
                 self.lut_e4m3_smem_off
-                + _LUT_E4M3_SMEM_REGION_BYTES
+                + self.trellis_lut_smem_bytes
             ) // 4
+            if self.shared_words * 4 > self.fc1.max_shared_mem:
+                raise ValueError(f"full trellis decode table requires {self.shared_words * 4} bytes")
             self.fc1.lut_e4m3_smem = True
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
@@ -7088,6 +7215,7 @@ class W4A16FusedMoeKernel:
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -7479,8 +7607,8 @@ class W4A16FusedMoeKernel:
         fc1_trellis_lut_addr = get_ptr_as_int64(fc1_trellis_lut_flat, Int32(0))
         fc2_trellis_lut_addr = get_ptr_as_int64(fc2_trellis_lut_flat, Int32(0))
 
-        # The emit hooks receive the staged value table's shared byte offset
-        # through the LUT ABI slot.
+        # The LUT ABI slot carries the shared byte offset for either the
+        # compact value table or the complete 2-bit direct table.
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
         if cutlass.const_expr(self.weight_layout in IQ2_CODECS):
@@ -7501,7 +7629,7 @@ class W4A16FusedMoeKernel:
             self._lut_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.lut_e4m3_smem_off),
-                _LUT_E4M3_SMEM_REGION_BYTES,
+                self.trellis_lut_smem_bytes,
                 tid,
             )
             cute.arch.sync_threads()
@@ -10208,13 +10336,18 @@ def compile_w4a16_fused_moe(
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     pipeline_stages: int | None = None,
+    skip_empty_m_blocks: bool | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     intermediate_hadamard: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
+    trellis_decode_table: str = "auto",
     _require_cached: bool = False,
+    small_m_occupancy: int | None = None,
 ) -> W4A16FusedMoeCompileResult:
+    if small_m_occupancy is None:
+        small_m_occupancy = _w4a16_small_m_occupancy()
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
     full_rotation = bool(full_rotation)
@@ -10346,6 +10479,7 @@ def compile_w4a16_fused_moe(
         weight_layout=weight_layout,
         weight_bits=weight_bits,
         allow_logical_tail=allow_native_logical_tail,
+        small_m_occupancy=small_m_occupancy,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
         problem_m=routed_rows,
@@ -10359,6 +10493,7 @@ def compile_w4a16_fused_moe(
         weight_layout=weight_layout,
         weight_bits=weight_bits,
         allow_logical_tail=allow_native_logical_tail,
+        small_m_occupancy=small_m_occupancy,
     )
     if fc1_cta_threads != fc2_cta_threads:
         common_cta_threads = min(fc1_cta_threads, fc2_cta_threads)
@@ -10375,6 +10510,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_native_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
             problem_m=routed_rows,
@@ -10389,6 +10525,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_native_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         )
         if fc1_cta_threads != fc2_cta_threads:
             raise ValueError(
@@ -10439,6 +10576,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
@@ -10474,6 +10612,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc2_tile_n = 256
             fc2_tile_k = wide_fc2_tile_k
@@ -10525,6 +10664,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_qualified_fc2_tile=True,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
@@ -10563,6 +10703,7 @@ def compile_w4a16_fused_moe(
                 allow_qualified_fc2_tile=name == "fc2",
                 uses_m_block_8=moe_block_size == 8,
                 pipeline_stages=pipeline_stages,
+                small_m_occupancy=small_m_occupancy,
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
@@ -10608,6 +10749,9 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         pipeline_stages=pipeline_stages,
+        skip_empty_m_blocks=skip_empty_m_blocks,
+        trellis_decode_table=trellis_decode_table,
+        small_m_occupancy=small_m_occupancy,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -10890,6 +11034,7 @@ def compile_w4a16_fused_moe(
         shared_memory_bytes=kernel.shared_words * 4,
         broadcast_suh=bool(broadcast_suh),
         small_m_direct_launches=tuple(small_m_direct_launches),
+        trellis_direct_lut=kernel.trellis_direct_lut,
     )
     attach_programs(result, compiled, *(launch.compiled for launch in small_m_direct_launches))
     _FUSED_CACHE[cache_key] = result
@@ -11597,7 +11742,7 @@ def _w4a16_fused_moe_launch_flat(
         fc2_trellis_lut_addr = iq2_lut.data_ptr()
     elif weight_layout == "trellis_t256" and trellis_codebook != "mcg":
         trellis_rank_lut = _trellis256_execution_lut(
-            a_input.device, trellis_codebook
+            a_input.device, trellis_codebook, direct_lut=fused.trellis_direct_lut
         )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
@@ -13302,12 +13447,12 @@ def run_w4a16_moe(
         if use_x4t_scale_predecode:
             # Native and packed GEMMs consume the same expanded scale grid.
             # The early-return micro path must refresh it before every launch.
-            from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
 
             programs = prepared.x4t_packed_pair_programs
             if programs is None or w13_layout != "w31":
                 raise ValueError("Native X4T requires prepared gate/up scale programs")
-            decode_x4t_packed_scale_pair(
+            _launch_x4t_packed_scale_pair(
                 x4t_w13_scale, x4t_w2_scale, topk_ids.view(-1),
                 micro_w13_scale, micro_w2_scale,
                 program=programs[2 if topk_ids.dtype == torch.int64 else 0],
@@ -13554,13 +13699,13 @@ def run_w4a16_moe(
         assert x4t_expert_ids is not None
         programs = getattr(prepared, "x4t_packed_pair_programs", None)
         if programs is not None:
-            from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
 
             counts = not use_direct_topk_routes
             active = expert_counts if counts else x4t_expert_ids
             sorted_ids = False
             block_bound = min(block_expert_ids.numel(), topk_ids.numel())
-            if counts and block_bound < int(prepared.num_experts):
+            if counts and (expert_counts is None or block_bound < int(prepared.num_experts)):
                 # A nonempty packed block contains at least one routed row.
                 # Its sorted expert list therefore needs no more entries than
                 # the routed-row count; the packer fills unused entries with -1.
@@ -13576,10 +13721,9 @@ def run_w4a16_moe(
                 program_index = 1
             else:
                 program_index = 2 if active.dtype == torch.int64 else 0
-            decode_x4t_packed_scale_pair(
+            _launch_x4t_packed_scale_pair(
                 x4t_w13_scale, x4t_w2_scale, active,
                 prepared.w13_scale, prepared.w2_scale,
-                expert_counts=counts, expert_ids_sorted=sorted_ids,
                 program=programs[program_index], stream=stream,
             )
         else:

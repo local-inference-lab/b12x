@@ -849,6 +849,9 @@ class TPMoEScratchCaps:
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
     w4a16_prefill_fused_sum: bool | None = None
+    trellis_decode_table: str = "auto"
+    w4a16_skip_empty_m_blocks: bool = True
+    w4a16_small_m_occupancy: int = 1
     w4a8_csf_inline: bool = False
     frozen: bool = True
 
@@ -903,6 +906,8 @@ class TPMoEScratchCaps:
                 raise ValueError("w4a16_block_size_m must be one of 8, 16, 32, 48, 64")
             object.__setattr__(self, "w4a16_block_size_m", block_size_m)
         object.__setattr__(self, "w4a16_fast_math", bool(self.w4a16_fast_math))
+        if self.trellis_decode_table not in {"auto", "compact", "full"}:
+            raise ValueError("trellis decode table must be auto, compact, or full")
         if self.w4a16_prefill_fused_sum is None:
             from b12x.moe._shared.kernels.w4a16.host import prefill_fused_sum_enabled
 
@@ -8193,6 +8198,9 @@ def _plan_full_rotation_w4a16_launches(
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
                 trellis_codebook=core_plan.trellis_codebook or LUT_E4M3,
+                trellis_decode_table=caps.trellis_decode_table,
+                skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
+                small_m_occupancy=caps.w4a16_small_m_occupancy,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
@@ -12855,10 +12863,7 @@ def _finalize_trellis_output(
     return target
 
 
-# Token capacity up to which W4A16 rebuilds NVFP4-CSF scales per pipeline stage.
-# Larger calls are compute bound: expanding the routed experts once costs less
-# there (GLM-5.3 TP2 MoE: stage reads +0.3% at 128 tokens, both +10% at 1536,
-# expansion +3% against stage reads +12% at 8192).
+# Planned token capacity limit for W4A16 per-stage compressed-scale reads.
 W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
 
 
@@ -12866,12 +12871,12 @@ W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS
 W4A8_CSF_INLINE_MAX_TOKENS = int(os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536"))
 
 
-def _w4a16_reads_stage_scales(binding, tokens: int) -> bool:
+def _w4a16_reads_stage_scales(binding) -> bool:
     """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
     launch = getattr(binding, "fused_launch", None)
     if launch is not None:
         return getattr(launch, "scale_format", None) == "e4m3_k16_csf"
-    return int(tokens) <= W4A16_CSF_STAGE_MAX_TOKENS
+    raise RuntimeError("Compressed W4A16 scales require a prepared fused launch")
 
 
 def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
@@ -12947,7 +12952,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     stage_scales = (
         experts.w4a16_expanded is not None
         and getattr(binding, "a4_prefill_launches", None) is None
-        and _w4a16_reads_stage_scales(binding, topk_ids.shape[0])
+        and _w4a16_reads_stage_scales(binding)
     )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None

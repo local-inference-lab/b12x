@@ -3,7 +3,7 @@
   "id": "b12x-450-moe-routing",
   "category": "fix",
   "summary": "Preserve route broadcasts and shared-input token addressing in dynamic MoE",
-  "models": [],
+  "models": ["all"],
   "compatibility": "Applies to native and compressed weights. Deterministic W4A8 M32 execution now reads the correct token activation for each routed pair.",
   "details": [
     "A CTA barrier prevents reuse of the shared work-claim slot before every warp has retained its value.",

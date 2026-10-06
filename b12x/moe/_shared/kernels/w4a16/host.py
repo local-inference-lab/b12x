@@ -21,6 +21,14 @@ _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
 
+def trellis_decode_table() -> str:
+    """Read the plan-time trellis decode-table selection; replay never reads it."""
+    value = os.environ.get("B12X_TRELLIS_DECODE_TABLE", "auto")
+    if value not in {"auto", "compact", "full"}:
+        raise ValueError("B12X_TRELLIS_DECODE_TABLE must be auto, compact, or full")
+    return value
+
+
 def prefill_fused_sum_enabled() -> bool:
     """Enable direct FP32 route reduction for large-M W4A16 launches.
 
@@ -368,6 +376,10 @@ def plan_w4a16_buffers(
         if weight_layout is not None
         else getattr(prepared, "weight_layout", "packed")
     )
+    cache2_width = intermediate_size
+    if weight_layout == "modelopt" and int(m) <= 8 and not full_rotation:
+        # Native micro decode stores 128-word chunks of paired BF16 values.
+        cache2_width = ((intermediate_size + 255) // 256) * 256
     use_prefill_fused_sum = prefill_fused_sum_eligible(
         dtype=dtype if dtype is not None else "",
         m=m,
@@ -400,7 +412,7 @@ def plan_w4a16_buffers(
             if use_prefill_fused_sum
             else routed_rows * max(fc1_cols, hidden_size)
         ),
-        intermediate_cache2_elements=routed_rows * intermediate_size,
+        intermediate_cache2_elements=routed_rows * cache2_width,
         block_size_m=block_size_m,
         rotation_a_elements=(routed_rows * hidden_size if full_rotation else 0),
         prefill_sum_accum_elements=(
@@ -475,7 +487,8 @@ def make_w4a16_packed_buffers(
             device=device,
         ),
         intermediate_cache2=torch.empty(
-            (plan.routed_rows, int(prepared.intermediate_size)),
+            (plan.routed_rows, plan.intermediate_cache2_elements // plan.routed_rows
+             if plan.routed_rows else int(prepared.intermediate_size)),
             dtype=dtype,
             device=device,
         ),
