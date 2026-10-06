@@ -4,10 +4,18 @@ W4A16 reads expert block scales one pipeline stage at a time: G k-groups of
 one or more row slabs, in its MMA-packed byte order. Packed CSF planes
 (layout 1) store each 128-row slab's row bases and 4-bit codes in that order.
 This storage keeps them with the plane's value table folded in and adds, per
-atom of four k-groups of one slab, an exception record that carries the
-atom's first replacement words. A kernel rebuilds any stage in shared memory
-with one add per word, from copies that never depend on each other, instead
-of expanding whole experts into scratch before every MoE layer.
+atom of four k-groups of one slab, an exception record, optionally with the
+atom's first replacement words inline. A kernel rebuilds any stage in shared
+memory with one add per word instead of expanding whole experts into scratch
+before every MoE layer.
+
+``B12X_NVFP4_CSF_INLINE_WORDS`` (read when the storage is built) sets the
+inline replacement words of a 128-row record (a multiple of four, at most 64;
+64-row records hold five eighths of it, rounded up to four). The default 0
+keeps 32-byte records and every replacement word in the spill area, the
+memory of uninlined storage; kernels then copy each stage's replacement-word
+window. Inline words make every stage copy independent of the others (no
+window), for 128 more bytes per atom at 32 words.
 
 W4A16's value table re-biases E4M3 exponents: it adds one constant to every
 normal scale byte. Stored row bases include that constant, so a word is its
@@ -28,7 +36,7 @@ Storage, in bytes:
 - one block per expert, ``S x (R + R/2 x C) + S x A x B`` bytes: the expert's
   fixed stream (``S`` slabs of ``R`` biased row bases and ``C`` k-groups of
   4-bit codes), then its exception records, ``A = ceil(C / 4)`` per slab, of
-  ``B`` bytes each (``record_bytes(R)``). The two code bytes of word j hold
+  ``B`` bytes each (``record_bytes(R, inline)``). The two code bytes of word j hold
   rows 4j and 4j + 2, then rows 4j + 1 and 4j + 3, low nibble first, so
   ``(h | h << 12) & 0x0F0F0F0F`` spreads a halfword ``h`` to the word's four
   bytes. Record words: 0, a base index such that the atom's replacement word
@@ -38,7 +46,8 @@ Storage, in bytes:
   word j, which holds rows 4j to 4j + 3 in packed order; from byte 32, the
   atom's first ``(B - 32) / 4`` replacement words in (k-group, word) order.
 - replacement words past each atom's inline words (W4A16 scale bytes in
-  packed order), followed by ``TAIL_BYTES`` zero bytes.
+  packed order; the words of consecutive atoms of a slab are consecutive),
+  followed by ``TAIL_BYTES`` zero bytes.
 
 Every offset is a function of the geometry and the expert index, never of the
 expert count, and records address replacement words from the storage start.
@@ -57,6 +66,25 @@ HEADER_BYTES = 1024
 RECORD_HEADER_BYTES = 32
 TAIL_BYTES = 512
 _EXPERT_CHUNK = 16
+INLINE_WORDS_ENV = "B12X_NVFP4_CSF_INLINE_WORDS"
+MAX_INLINE_WORDS = 64
+
+
+def configured_inline_words() -> int:
+    """Inline replacement words of 128-row records from ``B12X_NVFP4_CSF_INLINE_WORDS``."""
+    import os
+
+    value = os.environ.get(INLINE_WORDS_ENV, "0")
+    try:
+        words = int(value)
+    except ValueError:
+        words = -1
+    if words < 0 or words > MAX_INLINE_WORDS or words % 4:
+        raise ValueError(
+            f"{INLINE_WORDS_ENV} must be a multiple of 4 from 0 to "
+            f"{MAX_INLINE_WORDS}, got {value!r}"
+        )
+    return words
 
 
 def slab_rows(rows: int) -> int:
@@ -64,20 +92,27 @@ def slab_rows(rows: int) -> int:
     return 128 if int(rows) % 128 == 0 else 64
 
 
-def record_bytes(rows_per_slab: int) -> int:
-    """Record size of a slab height: 32 inline words for 128 rows, 20 for 64.
+def inline_words(rows_per_slab: int, words: int) -> int:
+    """Inline replacement words of a record of ``rows_per_slab`` rows.
 
-    A word past a record's inline words is a dependent global load on the
-    critical path of its CTA's pipeline. Records hold far more than the
-    typical atom (a 128-row atom of 128 words has 4-5 replacement words in
-    NVFP4 checkpoints, about 15 with 3% out-of-window scale bytes), so whole
-    layers run without one.
+    ``words`` is the 128-row value; a 64-row atom holds half the words, and
+    its record five eighths of them, rounded up to four (32 -> 20).
     """
-    return 160 if int(rows_per_slab) == 128 else 112
+    words = int(words)
+    if int(rows_per_slab) == 128:
+        return words
+    return -(-(5 * words) // 32) * 4
 
 
-def inline_words(rows_per_slab: int) -> int:
-    return (record_bytes(rows_per_slab) - RECORD_HEADER_BYTES) // 4
+def record_bytes(rows_per_slab: int, words: int) -> int:
+    """Record size of a slab height with ``words`` inline words per 128-row record.
+
+    In the kernels' stage reads a word past a record's inline words comes
+    from the stage's replacement-word window, or, past that, from global
+    memory. A 128-row atom of 128 words has 4-5 replacement words in NVFP4
+    checkpoints and about 15 with 3% out-of-window scale bytes.
+    """
+    return RECORD_HEADER_BYTES + 4 * inline_words(rows_per_slab, words)
 
 
 @dataclass(frozen=True)
@@ -89,6 +124,7 @@ class PackedCsfScales:
     columns: int
     num_experts: int
     max_atom_words: int
+    inline_words: int = 0
 
     @property
     def slab_rows(self) -> int:
@@ -104,7 +140,7 @@ class PackedCsfScales:
 
     @property
     def record_bytes(self) -> int:
-        return record_bytes(self.slab_rows)
+        return record_bytes(self.slab_rows, self.inline_words)
 
     @property
     def slab_bytes(self) -> int:
@@ -177,13 +213,17 @@ def _to_slabs(tensor: torch.Tensor, rows: int, rows_per_slab: int) -> torch.Tens
     return halves[:, : rows // 64]
 
 
-def build_packed_csf_scales(batch) -> PackedCsfScales:
+def build_packed_csf_scales(batch, inline=None) -> PackedCsfScales:
     """Index a layout-1 ``Nvfp4CsfBatch`` for stage-wise expansion in W4A16.
 
     Padded batches (``logical_rows`` / ``logical_columns``) keep their logical
     geometry: 64-row slabs for 64 mod 128 rows, and a two-group last atom for
-    a k-group count that is 2 mod 4.
+    a k-group count that is 2 mod 4. ``inline`` (default: the environment's
+    configured count) is the inline replacement words of a 128-row record.
     """
+    configured = configured_inline_words() if inline is None else int(inline)
+    if configured < 0 or configured > MAX_INLINE_WORDS or configured % 4:
+        raise ValueError("Packed CSF inline words must be a multiple of 4 up to 64")
     if batch.layout != 1 or batch.codec != 0 or batch.value_lut is None:
         raise ValueError("Packed CSF indexing requires MMA-packed byte-window planes")
     device = batch.fixed.device
@@ -195,7 +235,7 @@ def build_packed_csf_scales(batch) -> PackedCsfScales:
     r = slab_rows(rows)
     slabs, atoms = rows // r, (columns + 3) // 4
     words_per_group = r // 4
-    inline = inline_words(r)
+    inline = inline_words(r, configured)
     lut = batch.value_lut.to(device)
     offset = _table_offset(lut)
     raw = batch.exceptions
@@ -250,7 +290,7 @@ def build_packed_csf_scales(batch) -> PackedCsfScales:
     words = torch.cat(words_all)
     fixed = torch.cat(fixed_all)
 
-    rb = record_bytes(r)
+    rb = record_bytes(r, configured)
     slab_bytes = r + (r // 2) * columns
     expert_bytes = slabs * (slab_bytes + atoms * rb)
     words_offset = HEADER_BYTES + experts * expert_bytes
@@ -270,13 +310,14 @@ def build_packed_csf_scales(batch) -> PackedCsfScales:
     records[:, 2] = per_atom
     records[:, 4:8] = masks.reshape(-1, 4)
     words64 = words.to(torch.int64) & 0xFFFFFFFF
-    if words.numel():
+    if words.numel() and inline:
         slot = torch.arange(inline, device=device)
         index = first_word[:, None] + slot
         valid = slot < per_atom[:, None]
         records[:, 8:] = torch.where(
             valid, words64[index.clamp(max=words.numel() - 1)], 0
         )
+    if words.numel():
         atom_of_word = torch.repeat_interleave(
             torch.arange(per_atom.numel(), device=device), per_atom
         )
@@ -303,6 +344,7 @@ def build_packed_csf_scales(batch) -> PackedCsfScales:
         columns=columns,
         num_experts=experts,
         max_atom_words=int(per_atom.max()) if per_atom.numel() else 0,
+        inline_words=configured,
     )
 
 
@@ -312,7 +354,7 @@ def expand_packed_csf_scales(scales: PackedCsfScales) -> torch.Tensor:
     experts, rows, columns = scales.num_experts, scales.rows, scales.columns
     r, slabs, atoms = scales.slab_rows, scales.slabs, scales.atoms
     words_per_group = r // 4
-    inline = inline_words(r)
+    inline = inline_words(r, scales.inline_words)
     blocks = s[HEADER_BYTES : scales.words_offset].view(experts, scales.expert_bytes)
     fixed = blocks[:, : slabs * scales.slab_bytes].reshape(experts, slabs, -1)
     bases = fixed[..., :r].to(torch.int16).reshape(experts, slabs, 1, words_per_group, 4)
@@ -331,10 +373,13 @@ def expand_packed_csf_scales(scales: PackedCsfScales) -> torch.Tensor:
     before = torch.cumsum(flagged.to(torch.int64), -1) - flagged.to(torch.int64)
     prefix = (records[..., 1:2] >> (8 * torch.arange(4, device=s.device))) & 255
     index = prefix.unsqueeze(-1) + before  # [E, S, A, 4, W]
-    inline_values = records[..., 8:]  # [E, S, A, inline]
-    from_record = torch.gather(
-        inline_values, -1, index.clamp(max=inline - 1).reshape(experts, slabs, atoms, -1)
-    ).reshape(index.shape)
+    if inline:
+        inline_values = records[..., 8:]  # [E, S, A, inline]
+        from_record = torch.gather(
+            inline_values, -1, index.clamp(max=inline - 1).reshape(experts, slabs, atoms, -1)
+        ).reshape(index.shape)
+    else:
+        from_record = index
     from_storage = storage_words[
         (records[..., 0:1, None] + index).clamp(max=storage_words.numel() - 1)
     ]
@@ -364,6 +409,8 @@ class PackedCsfPlane:
     rows: int
     columns: int
     num_experts: int
+    # Stage-readable storage has no codec choice: this slot of the geometry
+    # carries the inline replacement words of its 128-row records.
     codec: int = 0
     layout: int = PACKED_STORAGE_LAYOUT
 
@@ -379,6 +426,7 @@ class PackedCsfPlane:
             rows=scales.rows,
             columns=scales.columns,
             num_experts=scales.num_experts,
+            codec=scales.inline_words,
         )
 
     @property
@@ -400,14 +448,14 @@ class PackedStoragePlane:
     """Expands one slab of stage-readable storage per CTA (256 threads)."""
 
     def __init__(self, geometry):
-        self.rows, self.columns, _, _ = map(int, geometry)
+        self.rows, self.columns, configured, _ = map(int, geometry)
         self.slab_rows = slab_rows(self.rows)
         self.tasks = self.rows // self.slab_rows
         self.words_per_group = self.slab_rows // 4
         self.slab_bytes = self.slab_rows + (self.slab_rows // 2) * self.columns
         self.atoms = (self.columns + 3) // 4
-        self.record_bytes = record_bytes(self.slab_rows)
-        self.inline_words = inline_words(self.slab_rows)
+        self.record_bytes = record_bytes(self.slab_rows, configured)
+        self.inline_words = inline_words(self.slab_rows, configured)
         self.expert_bytes = self.tasks * (
             self.slab_bytes + self.atoms * self.record_bytes
         )
