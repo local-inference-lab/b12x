@@ -795,9 +795,12 @@ def _capture_and_replay(fused_moe, binding, *, label: str):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = fused_moe.run(binding=binding)
+        allocated_before = torch.cuda.memory_stats()["allocation.all.allocated"]
         for _ in range(3):
+            captured.fill_(float("nan"))
             graph.replay()
         torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated_before
     misses_after = compile_cache_info()["compile_misses"]
     result = captured.clone()
     del graph
@@ -942,3 +945,51 @@ def test_w6a8_scale_validation_preserves_strided_input_support():
     )
     assert actual.is_contiguous()
     torch.testing.assert_close(actual, scales, rtol=0, atol=0)
+
+
+def test_w8a8_prepared_capacity_reuses_launches_for_live_counts():
+    require_b12x()
+    from b12x.moe import fused_moe as moe
+    from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_w8a8_mx
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    device = torch.device("cuda")
+    experts, hidden, intermediate, capacity, topk = 16, 2560, 320, 32, 10
+    prepared, native = _prepare_experts(moe, experts, hidden, intermediate, device)
+    plan = moe.plan_execution(
+        experts=prepared,
+        capacity=moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
+        routing=moe.RoutingSpec(deterministic_output=True),
+    )
+    x = torch.randn(capacity, hidden, device=device).to(torch.bfloat16) * 0.25
+    ids, weights = _routes(experts, capacity, topk, device)
+    output = torch.empty_like(x)
+
+    def primer(state):
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                        for spec in state.scratch.scratch_specs())
+        binding = state.bind(a=x, experts=prepared, topk_ids=ids,
+                             topk_weights=weights, output=output, scratch=scratch)
+        return PreparedCall(run=lambda: state.run(binding), owners=(scratch, binding))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        session.prepare((plan.request(name="w8a8-live-counts", prepare_call=primer),))
+        session.freeze()
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                        for spec in plan.scratch_specs())
+        for rows in (1, 17, 32):
+            reference = moe_reference_w8a8_mx(
+                x[:rows].float(), native["w13"], native["w13_scale"], native["w1_alpha"],
+                native["w2"], native["w2_scale"], native["w2_alpha"], ids[:rows], weights[:rows],
+                experts, hidden, intermediate,
+                a1_gscale=native["a1_gscale"], a2_gscale=native["a2_gscale"],
+            )
+            with kernel_resolution_guard():
+                binding = moe.bind(plan, a=x[:rows], experts=prepared,
+                                   topk_ids=ids[:rows], topk_weights=weights[:rows],
+                                   output=output[:rows], scratch=scratch)
+                actual = moe.run(binding=binding)
+            metrics = compare_to_reference(actual.float(), reference)
+            assert metrics.cos >= _MIN_COS, metrics
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
