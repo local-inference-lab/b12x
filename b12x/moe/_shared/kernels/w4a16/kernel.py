@@ -12925,12 +12925,12 @@ def run_w4a16_moe(
         if use_x4t_scale_predecode:
             # Native and packed GEMMs consume the same expanded scale grid.
             # The early-return micro path must refresh it before every launch.
-            from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
 
             programs = prepared.x4t_packed_pair_programs
             if programs is None or w13_layout != "w31":
                 raise ValueError("Native X4T requires prepared gate/up scale programs")
-            decode_x4t_packed_scale_pair(
+            _launch_x4t_packed_scale_pair(
                 x4t_w13_scale, x4t_w2_scale, topk_ids.view(-1),
                 micro_w13_scale, micro_w2_scale,
                 program=programs[2 if topk_ids.dtype == torch.int64 else 0],
@@ -13177,13 +13177,13 @@ def run_w4a16_moe(
         assert x4t_expert_ids is not None
         programs = getattr(prepared, "x4t_packed_pair_programs", None)
         if programs is not None:
-            from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
 
             counts = not use_direct_topk_routes
             active = expert_counts if counts else x4t_expert_ids
             sorted_ids = False
             block_bound = min(block_expert_ids.numel(), topk_ids.numel())
-            if counts and block_bound < int(prepared.num_experts):
+            if counts and (expert_counts is None or block_bound < int(prepared.num_experts)):
                 # A nonempty packed block contains at least one routed row.
                 # Its sorted expert list therefore needs no more entries than
                 # the routed-row count; the packer fills unused entries with -1.
@@ -13199,10 +13199,9 @@ def run_w4a16_moe(
                 program_index = 1
             else:
                 program_index = 2 if active.dtype == torch.int64 else 0
-            decode_x4t_packed_scale_pair(
+            _launch_x4t_packed_scale_pair(
                 x4t_w13_scale, x4t_w2_scale, active,
                 prepared.w13_scale, prepared.w2_scale,
-                expert_counts=counts, expert_ids_sorted=sorted_ids,
                 program=programs[program_index], stream=stream,
             )
         else:

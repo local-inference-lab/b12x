@@ -16,7 +16,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import _pack_e8m0_k32_scales
 from ..conftest import require_b12x
 
 
-def _batch(rows, columns, rotation, task_rows=64):
+def _batch(rows, columns, rotation, task_rows=64, *, finite=False):
     device = require_b12x()
     fixed, exceptions, logical = [], [], []
     for expert in range(4):
@@ -37,6 +37,8 @@ def _batch(rows, columns, rotation, task_rows=64):
         overrides = np.array([0, 246, 247, 248, 254, 255], dtype=np.uint32)[
             -len(positions) :
         ]
+        if finite:
+            overrides = np.full(len(positions), 122 + expert, dtype=np.uint32)
         values.flat[positions] = overrides
         words = positions.astype(np.uint32) | (overrides << 24)
         bases = np.full((rows // 16, 16), base, dtype=np.uint8)
@@ -309,3 +311,91 @@ def test_packed_pair_rejects_conflicting_modes_and_aliases():
         decode_x4t_packed_scales(
             batch, ids, output, expert_counts=True, expert_ids_sorted=True
         )
+
+
+@pytest.mark.parametrize("tokens", [1, 129])
+@pytest.mark.parametrize("packing", ["packed", "modelopt"])
+def test_paired_x4t_moe_without_caller_counts_matches_dense_scales(tokens, packing, monkeypatch):
+    from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+    from b12x.moe._shared.kernels.w4a16.prepare import (
+        prepare_w4a16_fp4_e8m0_k32_weights,
+        prepare_w4a16_e8m0_native_weights,
+        prepare_w4a16_x4t_weights,
+        make_w4a16_packed_buffers,
+    )
+    from b12x._lib.quant.x4t_scales import X4TScaleBatch
+
+    hidden, intermediate, experts, topk = 3584, 192, 4, 2
+    first, logical_first = _batch(2 * intermediate, hidden // 32, 0, finite=True)
+    second, logical_second = _batch(hidden, intermediate // 32, 0, finite=True)
+    device = first.fixed.device
+    w13 = torch.randint(256, (experts, 2 * intermediate, hidden // 2), dtype=torch.uint8, device=device)
+    w2 = torch.randint(256, (experts, hidden, intermediate // 2), dtype=torch.uint8, device=device)
+    unit = torch.ones(experts, dtype=torch.float32, device=device)
+    scales = (
+        torch.empty((experts, hidden // 32, 2 * intermediate), dtype=torch.uint8, device=device),
+        torch.empty((experts, intermediate // 32, hidden), dtype=torch.uint8, device=device),
+    )
+    prepare_dense = (prepare_w4a16_e8m0_native_weights if packing == "modelopt"
+                     else prepare_w4a16_fp4_e8m0_k32_weights)
+    dense = prepare_dense(
+        w13, logical_first, unit, w2, logical_second, unit,
+        activation="situ", w13_layout="w31",
+    )
+    with pytest.raises(ValueError, match="must not overlap"):
+        prepare_w4a16_x4t_weights(
+            w13, first, unit, w2, second, unit, scales[0],
+            scales[0].reshape(-1)[:scales[1].numel()].reshape_as(scales[1]),
+            activation="situ", w13_layout="w31", weight_layout=packing,
+        )
+    nonpaired, _ = _batch(2 * intermediate, hidden // 32, 0, task_rows=32, finite=True)
+    with pytest.raises(ValueError, match="paired 64-row tasks"):
+        prepare_w4a16_x4t_weights(
+            w13, nonpaired, unit, w2, second, unit, *scales,
+            activation="situ", w13_layout="w31", weight_layout=packing,
+        )
+    compressed = prepare_w4a16_x4t_weights(
+        w13, first, unit, w2, second, unit, *scales,
+        activation="situ", w13_layout="w31", weight_layout=packing,
+    )
+    x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device=device) * 0.125
+    ids = torch.randint(experts, (tokens, topk), dtype=torch.int32, device=device)
+    route_weights = torch.softmax(torch.randn(tokens, topk, device=device), -1)
+    buffers = [make_w4a16_packed_buffers(p, m=tokens, topk=topk, dtype=x.dtype, device=device)
+               for p in (dense, compressed)]
+
+    def run(prepared, scratch):
+        return run_w4a16_moe(
+            x, prepared, route_weights, ids, activation="situ",
+            intermediate_cache13=scratch.intermediate_cache13,
+            intermediate_cache2=scratch.intermediate_cache2,
+            output=scratch.output, fc1_c_tmp=scratch.fc1_c_tmp, fc2_c_tmp=scratch.fc2_c_tmp,
+            packed_route_indices=scratch.packed_route_indices,
+            block_expert_ids=scratch.block_expert_ids,
+            packed_route_count=scratch.packed_route_count,
+            expert_offsets=scratch.expert_offsets,
+        )
+
+    monkeypatch.setattr(X4TScaleBatch, "validate", lambda *_: pytest.fail("scale validation during execution"))
+    expected = run(dense, buffers[0]).clone()
+    actual = run(compressed, buffers[1]).clone()
+    assert torch.isfinite(actual).all() and actual.abs().any()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with kernel_resolution_guard("paired X4T MoE graph"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(compressed, buffers[1])
+        for _ in range(3):
+            ids.random_(0, experts)
+            ids[0, 0] = -1
+            x.mul_(-0.9)
+            expected = run(dense, buffers[0]).clone()
+            for scale in scales:
+                scale.fill_(0xD6)
+            buffers[1].output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(buffers[1].output, expected, rtol=0, atol=0)
+        graph.reset()

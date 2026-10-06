@@ -593,6 +593,18 @@ def decode_x4t_packed_scale_pair(
             for batch in (first, second)
         )
         compiled = _compiled_packed_scale_pair(*keys)
+    _launch_x4t_packed_scale_pair(
+        first, second, expert_ids, output_first, output_second,
+        program=compiled, stream=stream,
+    )
+
+
+def _launch_x4t_packed_scale_pair(
+    first, second, expert_ids, output_first, output_second, *, program, stream=None,
+):
+    """Launch a retained decoder over buffers validated during preparation."""
+    if not expert_ids.numel():
+        return
     pointers = []
     for batch, output in ((first, output_first), (second, output_second)):
         for tensor, dtype, alignment in (
@@ -610,7 +622,7 @@ def decode_x4t_packed_scale_pair(
                 )
             )
     ids64 = expert_ids.dtype == torch.int64
-    compiled(
+    program(
         *pointers,
         make_ptr(
             cutlass.Int64 if ids64 else cutlass.Int32,
