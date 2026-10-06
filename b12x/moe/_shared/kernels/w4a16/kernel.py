@@ -151,16 +151,7 @@ _STAGES = 4
 
 
 def _w4a16_small_m_occupancy() -> int:
-    """Resident CTAs per SM for small-M (M8 route block) packed W4A16 plans.
-
-    One persistent CTA per SM keeps the fewest participants in the fused
-    FC1 -> FC2 grid barriers, which suits wide experts (1024 channels per
-    rank at GLM-5.3-Flash TP2). Narrow experts leave the FC1 phase with too
-    few tiles to keep DRAM busy: at GLM-5.3 (744B) TP8, 256 channels per
-    rank, two CTAs per SM with three pipeline stages run the MoE 4-8% faster
-    at 4-64 tokens. ``B12X_W4A16_SMALL_M_OCCUPANCY=2`` selects that schedule;
-    the default keeps one CTA and four stages.
-    """
+    """Resolve the packed NVFP4 small-M schedule: one CTA/four stages or two/three."""
     value = os.environ.get("B12X_W4A16_SMALL_M_OCCUPANCY", "1")
     if value not in ("1", "2"):
         raise ValueError("B12X_W4A16_SMALL_M_OCCUPANCY must be 1 or 2")
@@ -168,7 +159,8 @@ def _w4a16_small_m_occupancy() -> int:
 
 
 def _w4a16_small_m_double_occupancy(
-    *, weight_layout: str, scale_format: str, uses_m_block_8: bool
+    *, weight_layout: str, scale_format: str, uses_m_block_8: bool,
+    small_m_occupancy: int | None = None,
 ) -> bool:
     """Whether a small-M plan runs two CTAs per SM with three stages: opted in,
     and packed NVFP4 weights with E4M3 scales, the measured geometry."""
@@ -176,7 +168,7 @@ def _w4a16_small_m_double_occupancy(
         uses_m_block_8
         and weight_layout == "packed"
         and scale_format == "e4m3_k16"
-        and _w4a16_small_m_occupancy() == 2
+        and (_w4a16_small_m_occupancy() if small_m_occupancy is None else small_m_occupancy) == 2
     )
 
 
@@ -540,6 +532,7 @@ def _iq2_xs_stage_bytes(tile_k: int, tile_n: int, codec: str = "iq2_xs") -> int:
 def _w4a16_pipeline_stages(
     *, weight_layout: str, tile_n: int, tile_k: int, uses_m_block_8: bool,
     pipeline_stages: int | None = None, scale_format: str = "e4m3_k16",
+    small_m_occupancy: int | None = None,
 ) -> int:
     if pipeline_stages is not None:
         if type(pipeline_stages) is not int or pipeline_stages not in (2, 3, 4, 5):
@@ -552,6 +545,7 @@ def _w4a16_pipeline_stages(
     if _w4a16_small_m_double_occupancy(
         weight_layout=weight_layout, scale_format=scale_format,
         uses_m_block_8=uses_m_block_8,
+        small_m_occupancy=small_m_occupancy,
     ):
         # Three stages leave room for two resident CTAs per SM.
         return 3
@@ -584,6 +578,7 @@ def _shared_memory_footprint(
     weight_bits: int = 4,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> int:
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
@@ -592,6 +587,7 @@ def _shared_memory_footprint(
         weight_layout=weight_layout, tile_n=cta_n, tile_k=cta_k,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages, scale_format=scale_format,
+        small_m_occupancy=small_m_occupancy,
     )
     activation_rows = 8 if uses_m_block_8 and stages == 3 else cta_m
     sh_block_meta_size = activation_rows * 16
@@ -638,6 +634,7 @@ def _determine_blocks_per_sm(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> int:
     num_regs = _w4a16_num_regs(
         cta_threads=cta_threads,
@@ -657,6 +654,7 @@ def _determine_blocks_per_sm(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        small_m_occupancy=small_m_occupancy,
     )
     blocks_per_sm_limit = min(
         _DEVICE_MAX_REG_BYTES // register_bytes,
@@ -678,6 +676,7 @@ def _determine_blocks_per_sm(
             if _w4a16_small_m_double_occupancy(
                 weight_layout=weight_layout, scale_format=scale_format,
                 uses_m_block_8=uses_m_block_8,
+                small_m_occupancy=small_m_occupancy,
             )
             else 1
         )
@@ -714,6 +713,7 @@ def _candidate_tile_fits(
     allow_qualified_fc2_tile: bool = False,
     uses_m_block_8: bool = False,
     pipeline_stages: int | None = None,
+    small_m_occupancy: int | None = None,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -760,6 +760,7 @@ def _candidate_tile_fits(
         weight_bits=weight_bits,
         uses_m_block_8=uses_m_block_8,
         pipeline_stages=pipeline_stages,
+        small_m_occupancy=small_m_occupancy,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -778,6 +779,7 @@ def _select_tile_config(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
+    small_m_occupancy: int | None = None,
 ) -> tuple[int, int, int, int]:
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
@@ -803,6 +805,7 @@ def _select_tile_config(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         ):
             continue
         occupancy_problem_n = (
@@ -824,6 +827,7 @@ def _select_tile_config(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         )
         occupancy = blocks_per_sm_limit * (
             cta_threads if weight_layout in BLOCK_CODECS else 1
@@ -1088,6 +1092,7 @@ class W4A16GemmKernel:
         schedule_route_block_factor: int = 1,
         pipeline_stages: int | None = None,
         skip_empty_m_blocks: bool | None = None,
+        small_m_occupancy: int | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1395,6 +1400,7 @@ class W4A16GemmKernel:
             weight_layout=weight_layout, tile_n=self.tile_n, tile_k=self.tile_k,
             uses_m_block_8=self.uses_m_block_8,
             pipeline_stages=pipeline_stages, scale_format=scale_format,
+            small_m_occupancy=small_m_occupancy,
         )
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
@@ -1424,6 +1430,7 @@ class W4A16GemmKernel:
                 max(4, self.trellis_bits) if self.weight_layout_trellis256 else 4
             ),
             pipeline_stages=self.stages,
+            small_m_occupancy=small_m_occupancy,
         )
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
@@ -6377,6 +6384,7 @@ class W4A16FusedMoeKernel:
         pipeline_stages: int | None = None,
         skip_empty_m_blocks: bool | None = None,
         trellis_decode_table: str = "auto",
+        small_m_occupancy: int | None = None,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6636,6 +6644,7 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
+            small_m_occupancy=small_m_occupancy,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6675,6 +6684,7 @@ class W4A16FusedMoeKernel:
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             pipeline_stages=pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
+            small_m_occupancy=small_m_occupancy,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -9906,7 +9916,10 @@ def compile_w4a16_fused_moe(
     broadcast_suh: bool = False,
     trellis_decode_table: str = "auto",
     _require_cached: bool = False,
+    small_m_occupancy: int | None = None,
 ) -> W4A16FusedMoeCompileResult:
+    if small_m_occupancy is None:
+        small_m_occupancy = _w4a16_small_m_occupancy()
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
     full_rotation = bool(full_rotation)
@@ -10038,6 +10051,7 @@ def compile_w4a16_fused_moe(
         weight_layout=weight_layout,
         weight_bits=weight_bits,
         allow_logical_tail=allow_native_logical_tail,
+        small_m_occupancy=small_m_occupancy,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
         problem_m=routed_rows,
@@ -10051,6 +10065,7 @@ def compile_w4a16_fused_moe(
         weight_layout=weight_layout,
         weight_bits=weight_bits,
         allow_logical_tail=allow_native_logical_tail,
+        small_m_occupancy=small_m_occupancy,
     )
     if fc1_cta_threads != fc2_cta_threads:
         common_cta_threads = min(fc1_cta_threads, fc2_cta_threads)
@@ -10067,6 +10082,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_native_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
             problem_m=routed_rows,
@@ -10081,6 +10097,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_logical_tail=allow_native_logical_tail,
+            small_m_occupancy=small_m_occupancy,
         )
         if fc1_cta_threads != fc2_cta_threads:
             raise ValueError(
@@ -10131,6 +10148,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
@@ -10166,6 +10184,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc2_tile_n = 256
             fc2_tile_k = wide_fc2_tile_k
@@ -10217,6 +10236,7 @@ def compile_w4a16_fused_moe(
             weight_layout=weight_layout,
             weight_bits=weight_bits,
             allow_qualified_fc2_tile=True,
+            small_m_occupancy=small_m_occupancy,
         ):
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
@@ -10255,6 +10275,7 @@ def compile_w4a16_fused_moe(
                 allow_qualified_fc2_tile=name == "fc2",
                 uses_m_block_8=moe_block_size == 8,
                 pipeline_stages=pipeline_stages,
+                small_m_occupancy=small_m_occupancy,
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
@@ -10302,6 +10323,7 @@ def compile_w4a16_fused_moe(
         pipeline_stages=pipeline_stages,
         skip_empty_m_blocks=skip_empty_m_blocks,
         trellis_decode_table=trellis_decode_table,
+        small_m_occupancy=small_m_occupancy,
     )
     cache_key = (
         "w4a16_fused_moe",
