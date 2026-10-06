@@ -102,6 +102,7 @@ def _control_snapshot() -> FrozenMapping:
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
+        "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -237,11 +238,9 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
-    from ._impl import W4A16_CSF_STAGE_MAX_TOKENS
-
     if (
         getattr(weight_plan, "w4a16_compressed_scales", False)
-        and query.num_tokens > W4A16_CSF_STAGE_MAX_TOKENS
+        and query.num_tokens > int(query.controls.get("w4a16_csf_stage_max_tokens", 1536))
     ):
         # Large calls read the scales expanded once per call (see b12x_moe_fp4).
         weight_plan = replace(weight_plan, w4a16_compressed_scales=False)

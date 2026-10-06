@@ -47,7 +47,7 @@ def compress_fixture(swizzled, rows, columns, raw=False):
 @pytest.mark.parametrize("n", [64, 128, 192, 320])
 def test_native_expert_output_and_shared_scratch_poisoned_replay(
     tokens, activation_mode, raw, n, inline_scales=None, autotune=False,
-    deterministic=True, tile_m=16,
+    deterministic=True, tile_m=16, after_plan=None,
 ):
     device = require_b12x()
     e, h, topk = 8, 256, 2
@@ -113,6 +113,8 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
         )
         for i, owner in enumerate(experts)
     ]
+    if after_plan is not None:
+        after_plan()
     source, ids, probabilities = domain["x"], domain["topk_ids"], domain["topk_weights"]
 
     def prepare(state):
@@ -414,3 +416,14 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode):
         # Without the flag the call still expands its own routed experts.
         poison()
         torch.testing.assert_close(call(1), reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("declared,changed,tokens", [(64, 1536, 300), (1536, 0, 33)])
+def test_stage_scale_capacity_control_is_retained(declared, changed, tokens, monkeypatch):
+    from b12x.moe.fused_moe import _impl
+
+    monkeypatch.setattr(_impl, "W4A16_CSF_STAGE_MAX_TOKENS", declared)
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        tokens, "a16", False, 128,
+        after_plan=lambda: monkeypatch.setattr(_impl, "W4A16_CSF_STAGE_MAX_TOKENS", changed),
+    )
