@@ -3152,6 +3152,18 @@ class W4A16GemmKernel:
                             expert_idx,
                             dynamic_pair_override,
                         )
+                        if cutlass.const_expr(
+                            self.csf_scales and kk == self.b_sh_wr_iters - 2
+                        ):
+                            # The lookahead barrier landed the next stage:
+                            # issue its scale-word reads now, so this stage's
+                            # MMAs hide them (the word is stored after them).
+                            csf_word = self._csf_word_reads(
+                                smem_base,
+                                tid,
+                                Int32((pipe + 1) % self.stages),
+                                reduce_k_tile + tile_idx + Int32(1),
+                            )
 
                         if cutlass.const_expr(self.trellis_pair_dynamic):
                             if cutlass.const_expr(
@@ -3215,10 +3227,16 @@ class W4A16GemmKernel:
                             )
 
                         if cutlass.const_expr(
+                            self.csf_scales and kk == self.b_sh_wr_iters - 2
+                        ):
+                            csf_word = self._csf_word_pick(csf_word)
+                        if cutlass.const_expr(
                             self.csf_scales and kk + 1 == self.b_sh_wr_iters
                         ):
-                            # Rebuild the next stage's scale words once this
-                            # step's MMAs are issued, so they hide its latency.
+                            # Store the next stage's scale words once this
+                            # step's MMAs are issued, then load its fragments.
+                            if tile_idx + Int32(1) < k_tiles:
+                                self._csf_word_store(smem_base, tid, csf_word)
                             self._load_next_fragment_bundle(
                                 b_scale_next,
                                 a_regs_next,
@@ -4251,13 +4269,6 @@ class W4A16GemmKernel:
         else:
             next_tile = tile_idx + Int32(1)
             if next_tile < k_tiles:
-                if cutlass.const_expr(self.csf_scales):
-                    self._expand_csf_warp(
-                        smem_base,
-                        tid,
-                        Int32((pipe + 1) % self.stages),
-                        reduce_k_tile + next_tile,
-                    )
                 self._load_b_scale_register_bundle(
                     b_scale_next,
                     smem_base,
@@ -5601,20 +5612,33 @@ class W4A16GemmKernel:
                 )
 
     @cute.jit
-    def _csf_scale_word(
-        self, stage: Int32, slab: Int32, group: Int32, word: Int32, sub: Int32,
-        base: Uint32, smem_base: Int32,
-    ) -> Uint32:
-        """One packed scale word (four rows of k-group ``group``) of a staged stage.
+    def _csf_lane_word(self, tid: Int32):
+        """The scale word a lane rebuilds: (k-group in the stage, word in the tile).
+
+        A warp reads two k-groups of its 64 output columns, one four-byte word
+        per lane. Warps own disjoint words.
+        """
+        warp = tid // Int32(32)
+        lane = tid % Int32(32)
+        group = Int32(2) * (warp // Int32(self.tb_n_warps)) + lane // Int32(16)
+        column = (warp % Int32(self.tb_n_warps)) * Int32(16) + lane % Int32(16)
+        return group, column
+
+    @cute.jit
+    def _csf_word_reads(self, smem_base: Int32, tid: Int32, pipe: Int32, tile_idx: Int32):
+        """Issue the staged reads of this lane's scale word of k-tile ``tile_idx``.
 
         The word is its rows' biased bases plus four 4-bit codes, already in
         W4A16's packed scale encoding, unless its mask bit selects a complete
-        replacement word: from the staged record, or from global memory past
-        the record's inline words. Every staged read issues up front and the
-        record's word is selected without a branch; only words past the
-        record's inline words branch to global memory.
+        replacement word from the atom's record. Reads of a stage past the
+        tile's last return stale bytes; only stores and global reads are
+        guarded.
         """
         csf = self.csf
+        group, column = self._csf_lane_word(tid)
+        slab = column // Int32(csf.slab_rows // 4)
+        word = column % Int32(csf.slab_rows // 4)
+        stage = self._csf_stage_addr(smem_base, pipe)
         # Stages reuse their shared addresses: the load must not be hoisted.
         codes = ld_shared_u16_zx_ordered(
             stage
@@ -5623,7 +5647,10 @@ class W4A16GemmKernel:
             + group * Int32(csf.slab_rows // 2)
             + word * Int32(2)
         )
-        position = sub + group
+        base = ld_shared_u32(
+            smem_base + Int32(self.sh_csf_bases_off * 16) + column * Int32(4)
+        )
+        position = (tile_idx * Int32(csf.groups)) % Int32(4) + group
         record = (
             stage
             + Int32(csf.records)
@@ -5632,6 +5659,19 @@ class W4A16GemmKernel:
         )
         mask = ld_shared_u32(record + Int32(16) + (position % Int32(4)) * Int32(4))
         prefixes = ld_shared_u32(record + Int32(4))
+        return (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            Uint32(0), Uint32(0),
+        )
+
+    @cute.jit
+    def _csf_word_pick(self, state):
+        """Locate the word in its record and issue the read of its inline replacement."""
+        csf = self.csf
+        (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            _, _,
+        ) = state
         bit = Uint32(1) << word.to(Uint32)
         index = (
             (prefixes >> ((position % Int32(4)).to(Uint32) * Uint32(8))) & Uint32(255)
@@ -5640,9 +5680,26 @@ class W4A16GemmKernel:
         if index > Uint32(csf.inline_words - 1):
             staged = Uint32(csf.inline_words - 1)
         replacement = ld_shared_u32(record + Int32(32) + staged.to(Int32) * Int32(4))
+        return (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            index, replacement,
+        )
+
+    @cute.jit
+    def _csf_word_store(self, smem_base: Int32, tid: Int32, state):
+        """Select this lane's scale word and store it where the register loads read it.
+
+        Words past the record's inline replacement words read global memory.
+        A warp barrier orders the stores before the warp's register loads.
+        """
+        csf = self.csf
+        (
+            pipe, group, column, word, position, record, codes, base, mask, prefixes,
+            index, replacement,
+        ) = state
         codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
         value = codes + base
-        flagged = (mask & bit) != Uint32(0)
+        flagged = (mask & (Uint32(1) << word.to(Uint32))) != Uint32(0)
         if flagged:
             value = replacement
         if flagged and index >= Uint32(csf.inline_words):
@@ -5654,43 +5711,24 @@ class W4A16GemmKernel:
                 address.to(Int64)
                 + (ld_shared_u32(record).to(Int64) + index.to(Int64)) * Int64(4)
             )
-        return value
+        st_shared_u32(
+            smem_base
+            + Int32(self.sh_s_off * 16)
+            + pipe * Int32(self.s_sh_stage * 16)
+            + group * Int32(self.tile_n)
+            + column * Int32(4),
+            value,
+        )
+        cute.arch.sync_warp()
 
     @cute.jit
     def _expand_csf_warp(self, smem_base: Int32, tid: Int32, pipe: Int32, tile_idx: Int32):
-        """Rebuild the packed scale words this warp reads from one staged k-tile.
-
-        A warp reads two k-groups of its 64 output columns, one four-byte word
-        per lane. Warps own disjoint words, so a warp barrier orders the
-        rebuild before its register loads.
-        """
-        csf = self.csf
-        warp = tid // Int32(32)
-        lane = tid % Int32(32)
-        warp_row = warp // Int32(self.tb_n_warps)
-        warp_col = warp % Int32(self.tb_n_warps)
-        stage = self._csf_stage_addr(smem_base, pipe)
-        slot = smem_base + Int32(self.sh_s_off * 16) + pipe * Int32(self.s_sh_stage * 16)
-        sub = (tile_idx * Int32(csf.groups)) % Int32(4)
-        group = Int32(2) * warp_row + lane // Int32(16)
-        column = warp_col * Int32(16) + lane % Int32(16)
-        words_per_slab = csf.slab_rows // 4
-        base = ld_shared_u32(
-            smem_base + Int32(self.sh_csf_bases_off * 16) + column * Int32(4)
+        """Rebuild the packed scale words this warp reads from one staged k-tile."""
+        self._csf_word_store(
+            smem_base,
+            tid,
+            self._csf_word_pick(self._csf_word_reads(smem_base, tid, pipe, tile_idx)),
         )
-        st_shared_u32(
-            slot + group * Int32(self.tile_n) + column * Int32(4),
-            self._csf_scale_word(
-                stage,
-                column // Int32(words_per_slab),
-                group,
-                column % Int32(words_per_slab),
-                sub,
-                base,
-                smem_base,
-            ),
-        )
-        cute.arch.sync_warp()
 
     @cute.jit
     def _prefetch_pipeline_step(
