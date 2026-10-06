@@ -24,15 +24,36 @@ Each Spark's single cabled QSFP port is exposed as two PCIe Gen5 x4 functions
 (`rocep1s0f0`, `roceP2p1s0f0`). The runtime stripes every peer payload across
 both functions so one rank pair can use both SoC-facing PCIe links.
 
+### Rails and routes (switched fabrics and switchless rings)
+
+A rail is one (local HCA, peer HCA) link; each peer payload is striped across
+up to two rails. A rank opens up to four HCAs and publishes each one's
+IPv4-mapped GID address and netdev prefix with its connection record.
+`_routes.plan_routes` then picks every peer's rails:
+
+- if rail `h` can pair HCA `h` with HCA `h` between every pair of ranks (every
+  switched fabric does), rail `h` uses HCA `h` at both ends; a device without an
+  IPv4 GID cannot be checked and is trusted in the order given;
+- otherwise each peer gets the local and remote HCAs that share a subnet,
+  ordered by link network address so both ends of a link agree on its rail.
+
+The second case is a switchless topology, such as three Sparks cabled in a ring
+(port 0 to the next node's port 1, both ports cabled). Each neighbour is then
+reached through one port, i.e. the two functions of that port, each on its own
+point-to-point subnet: list all four functions in `B12X_ROCE_HCA` or
+`NCCL_IB_HCA` (`rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1`). A peer with
+fewer links than rails fails setup with the addresses it found. Flags and slot
+geometry are sized by the rail count, so the kernels are the same either way.
+
 ## Protocol
 
-One pinned region per rank: `recv[src][slot]`, `flag[src][slot][hca]`,
+One pinned region per rank: `recv[src][slot]`, `flag[src][slot][rail]`,
 `send[slot]`, and a control record. One kernel launch per collective:
 
 1. stage the input into `send[seq & 1]`;
 2. the last block to finish staging publishes `nbytes` (per slot) and `seq` to
    the control record, which a C proxy thread (`_roce_proxy.c`, libibverbs)
-   polls; the proxy divides each peer payload into one stripe per HCA, then
+   polls; the proxy divides each peer payload into one stripe per rail, then
    posts each stripe followed by a 4-byte write of `seq` on the same reliable
    QP, so a stripe flag cannot land before its data. The doorbell holds only
    the newest `seq`, and a rank's kernel for
@@ -42,8 +63,8 @@ One pinned region per rank: `recv[src][slot]`, `flag[src][slot][hca]`,
    without a doorbell the thread requests a short sleep between polls (the OS
    decides the actual delay) so an idle runtime does not hold a core; the
    catch-up keeps the protocol correct however long the thread is away;
-3. wait on `flag[peer][seq & 1][hca] == seq` for every peer and HCA (bounded; a
-   timeout records the missing peer and HCA, the kernel skips its data phase
+3. wait on `flag[peer][seq & 1][rail] == seq` for every peer and rail (bounded; a
+   timeout records the missing peer and rail, the kernel skips its data phase
    and keeps the epoch, later launches do nothing, and the host raises: see
    Contract);
 4. all-reduce: sum the local input and every peer slot in fixed rank order, so
@@ -68,7 +89,7 @@ bumped on incompatible surface changes; integrations pin the value they target.
 Exchange setup over a CPU (gloo) group: using a torch NCCL group would create a
 torch NCCL communicator costing about 3.4 GB of unified memory per rank.
 
-Environment: `B12X_ROCE_HCA` (falls back to `NCCL_IB_HCA`), `B12X_ROCE_GID_INDEX`
+Environment: `B12X_ROCE_HCA` (falls back to `NCCL_IB_HCA`; up to four devices), `B12X_ROCE_GID_INDEX`
 (falls back to `NCCL_IB_GID_INDEX`, default 3), `B12X_ROCE_SPIN_LIMIT`,
 `B12X_ROCE_CACHE_DIR` (where the proxy .so is built with the host C compiler).
 
@@ -93,8 +114,10 @@ gather paths stage the shard contiguously and only the reader is strided, so
 ranks may take different paths for the same collective.
 
 **Configuration is checked at setup.** Every rank publishes its API version,
-proxy ABI, HCA count, slot geometry, size limits, spin limit and launch geometry
-in the setup exchange; any difference fails construction on every rank.
+proxy ABI, maximum rail count, slot geometry, size limits, spin limit and launch
+geometry in the setup exchange; any difference fails construction on every rank.
+Ranks may open different numbers of HCAs; the rail count is derived from every
+rank's devices after the exchange, so all ranks reach the same value.
 
 **Failures are fail-stop, never a fallback.** A wait that exceeds the spin limit
 records the sequence and the missing peer in the control record; the kernel

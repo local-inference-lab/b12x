@@ -1,0 +1,7 @@
+{"label": "nccl", "run": 0, "ttft_s": 0.315, "completion_tokens": 512, "decode_tok_s": 33.69}
+{"label": "nccl", "run": 1, "ttft_s": 0.223, "completion_tokens": 512, "decode_tok_s": 34.17}
+{"label": "nccl", "run": 2, "ttft_s": 0.222, "completion_tokens": 512, "decode_tok_s": 34.05}
+{"label": "nccl", "run": 3, "ttft_s": 0.226, "completion_tokens": 512, "decode_tok_s": 33.98}
+{"label": "nccl", "run": 4, "ttft_s": 0.224, "completion_tokens": 512, "decode_tok_s": 34.04}
+{"label": "nccl", "run": 5, "ttft_s": 0.223, "completion_tokens": 512, "decode_tok_s": 33.81}
+{"label": "nccl", "runs": 5, "median_decode_tok_s": 34.04, "min": 33.81, "max": 34.17}
