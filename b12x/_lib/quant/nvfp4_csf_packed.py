@@ -65,8 +65,15 @@ def slab_rows(rows: int) -> int:
 
 
 def record_bytes(rows_per_slab: int) -> int:
-    """Record size of a slab height: 24 inline words for 128 rows, 16 for 64."""
-    return 128 if int(rows_per_slab) == 128 else 96
+    """Record size of a slab height: 32 inline words for 128 rows, 20 for 64.
+
+    A word past a record's inline words is a dependent global load on the
+    critical path of its CTA's pipeline. Records hold far more than the
+    typical atom (a 128-row atom of 128 words has 4-5 replacement words in
+    NVFP4 checkpoints, about 15 with 3% out-of-window scale bytes), so whole
+    layers run without one.
+    """
+    return 160 if int(rows_per_slab) == 128 else 112
 
 
 def inline_words(rows_per_slab: int) -> int:
