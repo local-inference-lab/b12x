@@ -1087,6 +1087,7 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1272,6 +1273,12 @@ class W4A16GemmKernel:
         )
         self.lut_e4m3_smem = False
         self.trellis_direct_lut = False
+        # Large-M route blocks only issue the MMAs of 16-row blocks that hold
+        # live routes; padded rows of a partial block are never read back.
+        self.skip_empty_m_blocks = (
+            os.environ.get("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1") == "1"
+            if skip_empty_m_blocks is None else skip_empty_m_blocks
+        )
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1564,6 +1571,7 @@ class W4A16GemmKernel:
             self.lut_e4m3_smem,
             self.trellis_direct_lut,
             self.small_m_splitk,
+            self.skip_empty_m_blocks,
         )
 
     @cute.jit
@@ -2898,6 +2906,7 @@ class W4A16GemmKernel:
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
+        live_m_blocks = (block_valid_rows + Int32(15)) // Int32(16)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
             for pipe in cutlass.range(
@@ -2974,6 +2983,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     dynamic_pair_override,
+                                    live_m_blocks,
                                 )
                             else:
                                 self._dequant_and_accumulate_bundle(
@@ -2992,6 +3002,7 @@ class W4A16GemmKernel:
                                     trellis_lut_addr,
                                     uses_m_block_8,
                                     0,
+                                    live_m_blocks,
                                 )
                         else:
                             self._dequant_and_accumulate_bundle(
@@ -3010,6 +3021,7 @@ class W4A16GemmKernel:
                                 trellis_lut_addr,
                                 uses_m_block_8,
                                 -1,
+                                live_m_blocks,
                             )
 
                         if cutlass.const_expr(
@@ -3095,6 +3107,7 @@ class W4A16GemmKernel:
         trellis_lut_addr: Int64,
         uses_m_block_8: cutlass.Constexpr[bool],
         dynamic_pair_override: cutlass.Constexpr[int],
+        live_m_blocks: Int32,
     ):
         if cutlass.const_expr(
             uses_m_block_8
@@ -3218,6 +3231,16 @@ class W4A16GemmKernel:
                 self._scaled_dequant_b_fragment(b_frag, q, s)
             if cutlass.const_expr(uses_m_block_8):
                 self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            elif cutlass.const_expr(self.skip_empty_m_blocks and self.cta_m_blocks > 1):
+                self._mma_accumulate_large_m(acc0, a_regs_cur, 0, jj, b_frag)
+                if live_m_blocks > Int32(1):
+                    self._mma_accumulate_large_m(acc1, a_regs_cur, 1, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 2):
+                    if live_m_blocks > Int32(2):
+                        self._mma_accumulate_large_m(acc2, a_regs_cur, 2, jj, b_frag)
+                if cutlass.const_expr(self.cta_m_blocks > 3):
+                    if live_m_blocks > Int32(3):
+                        self._mma_accumulate_large_m(acc3, a_regs_cur, 3, jj, b_frag)
             else:
                 for mb in cutlass.range_constexpr(self.cta_m_blocks):
                     if cutlass.const_expr(mb == 0):
@@ -6352,6 +6375,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
         trellis_decode_table: str = "auto",
     ):
         activation = normalize_moe_activation(activation)
@@ -6611,6 +6635,7 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6649,6 +6674,7 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -9872,6 +9898,7 @@ def compile_w4a16_fused_moe(
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     pipeline_stages: int | None = None,
+    skip_empty_m_blocks: bool | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     intermediate_hadamard: bool = False,
@@ -10273,6 +10300,7 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         pipeline_stages=pipeline_stages,
+        skip_empty_m_blocks=skip_empty_m_blocks,
         trellis_decode_table=trellis_decode_table,
     )
     cache_key = (
@@ -12724,10 +12752,10 @@ def run_w4a16_moe(
         raise ValueError("prepared X4T weights have incomplete scale metadata")
     use_x4t_scale_predecode = x4t_w13_scale is not None
     if use_x4t_scale_predecode and (
-        weight_layout != "packed" or scale_format != "e8m0_k32"
+        weight_layout not in ("packed", "modelopt") or scale_format != "e8m0_k32"
     ):
         raise ValueError(
-            "X4T scale predecode requires packed FP4 weights with E8M0 K/32 scales"
+            "X4T scale predecode requires native or packed FP4 with E8M0 K/32 scales"
         )
     w13_layout = getattr(
         prepared,
@@ -12783,6 +12811,8 @@ def run_w4a16_moe(
         raise ValueError("a_input, topk_weights, and topk_ids must be contiguous")
     _validate_expert_map(expert_map, device=a_input.device)
     _validate_expert_map(output_expert_map, device=a_input.device)
+    if getattr(prepared, "x4t_packed_pair_programs", None) is not None and expert_map is not None:
+        raise NotImplementedError("DS4.1 packed X4T supports local TP expert IDs without expert mapping")
     if output_expert_map is not None and not full_rotation:
         raise ValueError("output_expert_map is only valid with full_rotation")
 
@@ -12963,6 +12993,20 @@ def run_w4a16_moe(
         ):
             raise RuntimeError(
                 "W4A16 small-M direct path requires prepared micro scale metadata"
+            )
+        if use_x4t_scale_predecode:
+            # Native and packed GEMMs consume the same expanded scale grid.
+            # The early-return micro path must refresh it before every launch.
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
+
+            programs = prepared.x4t_packed_pair_programs
+            if programs is None or w13_layout != "w31":
+                raise ValueError("Native X4T requires prepared gate/up scale programs")
+            _launch_x4t_packed_scale_pair(
+                x4t_w13_scale, x4t_w2_scale, topk_ids.view(-1),
+                micro_w13_scale, micro_w2_scale,
+                program=programs[2 if topk_ids.dtype == torch.int64 else 0],
+                stream=stream,
             )
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
@@ -13203,19 +13247,47 @@ def run_w4a16_moe(
             packed_route_indices if use_direct_topk_routes else block_expert_ids
         )
         assert x4t_expert_ids is not None
-        decode_x4t_tp12_w4a16_scales(
-            x4t_w13_scale,
-            x4t_w2_scale,
-            x4t_expert_ids,
-            prepared.w13_scale,
-            prepared.w2_scale,
-            expert_map=expert_map if use_direct_topk_routes else None,
-            w13_row_rotation=int(
-                getattr(prepared, "x4t_w13_row_rotation", 0)
-            ),
-            expert_ids_unique=bool(use_direct_topk_routes and m == 1),
-            stream=stream,
-        )
+        programs = getattr(prepared, "x4t_packed_pair_programs", None)
+        if programs is not None:
+            from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
+
+            counts = not use_direct_topk_routes
+            active = expert_counts if counts else x4t_expert_ids
+            sorted_ids = False
+            block_bound = min(block_expert_ids.numel(), topk_ids.numel())
+            if counts and (expert_counts is None or block_bound < int(prepared.num_experts)):
+                # A nonempty packed block contains at least one routed row.
+                # Its sorted expert list therefore needs no more entries than
+                # the routed-row count; the packer fills unused entries with -1.
+                # Bounding the grid avoids scheduling all experts for decode.
+                active = block_expert_ids[:block_bound]
+                counts = False
+                sorted_ids = True
+            if active is None:
+                raise ValueError("Packed X4T routing requires caller-owned expert counts")
+            if sorted_ids:
+                program_index = 3
+            elif counts:
+                program_index = 1
+            else:
+                program_index = 2 if active.dtype == torch.int64 else 0
+            _launch_x4t_packed_scale_pair(
+                x4t_w13_scale, x4t_w2_scale, active,
+                prepared.w13_scale, prepared.w2_scale,
+                program=programs[program_index], stream=stream,
+            )
+        else:
+            decode_x4t_tp12_w4a16_scales(
+                x4t_w13_scale,
+                x4t_w2_scale,
+                x4t_expert_ids,
+                prepared.w13_scale,
+                prepared.w2_scale,
+                expert_map=expert_map if use_direct_topk_routes else None,
+                w13_row_rotation=int(getattr(prepared, "x4t_w13_row_rotation", 0)),
+                expert_ids_unique=bool(use_direct_topk_routes and m == 1),
+                stream=stream,
+            )
 
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)

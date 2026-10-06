@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-464",
+  "category": "fix",
+  "summary": "Honor deterministic MoE output when preparing eligible kernels",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Capture B12X_DYNAMIC_DETERMINISTIC_OUTPUT before selecting kernels so shared-input NVFP4 quality evaluation can start with a supported reduction.",
+    "Explicit routing overrides retain precedence; fast-kernel arithmetic and checkpoint representations are unchanged."
+  ],
+  "pull_requests": [464],
+  "requires": []
+}

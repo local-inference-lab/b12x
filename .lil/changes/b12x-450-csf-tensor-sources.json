@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-450-csf-tensor-sources",
+  "category": "compatibility",
+  "summary": "Load compressed FP4 expert tensors without model-specific checkpoint readers in B12X",
+  "models": ["Kimi-K3", "DeepSeek-V4.1-Flash", "GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "Requires the companion vLLM tensor-source loader. The B12X root/path reader API is replaced; canonical CSF checkpoint bytes and serving flags are unchanged.",
+  "details": [
+    "CsfMatrix sources carry lazy packed weight views, compressed scales and optional FP32 NVFP4 calibration.",
+    "B12X performs generic TP slicing and GPU preparation; vLLM owns manifests, model tensor names and file handles.",
+    "Compute kernels, scale layouts and caller-owned scratch reuse are unchanged."
+  ],
+  "pull_requests": [450],
+  "requires": []
+}
