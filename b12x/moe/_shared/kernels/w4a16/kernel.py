@@ -170,7 +170,8 @@ def _w4a16_small_m_double_occupancy(
     small_m_occupancy: int | None = None,
 ) -> bool:
     """Whether a small-M plan runs two CTAs per SM with three stages: opted in,
-    and packed NVFP4 weights with E4M3 scales, the measured geometry."""
+    and packed NVFP4 weights with E4M3 scales (native or CSF), the measured
+    geometry."""
     return (
         uses_m_block_8
         and weight_layout == "packed"
