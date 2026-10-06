@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-w4a16-csf-tp6-small-m",
+  "category": "performance",
+  "summary": "W4A16 MoE decode on NVFP4-CSF checkpoints now runs as fast as plain NVFP4, and GLM-5.3 runs W4A16 at TP6 (352 expert channels per rank)",
+  "models": ["GLM-5.3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Stage-readable NVFP4-CSF scale storage carries each atom's replacement scale words inline, so every pipeline stage copies its compressed scales without dependent reads or a per-tile prologue wait, and the scale-word rebuild overlaps the stage's MMAs; outputs stay bit-identical to native NVFP4 scales.",
+    "GLM-5.3 TP8 (256 channels per rank) fused MoE with B12X_W4A16_SMALL_M_OCCUPANCY=2, CSF vs native at 4/8/16/32/64 tokens: +12.4/+3.1/+2.7/+1.7/+1.3% before, 0.0/-0.7/-0.6/-1.4/-1.3% now.",
+    "Packed NVFP4 W4A16 (native and CSF scales) supports expert shards whose channel count is 32 mod 64, such as GLM-5.3 TP6 (2048 padded to 2112, 352 channels per rank): N64 gate/up tiles and K32 down tiles, for decode and prefill. At TP6 CSF is within +0.1% of native at 4 tokens and 0.4-0.5% faster at 8-64.",
+    "Fixes a K32 activation-tile swizzle that left its 64-byte rows and corrupted large-batch outputs of K32 W4A16 tiles."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [],
+  "requires": []
+}
