@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-tuning-schema-22",
+  "category": "compatibility",
+  "summary": "Retune kernel selections with schema 22 across all built-in components",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The selection-cache envelope and every built-in query and config schema use version 22, so autotuned startup measures eligible configurations again and subsequent startups reuse those decisions.",
+    "Earlier cache files remain intact. Explicit B12X_TUNING_CACHE_VERSION values and configuration overrides retain their existing meaning.",
+    "Package source changes produce distinct compiled artifact identities, so startup can require kernel compilation as well as retuning."
+  ],
+  "authors": ["lukealonso"],
+  "pull_requests": [],
+  "requires": []
+}

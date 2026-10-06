@@ -401,7 +401,7 @@ def make_fixed_contract(*, component_id, query_type, backend) -> TuningContract:
             raise ValueError(f"unsupported {component_id} backend {config.backend!r}")
 
     return TuningContract(
-        component_id=component_id, query_schema_version=1, config_schema_version=1,
+        component_id=component_id, query_schema_version=22, config_schema_version=22,
         query_fields=query_fields, config_fields=frozenset({"backend"}),
         encode_query=lambda query: {name: getattr(query, name) for name in query_fields},
         encode_config=BackendConfig.to_dict, decode_config=BackendConfig.from_config,

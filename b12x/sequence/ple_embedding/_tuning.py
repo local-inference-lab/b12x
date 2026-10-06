@@ -55,7 +55,7 @@ def _validate_query(query, device):
 PleEmbeddingConfig = BackendConfig
 TUNING = replace(
     make_fixed_contract(component_id="sequence.ple_embedding", query_type=PleEmbeddingQuery, backend="triton"),
-    query_schema_version=3,
+    query_schema_version=22,
     validate_query=_validate_query,
 )
 

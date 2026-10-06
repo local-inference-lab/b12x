@@ -130,7 +130,7 @@ def _encode_query(query: KdaPrefillQuery) -> dict[str, object]:
 
 
 TUNING = TuningContract(
-    component_id="sequence.kda_prefill", query_schema_version=5, config_schema_version=1,
+    component_id="sequence.kda_prefill", query_schema_version=22, config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles"}),
     encode_query=_encode_query, encode_config=KdaPrefillConfig.to_dict,

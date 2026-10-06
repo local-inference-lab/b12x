@@ -12,9 +12,10 @@ from b12x._lib import compiler
 from b12x._lib.compile_plan import ProgramKey, record_program
 from b12x._lib.compile_pool import CompilationPlan, CompileJob
 from b12x.preparation import DetectedDevice, PreparationSession, PreparedCall, TuningCacheRequirement
-from b12x.preparation._cache import SelectionCache, cache_identity
+from b12x.preparation._cache import SelectionCache, cache_identity, digest
+from b12x.preparation.catalog import list_tuning_components
 from .test_defaults import contract
-from .test_session import _deterministic_timer, declaration
+from .test_session import _deterministic_timer, declaration, request, session
 
 
 # Ordinals 0 and 2 are the same part sold under two product labels, whose
@@ -56,6 +57,78 @@ def _save_choice(cache):
         coverage={"cartesian_count": 3, "legal_count": 3, "effective_count": 3, "measured_count": 3},
         programs=(ProgramKey("cute", "selected-source-key"),),
     )
+
+
+@pytest.mark.parametrize(
+    "registration", list_tuning_components(),
+    ids=lambda item: f"{item.op_qualname}:{item.variant}",
+)
+def test_builtin_contracts_use_schema_22_or_later(registration):
+    tuning = registration.load()
+    assert tuning.query_schema_version >= 22
+    assert tuning.config_schema_version >= 22
+
+
+@pytest.mark.parametrize("manual_version", [None, "41"])
+def test_schema_22_retunes_without_deleting_schema_6_choices(
+    cache_device, tmp_path, monkeypatch, manual_version,
+):
+    if manual_version is not None:
+        monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", manual_version)
+    identity = cache_identity({}, 0)
+    assert identity["schema_version"] == 22
+    assert identity["tuning_cache_version"] == int(manual_version or "1")
+    previous_identity = {**identity, "schema_version": 6}
+    previous_path = tmp_path / f"{digest(previous_identity)}.json"
+    previous_payload = json.dumps({
+        "identity": previous_identity,
+        "records": {"shape": {
+            "assignment": {"width": 2}, "config": {"width": 2},
+            "coverage": {
+                "cartesian_count": 3, "legal_count": 3,
+                "effective_count": 3, "measured_count": 3,
+            },
+            "programs": [["cute", "selected-source-key"]],
+        }},
+    })
+    previous_path.write_text(previous_payload)
+
+    cold = SelectionCache(tmp_path, identity)
+    assert cold.path != previous_path
+    assert cold.get("shape") is None
+    _save_choice(cold)
+    reused = SelectionCache(tmp_path, identity)
+    assert reused.path == cold.path
+    assert reused.get("shape") == cold.get("shape")
+    assert previous_path.read_text() == previous_payload
+    with pytest.raises(ValueError, match="requires schema 22"):
+        SelectionCache(tmp_path, previous_identity)
+
+
+@pytest.mark.parametrize("field", ["query_schema_version", "config_schema_version"])
+def test_contract_schema_change_requires_a_fresh_selection(
+    tmp_path, monkeypatch, field,
+):
+    _deterministic_timer(monkeypatch)
+
+    def prepare(tuning):
+        with session(tmp_path) as engine:
+            result = engine.prepare((request(
+                name="query", tuning=tuning,
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None,
+                ),
+            ),))
+            assert result.selections["query"].config.width == 2
+            return result.selections["query"].source, result.benchmarked_candidates
+
+    original = contract()
+    assert prepare(original) == ("tuned", 3)
+    assert prepare(original) == ("cached", 0)
+    changed = replace(original, **{field: getattr(original, field) + 1})
+    assert prepare(changed) == ("tuned", 3)
+    assert prepare(changed) == ("cached", 0)
+    assert prepare(original) == ("cached", 0)
 
 
 def test_manual_version_selects_a_distinct_decision_cache_without_deleting_choices(cache_device, tmp_path, monkeypatch):

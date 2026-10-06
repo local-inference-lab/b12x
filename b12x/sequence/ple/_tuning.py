@@ -64,7 +64,7 @@ PleConfig = BackendConfig
 _KEY_FIELDS = frozenset(PleQuery.__dataclass_fields__) - {"max_state_slots"}
 TUNING = replace(
     make_fixed_contract(component_id="sequence.ple", query_type=PleQuery, backend="triton"),
-    query_schema_version=4, validate_query=_validate_query, query_fields=_KEY_FIELDS,
+    query_schema_version=22, validate_query=_validate_query, query_fields=_KEY_FIELDS,
     encode_query=lambda query: {name: getattr(query, name) for name in _KEY_FIELDS},
 )
 

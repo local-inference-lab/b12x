@@ -253,7 +253,7 @@ def _equivalence(query, device, config):
 
 
 TUNING = TuningContract(
-    component_id="gemm.blockscaled_precision", query_schema_version=7, config_schema_version=4,
+    component_id="gemm.blockscaled_precision", query_schema_version=22, config_schema_version=22,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
@@ -345,5 +345,5 @@ def _validate_fixed_query(query, device):
 
 FIXED_TUNING = replace(
     make_fixed_contract(component_id="gemm.blockscaled.fixed", query_type=FixedBlockscaledQuery, backend="cutedsl"),
-    query_schema_version=4, validate_query=_validate_fixed_query,
+    query_schema_version=22, validate_query=_validate_fixed_query,
 )

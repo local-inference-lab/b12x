@@ -193,7 +193,7 @@ def _encode_query(query: GdnPrefillQuery) -> dict[str, object]:
 
 
 TUNING = TuningContract(
-    component_id="sequence.gdn_prefill", query_schema_version=5, config_schema_version=2,
+    component_id="sequence.gdn_prefill", query_schema_version=22, config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles", "algorithm", "segment_tokens"}),
     encode_query=_encode_query, encode_config=GdnPrefillConfig.to_dict,

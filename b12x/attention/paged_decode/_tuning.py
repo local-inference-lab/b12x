@@ -194,8 +194,8 @@ def _materialize(query, device, choice):
 
 TUNING = TuningContract(
     component_id="attention.paged_decode",
-    query_schema_version=1,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(PagedDecodeQuery)),
     config_fields=frozenset(field.name for field in fields(PagedDecodeConfig)),
     encode_query=asdict,

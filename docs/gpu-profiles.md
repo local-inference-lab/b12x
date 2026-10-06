@@ -118,7 +118,7 @@ propagation and complete-world completion. Incomplete races are not cached.
 `cache_only=True` refuses search and compilation. A complete cached restart
 loads and primes process-local state without starting compiler workers.
 
-The decision cache uses schema 6 and an explicit positive integer version,
+The decision cache uses schema 22 and an explicit positive integer version,
 `B12X_TUNING_CACHE_VERSION`, which defaults to `1`. Set the same version on
 every rank. Increment it before launch to discard prior tuning decisions:
 
@@ -139,9 +139,14 @@ keys; the tuning-cache version is excluded from the compiler environment key.
 A cached decision still validates its assignment and configuration, then
 compiles any missing artifacts for that selected configuration. Increment the
 decision version when implementation or toolchain changes warrant retuning.
-Schema-4 and schema-5 files are left intact and are not read by schema 6.
-The schema bump invalidates prior decisions even when the environment version
-is explicitly set, so kernels are retuned for ordinary CUDA weight storage.
+Files using earlier cache schemas remain intact and are not read by schema 22.
+All built-in query and config schemas are at least 22. Earlier selections are
+invalidated even when the environment version is explicitly set; the first
+autotuned startup measures eligible configurations and later startups reuse
+the resulting decisions. Package source changes also produce distinct compiled
+artifact identities, so startup can require kernel compilation as well as
+retuning. Explicit tuning-cache versions and configuration overrides retain
+their existing meaning.
 
 A selection key digests the component, the contract versions, the encoded
 query, the invocation, the pin and the dependencies. GDN decode, GDN and KDA

@@ -87,7 +87,7 @@ def test_collective_barrier_dispatch_contract(tmp_path):
 def session(tmp_path, **kwargs):
     """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
-    value._cache = SelectionCache(tmp_path, {"schema_version": 6, "tuning_cache_version": 1})
+    value._cache = SelectionCache(tmp_path, {"schema_version": 22, "tuning_cache_version": 1})
     return value
 
 

@@ -33,4 +33,4 @@ TUNING = make_fixed_contract(
     component_id="sequence.embedding", query_type=EmbeddingQuery, backend="cute",
 )
 
-TUNING = replace(TUNING, query_schema_version=2)
+TUNING = replace(TUNING, query_schema_version=22)
