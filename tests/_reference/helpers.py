@@ -307,7 +307,7 @@ def ref_fp4_quant(
     x: torch.Tensor,
     global_scale: torch.Tensor | float,
     block_size: int = NVFP4_BLOCK_SIZE,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     sliced_shape = x.shape[:-1] + (x.shape[-1] // block_size, block_size)
     sliced_x = x.reshape(sliced_shape)
     vec_max = torch.max(torch.abs(sliced_x), dim=-1, keepdim=True)[0].to(torch.float32)
@@ -325,7 +325,7 @@ def ref_grouped_fp4_quantize(
     input_tensor: torch.Tensor,
     row_counts: torch.Tensor,
     global_scale: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     num_groups, rows, cols = input_tensor.shape
     quantized = torch.zeros(
         (num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device
@@ -353,7 +353,7 @@ def ref_grouped_silu_mul_quantize(
     input_tensor: torch.Tensor,
     row_counts: torch.Tensor,
     global_scale: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     cols = input_tensor.shape[-1] // 2
     left = input_tensor[..., :cols].float()
     right = input_tensor[..., cols:].float()
