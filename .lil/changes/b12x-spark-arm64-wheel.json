@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-spark-arm64-wheel",
+  "category": "internal",
+  "summary": "The B12X wheel bundle can also be built for linux/arm64 (DGX Spark, GB10), for the DGX Spark image",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No change to linux/amd64 wheels, locks or build caches; LIL_WHEEL_PLATFORM=linux/arm64 selects the arm64 build.",
+  "details": [
+    "The arm64 build uses the arm64 twin of NVIDIA PyTorch 26.08 (same torch, CUDA 13.4.1 and packages) and aarch64 build-tool hashes, under QEMU on the amd64 wheel builder."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    488
+  ],
+  "requires": []
+}
