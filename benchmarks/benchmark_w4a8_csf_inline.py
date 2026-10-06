@@ -238,7 +238,7 @@ def main() -> None:
                 if not torch.equal(outputs[name].view(torch.int16), outputs["native"].view(torch.int16)):
                     raise AssertionError(f"{name} output differs from native")
             oracle_metrics = {}
-            for name, output in outputs.items():
+            for output in outputs.values():
                 assert torch.isfinite(output).all() and torch.count_nonzero(output)
                 metrics = compare_to_reference(output, reference)
                 assert metrics.cos >= 0.9975, (name, metrics)
@@ -253,7 +253,7 @@ def main() -> None:
                 graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
-            for name, output in outputs.items():
+            for output in outputs.values():
                 assert torch.isfinite(output).all() and torch.count_nonzero(output)
                 assert torch.equal(output.view(torch.int16), outputs["native"].view(torch.int16))
             calls = tuple(PreparedCall(run=graph.replay, produce=lambda: None,
