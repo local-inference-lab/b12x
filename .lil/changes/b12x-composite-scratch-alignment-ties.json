@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-composite-scratch-alignment-ties",
+  "category": "fix",
+  "summary": "Retain the larger scratch specification when aligned plan sizes tie",
+  "models": [
+    "Models using prepared B12X kernels"
+  ],
+  "compatibility": "Prepared plans expose scratch storage large enough for every exact token-count variant, including MXFP8 MoE decode capacities.",
+  "details": [
+    "Sequential memory composition compares raw byte counts when 256-byte-aligned requirements are equal, preventing an undersized scratch specification from being retained."
+  ],
+  "authors": [
+    "lukealonso"
+  ]
+}
