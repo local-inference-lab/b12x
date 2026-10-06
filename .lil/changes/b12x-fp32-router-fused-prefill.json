@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-fp32-router-fused-prefill",
+  "category": "fix",
+  "summary": "Preserve FP32 router weights in fused W4A16 prefill reduction",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. Both precision and fused-prefill options remain disabled by default.",
+  "details": [
+    "When B12X_W4A16_FP32_TOPK_WEIGHTS=1 and B12X_W4A16_PREFILL_FUSED_SUM=1, the FC2 epilogue applies FP32 router weights before accumulating expert outputs. Prepared capacities, mapped experts, logical tails, and allocation-stable CUDA graph replay retain the same semantics."
+  ],
+  "pull_requests": [
+    423
+  ],
+  "requires": []
+}

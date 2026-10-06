@@ -69,15 +69,19 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
 @pytest.mark.parametrize("fused_sum", [False, True])
 @pytest.mark.parametrize("mapped", [False, True])
 @pytest.mark.parametrize("capacity", [14, 129])
+@pytest.mark.parametrize("fp32_topk_weights", [False, True])
 def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
-    source_format, fused_sum, mapped, capacity, monkeypatch
+    source_format, fused_sum, mapped, capacity, fp32_topk_weights, monkeypatch
 ):
     """One declared capacity serves changed inputs and live lengths without JIT."""
     from b12x.moe import fused_moe
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x.preparation.types import require_prepared
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", str(int(fused_sum)))
+    monkeypatch.setenv("B12X_W4A16_FP32_TOPK_WEIGHTS", str(int(fp32_topk_weights)))
+    monkeypatch.setattr(w4a16_kernel, "_FP32_TOPK_WEIGHTS", fp32_topk_weights)
     torch.manual_seed(81281)
     experts, hidden, intermediate, topk = 8, 256, 192, 4
     x = (torch.randn(capacity, hidden, device="cuda") * 0.125).to(torch.bfloat16)

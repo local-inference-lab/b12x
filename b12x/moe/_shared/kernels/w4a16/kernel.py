@@ -1455,6 +1455,9 @@ class W4A16GemmKernel:
             raise ValueError("route_major_a requires the exact dual-A FC1 path")
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_fp32 = bool(fused_sum_fp32)
+        self.fused_sum_router_weights_fp32 = bool(
+            fused_sum_fp32 and _FP32_TOPK_WEIGHTS
+        )
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
         # CTA over the full K (grid-strided waves, ragged last wave), skipping
@@ -1696,6 +1699,7 @@ class W4A16GemmKernel:
             self.route_major_a,
             self.fused_topk_sum,
             self.fused_sum_fp32,
+            self.fused_sum_router_weights_fp32,
             self.fused_sum_topk,
             self.size_m if self.fused_sum_fp32 else None,
             self.cta_m_blocks,
@@ -2239,6 +2243,11 @@ class W4A16GemmKernel:
                         smem_base + Int32(self.sh_topk_off * 16),
                         self._broadcast_f32_to_elem2(topk),
                     )
+                elif cutlass.const_expr(self.fused_sum_router_weights_fp32):
+                    st_shared_f32(
+                        smem_base + Int32(self.sh_topk_off * 16),
+                        topk_weights_flat[idx].to(cutlass.Float32),
+                    )
             cute.arch.sync_threads()
             return Int32(1)
 
@@ -2263,6 +2272,14 @@ class W4A16GemmKernel:
                     st_shared_u32(
                         smem_base + Int32(self.sh_topk_off * 16),
                         self._broadcast_f32_to_elem2(topk),
+                    )
+                elif cutlass.const_expr(self.fused_sum_router_weights_fp32):
+                    safe_idx = idx
+                    if idx >= active_size_m * Int32(self.top_k):
+                        safe_idx = Int32(0)
+                    st_shared_f32(
+                        smem_base + Int32(self.sh_topk_off * 16),
+                        topk_weights_flat[safe_idx].to(cutlass.Float32),
                     )
             cute.arch.sync_threads()
             return Int32(1)
@@ -2323,6 +2340,14 @@ class W4A16GemmKernel:
                     smem_base + Int32(self.sh_topk_off * 16) + tid * Int32(4)
                 )
                 st_shared_u32(topk_word_addr, packed_topk)
+            elif cutlass.const_expr(self.fused_sum_router_weights_fp32):
+                safe_idx = idx
+                if idx >= active_size_m * Int32(self.top_k):
+                    safe_idx = Int32(0)
+                st_shared_f32(
+                    smem_base + Int32(self.sh_topk_off * 16) + tid * Int32(4),
+                    topk_weights_flat[safe_idx].to(cutlass.Float32),
+                )
 
         cute.arch.sync_threads()
         valid_count = ld_shared_i32_relaxed(
@@ -6162,6 +6187,16 @@ class W4A16GemmKernel:
                         q10, q11 = self._elem2_to_f32x2(q1)
                         q20, q21 = self._elem2_to_f32x2(q2)
                         q30, q31 = self._elem2_to_f32x2(q3)
+                        if cutlass.const_expr(self.fused_sum_router_weights_fp32):
+                            scale = ld_shared_f32(
+                                smem_base
+                                + Int32(self.sh_topk_off * 16)
+                                + row * Int32(4)
+                            )
+                            q00, q01 = q00 * scale, q01 * scale
+                            q10, q11 = q10 * scale, q11 * scale
+                            q20, q21 = q20 * scale, q21 * scale
+                            q30, q31 = q30 * scale, q31 * scale
                         red_add_global_v4_f32(out_addr, q00, q01, q10, q11)
                         red_add_global_v4_f32(
                             out_addr + Int64(16), q20, q21, q30, q31
@@ -6241,6 +6276,16 @@ class W4A16GemmKernel:
                         q10, q11 = self._elem2_to_f32x2(q1)
                         q20, q21 = self._elem2_to_f32x2(q2)
                         q30, q31 = self._elem2_to_f32x2(q3)
+                        if cutlass.const_expr(self.fused_sum_router_weights_fp32):
+                            scale = ld_shared_f32(
+                                smem_base
+                                + Int32(self.sh_topk_off * 16)
+                                + row * Int32(4)
+                            )
+                            q00, q01 = q00 * scale, q01 * scale
+                            q10, q11 = q10 * scale, q11 * scale
+                            q20, q21 = q20 * scale, q21 * scale
+                            q30, q31 = q30 * scale, q31 * scale
                         red_add_global_v4_f32(out_addr, q00, q01, q10, q11)
                         red_add_global_v4_f32(
                             out_addr + Int64(16), q20, q21, q30, q31
