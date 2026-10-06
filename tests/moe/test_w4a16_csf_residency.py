@@ -3,8 +3,11 @@
 vLLM prepares one MoE plan per decode capacity up to 256 tokens (64 sequences
 x 4 MTP tokens) and prefill chunks up to 8192 tokens. Each fused W4A16 launch
 is cooperative: if the planned CTAs per SM do not fit, the launch fails with
-CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE. Compressed scales also keep the
-residency (and so the persistent schedule) of native scales.
+CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE. Compressed scales keep the residency
+(and so the persistent schedule) of native scales wherever their shared
+footprint admits it; where it does not (the fused kernel's own shared
+regions, such as a staged E4M3 value table, can leave room for fewer CTAs),
+they run fewer CTAs per SM and a different split-K partition.
 """
 
 import numpy as np
@@ -116,24 +119,39 @@ def test_csf_plans_fit_their_cooperative_grid_at_every_capacity(
         ))
         for tokens, pair in plans.items():
             x, ids, weights = inputs(tokens)
-            outputs = []
+            outputs, residency = [], []
             for p in pair:
                 scratch = tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in p.scratch_specs())
                 output = torch.full_like(x, float("nan"))
-                moe.run(binding=moe.bind(p, a=x, topk_ids=ids, topk_weights=weights, output=output,
-                                         scratch=scratch, input_scales_static=True))
+                binding = moe.bind(p, a=x, topk_ids=ids, topk_weights=weights, output=output,
+                                   scratch=scratch, input_scales_static=True)
+                launch = getattr(binding, "fused_launch", None)
+                residency.append(None if launch is None else launch.blocks_per_sm)
+                moe.run(binding=binding)
                 outputs.append(output)
             torch.cuda.synchronize()
             assert torch.isfinite(outputs[0]).all() and torch.count_nonzero(outputs[0]), tokens
             assert torch.isfinite(outputs[1]).all(), tokens
-            # Both scale formats run the same schedule. Its cross-CTA split-K
-            # reductions (and the prefill route sum) are not ordered: native
-            # differs from itself by a BF16 rounding in rare elements, so allow
-            # a few such elements.
-            differ = outputs[1] != outputs[0]
-            rare = outputs[0].numel() // (10_000 if tokens <= 256 else 1_000)
-            assert int(differ.sum()) <= max(16, rare), tokens
-            if bool(differ.any()):
-                scale = float(outputs[0].float().abs().max())
-                delta = (outputs[1].float() - outputs[0].float()).abs()[differ]
-                assert float(delta.max()) <= 2.0**-6 * scale, tokens
+            scale = float(outputs[0].float().abs().max())
+            if residency[0] == residency[1]:
+                # Both scale formats run the same schedule. Its cross-CTA
+                # split-K reductions (and the prefill route sum) are not
+                # ordered: native differs from itself by a BF16 rounding in
+                # rare elements, so allow a few such elements.
+                differ = outputs[1] != outputs[0]
+                rare = outputs[0].numel() // (10_000 if tokens <= 256 else 1_000)
+                assert int(differ.sum()) <= max(16, rare), tokens
+                if bool(differ.any()):
+                    delta = (outputs[1].float() - outputs[0].float()).abs()[differ]
+                    assert float(delta.max()) <= 2.0**-6 * scale, tokens
+            else:
+                # Fewer CTAs per SM: a different persistent grid splits K
+                # differently across CTAs, which reassociates FP32 partial
+                # sums. Results then differ by BF16 roundings of the
+                # intermediate and the output only: a few BF16 ulps.
+                assert residency[1] < residency[0], (tokens, residency)
+                torch.testing.assert_close(
+                    outputs[1].float(), outputs[0].float(),
+                    rtol=2.0**-6, atol=2.0**-10 * scale,
+                    msg=lambda m: f"{tokens} tokens, residency {residency}: {m}",
+                )
