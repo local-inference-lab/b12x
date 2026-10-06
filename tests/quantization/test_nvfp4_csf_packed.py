@@ -114,3 +114,63 @@ def test_index_matches_the_expansion_pass(rows, columns, rotation, table):
     torch.cuda.synchronize()
     for out, expected in zip(again, (out13, out2), strict=True):
         assert torch.equal(out[[1, 3]], expected[[1, 3]])
+
+
+def _w4a16_scale_bytes(logical, lut, rotation):
+    """W4A16 packed scale bytes ``[E, C, R]`` of logical ``[E, R, C]`` scales."""
+    experts, rows, columns = logical.shape
+    rotated = np.roll(logical, -rotation, axis=1)
+    row = np.arange(rows)
+    position = (row // 128) * 128 + packed_slab_position(torch.from_numpy(row % 128)).numpy()
+    out = np.empty((experts, columns, rows), dtype=np.uint8)
+    out[:, :, position] = lut.cpu().numpy()[rotated].transpose(0, 2, 1)
+    return torch.from_numpy(out)
+
+
+@pytest.mark.parametrize("rows,columns,rotation", [(192, 22, 96), (704, 6, 352), (128, 10, 0)])
+def test_index_of_planes_off_the_native_grid(rows, columns, rotation):
+    """2048/TP6 = 352 channels: 704 gate/up rows (64-row slabs), 22 down k-groups."""
+    device = require_b12x()
+    experts = 3
+    lut = _value_table("w4a16", device)
+    logical = _logical_scales(experts, rows, columns, 5)
+    native = _native_batch(logical, device)
+    assert (native.rows, native.columns) == (-(-rows // 128) * 128, -(-columns // 4) * 4)
+    assert (native.logical_rows or native.rows, native.logical_columns or native.columns) == (
+        rows, columns,
+    )
+    batch = repack_nvfp4_csf_batch(native, row_rotation=rotation, value_lut=lut)
+    scales = build_packed_csf_scales(batch)
+    assert (scales.rows, scales.columns) == (rows, columns)
+    assert scales.slab_rows == (128 if rows % 128 == 0 else 64)
+    expected = _w4a16_scale_bytes(logical, lut, rotation).to(device)
+    assert torch.equal(expand_packed_csf_scales(scales), expected)
+    out = torch.full((experts, columns, rows), 0xFF, dtype=torch.uint8, device=device)
+    other = torch.empty(experts, 32, 256, dtype=torch.uint8, device=device)
+    second = build_packed_csf_scales(
+        repack_nvfp4_csf_batch(
+            _native_batch(_logical_scales(experts, 256, 32, 2), device),
+            row_rotation=0,
+            value_lut=lut,
+        )
+    )
+    views = (out.view(torch.float8_e4m3fn), other.view(torch.float8_e4m3fn))
+    expander = Nvfp4CsfDecoder.prepare(PackedCsfPlane.of(scales), PackedCsfPlane.of(second), *views)
+    expander.decode(torch.tensor([2, 0], dtype=torch.int32, device=device), *views)
+    torch.cuda.synchronize()
+    assert torch.equal(out[[0, 2]], expected[[0, 2]])
+    assert torch.equal(other[[0, 2]], expand_packed_csf_scales(second)[[0, 2]])
+
+
+def test_records_spill_past_their_inline_words():
+    """Atoms with more replacement words than a record holds read the rest from storage."""
+    device = require_b12x()
+    experts, rows, columns = 2, 128, 8
+    lut = _value_table("w4a16", device)
+    logical = _logical_scales(experts, rows, columns, 9, outliers=0.5)
+    batch = repack_nvfp4_csf_batch(_native_batch(logical, device), row_rotation=0, value_lut=lut)
+    scales = build_packed_csf_scales(batch)
+    assert scales.max_atom_words > 24
+    assert torch.equal(
+        expand_packed_csf_scales(scales), _w4a16_scale_bytes(logical, lut, 0).to(device)
+    )
