@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-loader-plugin-native-delegation",
+  "category": "fix",
+  "summary": "Register the host's native B12X checkpoint loader when available",
+  "models": [
+    "Models selecting the B12X checkpoint loader plugin"
+  ],
+  "compatibility": "The b12x_loader plugin delegates to the native vLLM loader when its module is available. Hosts without that module retain the packaged adapter, and custom loader registration remains supported.",
+  "details": [
+    "Errors importing an existing native loader propagate instead of selecting the packaged adapter. Native shared-GDS allocator handling therefore applies when launch scripts explicitly enable the plugin."
+  ],
+  "authors": [
+    "lukealonso"
+  ]
+}

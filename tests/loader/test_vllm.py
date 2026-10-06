@@ -1,6 +1,7 @@
 """The adapter preserves vLLM's indexed source selection and owned inputs."""
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,48 @@ from b12x.integration.vllm.loader import B12xModelLoader
 from b12x.loader._checkpoint import DirectWeightSession
 
 from b12x.loader._progress import CheckpointDisplay
+
+
+@pytest.mark.parametrize("native_available", [False, True])
+def test_loader_plugin_uses_the_host_loader_when_available(monkeypatch, native_available):
+    from b12x.integration.vllm import loader
+    from vllm.model_executor import model_loader
+
+    monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", {})
+    monkeypatch.setattr(loader, "find_spec", lambda name: object() if native_available else None)
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.model_loader.b12x_loader",
+        SimpleNamespace(B12xModelLoader=DefaultModelLoader),
+    )
+    loader.register_b12x_loader()
+    assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["b12x"] is (
+        DefaultModelLoader if native_available else B12xModelLoader
+    )
+
+    class CustomLoader(DefaultModelLoader):
+        pass
+
+    model_loader.register_model_loader("b12x")(CustomLoader)
+    assert isinstance(model_loader.get_model_loader(LoadConfig(load_format="b12x")), CustomLoader)
+
+
+def test_loader_plugin_propagates_native_import_errors(monkeypatch):
+    from b12x.integration.vllm import loader
+    from vllm.model_executor import model_loader
+
+    class MissingDependency:
+        @property
+        def B12xModelLoader(self):
+            raise ModuleNotFoundError("native loader dependency unavailable")
+
+    monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", {})
+    monkeypatch.setattr(loader, "find_spec", lambda name: object())
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.model_loader.b12x_loader", MissingDependency(),
+    )
+    with pytest.raises(ModuleNotFoundError, match="native loader dependency unavailable"):
+        loader.register_b12x_loader()
+    assert "b12x" not in model_loader._LOAD_FORMAT_TO_MODEL_LOADER
 
 
 @pytest.mark.parametrize("enabled", [False, True])

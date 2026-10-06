@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 from contextlib import ExitStack
 import heapq
+from importlib.util import find_spec
 import json
 import math
 import sys
@@ -264,4 +265,10 @@ class B12xModelLoader(DefaultModelLoader):
 def register_b12x_loader():
     from vllm.model_executor.model_loader import register_model_loader
 
-    register_model_loader("b12x")(B12xModelLoader)
+    if find_spec("vllm.model_executor.model_loader.b12x_loader") is not None:
+        from vllm.model_executor.model_loader.b12x_loader import (
+            B12xModelLoader as loader_class,
+        )
+    else:
+        loader_class = B12xModelLoader
+    register_model_loader("b12x")(loader_class)
