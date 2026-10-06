@@ -6,8 +6,8 @@ unsigned offset, with exact exception bytes for values outside the interval.
 
 | Representation | Source scale bytes | Offset width | Native expert arithmetic |
 | --- | --- | ---: | --- |
-| MXFP4-CSF | E8M0 | 1 bit | MXFP4 weights, BF16 activations |
-| NVFP4-CSF | E4M3 | 4 bits | NVFP4 weights and calibrated FP4 activations |
+| MXFP4-CSF | E8M0 | 1 bit | MXFP4 weights, BF16 or MXFP8 activations |
+| NVFP4-CSF | E4M3 | 4 bits | NVFP4 weights, BF16 or calibrated FP4 activations |
 
 One base belongs to a row of block scales. A row contains multiple scales;
 the base is not a replacement for the row's entire scale tensor.
@@ -27,7 +27,8 @@ the source FP32 scalar weight and activation calibration.
 `prepare_weights` uploads the compressed planes, partitions exception ranges,
 and applies the planned scale layout. NVFP4 uses the ordinary packed-weight
 preparation, including its W4A16 normalization when A16 is selected. MXFP4 uses
-the W4A16 preparation path for its planned native or MMA-packed weight layout.
+W4A16 preparation for BF16 activations and native W4A8 scale packing for MXFP8
+activations.
 These operations happen during weight preparation, before graph capture.
 Callers with already resident scale batches may also pass those batches.
 
