@@ -150,6 +150,36 @@ _PACK_FACTOR = 8
 _STAGES = 4
 
 
+def _w4a16_small_m_occupancy() -> int:
+    """Resident CTAs per SM for small-M (M8 route block) packed W4A16 plans.
+
+    One persistent CTA per SM keeps the fewest participants in the fused
+    FC1 -> FC2 grid barriers, which suits wide experts (1024 channels per
+    rank at GLM-5.3-Flash TP2). Narrow experts leave the FC1 phase with too
+    few tiles to keep DRAM busy: at GLM-5.3 (744B) TP8, 256 channels per
+    rank, two CTAs per SM with three pipeline stages run the MoE 4-8% faster
+    at 4-64 tokens. ``B12X_W4A16_SMALL_M_OCCUPANCY=2`` selects that schedule;
+    the default keeps one CTA and four stages.
+    """
+    value = os.environ.get("B12X_W4A16_SMALL_M_OCCUPANCY", "1")
+    if value not in ("1", "2"):
+        raise ValueError("B12X_W4A16_SMALL_M_OCCUPANCY must be 1 or 2")
+    return int(value)
+
+
+def _w4a16_small_m_double_occupancy(
+    *, weight_layout: str, scale_format: str, uses_m_block_8: bool
+) -> bool:
+    """Whether a small-M plan runs two CTAs per SM with three stages: opted in,
+    and packed NVFP4 weights with E4M3 scales, the measured geometry."""
+    return (
+        uses_m_block_8
+        and weight_layout == "packed"
+        and scale_format == "e4m3_k16"
+        and _w4a16_small_m_occupancy() == 2
+    )
+
+
 def _w4a16_small_m_splitk_enabled() -> bool:
     """Experimental small-M split-K schedule toggle.  NOT yet correct.
 
@@ -509,7 +539,7 @@ def _iq2_xs_stage_bytes(tile_k: int, tile_n: int, codec: str = "iq2_xs") -> int:
 
 def _w4a16_pipeline_stages(
     *, weight_layout: str, tile_n: int, tile_k: int, uses_m_block_8: bool,
-    pipeline_stages: int | None = None,
+    pipeline_stages: int | None = None, scale_format: str = "e4m3_k16",
 ) -> int:
     if pipeline_stages is not None:
         if type(pipeline_stages) is not int or pipeline_stages not in (2, 3, 4, 5):
@@ -518,6 +548,12 @@ def _w4a16_pipeline_stages(
     if weight_layout in BLOCK_CODECS and tile_n == 128 and tile_k == 128:
         return 2
     if weight_layout in BLOCK_CODECS and uses_m_block_8 and tile_n == 64 and tile_k == 128:
+        return 3
+    if _w4a16_small_m_double_occupancy(
+        weight_layout=weight_layout, scale_format=scale_format,
+        uses_m_block_8=uses_m_block_8,
+    ):
+        # Three stages leave room for two resident CTAs per SM.
         return 3
     return _STAGES
 
@@ -555,7 +591,7 @@ def _shared_memory_footprint(
     stages = _w4a16_pipeline_stages(
         weight_layout=weight_layout, tile_n=cta_n, tile_k=cta_k,
         uses_m_block_8=uses_m_block_8,
-        pipeline_stages=pipeline_stages,
+        pipeline_stages=pipeline_stages, scale_format=scale_format,
     )
     activation_rows = 8 if uses_m_block_8 and stages == 3 else cta_m
     sh_block_meta_size = activation_rows * 16
@@ -635,8 +671,16 @@ def _determine_blocks_per_sm(
         # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
         # barrier participant count while still covering the machine for the
         # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
-        # is numerically identical.
-        blocks_per_sm_limit = 1
+        # is numerically identical. Narrow NVFP4 experts may opt into two
+        # CTAs per SM (see _w4a16_small_m_occupancy).
+        blocks_per_sm_limit = (
+            min(blocks_per_sm_limit, 2)
+            if _w4a16_small_m_double_occupancy(
+                weight_layout=weight_layout, scale_format=scale_format,
+                uses_m_block_8=uses_m_block_8,
+            )
+            else 1
+        )
     elif uses_m_block_8:
         block_limit = 4 if tile_n == 64 and tile_k == 128 else 2
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, block_limit), 1)
@@ -1343,7 +1387,7 @@ class W4A16GemmKernel:
         self.stages = _w4a16_pipeline_stages(
             weight_layout=weight_layout, tile_n=self.tile_n, tile_k=self.tile_k,
             uses_m_block_8=self.uses_m_block_8,
-            pipeline_stages=pipeline_stages,
+            pipeline_stages=pipeline_stages, scale_format=scale_format,
         )
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
