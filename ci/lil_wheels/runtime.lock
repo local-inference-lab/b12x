@@ -7,5 +7,5 @@ cuda.version=13.4.1
 pytorch.version=2.14.0a0+4fdf77b940.nv26.8.63802676
 pytorch.commit=4fdf77b940a7e61d854b9be527884e38f32d335a
 cxx11-abi=1
-cutlass-dsl.version=4.6.2
+cutlass-dsl.version=4.7.1
 cuda.arch-list=12.0a

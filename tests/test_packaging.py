@@ -26,3 +26,17 @@ def test_pcie_collectives_are_python_only() -> None:
         assert "torch.utils.cpp_extension" not in text
         assert "cpp_extension.load" not in text
         assert "load_inline(" not in text
+
+
+def test_wheel_runtime_locks_match_required_cutlass_family() -> None:
+    """The bundle manifest must declare the kernel runtime required by its wheel."""
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    versions = {
+        dependency.split("==", 1)[1]
+        for dependency in config["project"]["dependencies"]
+        if dependency.startswith("nvidia-cutlass-dsl")
+    }
+    assert len(versions) == 1
+    for path in (ROOT / "ci" / "lil_wheels").rglob("runtime.lock"):
+        contract = dict(line.split("=", 1) for line in path.read_text().splitlines())
+        assert contract["cutlass-dsl.version"] in versions, path

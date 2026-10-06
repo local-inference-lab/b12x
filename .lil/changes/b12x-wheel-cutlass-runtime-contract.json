@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-wheel-cutlass-runtime-contract",
+  "category": "fix",
+  "summary": "Match wheel runtime manifests to the required CUTLASS DSL version",
+  "models": [
+    "Models using B12X kernels"
+  ],
+  "compatibility": "Wheel bundles declare CUTLASS DSL 4.7.1, matching the package dependency required to compile B12X kernels.",
+  "details": [
+    "The AMD64 runtime lock uses CUTLASS DSL 4.7.1, and packaging tests check both architecture locks against the package dependencies."
+  ],
+  "authors": [
+    "lukealonso"
+  ]
+}
