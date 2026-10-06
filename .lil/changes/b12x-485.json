@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-485",
+  "category": "performance",
+  "summary": "Opt-in faster small-batch W4A16 MoE decode for narrow experts: two CTAs per SM (GLM-5.3 744B TP8 MoE 4-8% faster)",
+  "models": ["GLM-5.3"],
+  "compatibility": "Opt-in with B12X_W4A16_SMALL_M_OCCUPANCY=2 (the GLM-5.3 744B docker profile sets it). The default schedule is unchanged.",
+  "details": [
+    "Small-M (M8 route block) packed NVFP4 W4A16 plans with E4M3 scales, native or FP4-CSF, run three pipeline stages with two resident CTAs per SM instead of four stages on one CTA; E8M0 kernels keep the default.",
+    "GLM-5.3 TP8 geometry (256 experts, hidden 6144, 256 channels per rank): fused MoE 55.9/99.6/156.5/266.2/352.1 us -> 53.4/93.6/146.0/245.0/328.2 us at 4/8/16/32/64 tokens; with FP4-CSF scales the cost over native drops from +8-13% to +1.5-3.3% at 8-64 tokens.",
+    "Serving (TP8 MTP3, MTP-normalized decode steps/s): C1 84.2 -> 85.0, C2 135.1 -> 138.7, C4 189.0 -> 196.8 at context 0."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [485],
+  "requires": []
+}
