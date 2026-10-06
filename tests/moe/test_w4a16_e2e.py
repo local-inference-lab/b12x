@@ -260,6 +260,15 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
         activation="silu",
     )
     outputs = {}
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16GemmKernel
+    original_init = W4A16GemmKernel.__init__
+    compiled_controls = []
+
+    def record_control(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        compiled_controls.append(self.skip_empty_m_blocks)
+
+    monkeypatch.setattr(W4A16GemmKernel, "__init__", record_control)
     for skip in ("0", "1"):
         monkeypatch.setenv("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", skip)
         weight_plan = fused_moe.plan_weights(
@@ -291,6 +300,8 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
             capacity=fused_moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
             routing=fused_moe.RoutingSpec(),
         )
+        monkeypatch.setenv("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", str(1 - int(skip)))
+        compiled_controls.clear()
         output = torch.empty_like(x)
 
         def allocate(state):
@@ -311,7 +322,7 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
             )
             return PreparedCall(run=lambda: state.run(binding), owners=scratch)
 
-        with PreparationSession(device=x.device, autotune=False) as session:
+        with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
             request = plan.request(name=f"skip-empty-rows-{skip}", prepare_call=primer)
             session.prepare((request,))
             state = require_prepared(request.plan, "moe.decode")
@@ -326,6 +337,18 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
             )
             assert binding.fused_launch.moe_block_size > 16
             outputs[skip] = binding.run().clone()
+            assert compiled_controls and set(compiled_controls) == {skip == "1"}
+            session.freeze()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                binding.run()
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, outputs[skip], rtol=0, atol=0)
+            graph.reset()
     assert torch.isfinite(outputs["1"]).all() and torch.count_nonzero(outputs["1"])
     assert torch.equal(outputs["0"], outputs["1"])
     _assert_matches_oracle(

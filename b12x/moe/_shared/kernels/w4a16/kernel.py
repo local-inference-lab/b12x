@@ -1043,6 +1043,7 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1232,6 +1233,7 @@ class W4A16GemmKernel:
         # live routes; padded rows of a partial block are never read back.
         self.skip_empty_m_blocks = (
             os.environ.get("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1") == "1"
+            if skip_empty_m_blocks is None else skip_empty_m_blocks
         )
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
@@ -6329,6 +6331,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         pipeline_stages: int | None = None,
+        skip_empty_m_blocks: bool | None = None,
         trellis_decode_table: str = "auto",
     ):
         activation = normalize_moe_activation(activation)
@@ -6588,6 +6591,7 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6626,6 +6630,7 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             pipeline_stages=pipeline_stages,
+            skip_empty_m_blocks=skip_empty_m_blocks,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -9849,6 +9854,7 @@ def compile_w4a16_fused_moe(
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     pipeline_stages: int | None = None,
+    skip_empty_m_blocks: bool | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     intermediate_hadamard: bool = False,
@@ -10250,6 +10256,7 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         pipeline_stages=pipeline_stages,
+        skip_empty_m_blocks=skip_empty_m_blocks,
         trellis_decode_table=trellis_decode_table,
     )
     cache_key = (
