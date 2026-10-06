@@ -1,0 +1,63 @@
+{
+  "status": "qualified",
+  "scope": "Rank-local prepared tensors and component execution; no full-model rerun or timing claim",
+  "reference_b12x_revision": "1b32d927bab8d354718bfb559fa925f23e6266d2",
+  "reference_vllm_revision": "096c7037ee3f526434ee4816fc555b5cd3767715",
+  "source_sha256": {
+    "b12x:b12x/moe/fused_moe/__init__.py": "7a2f457a8d505a4b7ba62d3e6334945d077db0897f0424c28d6e87dceb201658",
+    "b12x:b12x/moe/fused_moe/api.py": "85dac6a67b24dd125b33ca57f1a660618b310d7051e69bac936f33d5f5480932",
+    "b12x:b12x/moe/fused_moe/weights.py": "b341f48fb63ed48097203680d3e331cfa0f3953709de899b839db0ac25aff4fb",
+    "b12x:b12x/moe/fused_moe/planning.py": "36595350fd7b60f4521f14a4e1182a074a0d960c2f8462d6c72300309c25606c",
+    "vllm:vllm/model_executor/model_loader/csf_utils.py": "90746fe65dc586485aa02dc89752757acedfc65e100201d3630887fc7b81651e",
+    "vllm:vllm/model_executor/model_loader/mxfp4_csf_loader.py": "80118115a920a28675665b428b894e516955c7e6c9ae8248a91098b4ccc0b165",
+    "vllm:vllm/model_executor/model_loader/nvfp4_csf_loader.py": "989c98b8d634538ff571bcfcf462fa333c08cc7de58c99f322b69c308ef748b2",
+    "vllm:vllm/model_executor/layers/quantization/mxfp4_csf.py": "789320a4756a1bfd42d1614c3590063bd024994898d32e0000da4628e74a7200",
+    "vllm:vllm/model_executor/layers/quantization/nvfp4_csf.py": "841bbc44be2b113e64815314154e987d311df33a365f46fc66b6f3e2f084345a",
+    "vllm:vllm/models/deepseek_v4_1/mxfp4_csf.py": "3f3ba7615de8ef2447f94a6a223e42eddd85fc58ea98a2b05987b855a18c5700"
+  },
+  "validation_tool_sha256": "98ac2bf879033a3e8d46c1ad13bc73ec85d7ce029925dfaa889a3879b5473635",
+  "compute_kernels_changed": false,
+  "environment": {
+    "base_image": "local/fp4-csf:beta-ce707c68e4-00c6f79301",
+    "base_image_id": "sha256:18b00b38c792463e8a9ba886d68b9f58256544776856d67c5146d9b2c872cf3f",
+    "python_source": "review worktrees via PYTHONPATH=/work/b12x:/work/vllm; native extensions from the base image",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "gpu_uuid": "GPU-6171baff-cc22-608e-4029-507f67c392ff",
+    "physical_gpu_index": 10,
+    "power_limit_w": 600,
+    "cutlass_dsl": "4.7.1",
+    "clocks": "dynamic; no timing claim"
+  },
+  "tests": {
+    "b12x": {
+      "passed": 69,
+      "command": ".venv/bin/python -m pytest -q tests/quantization/test_nvfp4_csf.py tests/moe/test_nvfp4_csf.py tests/quantization/test_x4t_packed_scales.py"
+    },
+    "vllm": {
+      "passed": 56,
+      "command": ".venv/bin/python -m pytest -q tests/quantization/test_mxfp4_csf.py tests/quantization/test_nvfp4_csf.py"
+    },
+    "vllm_lint": "All applicable staged-file hooks and manual mypy-3.12 pass.",
+    "b12x_lint": "Changed code passes Ruff. api.py retains three B008 diagnostics on FrozenMapping defaults reproduced in the unchanged control; no new diagnostics."
+  },
+  "comparison": {
+    "layer_rank_cases": 10,
+    "tensors": 132,
+    "tensor_bytes": 13011266748,
+    "equal": true,
+    "exclusions": "Uninitialized shared scale scratch contents and compiled program objects; scratch storage identity is checked. No MoE inference in layer parity tool."
+  },
+  "case_receipts": [
+    "ds-prepared-parity.json",
+    "glm-prepared-parity.json",
+    "qwen-prepared-parity.json",
+    "kimi-tp16-prepared-parity.json",
+    "kimi-tp12-prepared-parity.json"
+  ],
+  "kimi_source_shard": {
+    "file": "model-00002-of-000096.safetensors",
+    "bytes": 16209974572,
+    "sha256": "02182faabfa61a4ef6c506d3d1f4c9c905b80fa9e759401dcb632e1d0af74c8e",
+    "role": "temporary read-only fixture copied from the published snapshot on frank2; hash matches its manifest"
+  }
+}

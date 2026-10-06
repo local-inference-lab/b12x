@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-450-nvfp4-csf-cooperative",
+  "category": "performance",
+  "summary": "Reconstruct NVFP4-CSF scale operands inside dynamic expert kernels",
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "Canonical checkpoint bytes, FP32 calibration and A4 arithmetic are unchanged. Preparation retunes its versioned decoder choice; no launch flag changes are required.",
+  "details": [
+    "Typed preparation selects complete-plane expansion or cooperative reconstruction in shared operand slots. N64 intermediate tails are supported.",
+    "Short-route expansion uses equal-size output spans and the prepared exception-word index. Scratch remains caller-owned and graph replay does not allocate.",
+    "The serving report records measured concurrency, hardware, source identities and remaining overhead; component decoder timings alone do not establish model throughput."
+  ],
+  "pull_requests": [450],
+  "requires": ["b12x-450-csf-mxfp8"]
+}

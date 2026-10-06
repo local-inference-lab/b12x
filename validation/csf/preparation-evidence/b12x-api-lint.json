@@ -1,0 +1,53 @@
+[
+  {
+    "cell": null,
+    "code": "B008",
+    "end_location": {
+      "column": 48,
+      "row": 127
+    },
+    "filename": "/work/b12x/b12x/moe/fused_moe/api.py",
+    "fix": null,
+    "location": {
+      "column": 33,
+      "row": 127
+    },
+    "message": "Do not perform function call `FrozenMapping` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable",
+    "noqa_row": 127,
+    "url": "https://docs.astral.sh/ruff/rules/function-call-in-default-argument"
+  },
+  {
+    "cell": null,
+    "code": "B008",
+    "end_location": {
+      "column": 93,
+      "row": 141
+    },
+    "filename": "/work/b12x/b12x/moe/fused_moe/api.py",
+    "fix": null,
+    "location": {
+      "column": 78,
+      "row": 141
+    },
+    "message": "Do not perform function call `FrozenMapping` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable",
+    "noqa_row": 141,
+    "url": "https://docs.astral.sh/ruff/rules/function-call-in-default-argument"
+  },
+  {
+    "cell": null,
+    "code": "B008",
+    "end_location": {
+      "column": 57,
+      "row": 152
+    },
+    "filename": "/work/b12x/b12x/moe/fused_moe/api.py",
+    "fix": null,
+    "location": {
+      "column": 42,
+      "row": 152
+    },
+    "message": "Do not perform function call `FrozenMapping` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable",
+    "noqa_row": 152,
+    "url": "https://docs.astral.sh/ruff/rules/function-call-in-default-argument"
+  }
+]

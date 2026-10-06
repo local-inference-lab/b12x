@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-kimi-x4t-prepared-scales",
+  "category": "feature",
+  "summary": "Prepare lossless Kimi-K3 X4T experts and retain compressed-scale programs for frozen serving.",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Adds Kimi TP1/2/4/8/12/16 geometry to the DS4.1 X4T reader. TP16 serving is measured; other topologies require separate qualification.",
+  "pull_requests": [
+    446
+  ],
+  "authors": [
+    "voipmonitor"
+  ]
+}
