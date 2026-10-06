@@ -423,6 +423,15 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
         poison()
         torch.testing.assert_close(call(1), reference, rtol=0, atol=0)
 
+        if torch.cuda.device_count() > 1:
+            poison()
+            torch.cuda.synchronize(device)
+            with torch.cuda.device(1):
+                assert moe.expand_scales(experts[1])
+                assert torch.cuda.current_device() == 1
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(call(1, scales_expanded=True), reference, rtol=0, atol=0)
+
         output = torch.empty_like(source)
         binding = moe.bind(
             plans[1], a=source, topk_ids=ids, topk_weights=probabilities,
