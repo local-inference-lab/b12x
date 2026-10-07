@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 from b12x.preparation import PreparationSession, PreparedCall
+
+# Polls before a fault-injection wait gives up: about 3 s on GB10.
+FAULT_SPIN_LIMIT = 2_000_000
 
 pytestmark = pytest.mark.skipif(
     "WORLD_SIZE" not in os.environ or int(os.environ.get("WORLD_SIZE", "1")) < 2,
@@ -43,11 +47,45 @@ class _PreparedRuntime:
         return getattr(self._runtime, name)
 
 
+@contextmanager
+def _prepared(rt):
+    """``rt`` behind a published plan for every dtype and the gather.
+
+    Closing a preparation session releases its plans, so the session stays
+    open for as long as the caller uses the runtime.
+    """
+    from b12x.comm import roce
+    from b12x.comm.roce import _preparation
+
+    query = roce.query_from_runtime(
+        rt,
+        surface="AllReduce.all_reduce",
+        call={"dtypes": ("bfloat16", "float32", "float16")},
+        topology="roce_rdma",
+        peer_hosts=tuple(f"rank-{rank}" for rank in range(rt.world_size)),
+    )
+    declaration = roce.plan(query, runtime=rt)
+    seeds = [torch.zeros(16 // dtype.itemsize, dtype=dtype, device=rt.device)
+             for dtype in (torch.float16, torch.bfloat16, torch.float32)]
+
+    def prepare(state):
+        calls = [_preparation.prepared_call(state, inp=seed) for seed in seeds]
+        calls.append(_preparation.prepared_gather_call(state, inp=seeds[1]))
+        return PreparedCall(run=lambda: [call.run() for call in calls])
+
+    request = declaration.request(
+        name="roce",
+        prepare_call=prepare,
+    )
+    with PreparationSession(device=rt.device, autotune=False, compile_workers=2) as session:
+        session.prepare((request,))
+        yield _PreparedRuntime(rt, declaration)
+
+
 @pytest.fixture(scope="module")
 def runtime():
     """Module-scoped RoCEnante runtime over the torchrun world; skips without RDMA support."""
     from b12x.comm import roce
-    from b12x.comm.roce import _preparation
 
     if not roce.is_supported():
         pytest.skip(
@@ -65,29 +103,8 @@ def runtime():
         max_size=1 << 20,
         max_gather_bytes=4 << 20,
     )
-    query = roce.query_from_runtime(
-        rt,
-        surface="AllReduce.all_reduce",
-        call={"dtypes": ("bfloat16", "float32", "float16")},
-        topology="roce_rdma",
-        peer_hosts=tuple(f"rank-{rank}" for rank in range(rt.world_size)),
-    )
-    declaration = roce.plan(query, runtime=rt)
-    seeds = [torch.zeros(16 // dtype.itemsize, dtype=dtype, device=device)
-             for dtype in (torch.float16, torch.bfloat16, torch.float32)]
-
-    def prepare(state):
-        calls = [_preparation.prepared_call(state, inp=seed) for seed in seeds]
-        calls.append(_preparation.prepared_gather_call(state, inp=seeds[1]))
-        return PreparedCall(run=lambda: [call.run() for call in calls])
-
-    request = declaration.request(
-        name="roce",
-        prepare_call=prepare,
-    )
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare((request,))
-        yield _PreparedRuntime(rt, declaration)
+    with _prepared(rt) as prepared:
+        yield prepared
     rt.close()
     dist.barrier()
 
@@ -435,12 +452,13 @@ def test_adapter_path_graph_replay(runtime):
     dist.barrier()
 
 
-def _fresh_runtime(spin_limit: int):
+@pytest.fixture
+def fresh_runtime(runtime):
     """A runtime of its own with a short spin limit, for fault injection."""
     from b12x.comm import roce
 
     previous = os.environ.get("B12X_ROCE_SPIN_LIMIT")
-    os.environ["B12X_ROCE_SPIN_LIMIT"] = str(spin_limit)
+    os.environ["B12X_ROCE_SPIN_LIMIT"] = str(FAULT_SPIN_LIMIT)
     try:
         rt = roce.AllReduce.from_exchange_group(
             exchange_group=dist.group.WORLD,
@@ -452,11 +470,12 @@ def _fresh_runtime(spin_limit: int):
             del os.environ["B12X_ROCE_SPIN_LIMIT"]
         else:
             os.environ["B12X_ROCE_SPIN_LIMIT"] = previous
-    rt.prepare((torch.bfloat16,))
-    return rt
+    with _prepared(rt) as prepared:
+        yield prepared
+    rt.close()
 
 
-def test_fail_stop_on_timeout_eager(runtime):
+def test_fail_stop_on_timeout_eager(fresh_runtime):
     """A wait that times out poisons the runtime: the epoch stops, the failure
     is raised on the next check, another launch raises before enqueue, and the
     peers converge to the same state on their own.
@@ -468,7 +487,7 @@ def test_fail_stop_on_timeout_eager(runtime):
     """
     world = dist.get_world_size()
     rank = dist.get_rank()
-    rt = _fresh_runtime(2_000_000)
+    rt = fresh_runtime
     epoch_before = rt.stats()["epoch"]
     dist.barrier()
     if rank == 1:
@@ -477,7 +496,10 @@ def test_fail_stop_on_timeout_eager(runtime):
     out = rt.all_reduce(
         x
     )  # enqueue succeeds: the fault is only visible once the kernel waited
+    started = time.monotonic()
     torch.cuda.synchronize()
+    # The wait is bounded: FAULT_SPIN_LIMIT polls take about 3 s on GB10.
+    assert time.monotonic() - started < 60
     if rank != 1:
         with pytest.raises(RuntimeError, match="poisoned"):
             rt.check_health()
@@ -494,15 +516,16 @@ def test_fail_stop_on_timeout_eager(runtime):
         with pytest.raises(RuntimeError, match="poisoned"):
             rt.check_health()
     assert rt.poisoned
+    _assert_snapshot_names_failed_op(rt)
     rt.close()  # teardown during failure must not hang
     dist.barrier()
 
 
-def test_fail_stop_on_timeout_graph_replay(runtime):
+def test_fail_stop_on_timeout_graph_replay(fresh_runtime):
     """A faulted replay leaves the epoch where it was and raises on the post-step check."""
     world = dist.get_world_size()
     rank = dist.get_rank()
-    rt = _fresh_runtime(2_000_000)
+    rt = fresh_runtime
     static = torch.ones(4096, dtype=torch.bfloat16, device=rt.device)
     stream = torch.cuda.Stream(device=rt.device)
     stream.wait_stream(torch.cuda.current_stream())
@@ -523,6 +546,9 @@ def test_fail_stop_on_timeout_graph_replay(runtime):
     rt.check_health()
     torch.testing.assert_close(o3, static * world**3)
     epoch_ok = rt.stats()["epoch"]
+    snap = rt.snapshot()
+    assert snap["doorbell"] == snap["completed"] == epoch_ok
+    assert snap["failed"] == 0
     dist.barrier()
     if rank == 1:
         rt._proxy.stop()
@@ -535,8 +561,24 @@ def test_fail_stop_on_timeout_graph_replay(runtime):
     # completed on the peers' payloads, and none produced the step's result
     assert rt.stats()["epoch"] < epoch_ok + 3
     assert not torch.equal(o3, static * world**3)
+    _assert_snapshot_names_failed_op(rt)
     rt.close()
     dist.barrier()
+
+
+def _assert_snapshot_names_failed_op(rt):
+    """The host-only snapshot pins a timeout to one collective in flight.
+
+    The failed kernel rang its doorbell and never completed, so the doorbell is
+    exactly one ahead of the completed word, the recorded error names that
+    sequence, and later launches were no-ops that moved neither word.
+    """
+    snap = rt.snapshot()
+    assert snap["failed"] == 1
+    assert snap["error_seq"] == snap["doorbell"]
+    assert snap["doorbell"] == snap["completed"] + 1
+    assert snap["error_peer"] != rt.rank
+    assert set(snap["flags"]) == set(range(rt.world_size)) - {rt.rank}
 
 
 @pytest.mark.parametrize(
