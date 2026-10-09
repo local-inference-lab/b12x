@@ -21,11 +21,15 @@ from ._contract import (
     plan,
     run,
     select,
+    KVWriterBinding,
+    bind_kv_writer,
 )
 from ._tuning import QsaConfig, QsaQuery
+from ..paged._nvfp4_kv import NVFP4_KV_DTYPE
 from b12x.preparation import Plan
 
 __all__ = [
+    "NVFP4_KV_DTYPE",
     "CacheRequirements",
     "Caps",
     "DraftSelectionPlan",
@@ -47,4 +51,6 @@ __all__ = [
     "attend",
     "attend_reuse",
     "is_supported",
+    "KVWriterBinding",
+    "bind_kv_writer",
 ]

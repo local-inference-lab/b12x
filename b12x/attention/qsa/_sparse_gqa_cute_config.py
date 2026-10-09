@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from ..paged._nvfp4_kv import is_nvfp4_cache as _is_nvfp4_cache
 from ..paged._selected_forward_config import (
     HEAD_DIM,
     MAX_SPLITS as NUM_SPLITS,
@@ -96,7 +97,7 @@ def is_candidate(
             splits=splits,
         )
         and int(key_cache.shape[0]) > 0
-        and int(key_cache.shape[3]) == HEAD_DIM
+        and (int(key_cache.shape[3]) == HEAD_DIM or _is_nvfp4_cache(key_cache, HEAD_DIM))
         and int(selected_positions.shape[0]) >= rows
     ):
         return False
@@ -104,7 +105,10 @@ def is_candidate(
         return False
     if (
         query.dtype != torch.bfloat16
-        or key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or (
+            key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+            and not _is_nvfp4_cache(key_cache, HEAD_DIM)
+        )
         or value_cache.dtype != key_cache.dtype
         or block_table.dtype != torch.int32
         or request_ids.dtype not in (torch.int32, torch.int64)

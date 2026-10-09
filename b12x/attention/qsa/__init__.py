@@ -16,8 +16,9 @@ META = OpMeta(
         "QsaConfig", "QsaQuery", "cache_requirements", "draft_selection_plan",
         "invocation_from_descriptors", "invocation_from_tensors",
         "plan", "bind", "run", "select", "attend", "attend_reuse", "is_supported",
+        "KVWriterBinding", "bind_kv_writer", "NVFP4_KV_DTYPE",
     ),
-    dtypes=("bf16",),
+    dtypes=("bf16", "fp8_e4m3", "nvfp4"),
     recipes=("grouped_selector_sparse_gqa",),
     requires=("triton",),
     provenance=Provenance(
@@ -37,7 +38,8 @@ if TYPE_CHECKING:
         Binding, CacheRequirements, Caps, DraftSelectionPlan, DraftSelectionReuse,
         DraftSelectionState, Plan, QsaConfig, QsaQuery, bind, cache_requirements,
         draft_selection_plan, invocation_from_descriptors, invocation_from_tensors,
-        LocalSelection, attend, attend_reuse, is_supported, plan, run, select,
+        LocalSelection, NVFP4_KV_DTYPE, attend, attend_reuse, is_supported, plan,
+        run, select, KVWriterBinding, bind_kv_writer,
     )
 
 install_lazy_api(globals(), META)

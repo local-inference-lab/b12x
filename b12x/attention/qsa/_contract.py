@@ -24,6 +24,7 @@ from ...preparation.types import (
     plan_from_handle,
     require_prepared,
 )
+from ..paged._nvfp4_kv import NVFP4_KV_DTYPE, kv_storage, validate_record_caches
 from ._tuning import QsaConfig, QsaQuery, TUNING
 from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS
 
@@ -32,6 +33,15 @@ _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
 _MIN_TOPK_WORKSPACE_BYTES = 1024 * 1024
 _STABLE_TOPK_BLOCK = 512
 _MAX_SCORE_CHUNK_GROUPS = 65536
+# Main K/V formats. NVFP4 names the self-scaled record format of
+# ``paged._nvfp4_kv``; its cache operands are uint8 records.
+_KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn, NVFP4_KV_DTYPE)
+_KV_DTYPE_ERROR = "QSA main KV cache dtype must be BF16, FP8 E4M3FN, or NVFP4"
+_KV_FORMATS = {
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "fp8",
+    NVFP4_KV_DTYPE: "nvfp4",
+}
 
 
 def _align_up(value: int, alignment: int = _ALIGN_BYTES) -> int:
@@ -113,8 +123,8 @@ def cache_requirements(
             raise ValueError(f"{name} must be positive")
     if dtype != torch.bfloat16:
         raise TypeError("QSA query and selector-cache dtype must be torch.bfloat16")
-    if kv_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise TypeError("QSA main KV cache dtype must be BF16 or FP8 E4M3FN")
+    if kv_dtype not in _KV_DTYPES:
+        raise TypeError(_KV_DTYPE_ERROR)
     if not _is_power_of_two(head_dim) or int(head_dim) < 16:
         raise ValueError("head_dim must be a power of two at least 16")
     if not _is_power_of_two(index_head_dim):
@@ -136,10 +146,11 @@ def cache_requirements(
         raise ValueError("raw_ring_capacity must divide main_page_size")
 
     element_nbytes = dtype.itemsize
-    kv_element_nbytes = kv_dtype.itemsize
+    kv_storage_dtype, kv_row_width = kv_storage(kv_dtype, int(head_dim))
+    kv_element_nbytes = kv_storage_dtype.itemsize
     int64_nbytes = torch.int64.itemsize
     compressed_page_size = int(main_page_size) // ratio
-    main_page_shape = (int(main_page_size), int(kv_heads), int(head_dim))
+    main_page_shape = (int(main_page_size), int(kv_heads), kv_row_width)
     main_page_nbytes = math.prod(main_page_shape) * kv_element_nbytes
     compressed_page_shape = (compressed_page_size, int(index_head_dim))
     compressed_page_nbytes = math.prod(compressed_page_shape) * element_nbytes
@@ -279,8 +290,8 @@ class Caps:
             )
         if self.dtype != torch.bfloat16:
             raise TypeError("QSA query and selector-cache dtype must be torch.bfloat16")
-        if self.kv_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-            raise TypeError("QSA main KV cache dtype must be BF16 or FP8 E4M3FN")
+        if self.kv_dtype not in _KV_DTYPES:
+            raise TypeError(_KV_DTYPE_ERROR)
         if int(self.index_kv_heads) != 1:
             raise ValueError("QSA requires exactly one index KV head")
         if int(self.q_heads) % int(self.kv_heads):
@@ -382,6 +393,16 @@ class Caps:
         return self.cache_requirements.selection_width
 
     @property
+    def kv_format(self) -> str:
+        """Planned main K/V format passed to launches: bf16, fp8 or nvfp4."""
+        return _KV_FORMATS[self.kv_dtype]
+
+    @property
+    def kv_storage(self) -> tuple[torch.dtype, int]:
+        """Main K/V operand dtype and innermost row width."""
+        return kv_storage(self.kv_dtype, int(self.head_dim))
+
+    @property
     def raw_ring_capacity(self) -> int:
         return self.cache_requirements.raw_ring_capacity
 
@@ -479,12 +500,18 @@ class QsaPrograms:
     sparse: Mapping[str, object]
     sparse_draft: Mapping[str, object]
     draft: Mapping[str, object]
+    # Planned main K/V format (Caps.kv_format) for the prepared attention launches.
+    kv_format: str
+    # NVFP4 main-cache writer; None for BF16 and FP8, whose caches the caller
+    # fills with its own cache writer.
+    writer: object | None = None
 
     def __post_init__(self) -> None:
         objects = (
             *self.support.values(), self.score, *self.sparse.values(),
             *self.sparse_draft.values(),
             *self.draft.values(),
+            *((self.writer,) if self.writer is not None else ()),
         )
         if any(item is None for item in objects):
             raise RuntimeError("QSA preparation did not retain every native executable")
@@ -993,10 +1020,12 @@ def _canonical_abi(caps: Caps) -> FrozenMapping:
         "index_query": (caps.max_q_rows, caps.index_heads, caps.index_head_dim),
         "raw_index_key": (caps.max_q_rows, caps.index_head_dim),
         "main_k_cache": (
-            caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads, caps.head_dim,
+            caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads,
+            caps.kv_storage[1],
         ),
         "main_v_cache": (
-            caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads, caps.head_dim,
+            caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads,
+            caps.kv_storage[1],
         ),
         "main_block_table": (caps.max_batch, caps.main_table_width),
         "compressed_k_cache": (
@@ -1018,8 +1047,8 @@ def _canonical_abi(caps: Caps) -> FrozenMapping:
         "rope_positions": torch.int64,
         "index_query": caps.dtype,
         "raw_index_key": caps.dtype,
-        "main_k_cache": caps.kv_dtype,
-        "main_v_cache": caps.kv_dtype,
+        "main_k_cache": caps.kv_storage[0],
+        "main_v_cache": caps.kv_storage[0],
         "main_block_table": torch.int32,
         "compressed_k_cache": caps.dtype,
         "compressed_block_table": torch.int32,
@@ -1264,11 +1293,12 @@ def compile_qsa(
             )
 
         scratch = empty(state.scratch_specs()[0].shape, torch.uint8)
+        kv_storage_dtype, kv_row_width = caps.kv_storage
         main_k = empty(
-            (caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads, caps.head_dim),
-            caps.kv_dtype, "main_k_cache",
+            (caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads, kv_row_width),
+            kv_storage_dtype, "main_k_cache",
         )
-        main_v = empty(tuple(main_k.shape), caps.kv_dtype, "main_v_cache")
+        main_v = empty(tuple(main_k.shape), kv_storage_dtype, "main_v_cache")
         main_table = empty(
             (caps.max_batch, caps.main_table_width), torch.int32, "main_block_table",
         )
@@ -1406,7 +1436,10 @@ def compile_qsa(
                 dcp_size=caps.dcp_size,
                 dcp_rank=caps.dcp_rank,
                 cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
-                programs=SimpleNamespace(support=support, score=score, sparse=sparse),
+                programs=SimpleNamespace(
+                    support=support, score=score, sparse=sparse,
+                    kv_format=caps.kv_format,
+                ),
             )
         if not support:
             raise RuntimeError("QSA support compilation produced no native programs")
@@ -1435,12 +1468,24 @@ def compile_qsa(
             )
         else:
             draft["disabled"] = score
+        writer = None
+        if caps.kv_dtype == NVFP4_KV_DTYPE:
+            # NVFP4 records are written by b12x, so the plan owns the writer
+            # for its exact cache layout; row strides stay runtime arguments.
+            from ..paged._nvfp4_kv import compile_nvfp4_kv_writer
+
+            rows_kv = empty((rows, caps.kv_heads, caps.head_dim), torch.bfloat16)
+            writer = compile_nvfp4_kv_writer(
+                key=rows_kv, value=rows_kv, key_cache=main_k, value_cache=main_v,
+            )
     return QsaPrograms(
         support=support,
         score=score,
         sparse=sparse,
         sparse_draft=sparse_draft,
         draft=draft,
+        kv_format=caps.kv_format,
+        writer=writer,
     )
 
 
@@ -1773,14 +1818,15 @@ def _bind_materialized(
         state.scratch_specs(),
         owner="qsa",
     )
+    kv_storage_dtype, kv_row_width = caps.kv_storage
     if main_k_cache.ndim != 4 or tuple(main_k_cache.shape[1:]) != (
         int(caps.main_page_size),
         int(caps.kv_heads),
-        int(caps.head_dim),
+        kv_row_width,
     ):
         raise ValueError(
             "main_k_cache must have shape "
-            f"[pages, {caps.main_page_size}, {caps.kv_heads}, {caps.head_dim}]"
+            f"[pages, {caps.main_page_size}, {caps.kv_heads}, {kv_row_width}]"
         )
     if not 0 < int(main_k_cache.shape[0]) <= int(caps.num_main_cache_pages):
         raise ValueError("main_k_cache page count exceeds planned capacity")
@@ -1788,7 +1834,7 @@ def _bind_materialized(
         main_k_cache,
         name="main_k_cache",
         device=caps.device,
-        dtype=caps.kv_dtype,
+        dtype=kv_storage_dtype,
         unit_inner_stride=True,
     )
     _check_tensor(
@@ -1796,9 +1842,15 @@ def _bind_materialized(
         name="main_v_cache",
         device=caps.device,
         shape=tuple(main_k_cache.shape),
-        dtype=caps.kv_dtype,
+        dtype=kv_storage_dtype,
         unit_inner_stride=True,
     )
+    if caps.kv_dtype == NVFP4_KV_DTYPE:
+        # NVFP4 records are read with four-byte loads; runs rely on this check.
+        validate_record_caches(
+            main_k_cache, main_v_cache,
+            kv_heads=int(caps.kv_heads), head_dim=int(caps.head_dim),
+        )
     fp8_kv = caps.kv_dtype == torch.float8_e4m3fn
     if fp8_kv and (k_descale is None or v_descale is None):
         raise ValueError("FP8 QSA main caches require k_descale and v_descale")
@@ -2221,6 +2273,75 @@ def bind(
     return _bind_materialized(state, plan=plan, **kwargs)
 
 
+@dataclass(frozen=True)
+class KVWriterBinding:
+    """An NVFP4 plan's main-cache writer bound to one pair of caches.
+
+    :func:`bind_kv_writer` checks the caches once; :meth:`write` only launches.
+    """
+
+    writer: object
+    main_k_cache: torch.Tensor
+    main_v_cache: torch.Tensor
+
+    def write(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Quantize new K/V rows into the bound caches (capture-safe).
+
+        ``key``/``value`` are BF16 ``[tokens, kv_heads, head_dim]`` with the
+        planned head count and size and contiguous heads (token rows may be
+        strided); ``slot_mapping`` is int64 ``page * page_size + offset``, one
+        entry per token, with negative entries skipped. These describe the
+        caller's per-step projection buffers and are not checked here; use
+        ``paged._nvfp4_kv.write_nvfp4_kv`` for checked writes.
+        """
+        from ..paged._nvfp4_kv import launch_nvfp4_kv_writer
+
+        launch_nvfp4_kv_writer(
+            self.writer, key=key, value=value, key_cache=self.main_k_cache,
+            value_cache=self.main_v_cache, slot_mapping=slot_mapping,
+        )
+
+
+def bind_kv_writer(
+    plan: Plan,
+    *,
+    main_k_cache: torch.Tensor,
+    main_v_cache: torch.Tensor,
+) -> KVWriterBinding:
+    """Bind an NVFP4 plan's main-cache writer to the caches the plan reads.
+
+    ``main_k_cache``/``main_v_cache`` are the uint8 record views passed to
+    :func:`bind`. BF16 and FP8 plans own no writer: their caches keep the
+    caller's native writer.
+    """
+    state = require_prepared(plan, "attention.qsa", main_k_cache.device)
+    if not isinstance(state, _MaterializedPlan):
+        raise TypeError("QSA plan has an invalid materialized state")
+    programs = state.programs
+    if not isinstance(programs, QsaPrograms) or programs.writer is None:
+        raise ValueError("only NVFP4 QSA plans own a main-cache writer")
+    caps = state.caps
+    validate_record_caches(
+        main_k_cache, main_v_cache,
+        kv_heads=int(caps.kv_heads), head_dim=int(caps.head_dim),
+    )
+    abi = state.abi["operands"]
+    if (
+        tuple(map(int, main_k_cache.stride())) != tuple(abi["main_k_cache"]["strides"])
+        or tuple(map(int, main_v_cache.stride())) != tuple(abi["main_v_cache"]["strides"])
+        or int(main_k_cache.shape[1]) != int(caps.main_page_size)
+        or not 0 < int(main_k_cache.shape[0]) <= int(caps.num_main_cache_pages)
+    ):
+        raise ValueError("QSA writer caches differ from the prepared cache layout")
+    return KVWriterBinding(programs.writer, main_k_cache, main_v_cache)
+
+
 def _qsa_decode_impl(
     query: torch.Tensor | None,
     index_query: torch.Tensor,
@@ -2636,6 +2757,7 @@ def _qsa_decode_impl(
             block_n=block_n,
             splits=splits,
             direct_kv_warps=int(sparse_gqa_direct_kv_warps),
+            kv_format=None if programs is None else programs.kv_format,
             _prepared=None if programs is None else programs.sparse,
         )
 
@@ -4036,6 +4158,7 @@ def _qsa_attention_op(
             block_n=BLOCK_N,
             splits=splits,
             direct_kv_warps=direct_kv_warps,
+            kv_format=state.programs.kv_format,
             _prepared=(
                 state.programs.sparse_draft
                 if draft_reuse

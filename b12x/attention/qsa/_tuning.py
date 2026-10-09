@@ -113,6 +113,14 @@ class QsaConfig:
         }
 
 
+# Declared main K/V format -> native cache operand dtype. NVFP4 records are
+# stored as uint8 bytes (see ``paged._nvfp4_kv``).
+_KV_STORAGE = {
+    "bfloat16": "bfloat16",
+    "float8_e4m3fn": "float8_e4m3fn",
+    "float4_e2m1fn_x2": "uint8",
+}
+
 def _default_config(
     _query: QsaQuery,
     _device: DeviceIdentity | None,
@@ -129,8 +137,8 @@ def _validate_query(
 ) -> None:
     if query.q_dtype != "bfloat16":
         raise ValueError("QSA requires BF16 queries")
-    if query.kv_dtype not in ("bfloat16", "float8_e4m3fn"):
-        raise ValueError("QSA requires BF16 or FP8 E4M3 KV storage")
+    if query.kv_dtype not in _KV_STORAGE:
+        raise ValueError("QSA requires BF16, FP8 E4M3, or NVFP4 KV storage")
     selection_width = int(query.budget) + int(query.compress_ratio) - 1
     if not is_qwen_geometry(
         q_heads=int(query.q_heads),
@@ -215,8 +223,8 @@ def _validate_query(
         "rope_positions": ("int64",),
         "index_query": ("bfloat16",),
         "raw_index_key": ("bfloat16",),
-        "main_k_cache": (query.kv_dtype,),
-        "main_v_cache": (query.kv_dtype,),
+        "main_k_cache": (_KV_STORAGE.get(query.kv_dtype, query.kv_dtype),),
+        "main_v_cache": (_KV_STORAGE.get(query.kv_dtype, query.kv_dtype),),
         "main_block_table": ("int32",),
         "compressed_k_cache": (query.q_dtype,),
         "compressed_block_table": ("int32",),
