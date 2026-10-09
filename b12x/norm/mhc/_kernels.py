@@ -856,6 +856,8 @@ class MHCPostPrePartialKernel:
         hidden_tile, partial_group, token = cute.arch.block_idx()
         token = Int64(token)
         tidx = cute.arch.thread_idx()[0]
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)
         nwarps = self.num_threads // 32
